@@ -10,6 +10,7 @@ import contextlib
 import io
 import ntpath
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,9 @@ from conventiondrift.gitread import GitReader, is_valid_sha
 # Saved before any test patches subprocess.run, so fixture setup is never spied on.
 _REAL_RUN = subprocess.run
 _GIT = shutil.which("git") or "git"
+#: The folder of the test machine's own git: a known-good absolute PATH entry
+#: outside the repo and the cwd, so the filtered PATH gitread passes on is known.
+_GIT_DIR = os.path.dirname(_GIT)
 
 _TEST_GIT_ENV = {
     "PATH": os.environ.get("PATH", ""),
@@ -54,6 +58,18 @@ def _git(repo: Path, *args: str, date: str | None = None) -> str:
 def _commit(repo: Path, msg: str, date: str | None = None) -> str:
     _git(repo, "commit", "-q", "--allow-empty", "-m", msg, date=date)
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _config_path(path: Path) -> str:
+    """``path`` as a git config value: forward slashes, so a Windows path has no
+    backslash escapes (``\\U`` is a fatal "bad config line" to git)."""
+    return path.as_posix()
+
+
+def _sh_path(path: Path) -> str:
+    """``path`` quoted for a ``#!/bin/sh`` script, in forward slashes so Git for
+    Windows' sh does not eat the backslashes of ``C:\\...``."""
+    return "'" + path.as_posix() + "'"
 
 
 @pytest.fixture
@@ -182,10 +198,16 @@ def test_environment_is_fixed_and_nothing_else_leaks(
     monkeypatch.setenv("GITHUB_TOKEN", "ghs_secret")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(repo))
     monkeypatch.setenv("HOME", str(repo))
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    # A known PATH: the real one can hold entries inside the cwd (a .venv in
+    # the checkout on CI), which gitread correctly drops.
+    _set_path(monkeypatch, _GIT_DIR)
     assert is_valid_sha(GitReader(repo).resolve("HEAD"))
     env = spy[0]["kwargs"]["env"]
+    # I-11 C3: SYSTEMROOT is passed on only when os.name == "nt".
+    windows_only = {"SYSTEMROOT": r"C:\Windows"} if os.name == "nt" else {}
     assert env == {
-        "PATH": os.environ["PATH"],
+        "PATH": _GIT_DIR,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
@@ -195,19 +217,21 @@ def test_environment_is_fixed_and_nothing_else_leaks(
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(repo)),
         "HOME": env["HOME"],
+        **windows_only,
     }
     assert env["HOME"] != str(repo)
     assert spy[0]["home_listing"] == []
     assert not os.path.exists(env["HOME"])  # removed after the call
 
 
-def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
-    repo_dir = Path("/r/repo")  # built before os.name changes, so it stays a PosixPath
+    repo_dir = tmp_path / "repo"  # built before os.name changes (SR N-9)
+    ceiling = os.path.realpath(tmp_path)  # a real folder on this platform
     with _simulated_windows(monkeypatch):
         nt_env = gitread._environment("/h", "/bin", repo_dir)
     posix_env = gitread._environment("/h", "/bin", repo_dir)
-    base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES="/r")
+    base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES=ceiling)
     assert nt_env == dict(base, SYSTEMROOT=r"C:\Windows")
     assert posix_env == base
 
@@ -236,17 +260,18 @@ def test_hostile_repo_config_runs_nothing(repo: Path, tmp_path: Path) -> None:
     hooks = tmp_path / "hooks"
     hooks.mkdir()
     script = tmp_path / "evil.sh"
-    script.write_text(f"#!/bin/sh\ntouch {sentinel}\n")
+    script.write_text(f"#!/bin/sh\ntouch {_sh_path(sentinel)}\n")
     script.chmod(0o755)
     for hook in ("post-checkout", "pre-commit", "reference-transaction", "post-index-change"):
-        (hooks / hook).write_text(f"#!/bin/sh\ntouch {sentinel}\n")
+        (hooks / hook).write_text(f"#!/bin/sh\ntouch {_sh_path(sentinel)}\n")
         (hooks / hook).chmod(0o755)
+    run, hook_dir = _config_path(script), _config_path(hooks)
     with (repo / ".git" / "config").open("a") as cfg:
         cfg.write(
-            f"[core]\n\tfsmonitor = {script}\n\thooksPath = {hooks}\n\tpager = {script}\n"
-            f'[diff]\n\texternal = {script}\n[diff "x"]\n\ttextconv = {script}\n'
-            f'[filter "x"]\n\tsmudge = {script}\n\tclean = {script}\n'
-            f"[log]\n\tshowSignature = true\n[gpg]\n\tprogram = {script}\n"
+            f"[core]\n\tfsmonitor = {run}\n\thooksPath = {hook_dir}\n\tpager = {run}\n"
+            f'[diff]\n\texternal = {run}\n[diff "x"]\n\ttextconv = {run}\n'
+            f'[filter "x"]\n\tsmudge = {run}\n\tclean = {run}\n'
+            f"[log]\n\tshowSignature = true\n[gpg]\n\tprogram = {run}\n"
         )
     (repo / ".gitattributes").write_text("* diff=x filter=x\n")
     reader = GitReader(repo)
@@ -402,7 +427,10 @@ def test_bounded_large_stdout_is_never_held_whole(tmp_path: Path) -> None:
 
 def test_bounded_large_stderr_is_drained_and_discarded(tmp_path: Path) -> None:
     # 8 MiB of stderr: far past any pipe buffer, so an undrained pipe would hang.
-    code = "import sys\nsys.stderr.write('fatal: secret ' * 600000); print('ok')"
+    # stdout is written as bytes: print() would give b"ok\\r\\n" on Windows.
+    code = (
+        "import sys\nsys.stderr.write('fatal: secret ' * 600000)\nsys.stdout.buffer.write(b'ok\\n')"
+    )
     out = _bounded(_py(code), tmp_path, timeout=20.0)
     assert out == gitread._Output(0, b"ok\n")
 
@@ -683,7 +711,7 @@ def test_symlinked_git_is_resolved_to_its_real_path(
 
 
 @pytest.mark.parametrize("entry", ["", ".", "bin", "./bin", "../cwd/bin"])
-@pytest.mark.parametrize("windows", [False, True], ids=["posix", "nt"])
+@pytest.mark.parametrize("windows", [False, True], ids=["native", "simulated-nt"])
 def test_empty_dot_and_relative_path_entries_are_dropped(
     repo: Path,
     tmp_path: Path,
@@ -692,7 +720,8 @@ def test_empty_dot_and_relative_path_entries_are_dropped(
     entry: str,
     windows: bool,
 ) -> None:
-    name = "git.exe" if windows else "git"
+    # "native" runs this platform's own rules (git.exe on a real Windows runner).
+    name = "git.exe" if windows else _platform_git_name()
     _fake_git_in(elsewhere, name)  # ./git, reachable through "" and "."
     _fake_git_in(elsewhere / "bin", name)  # ./bin/git, reachable through the relative entries
     trusted = _fake_git_in(tmp_path / "trusted", name)
@@ -779,11 +808,10 @@ def test_no_path_means_git_unavailable(
 def test_filtered_path_is_passed_to_git(
     repo: Path, spy: list[Call], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    real_path = os.environ["PATH"]
     (repo / "tools").mkdir()
-    _set_path(monkeypatch, "", ".", "rel/bin", repo / "tools", real_path)
+    _set_path(monkeypatch, "", ".", "rel/bin", repo / "tools", _GIT_DIR)
     GitReader(repo).is_shallow()
-    assert spy[0]["kwargs"]["env"]["PATH"] == real_path
+    assert spy[0]["kwargs"]["env"]["PATH"] == _GIT_DIR
 
 
 def test_windows_looks_only_for_git_exe(
@@ -894,6 +922,11 @@ def test_windows_git_cmd_bat_and_com_are_never_picked(
         gitread._find_git(repo)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX-only: Windows has no execute bit and I-14 accepts any git.exe file there "
+    "(see test_windows_accepts_git_exe_without_an_execute_bit)",
+)
 def test_non_executable_posix_git_is_skipped_for_a_later_folder(
     repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -905,6 +938,20 @@ def test_non_executable_posix_git_is_skipped_for_a_later_folder(
     found = gitread._find_git(repo)
     assert found.path == os.path.realpath(trusted)
     assert found.search_path == os.pathsep.join([str(tmp_path / "first"), str(tmp_path / "second")])
+
+
+def test_windows_accepts_git_exe_without_an_execute_bit(
+    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # I-14: os.access(X_OK) is checked only outside Windows, so the first
+    # git.exe file wins there even with no execute bit set.
+    first = _fake_git_in(tmp_path / "first", "git.exe")
+    first.chmod(0o644)
+    _fake_git_in(tmp_path / "second", "git.exe")
+    _set_path(monkeypatch, tmp_path / "first", tmp_path / "second")
+    with _simulated_windows(monkeypatch):
+        found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(first)
 
 
 def test_directory_named_git_is_skipped(
@@ -955,23 +1002,51 @@ def test_git_is_resolved_once_per_reader(repo: Path, monkeypatch: pytest.MonkeyP
     assert len(calls) == 1
 
 
-def test_is_within() -> None:
-    assert gitread._is_within("/a/b/git", "/a") is True
-    assert gitread._is_within("/ab/git", "/a") is False
-    assert gitread._is_within("/a", "/a") is True
+@contextlib.contextmanager
+def _posix_path_rules(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run the body with ``posixpath`` as ``os.path``, on any platform.
+
+    ``_is_within`` and ``_is_absolute_entry`` are pure string functions keyed on
+    ``os.path``, so this gives POSIX results on a Windows runner too. Restored
+    before any assertion runs, as ``_simulated_windows`` is.
+    """
+    monkeypatch.setattr(os, "path", posixpath)
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(os, "path", _REAL_OS_PATH)
+
+
+def _posix_is_within(monkeypatch: pytest.MonkeyPatch, path: str, folder: str) -> bool:
+    with _posix_path_rules(monkeypatch):
+        within = gitread._is_within(path, folder)
+    return within
+
+
+@pytest.mark.parametrize(
+    ("path", "folder", "expected"),
+    [
+        ("/a/b/git", "/a", True),
+        ("/ab/git", "/a", False),
+        ("/a", "/a", True),
+        ("/", "/", True),
+        ("/usr/bin/git", "/", True),
+        ("/A/git", "/a", False),  # case-sensitive
+        ("/a/.//b/git", "/a", True),
+    ],
+)
+def test_is_within_posix_rules(
+    monkeypatch: pytest.MonkeyPatch, path: str, folder: str, expected: bool
+) -> None:
+    assert _posix_is_within(monkeypatch, path, folder) is expected
 
 
 def test_is_within_fails_closed_when_commonpath_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(_paths: Any) -> str:
         raise ValueError("Can't mix absolute and relative paths")
 
-    monkeypatch.setattr(os.path, "commonpath", boom)
-    assert gitread._is_within("/x/git", "/y") is True
-
-
-def test_is_within_posix_is_case_sensitive_and_ignores_windows_forms() -> None:
-    assert gitread._is_within("/A/git", "/a") is False
-    assert gitread._is_within("/a/.//b/git", "/a") is True
+    monkeypatch.setattr(posixpath, "commonpath", boom)
+    assert _posix_is_within(monkeypatch, "/x/git", "/y") is True
 
 
 # --- SR N-7 / N-8: Windows containment forms ---------------------------------------
@@ -1198,15 +1273,50 @@ def test_is_filesystem_root_posix() -> None:
 
 
 def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch) -> None:
-    paths = ["C:\\", "C:/", "C:", "Z:\\", "C:\\Windows", "Z:\\tools", "git"]
+    # Absolute forms only: production passes realpath(getcwd()). A bare "C:"
+    # means drive C's own current folder, which a real Windows runner keeps
+    # outside the simulated cwd (see the drive-relative test below).
+    paths = ["C:\\", "C:/", "Z:\\", "C:\\Windows", "Z:\\tools", "git"]
     with _simulated_windows(monkeypatch, cwd="C:\\"):
         roots = [gitread._is_filesystem_root(p) for p in paths]
-    assert roots == [True, True, True, True, False, False, False]
+    assert roots == [True, True, True, False, False, False]
 
 
-def _posix_root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Simulate cwd=/ without chdir or creating a repo at /."""
-    monkeypatch.setattr(os, "getcwd", lambda: "/")
+@pytest.mark.parametrize(("drive_cwd", "expected"), [("C:\\", True), ("C:\\Users\\runner", False)])
+def test_is_filesystem_root_resolves_a_drive_relative_path_first(
+    monkeypatch: pytest.MonkeyPatch, drive_cwd: str, expected: bool
+) -> None:
+    # "C:" is a root only when drive C's current folder is its root (I-14:
+    # resolve, then compare with the anchor). realpath is pinned so the answer
+    # does not depend on the runner's real per-drive folder.
+    def realpath(path: str) -> str:
+        return drive_cwd if path == "C:" else path
+
+    monkeypatch.setattr(ntpath, "realpath", realpath)
+    with _simulated_windows(monkeypatch, cwd="C:\\"):
+        root = gitread._is_filesystem_root("C:")
+    assert root is expected
+
+
+#: This platform's filesystem root and a system folder below it: ``/`` and
+#: ``/usr/bin`` on POSIX, the current drive's root (for example ``D:\\``) and
+#: ``D:\\usr\\bin`` on Windows. The root tests run with real path rules on both.
+_ROOT = os.path.abspath(os.sep)
+_USR_BIN = os.path.join(_ROOT, "usr", "bin")
+_USR_BIN_GIT = os.path.join(_USR_BIN, _platform_git_name())
+
+
+def test_root_constants_are_this_platforms_root() -> None:
+    if os.name == "nt":
+        assert len(_ROOT) == 3 and _ROOT[1:] == ":\\"
+        assert _USR_BIN == _ROOT + "usr\\bin"
+    else:
+        assert (_ROOT, _USR_BIN, _USR_BIN_GIT) == ("/", "/usr/bin", "/usr/bin/git")
+
+
+def _root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate the cwd at the filesystem root without chdir or a repo there."""
+    monkeypatch.setattr(os, "getcwd", lambda: _ROOT)
     monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
 
 
@@ -1220,24 +1330,24 @@ def _accept_as_git(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
     monkeypatch.setattr(gitread, "_is_runnable_git", is_runnable)
 
 
-def test_cwd_at_posix_root_keeps_usr_bin(
+def test_cwd_at_filesystem_root_keeps_usr_bin(
     repo: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _posix_root_cwd(monkeypatch)
-    _set_path(monkeypatch, "/usr/bin")
+    _root_cwd(monkeypatch)
+    _set_path(monkeypatch, _USR_BIN)
     kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
-    assert "/usr/bin" in kept
-    assert "/usr/bin" not in dropped
-    _accept_as_git(monkeypatch, "/usr/bin/git")
+    assert kept == [_USR_BIN]
+    assert _USR_BIN not in dropped
+    _accept_as_git(monkeypatch, _USR_BIN_GIT)
     found = gitread._find_git(repo)
-    assert found.path == os.path.realpath("/usr/bin/git")
-    assert found.search_path == "/usr/bin"
+    assert found.path == os.path.realpath(_USR_BIN_GIT)
+    assert found.search_path == _USR_BIN
 
 
-def test_git_inside_the_repo_is_refused_when_cwd_is_posix_root(
+def test_git_inside_the_repo_is_refused_when_cwd_is_filesystem_root(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _posix_root_cwd(monkeypatch)
+    _root_cwd(monkeypatch)
     _fake_git_in(repo / "tools")
     _set_path(monkeypatch, repo / "tools")
     with pytest.raises(ComponentError) as info:
@@ -1245,52 +1355,52 @@ def test_git_inside_the_repo_is_refused_when_cwd_is_posix_root(
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
-def test_repo_at_posix_root_refuses_usr_bin_git(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Repo itself is /. The cwd exemption must not keep a git under the repo.
-    _posix_root_cwd(monkeypatch)
-    _set_path(monkeypatch, "/usr/bin")
-    kept, dropped = gitread._split_path(gitread._untrusted_folders(Path("/")))
+def test_repo_at_filesystem_root_refuses_usr_bin_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Repo itself is the root. The cwd exemption must not keep a git under the repo.
+    _root_cwd(monkeypatch)
+    _set_path(monkeypatch, _USR_BIN)
+    kept, dropped = gitread._split_path(gitread._untrusted_folders(Path(_ROOT)))
     assert kept == []
-    assert "/usr/bin" in dropped
-    _accept_as_git(monkeypatch, "/usr/bin/git")
+    assert dropped == [_USR_BIN]
+    _accept_as_git(monkeypatch, _USR_BIN_GIT)
     with pytest.raises(ComponentError) as info:
-        gitread._find_git(Path("/"))
+        gitread._find_git(Path(_ROOT))
     assert info.value.message == gitread._UNTRUSTED_GIT
     assert info.value.component == "gitread"
 
 
-def test_repo_at_posix_root_with_no_git_is_git_unavailable(
+def test_repo_at_filesystem_root_with_no_git_is_git_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _posix_root_cwd(monkeypatch)
-    _set_path(monkeypatch, "/usr/bin")
+    _root_cwd(monkeypatch)
+    _set_path(monkeypatch, _USR_BIN)
     monkeypatch.setattr(gitread, "_is_runnable_git", lambda _path: False)
     with pytest.raises(GitUnavailable):
-        gitread._find_git(Path("/"))
+        gitread._find_git(Path(_ROOT))
 
 
-def test_realpath_check_refuses_git_inside_repo_at_posix_root(
+def test_realpath_check_refuses_git_inside_repo_at_filesystem_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Defence in depth: even if a kept-path walk returned a hit under /, refuse it.
-    _posix_root_cwd(monkeypatch)
-    _set_path(monkeypatch, "/usr/bin")
-    monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: "/usr/bin/git")
+    # Defence in depth: even if a kept-path walk returned a hit under the root, refuse it.
+    _root_cwd(monkeypatch)
+    _set_path(monkeypatch, _USR_BIN)
+    monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: _USR_BIN_GIT)
     with pytest.raises(ComponentError) as info:
-        gitread._find_git(Path("/"))
+        gitread._find_git(Path(_ROOT))
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
-def test_workspace_at_posix_root_still_drops_usr_bin(
+def test_workspace_at_filesystem_root_still_drops_usr_bin(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(os, "getcwd", lambda: "/")
-    monkeypatch.setenv("GITHUB_WORKSPACE", "/")
-    _set_path(monkeypatch, "/usr/bin")
+    monkeypatch.setattr(os, "getcwd", lambda: _ROOT)
+    monkeypatch.setenv("GITHUB_WORKSPACE", _ROOT)
+    _set_path(monkeypatch, _USR_BIN)
     kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
-    assert "/usr/bin" not in kept
-    assert "/usr/bin" in dropped
-    _accept_as_git(monkeypatch, "/usr/bin/git")
+    assert kept == []
+    assert dropped == [_USR_BIN]
+    _accept_as_git(monkeypatch, _USR_BIN_GIT)
     with pytest.raises(ComponentError) as info:
         gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
@@ -1349,6 +1459,83 @@ def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
     with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd="C:\\"):
         gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+def test_workspace_at_windows_drive_root_still_drops_git_on_that_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = Path("D:\\repo")  # built before os.name changes (SR N-9)
+    monkeypatch.setenv("PATH", "C:\\tools")
+    _accept_as_git(monkeypatch, "C:\\tools\\git.exe")
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd="C:\\"):
+        monkeypatch.setenv("GITHUB_WORKSPACE", "C:\\")
+        kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+        gitread._find_git(repo)
+    assert kept == []
+    assert dropped == ["C:\\tools"]
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+# --- I-14: which PATH entries count as absolute ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("/usr/bin", True),
+        ("/", True),
+        ("usr/bin", False),
+        ("./bin", False),
+        (".", False),
+        ("", False),
+        ("C:\\tools", False),  # a relative name on POSIX
+    ],
+)
+def test_absolute_entry_posix_rules(
+    monkeypatch: pytest.MonkeyPatch, entry: str, expected: bool
+) -> None:
+    with _posix_path_rules(monkeypatch):
+        absolute = gitread._is_absolute_entry(entry)
+    assert absolute is expected
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("C:\\tools", True),
+        ("C:/tools", True),
+        ("C:\\", True),
+        ("\\\\server\\share\\tools", True),
+        ("\\tools", False),  # rooted on whatever drive is current: relative
+        ("/usr/bin", False),
+        ("C:tools", False),  # drive-relative
+        ("C:", False),
+        ("tools", False),
+        (".", False),
+        ("", False),
+    ],
+)
+def test_absolute_entry_windows_rules(
+    monkeypatch: pytest.MonkeyPatch, entry: str, expected: bool
+) -> None:
+    # Python 3.11's ntpath.isabs calls "\\tools" absolute and 3.13's does not;
+    # gitread uses the 3.13 rule on both.
+    with _simulated_windows(monkeypatch, cwd="D:\\work"):
+        absolute = gitread._is_absolute_entry(entry)
+    assert absolute is expected
+
+
+def test_windows_rooted_entry_without_a_drive_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = Path("E:\\repo")  # built before os.name changes (SR N-9)
+    monkeypatch.setenv("PATH", "\\tools;/usr/bin;C:tools;C:\\tools")
+    with _simulated_windows(monkeypatch, cwd="D:\\work"):
+        kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+    assert kept == ["C:\\tools"]
+    # Each relative entry is reported as the folder it would mean; on a real
+    # Windows runner that uses the real current drive, so only the count is fixed.
+    assert len(dropped) == 3
 
 
 # --- I-14 / D-TL-18: version check ---------------------------------------------
@@ -1489,11 +1676,11 @@ def test_version_check_runs_once_first_with_fixed_env_and_no_flags(
     assert [a for a in argvs if a[1:] == ["--version"]] == [argvs[0]]  # once
     assert all(a[0] == argvs[0][0] for a in argvs)  # the same resolved git every time
     version_kwargs = seen[0][1]
-    assert set(version_kwargs["env"]) == set(gitread.FIXED_ENV) | {
-        "PATH",
-        "HOME",
-        "GIT_CEILING_DIRECTORIES",
-    }
+    # I-11 C3: SYSTEMROOT too, only when os.name == "nt" (every Windows host sets it).
+    expected = {*gitread.FIXED_ENV, "PATH", "HOME", "GIT_CEILING_DIRECTORIES"}
+    if os.name == "nt":
+        expected.add("SYSTEMROOT")
+    assert set(version_kwargs["env"]) == expected
     assert version_kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
     assert version_kwargs["max_stdout"] == gitread.SMALL_OUTPUT_MAX_BYTES
 
@@ -1880,7 +2067,7 @@ def _drop_diff_flag(monkeypatch: pytest.MonkeyPatch, flag: str) -> None:
 def _sentinel_script(tmp_path: Path) -> tuple[Path, Path]:
     sentinel = tmp_path / "sentinel"
     script = tmp_path / "evil.sh"
-    script.write_text(f'#!/bin/sh\ntouch {sentinel}\ncat "$1" 2>/dev/null\nexit 0\n')
+    script.write_text(f'#!/bin/sh\ntouch {_sh_path(sentinel)}\ncat "$1" 2>/dev/null\nexit 0\n')
     script.chmod(0o755)
     return script, sentinel
 
@@ -1896,7 +2083,8 @@ def textconv_repo(repo: Path, tmp_path: Path) -> tuple[Path, Path, str]:
     _git(repo, "add", "f.txt")
     head = _commit(repo, "change f")
     with (repo / ".git" / "config").open("a") as cfg:
-        cfg.write(f'[diff "x"]\n\ttextconv = {script}\n[diff]\n\texternal = {script}\n')
+        run = _config_path(script)
+        cfg.write(f'[diff "x"]\n\ttextconv = {run}\n[diff]\n\texternal = {run}\n')
     (repo / ".gitattributes").write_text("* diff=x\n")
     return repo, sentinel, head
 
@@ -1910,7 +2098,6 @@ def test_plain_git_control_runs_the_hostile_textconv(textconv_repo: tuple[Path, 
     assert sentinel.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script")
 def test_hardened_patch_calls_run_nothing(textconv_repo: tuple[Path, Path, str]) -> None:
     repo, sentinel, head = textconv_repo
     parent = _git(repo, "rev-parse", "HEAD~1")
@@ -1922,7 +2109,6 @@ def test_hardened_patch_calls_run_nothing(textconv_repo: tuple[Path, Path, str])
     assert not sentinel.exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script")
 @pytest.mark.parametrize("sub", ["log", "show"])
 def test_no_textconv_is_load_bearing(
     textconv_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch, sub: str
@@ -1971,14 +2157,13 @@ def _signed_commit(repo: Path) -> str:
     return out.stdout.strip()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script")
 def test_log_show_signature_false_is_load_bearing(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     script, sentinel = _sentinel_script(tmp_path)
     signed = _signed_commit(repo)
     _git(repo, "config", "log.showSignature", "true")
-    _git(repo, "config", "gpg.program", str(script))
+    _git(repo, "config", "gpg.program", _config_path(script))
     assert GitReader(repo).commit_date(signed) == datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)
     assert not sentinel.exists()
     _drop_config(monkeypatch, "log.showSignature=false")
