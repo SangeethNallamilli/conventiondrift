@@ -72,11 +72,15 @@ def _run_batches(
     """
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be at least 1")
-    if len(work) <= 1 or max_workers == 1:
-        return [analyze_batch(checkers, batch) for batch in work], 0
-    context = multiprocessing.get_context("spawn")
-    workers = min(len(work), max_workers or context.cpu_count())
+    # The inline path (<= one batch, or max_workers=1) uses the same mapping
+    # as the pool path: KeyboardInterrupt propagates; every other
+    # BaseException, including MemoryError and SystemExit, becomes
+    # ComponentError("checkers") and fails closed (I-13 C7 ruling 2).
     try:
+        if len(work) <= 1 or max_workers == 1:
+            return [analyze_batch(checkers, batch) for batch in work], 0
+        context = multiprocessing.get_context("spawn")
+        workers = min(len(work), max_workers or context.cpu_count())
         with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
             return list(pool.map(analyze_batch, [checkers] * len(work), work)), workers
     except KeyboardInterrupt:

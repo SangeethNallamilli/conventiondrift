@@ -233,6 +233,28 @@ def test_a_broken_pool_fails_closed_as_a_checkers_component_error() -> None:
     assert info.value.component == "checkers"
 
 
+# Parser-stack overflow: MemoryError from parse, not a skip (I-13 C7 ruling 2).
+_MEMORY_ERROR_SRC = "-" * 200_000 + "1"
+
+
+def test_a_memory_error_on_the_inline_path_is_a_checkers_component_error() -> None:
+    with pytest.raises(ComponentError) as info:
+        analyze(
+            [py("src/huge.py", _MEMORY_ERROR_SRC)],
+            checkers=reg(PRINT),
+            is_script=never,
+            max_workers=1,
+        )
+    assert info.value.component == "checkers"
+
+
+def test_a_memory_error_on_the_pool_path_is_a_checkers_component_error() -> None:
+    files = [*_many(64), py("src/huge.py", _MEMORY_ERROR_SRC)]
+    with pytest.raises(ComponentError) as info:
+        analyze(files, checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert info.value.component == "checkers"
+
+
 # --- manifests (I-10 manifest_sites) ------------------------------------------------------
 
 MANIFESTS = [
