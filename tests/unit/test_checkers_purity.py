@@ -26,10 +26,31 @@ I10_LIST = {
     "urllib",
 }
 
+
+def real_checkers_dir(test_file: str) -> Path:
+    """The pristine ``src/conventiondrift/checkers`` for a test file at ``tests/unit/``.
+
+    mutmut 3.x runs the suite from a ``mutants/`` copy of the project, so this
+    file may itself sit under ``<project>/mutants/tests/unit/``. The last
+    ``mutants`` segment is mutmut's copy root (a parent folder may share the
+    name); dropping it gives the real tree, so the scan covers the real source
+    and never the mutated copy (same mapping as #25 S2 in test_verdicts.py).
+    The copy is used only when no pristine tree exists next to it.
+    """
+    root = Path(test_file).resolve().parents[2]
+    found = root / "src" / "conventiondrift" / "checkers"
+    parts = found.parts
+    indexes = [i for i, part in enumerate(parts) if part == "mutants"]
+    if not indexes:
+        return found
+    idx = indexes[-1]
+    original = Path(*parts[:idx], *parts[idx + 1 :])
+    return original if original.is_dir() else found
+
+
 # Locate the real source tree from this test file, not from
-# conventiondrift.checkers.__file__. Under mutmut 3.x that path is the
-# mutants/ copy (same approach as #25 S2 in test_verdicts.py).
-CHECKERS_DIR = Path(__file__).resolve().parents[2] / "src" / "conventiondrift" / "checkers"
+# conventiondrift.checkers.__file__, which is the mutants/ copy under mutmut 3.x.
+CHECKERS_DIR = real_checkers_dir(__file__)
 
 
 def violations(source: str) -> list[str]:
@@ -64,7 +85,41 @@ def test_the_scanned_checkers_directory_exists_and_is_not_empty() -> None:
     assert CHECKERS_DIR.is_dir()
     files = list(CHECKERS_DIR.rglob("*.py"))
     assert files
-    assert "mutants" not in CHECKERS_DIR.parts
+
+
+def _tree(base: Path) -> Path:
+    test_file = base / "tests" / "unit" / "test_checkers_purity.py"
+    checkers = base / "src" / "conventiondrift" / "checkers"
+    test_file.parent.mkdir(parents=True)
+    checkers.mkdir(parents=True)
+    test_file.write_text("", encoding="utf-8")
+    return test_file
+
+
+def test_a_mutants_copy_maps_back_to_the_real_checkers_dir(tmp_path: Path) -> None:
+    _tree(tmp_path / "proj")
+    copied = _tree(tmp_path / "proj" / "mutants")
+    expected = (tmp_path / "proj" / "src" / "conventiondrift" / "checkers").resolve()
+    assert real_checkers_dir(str(copied)) == expected
+
+
+def test_only_the_last_mutants_segment_is_mutmuts_copy_root(tmp_path: Path) -> None:
+    _tree(tmp_path / "mutants" / "proj")
+    copied = _tree(tmp_path / "mutants" / "proj" / "mutants")
+    expected = (tmp_path / "mutants" / "proj" / "src" / "conventiondrift" / "checkers").resolve()
+    assert real_checkers_dir(str(copied)) == expected
+
+
+def test_a_plain_layout_is_used_as_it_is(tmp_path: Path) -> None:
+    test_file = _tree(tmp_path / "proj")
+    expected = (tmp_path / "proj" / "src" / "conventiondrift" / "checkers").resolve()
+    assert real_checkers_dir(str(test_file)) == expected
+
+
+def test_a_mutants_copy_without_a_pristine_tree_is_scanned_as_found(tmp_path: Path) -> None:
+    copied = _tree(tmp_path / "proj" / "mutants")
+    expected = (tmp_path / "proj" / "mutants" / "src" / "conventiondrift" / "checkers").resolve()
+    assert real_checkers_dir(str(copied)) == expected
 
 
 def test_checkers_package_has_no_banned_use() -> None:
