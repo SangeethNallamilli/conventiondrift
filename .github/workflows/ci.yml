@@ -205,7 +205,7 @@ jobs:
       # Restore on pull_request; restore and save on push, schedule, and
       # workflow_dispatch. Key is runner.os, the Python version, and
       # hashFiles of the committed lockfiles. Hash-checked uv installs
-      # still use --require-hashes and --only-binary/--no-build. UV_CACHE_DIR
+      # still use --require-hashes and --only-binary=:all:. UV_CACHE_DIR
       # is set on the install steps (runner.* is not available in job env).
       - name: Restore the uv package cache
         if: github.event_name == 'pull_request'
@@ -234,7 +234,7 @@ jobs:
           # Keep the .venv layout and PATH so later steps still use
           # .venv/Scripts/python and .venv/Scripts/conventiondrift.
           python -m venv .venv
-          uv pip install --python .venv/Scripts/python --require-hashes --no-deps --only-binary=:all: --no-build -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python .venv/Scripts/python --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
           uv pip install --python .venv/Scripts/python --no-deps --no-build-isolation -e .
           echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
           .venv/Scripts/conventiondrift --version
@@ -243,7 +243,7 @@ jobs:
         env:
           UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
-          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: --no-build -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         if: runner.os != 'Windows'
         env:
@@ -317,7 +317,7 @@ jobs:
       # Restore on pull_request; restore and save on push, schedule, and
       # workflow_dispatch. Key is runner.os, the Python version, and
       # hashFiles of the committed lockfiles. Hash-checked uv installs
-      # still use --require-hashes and --only-binary/--no-build. UV_CACHE_DIR
+      # still use --require-hashes and --only-binary=:all:. UV_CACHE_DIR
       # is set on the install steps (runner.* is not available in job env).
       - name: Restore the uv package cache
         if: github.event_name == 'pull_request'
@@ -337,7 +337,7 @@ jobs:
         env:
           UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
-          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: --no-build -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         env:
           UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
