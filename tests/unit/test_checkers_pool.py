@@ -2,6 +2,8 @@
 
 import concurrent.futures
 import functools
+import multiprocessing
+import multiprocessing.context
 import os
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -294,6 +296,23 @@ def test_a_keyboard_interrupt_is_re_raised_not_mapped(
         monkeypatch.setattr("conventiondrift.checkers.pool.analyze_batch", interrupted)
     with pytest.raises(KeyboardInterrupt):
         analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=max_workers)
+
+
+@pytest.mark.usefixtures("outside_repo")
+def test_the_pool_uses_the_spawn_start_method(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+    real = concurrent.futures.ProcessPoolExecutor
+
+    def recording(*args: object, **kwargs: object) -> object:
+        context = kwargs["mp_context"]
+        assert isinstance(context, multiprocessing.context.BaseContext)
+        seen.append(context.get_start_method())
+        return real(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", recording)
+    result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert result.workers == 2
+    assert seen == ["spawn"]
 
 
 # --- worker isolation (I-13 C7 ruling 8, SR C-1 on #31) ---------------------------------
