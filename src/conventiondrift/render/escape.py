@@ -91,18 +91,39 @@ def md_cell(text: str) -> str:
     return md(text).replace("|", "\\|")
 
 
+def _reject_residual_controls(text: str) -> str:
+    """Fail closed if any control, format, separator or surrogate char remains.
+
+    After :func:`_visible_text` this cannot happen for normal input. The
+    check is a guard against a later change that skips or reorders the
+    mapping, which would otherwise let a workflow command leak through.
+    The message is fixed and never includes the input.
+    """
+    for char in text:
+        if unicodedata.category(char) in _LABEL_CATEGORIES:
+            raise ValueError("residual control character after mapping")
+    return text
+
+
+def _workflow_escape(text: str) -> str:
+    """Map, reject leftover controls, then apply the remaining ``%`` encoding."""
+    return _reject_residual_controls(_visible_text(text)).replace("%", "%25")
+
+
 def workflow_cmd(text: str) -> str:
     """Escape the data part of ``::command props::data`` (R3.1, AC-N3.13, I-14).
 
     The I-14 mapping runs first, so CR and LF are already ``␍`` / ``␊``. The
-    remaining protocol encoding is ``%`` -> ``%25``.
+    remaining protocol encoding is ``%`` -> ``%25``. A residual CR, LF or
+    other character in categories Cc, Cf, Zl, Zp or Cs raises
+    ``ValueError``.
     """
-    return _visible_text(text).replace("%", "%25")
+    return _workflow_escape(text)
 
 
 def workflow_prop(text: str) -> str:
     """Escape a workflow-command property value: as :func:`workflow_cmd`, plus ``:`` and ``,``."""
-    return workflow_cmd(text).replace(":", "%3A").replace(",", "%2C")
+    return _workflow_escape(text).replace(":", "%3A").replace(",", "%2C")
 
 
 _OUTPUT_NAME: Final = re.compile(r"[a-z][a-z0-9-]{0,63}")  # fullmatch; linear

@@ -7,8 +7,10 @@ the Test Engineer. This file does not use that prefix.
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
+from collections.abc import Callable
 
 import pytest
 from hypothesis import given, settings
@@ -417,6 +419,35 @@ def test_no_hidden_categories_in_md_cell_or_workflow_outputs(text: str) -> None:
     assert hidden_chars(delivered) == []
 
 
+_RESIDUAL_MESSAGE = r"^residual control character after mapping$"
+
+
+@pytest.mark.parametrize("func", [workflow_cmd, workflow_prop], ids=lambda f: f.__name__)
+@pytest.mark.parametrize(
+    "residual",
+    ["\r", "\n", "\x00", "\x7f", "\x85", "\u202e", "\u2028", "\ud800"],
+    ids=["CR", "LF", "NUL", "DEL", "C1", "Cf bidi", "Zl", "Cs"],
+)
+def test_workflow_fails_closed_if_mapping_is_bypassed(
+    monkeypatch: pytest.MonkeyPatch,
+    func: Callable[[str], str],
+    residual: str,
+) -> None:
+    monkeypatch.setattr(esc, "_visible_text", lambda text: text)
+    with pytest.raises(ValueError, match=_RESIDUAL_MESSAGE) as caught:
+        func("pre" + residual + "post")
+    message = str(caught.value)
+    assert residual not in message
+    assert "pre" not in message
+    assert "post" not in message
+
+
+def test_workflow_guard_is_silent_when_mapping_ran() -> None:
+    hostile = "a\nb\rc" + "\x00\x7f\x85\u202e\u2028\ud800"
+    assert workflow_cmd(hostile)
+    assert workflow_prop(hostile)
+
+
 # ---- output_heredoc() ---------------------------------------------------------------
 
 
@@ -464,6 +495,28 @@ def test_output_heredoc_shape_and_fresh_delimiter() -> None:
     m = re.fullmatch(r"stale-count<<(ghadelimiter_[0-9a-f]{32})\n3\n\1\n", a)
     assert m
     assert a != b, "delimiter must be fresh per call"
+    assert m.group(1) not in "3"
+
+
+def _value_block(entry: str) -> tuple[str, str]:
+    """Return (delimiter, value) from one heredoc entry."""
+    header, newline, rest = entry.partition("\n")
+    assert newline == "\n"
+    delimiter = header.split("<<", 1)[1]
+    assert rest.endswith(delimiter + "\n")
+    value = rest[: -(len(delimiter) + 1)]
+    assert value.endswith("\n")
+    return delimiter, value[:-1]
+
+
+def test_output_heredoc_delimiter_never_appears_in_the_value_block() -> None:
+    for value in ("3", "has ghadelimiter_ prefix only", INJECT_RULE, "a\nb", ""):
+        entry = output_heredoc("report-path", value)
+        delimiter, delivered = _value_block(entry)
+        assert delimiter.startswith("ghadelimiter_")
+        assert len(delimiter) == len("ghadelimiter_") + 32
+        assert delimiter not in delivered
+        assert parse_output_file(entry) == {"report-path": visible(value)}
 
 
 def test_output_heredoc_regenerates_when_delimiter_in_value(
@@ -480,6 +533,9 @@ def test_output_heredoc_regenerates_when_delimiter_in_value(
     entry = output_heredoc("report-path", "has ghadelimiter_aa inside")
     assert entry == "report-path<<ghadelimiter_bb\nhas ghadelimiter_aa inside\nghadelimiter_bb\n"
     assert seen == [16, 16, 16]
+    delimiter, delivered = _value_block(entry)
+    assert delimiter == "ghadelimiter_bb"
+    assert delimiter not in delivered
 
 
 def test_output_heredoc_gives_up_after_bounded_tries(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -578,6 +634,18 @@ def test_sarif_text_no_embedded_link_and_roundtrip(text: str) -> None:
 
 def test_sarif_text_hostile_rule_visible_verbatim() -> None:
     assert sarif_unescape(sarif_text(HOSTILE_RULE)) == HOSTILE_RULE
+
+
+def test_sarif_text_json_roundtrips_every_mapped_class() -> None:
+    sample = (
+        f"plain {C0_NUL}{C0_TAB}{C0_LF}{C0_CR}{C0_US}{DEL}"
+        f"{C1_PAD}{C1_NEL}{C1_APC}{CF_BIDI}{CF_ZWSP}{CF_ZWJ}{ZL}{ZP}{CS_LOW}"
+        " [link] slash\\ end"
+    )
+    encoded = sarif_text(sample)
+    assert hidden_chars(encoded) == []
+    payload = {"message": {"text": encoded}}
+    assert json.loads(json.dumps(payload, ensure_ascii=False)) == payload
 
 
 # ---- module surface -------------------------------------------------------------------
