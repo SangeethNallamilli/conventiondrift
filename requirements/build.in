@@ -1,3 +1,4 @@
 # Build tools (T-001). Locked with hashes into build.txt the same way as dev.txt.
 setuptools==84.2.1
 build
+pip==26.3
