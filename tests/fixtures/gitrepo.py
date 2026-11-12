@@ -20,6 +20,7 @@ import shutil
 import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Any, TypeAlias
 
 UTC = _dt.UTC
 
@@ -28,7 +29,7 @@ DEFAULT_COMMITTER = ("Fixture Committer", "fixture-committer@example.invalid")
 
 _HEX_SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 
-DateLike = "_dt.datetime | str"
+DateLike: TypeAlias = _dt.datetime | str
 
 
 def to_datetime(value: _dt.datetime | str) -> _dt.datetime:
@@ -54,6 +55,20 @@ def git_date(value: _dt.datetime | str) -> str:
 
 def days_before(anchor: _dt.datetime | str, days: float) -> _dt.datetime:
     return to_datetime(anchor) - _dt.timedelta(days=days)
+
+
+def git_version() -> tuple[int, ...]:
+    """Installed git version as integers, e.g. (2, 47, 3)."""
+    out = subprocess.run(
+        ["git", "--version"],  # noqa: S607 - git from PATH by design
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out)
+    if m is None:
+        raise RuntimeError(f"cannot parse git version from {out!r}")
+    return tuple(int(x) for x in m.groups() if x is not None)
 
 
 def base_git_env(home: Path) -> dict[str, str]:
@@ -87,7 +102,7 @@ class PullRequest:
         repo_full_name: str = "fixture-owner/fixture-repo",
         head_repo_full_name: str | None = None,
         author_login: str = "fixture-user",
-    ) -> dict:
+    ) -> dict[str, Any]:
         """A minimal `pull_request` event payload (GITHUB_EVENT_PATH contents)."""
         head_repo = head_repo_full_name or repo_full_name
         return {
@@ -110,7 +125,7 @@ class PullRequest:
             "repository": {"full_name": repo_full_name},
         }
 
-    def write_event(self, path: Path, **kw) -> Path:
+    def write_event(self, path: Path, **kw: Any) -> Path:
         path.write_text(
             json.dumps(self.event_payload(**kw), indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -136,11 +151,23 @@ class GitRepo:
 
     # ------------------------------------------------------------------ setup
     @classmethod
-    def init(cls, path: Path, *, default_branch: str = "main", **kw) -> GitRepo:
+    def init(
+        cls,
+        path: Path,
+        *,
+        default_branch: str = "main",
+        home: Path | None = None,
+        author: tuple[str, str] = DEFAULT_AUTHOR,
+        committer: tuple[str, str] = DEFAULT_COMMITTER,
+    ) -> GitRepo:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        repo = cls(path, **kw)
-        repo.git("init", "-q", "-b", default_branch, ".")
+        repo = cls(path, home=home, author=author, committer=committer)
+        if git_version() >= (2, 28):
+            repo.git("init", "-q", "-b", default_branch, ".")
+        else:  # `git init -b` is new in git 2.28
+            repo.git("init", "-q", ".")
+            repo.git("symbolic-ref", "HEAD", f"refs/heads/{default_branch}")
         for key, value in (
             ("core.autocrlf", "false"),
             ("commit.gpgsign", "false"),
@@ -221,7 +248,7 @@ class GitRepo:
         self.git("add", "--", relpath)
 
     # ------------------------------------------------------------------ commits
-    def _date_env(self, date, author_date=None) -> dict[str, str]:
+    def _date_env(self, date: DateLike, author_date: DateLike | None = None) -> dict[str, str]:
         if date is None:
             raise ValueError("every fixture commit needs an explicit date")
         return {
@@ -229,7 +256,14 @@ class GitRepo:
             "GIT_AUTHOR_DATE": git_date(author_date if author_date is not None else date),
         }
 
-    def commit(self, message: str, *, date, author_date=None, allow_empty: bool = False) -> str:
+    def commit(
+        self,
+        message: str,
+        *,
+        date: DateLike,
+        author_date: DateLike | None = None,
+        allow_empty: bool = False,
+    ) -> str:
         """Commit the index. `date` is the committer date; `author_date` defaults to it."""
         args = ["commit", "-q", "--no-verify", "-m", message]
         if allow_empty:
@@ -238,7 +272,12 @@ class GitRepo:
         return self.rev_parse("HEAD")
 
     def commit_files(
-        self, message: str, files: Mapping[str, str | bytes], *, date, author_date=None
+        self,
+        message: str,
+        files: Mapping[str, str | bytes],
+        *,
+        date: DateLike,
+        author_date: DateLike | None = None,
     ) -> str:
         self.write_many(files)
         return self.commit(message, date=date, author_date=author_date)
@@ -252,7 +291,9 @@ class GitRepo:
     def current_branch(self) -> str:
         return self.git("rev-parse", "--abbrev-ref", "HEAD")
 
-    def merge(self, branch: str, *, date, message: str | None = None, no_ff: bool = True) -> str:
+    def merge(
+        self, branch: str, *, date: DateLike, message: str | None = None, no_ff: bool = True
+    ) -> str:
         """Merge `branch` into the current branch with a controlled merge-commit date."""
         args = ["merge", "-q", "--no-edit", "--no-verify"]
         if no_ff:
@@ -261,7 +302,9 @@ class GitRepo:
         self.git(*args, env=self._date_env(date))
         return self.rev_parse("HEAD")
 
-    def commit_tree(self, tree: str, parents: Iterable[str], message: str, *, date) -> str:
+    def commit_tree(
+        self, tree: str, parents: Iterable[str], message: str, *, date: DateLike
+    ) -> str:
         args = ["commit-tree", tree]
         for p in parents:
             args += ["-p", p]
@@ -333,7 +376,7 @@ class GitRepo:
         base_branch: str,
         files: Mapping[str, str | bytes],
         *,
-        date,
+        date: DateLike,
         message: str = "base: commit after the merge base",
     ) -> str:
         """Add a commit on the base branch after the PR forked (TRACEABILITY §1.5 ruling)."""
@@ -358,7 +401,7 @@ class GitRepo:
             )
         return PullRequest(number, base_branch, head_branch, base_tip, head, mb)
 
-    def github_merge_commit(self, pr: PullRequest, *, date) -> PullRequest:
+    def github_merge_commit(self, pr: PullRequest, *, date: DateLike) -> PullRequest:
         """Create refs/pull/<n>/merge the way GitHub does: parents (base tip, PR head)."""
         tree = self.git("merge-tree", "--write-tree", pr.base_tip, pr.head).splitlines()[0]
         sha = self.commit_tree(

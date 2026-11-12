@@ -121,3 +121,19 @@ def test_enforce_security_table(tmp_path: Path) -> None:
 )
 def test_planned_mode_on_real_docs() -> None:
     assert ctt.main(["--planned", "--docs", os.environ["CD_TEAM_DOCS"]]) == 0
+
+
+def test_enforce_interface_contract_rows(tmp_path: Path) -> None:
+    """§2.1 IC rows: their test IDs must exist and their status must be valid."""
+    ic = (
+        "\n\n### 2.1 Interface contract tests\n\n"
+        "| IC ID | Interface | Summary | Tests | Tasks | Owner | Status |\n|---|\n"
+        "| IC-I4.1 | I-4 | s | `tests/spec/test_c.py::test_ic_x[a]` | T-031 | TE | written |\n"
+        "| IC-I4.2 | I-4 | s | `tests/spec/test_c.py::test_ic_y` | T-032 | TE | done |"
+    )
+    trace = _trace([ROW1, ROW2, ROWR + ic])
+    assert run(trace, tmp_path) == []  # --planned ignores test IDs
+    fails = run(trace, tmp_path, enforce=True)
+    assert any("IC-I4.1: tests/spec/test_c.py does not exist" in f for f in fails)
+    assert any("IC-I4.2: status 'done'" in f for f in fails)
+    assert ctt.check(SPEC, trace, tmp_path, False)[1]["interface_rows"] == 2

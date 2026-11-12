@@ -125,3 +125,14 @@ def test_oracle_first_parent_dates(tmp_path: Path) -> None:
     r.commit("rename", date=days_before(T, 5))
     r.commit_files("head", {"g.py": "a\nB\nc\nd\ne\n"}, date=T)
     assert recent_lines(r, "HEAD") == {"g.py": {2, 4, 5}}
+
+
+def test_init_without_dash_b_for_old_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """git < 2.28 has no `git init -b`; the builder falls back to symbolic-ref."""
+    from fixtures import gitrepo
+
+    monkeypatch.setattr(gitrepo, "git_version", lambda: (2, 27, 0))
+    r = gitrepo.GitRepo.init(tmp_path / "old", default_branch="trunk")
+    r.commit_files("c", {"a.txt": "a\n"}, date="2026-01-01T00:00:00+00:00")
+    assert r.current_branch() == "trunk"
+    assert gitrepo.git_version() >= (1,)

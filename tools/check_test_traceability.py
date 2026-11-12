@@ -6,7 +6,8 @@
         same set, in the same order, with no duplicates on either side.
      2. Each row's REQ ID equals the AC's `[REQ-...]` tag in SPEC.md (`REQ-6.R` for AC-R.x).
   --enforce  additionally:
-     3. Every planned test ID `tests/<path>.py::<name>` (§2 and the §3 security table) exists:
+     3. Every planned test ID `tests/<path>.py::<name>` (§2, including the §2.1 interface
+        contract rows `IC-I<n>.<m>`, and the §3 security table) exists:
         the file exists and defines `def <name>` (pytest `[...]` parameters stripped; a
         `…::<name>` entry refers to the previous file in the same cell). Each
         `tests/manual/CHECKLIST.md#<anchor>` exists. `ci matrix job` / `ci-demo PR` entries
@@ -119,7 +120,14 @@ def check(spec_text: str, trace_text: str, repo: Path, enforce: bool) -> tuple[l
     sec_rows = table_rows(sec3, re.compile(r"^SEC-[A-Z0-9]+$"))
     refs = [(r[0], f, n) for r in rows for f, n in test_refs(r[4] if len(r) > 4 else "")]
     refs += [(r[0], f, n) for r in sec_rows for f, n in test_refs(r[3] if len(r) > 3 else "")]
+    # §2.1 interface contract rows: | IC ID | Interface | Summary | Test ID(s) | ... | Status |
+    ic_rows = table_rows(sec2, re.compile(r"^IC-I\d+\.\d+$"))
+    for a, n in collections.Counter(r[0] for r in ic_rows).items():
+        if n > 1:
+            fail.append(f"TRACEABILITY.md §2.1 lists {a} {n} times")
+    refs += [(r[0], f, n) for r in ic_rows for f, n in test_refs(r[3] if len(r) > 3 else "")]
     stats["test_refs"] = len(refs)
+    stats["interface_rows"] = len(ic_rows)
     stats["security_rows"] = len(sec_rows)
     if enforce:
         cache: dict[str, str | None] = {}
@@ -156,6 +164,7 @@ def check(spec_text: str, trace_text: str, repo: Path, enforce: bool) -> tuple[l
                     fail.append(
                         f"{r[0]}: {kind} '{label}' not named in .github/workflows/ or RELEASING.md"
                     )
+        for r in [*rows, *ic_rows]:
             status = r[-1]
             if status not in STATUSES:
                 fail.append(f"{r[0]}: status {status!r} not in {sorted(STATUSES)}")
@@ -190,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"mode: {'enforce' if a.enforce else 'planned'}")
     print(
         f"SPEC ACs: {stats['spec_acs']}; TRACEABILITY §2 rows: {stats['rows']}; "
+        f"§2.1 interface rows: {stats['interface_rows']}; "
         f"§3 security rows: {stats['security_rows']}; planned test IDs: {stats['test_refs']}"
     )
     if a.enforce:
