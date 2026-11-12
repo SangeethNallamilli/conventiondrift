@@ -45,7 +45,7 @@ def opened() -> Iterator[list[object]]:
 
 
 @pytest.mark.parametrize("value", list(AC_N3_8_VALUES.values()), ids=list(AC_N3_8_VALUES))
-def test_ac_n3_8_reject(value: str, tmp_path: Path, opened: list[object]) -> None:
+def test_validate_relpath_rejects(value: str, tmp_path: Path, opened: list[object]) -> None:
     with pytest.raises(FileSkipped) as exc:
         validate_relpath(value)
     assert exc.value.reason == REASON_OUTSIDE

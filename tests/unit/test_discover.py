@@ -72,7 +72,7 @@ SIZE_CASES: dict[str, tuple[str, FileKind, int]] = {
 
 
 @pytest.mark.parametrize("case", list(SIZE_CASES))
-def test_ac_n3_7_size_limit_boundary(case: str, tmp_path: Path, strategy: str) -> None:
+def test_read_size_limit_boundary(case: str, tmp_path: Path, strategy: str) -> None:
     rel, kind, limit = SIZE_CASES[case]
     f = tmp_path / rel
     f.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +164,7 @@ def _symlink(link: Path, target: Path) -> None:
 
 @pytest.mark.skipif(not POSIX, reason="POSIX variant; Windows variant is TE's (D-PM-21)")
 @pytest.mark.parametrize("which", ["file", "py", "dir", "config"])
-def test_ac_n3_9_symlink_kinds(
+def test_symlink_kinds_skipped(
     which: str, tmp_path: Path, outside: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     read_paths: list[str] = []
@@ -420,7 +420,7 @@ def test_no_fd_leak(tmp_path: Path, strategy: str) -> None:
 # ---- AC-E.15 decoding, AC-E.16 binary (R2.4) ------------------------------------------
 
 
-def test_ac_e_15_decoding() -> None:
+def test_decode_text_cases() -> None:
     latin1_py = "name = 'café'\n".encode("latin-1")  # 0xE9 is invalid UTF-8
     assert _reason(decode_text, latin1_py, "python") == REASON_NOT_DECODABLE
     utf16_md = "- Use httpx\n".encode("utf-16")  # with BOM, as Python writes it
@@ -476,7 +476,7 @@ def test_foreign_bom_is_not_decodable_not_binary(bom: bytes, kind: FileKind) -> 
     assert _reason(decode_text, bom + b"a\x00b\x00", kind) == REASON_NOT_DECODABLE
 
 
-def test_ac_e_16_binary_detection() -> None:
+def test_binary_detection() -> None:
     blob = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
     assert _reason(decode_text, blob, "instruction") == REASON_BINARY  # binary AGENTS.md
     assert _reason(decode_text, b"x = 1\n\x00\n", "python") == REASON_BINARY  # binary x.py
