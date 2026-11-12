@@ -3,7 +3,7 @@
 import dataclasses
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, get_args, get_type_hints
+from typing import Any, Literal, get_args, get_type_hints
 
 import pytest
 
@@ -343,8 +343,7 @@ def _different(value: Any) -> Any:
 
 
 def test_unhashable_types_declare_hash_none() -> None:
-    assert Policy.__hash__ is None
-    assert Result.__hash__ is None
+    assert all(cls.__hash__ is None for cls in (Policy, Result))
 
 
 def test_policy_mappings_are_read_only() -> None:
@@ -509,7 +508,9 @@ def test_policy_rejects_a_swapped_checker_key() -> None:
         ("any-stale", False, False),
     ],
 )
-def test_policy_gated_matches_fail_on(fail_on: str, gated: bool, ok: bool) -> None:
+def test_policy_gated_matches_fail_on(
+    fail_on: Literal["none", "new-stale", "any-stale"], gated: bool, ok: bool
+) -> None:
     if ok:
         policy = dataclasses.replace(POLICY, effective_fail_on=fail_on, gated=gated)
         assert policy.gated is gated
