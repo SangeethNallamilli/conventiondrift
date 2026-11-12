@@ -1578,13 +1578,16 @@ def test_max_count_is_not_allowed_where_it_is_not_needed() -> None:
 #   GIT_NO_REPLACE_OBJECTS=1        -> test_no_replace_objects_is_load_bearing
 #   GIT_CEILING_DIRECTORIES         -> test_ceiling_directories_is_load_bearing
 #   HOME (fresh temp dir)           -> test_global_config_in_inherited_home_is_ignored
-# Not observable through the allowed subcommands, so kept as defence in depth
-# (a test can't fail when they are removed): core.fsmonitor, core.hooksPath,
-# core.untrackedCache, GIT_OPTIONAL_LOCKS (no allowed subcommand reads the index or
-# runs hooks); diff.external= and --no-ext-diff (log/show/diff-tree run an external
-# diff only with --ext-diff, which the option allowlist refuses); core.pager=cat
-# (stdout is never a tty); GIT_TERMINAL_PROMPT (no transport is allowed);
-# GIT_CONFIG_GLOBAL (HOME is empty and XDG_CONFIG_HOME is not passed);
+# core.fsmonitor=false is needed defence: plain diff-tree runs a repo's
+# fsmonitor (git 2.30, 2.37 and 2.47). The load-bearing behaviour test is
+# due in T-008, so it is not added here.
+# Not observable through T-007's allowed subcommands, so kept as defence in
+# depth (a test can't fail when they are removed): core.hooksPath,
+# core.untrackedCache, GIT_OPTIONAL_LOCKS (no T-007 subcommand reads the index
+# or runs hooks); diff.external= and --no-ext-diff (log/show/diff-tree run an
+# external diff only with --ext-diff, which the option allowlist refuses);
+# core.pager=cat (stdout is never a tty); GIT_TERMINAL_PROMPT (no transport is
+# allowed); GIT_CONFIG_GLOBAL (HOME is empty and XDG_CONFIG_HOME is not passed);
 # GIT_CONFIG_NOSYSTEM and GIT_ATTR_NOSYSTEM (need root to plant system files).
 
 

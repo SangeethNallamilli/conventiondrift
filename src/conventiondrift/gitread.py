@@ -83,6 +83,8 @@ ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset(
 
 #: DESIGN §3 "On every call", in the design's order.
 HARDENING_CONFIG: tuple[str, ...] = (
+    # Needed defence: plain `diff-tree` runs a repo's fsmonitor (confirmed on
+    # git 2.30, 2.37 and 2.47). A load-bearing behaviour test belongs to T-008.
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
     "core.untrackedCache=false",
