@@ -418,10 +418,10 @@ def test_blob_protocol_errors_kill_both_processes(
     assert "abc" not in info.value.message
     assert reader._batch_check is None and reader._batch is None
     reader.close()
-    assert started  # and a later call starts fresh processes:
-    with pytest.raises(ComponentError):
+    count = len(started)  # and a later call raises without restarting (I-14 item 9):
+    with pytest.raises(ComponentError, match="git cat-file stopped after an error"):
         reader.blob(SHA, 100)
-    assert len(started) >= 2
+    assert len(started) == count
 
 
 def test_blob_request_timeout_kills_both_processes(

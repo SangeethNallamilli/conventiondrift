@@ -821,6 +821,8 @@ class GitReader:
         self._batch_check: _BatchProcess | None = None
         self._batch: _BatchProcess | None = None
         self._batch_home: tempfile.TemporaryDirectory[str] | None = None
+        # Set once a cat-file request fails (I-14 item 9): no restart afterwards.
+        self._batch_failed = False
 
     def _resolved_git(self) -> _ResolvedGit:
         """Git, resolved once per reader and cached (I-14 step 1)."""
@@ -924,7 +926,8 @@ class GitReader:
         """Kill and reap both long-lived ``cat-file`` processes (I-14 item 9).
 
         Idempotent, and safe when they were never started. T-028 calls it in a
-        ``finally``. A later ``blob`` call starts new processes.
+        ``finally``. A later ``blob`` call starts new processes, unless a failed
+        request stopped them (then it raises, I-14 item 9).
         """
         for process in (self._batch_check, self._batch):
             if process is not None:
@@ -933,6 +936,11 @@ class GitReader:
         if self._batch_home is not None:
             self._batch_home.cleanup()
             self._batch_home = None
+
+    def _stop_batch(self) -> None:
+        """A cat-file request failed: kill both processes, and never restart them."""
+        self._batch_failed = True
+        self.close()
 
     def _fail(self, subcommand: str, out: _Output) -> ComponentError:
         # Fixed text: never stderr, never a revision or path from input (DESIGN §4).
@@ -1032,14 +1040,19 @@ class GitReader:
         :data:`SMALL_OUTPUT_MAX_BYTES`); a blob over ``max_bytes`` raises
         ``FileSkipped("size limit")`` and ``--batch`` is never asked for it (R2.3).
         Otherwise ``--batch`` gives the same header, then exactly the body and its
-        trailing LF. Each request waits at most :data:`GIT_TIMEOUT_SECONDS`. A
-        timeout, short read or protocol mismatch kills both processes and raises
-        ``ComponentError("gitread")``; so do a missing object and a non-blob, which
-        leave the processes in step and running.
+        trailing LF. Each request waits at most :data:`GIT_TIMEOUT_SECONDS`.
+
+        I-14 item 9: a well-formed ``<oid> missing`` reply (and a non-blob) raises
+        ``ComponentError("gitread")`` and leaves both processes running and in step.
+        A timeout, short read, malformed header or oid mismatch kills both and
+        raises ``ComponentError("gitread")``; every later call then raises too,
+        without starting new processes.
         """
         request = _require_sha(oid).encode("ascii") + b"\n"
         if max_bytes < 0:
             raise ComponentError(_COMPONENT, "invalid size limit")
+        if self._batch_failed:
+            raise ComponentError(_COMPONENT, "git cat-file stopped after an error")
         try:
             check = self._batch_process("--batch-check")
             check.send(request)
@@ -1049,7 +1062,7 @@ class GitReader:
             if not missing and (m is None or m[1] + b"\n" != request):
                 raise _bad_output()
         except ComponentError:
-            self.close()
+            self._stop_batch()
             raise
         if m is None:  # "<oid> missing": the protocol is still in step
             raise ComponentError(_COMPONENT, "object not found")
@@ -1068,7 +1081,7 @@ class GitReader:
             if not body.endswith(b"\n"):
                 raise _bad_output()
         except ComponentError:
-            self.close()
+            self._stop_batch()
             raise
         return body[:-1]
 
