@@ -32,10 +32,10 @@ from types import MappingProxyType
 from typing import Final, Literal
 
 from conventiondrift.core import FailOn, error_fail_on
+from conventiondrift.defaults import DEFAULT_EXCLUDES
 from conventiondrift.model import CheckerId, CheckerPolicy, IgnoreEntry, Policy, Thresholds
 from conventiondrift.policy.config import (
     DEFAULT_CHECKERS,
-    DEFAULT_EXCLUDES,
     DEFAULT_HISTORY_DAYS,
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_THRESHOLDS,

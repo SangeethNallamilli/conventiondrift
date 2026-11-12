@@ -12,7 +12,6 @@ import pytest
 from conventiondrift.model import CheckerId, CheckerPolicy, Thresholds
 from conventiondrift.policy.config import (
     DEFAULT_CHECKERS,
-    DEFAULT_EXCLUDES,
     DEFAULT_HISTORY_DAYS,
     DEFAULT_LOGGING_SCRIPT_PATHS,
     DEFAULT_MAX_FILE_BYTES,
@@ -61,19 +60,6 @@ def test_default_checkers_match_i6() -> None:
     assert all(p.script_paths == () for cid, p in DEFAULT_CHECKERS.items() if cid != "logging")
     with pytest.raises(TypeError):
         DEFAULT_CHECKERS["money"] = CheckerPolicy(True, ())  # type: ignore[index]
-
-
-def test_default_excludes_cover_design_list_without_hard_excludes() -> None:
-    # DESIGN §10 "Default excludes" glob entries; folder patterns match at any depth.
-    design = {
-        ".venv/", "venv/", ".tox/", ".nox/", "vendor/", "_vendor/", "third_party/",
-        "build/", "dist/", "*.egg-info/", "__pycache__/", "site-packages/",
-        "migrations/", "**/alembic/versions/", "*_pb2.py", "*_pb2_grpc.py",
-    }  # fmt: skip
-    assert set(DEFAULT_EXCLUDES) == design
-    assert len(DEFAULT_EXCLUDES) == len(design)
-    # I-13: hard excludes are applied by C4 and are not listed.
-    assert not {".git/", "node_modules/"} & set(DEFAULT_EXCLUDES)
 
 
 def test_side_config_checkers_are_read_only_copies() -> None:

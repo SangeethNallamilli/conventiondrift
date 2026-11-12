@@ -11,6 +11,7 @@ import pytest
 
 from conventiondrift import core, policy
 from conventiondrift.core import FailOn
+from conventiondrift.defaults import DEFAULT_EXCLUDES
 from conventiondrift.model import CheckerPolicy, IgnoreEntry, Thresholds
 from conventiondrift.policy import (
     DEFAULT_CONFIG_PATH,
@@ -19,7 +20,7 @@ from conventiondrift.policy import (
     build_policy,
     config_path,
 )
-from conventiondrift.policy.config import DEFAULT_EXCLUDES, HISTORY_DAYS_RANGE, SideConfig
+from conventiondrift.policy.config import HISTORY_DAYS_RANGE, SideConfig
 
 FAIL_ON: tuple[FailOn, ...] = get_args(FailOn)
 M = "<!-- conventiondrift: ignore -->"

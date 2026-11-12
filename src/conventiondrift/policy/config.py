@@ -22,7 +22,6 @@ from conventiondrift.model import CheckerId, CheckerPolicy, IgnoreEntry, Thresho
 
 __all__ = [
     "DEFAULT_CHECKERS",
-    "DEFAULT_EXCLUDES",
     "DEFAULT_HISTORY_DAYS",
     "DEFAULT_LOGGING_SCRIPT_PATHS",
     "DEFAULT_MAX_FILE_BYTES",
@@ -85,32 +84,6 @@ DEFAULT_CHECKERS: Final[Mapping[CheckerId, CheckerPolicy]] = MappingProxyType(
     }
 )
 """I-6: every checker is on except ``money`` (AC-F3.14)."""
-
-# QUESTION(T-012-default-excludes): DESIGN §10 lists the default excludes, and C4
-# (T-010a) applies them, but T-010a isn't on main. They live here as globs so the
-# effective set (I-5, SC-2.41) can be built; T-010a should import them from here.
-# The two content rules (a folder holding pyvenv.cfg, the generated-file header)
-# and the hard .git/ and node_modules/ exclusions are not globs: C4 applies them
-# in every mode and they are not listed (I-13 Policy.excludes).
-DEFAULT_EXCLUDES: Final = (
-    ".venv/",
-    "venv/",
-    ".tox/",
-    ".nox/",
-    "vendor/",
-    "_vendor/",
-    "third_party/",
-    "build/",
-    "dist/",
-    "*.egg-info/",
-    "__pycache__/",
-    "site-packages/",
-    "migrations/",
-    "**/alembic/versions/",
-    "*_pb2.py",
-    "*_pb2_grpc.py",
-)
-"""DESIGN §10 default excludes as gitignore-style globs; every folder matches at any depth."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
