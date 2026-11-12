@@ -75,6 +75,30 @@ def git_version() -> tuple[int, ...]:
     return tuple(int(x) for x in m.groups() if x is not None)
 
 
+def base_git_env(home: Path) -> dict[str, str]:
+    """A fixed environment for the fixture's own git calls (not the tool's).
+
+    Config is isolated (no system or global file). HOME and USERPROFILE point
+    at `home`. SYSTEMROOT and the other Windows runtime variables are kept so
+    git.exe can start; PATH is the host PATH so git itself is found.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(_isolated_gitconfig(home)),
+        "GIT_TERMINAL_PROMPT": "0",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+    }
+    for key in _HOST_RUNTIME_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
 SYMLINK_UNAVAILABLE_REASON = "OS cannot create symlinks (Windows without Developer Mode)"
 
 # Host variables git (and, on Windows, git.exe itself) still need. HOME and
@@ -132,30 +156,6 @@ def _rmtree(path: Path) -> None:
         shutil.rmtree(path, onexc=_retry)
     else:
         shutil.rmtree(path, onerror=_retry)
-
-
-def base_git_env(home: Path) -> dict[str, str]:
-    """A fixed environment for the fixture's own git calls (not the tool's).
-
-    Config is isolated (no system or global file). HOME and USERPROFILE point
-    at `home`. SYSTEMROOT and the other Windows runtime variables are kept so
-    git.exe can start; PATH is the host PATH so git itself is found.
-    """
-    env = {
-        "PATH": os.environ.get("PATH", os.defpath),
-        "HOME": str(home),
-        "USERPROFILE": str(home),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": str(_isolated_gitconfig(home)),
-        "GIT_TERMINAL_PROMPT": "0",
-        "LC_ALL": "C",
-        "TZ": "UTC",
-    }
-    for key in _HOST_RUNTIME_KEYS:
-        value = os.environ.get(key)
-        if value is not None:
-            env[key] = value
-    return env
 
 
 @dataclasses.dataclass(frozen=True)
