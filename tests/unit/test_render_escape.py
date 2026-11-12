@@ -469,14 +469,17 @@ def test_no_hidden_categories_in_md_cell_or_workflow_outputs(text: str) -> None:
 
 
 _RESIDUAL_MESSAGE = r"^residual control character after mapping$"
+_RESIDUALS = ["\r", "\n", "\x00", "\x7f", "\x85", "\u202e", "\u2028", "\u2029", "\ud800"]
+_RESIDUAL_IDS = ["CR", "LF", "NUL", "DEL", "C1", "Cf bidi", "Zl", "Zp", "Cs"]
+
+
+def test_residual_cases_cover_every_guarded_category() -> None:
+    """D-TL-25: the residual cases must span exactly the categories the guard rejects."""
+    assert {unicodedata.category(c) for c in _RESIDUALS} == set(esc._LABEL_CATEGORIES)
 
 
 @pytest.mark.parametrize("func", [workflow_cmd, workflow_prop], ids=lambda f: f.__name__)
-@pytest.mark.parametrize(
-    "residual",
-    ["\r", "\n", "\x00", "\x7f", "\x85", "\u202e", "\u2028", "\u2029", "\ud800"],
-    ids=["CR", "LF", "NUL", "DEL", "C1", "Cf bidi", "Zl", "Zp", "Cs"],
-)
+@pytest.mark.parametrize("residual", _RESIDUALS, ids=_RESIDUAL_IDS)
 def test_workflow_fails_closed_if_mapping_is_bypassed(
     monkeypatch: pytest.MonkeyPatch,
     func: Callable[[str], str],
@@ -492,7 +495,7 @@ def test_workflow_fails_closed_if_mapping_is_bypassed(
 
 
 def test_workflow_guard_is_silent_when_mapping_ran() -> None:
-    hostile = "a\nb\rc" + "\x00\x7f\x85\u202e\u2028\u2029\ud800"
+    hostile = "a\nb\rc" + "".join(_RESIDUALS)
     assert workflow_cmd(hostile)
     assert workflow_prop(hostile)
 
