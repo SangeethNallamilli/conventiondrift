@@ -39,6 +39,7 @@ SkipReason = Literal[
     "walk limit",
     "manifest parse error",
     "unsupported path",
+    "unreadable",
 ]
 Case = Literal["made-stale-by-code", "stale-rule-added", "fixed", "pre-existing-stale", "removed"]
 
@@ -175,6 +176,8 @@ class Policy:
         object.__setattr__(self, "markers", _read_only(self.markers))
         if self.checkers.keys() != _CHECKER_IDS:
             raise ValueError("Policy.checkers must have exactly the 8 checker ids")
+        if any(p.script_paths for cid, p in self.checkers.items() if cid != "logging"):
+            raise ValueError('CheckerPolicy.script_paths must be () except for "logging"')
         if self.gated != (self.effective_fail_on != "none"):
             raise ValueError('Policy.gated must equal effective_fail_on != "none"')
 
@@ -194,6 +197,10 @@ class Rule:
     scope_dir: str
     ignored: bool
     disabled: bool
+
+    def __post_init__(self) -> None:
+        if self.scope_dir.startswith("/") or self.scope_dir.endswith("/"):
+            raise ValueError("Rule.scope_dir must have no leading or trailing slash")
 
 
 @dataclass(frozen=True, slots=True)
