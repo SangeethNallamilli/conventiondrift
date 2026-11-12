@@ -399,17 +399,17 @@ DEVICE_PROBES = [
 
 
 @pytest.mark.skipif(not hasattr(ntpath, "isreserved"), reason="ntpath.isreserved is 3.13+")
-@pytest.mark.parametrize("name", DEVICE_PROBES)
-def test_tree_name_agrees_with_ntpath_isreserved(name: str, os_name: str) -> None:
+def test_tree_name_agrees_with_ntpath_isreserved(os_name: str) -> None:
     """Our device-name and trailing-dot checks say what Python 3.13's ``isreserved`` says."""
-    reserved: bool = ntpath.isreserved(name)  # type: ignore[attr-defined,unused-ignore]
-    try:
-        validate_relpath(name, origin="tree")
-    except FileSkipped as exc:
-        assert exc.reason == REASON_UNSUPPORTED
-        assert reserved, name
-    else:
-        assert not reserved, name
+    for name in DEVICE_PROBES:
+        reserved: bool = ntpath.isreserved(name)  # type: ignore[attr-defined,unused-ignore]
+        try:
+            validate_relpath(name, origin="tree")
+        except FileSkipped as exc:
+            assert exc.reason == REASON_UNSUPPORTED
+            assert reserved, name
+        else:
+            assert not reserved, name
 
 
 # ---- CR2 S4: an origin outside Literal["input", "tree"] gets the strict branch ---------
