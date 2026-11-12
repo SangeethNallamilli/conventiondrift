@@ -2,7 +2,9 @@
 
 Every call goes through :meth:`GitReader._run`, which:
 
-* runs ``git`` from an absolute path, as an argv list, never through a shell;
+* runs ``git`` from a resolved absolute path found only on absolute ``PATH``
+  entries and never inside the repository or current folder (SR-013), as an
+  argv list, never through a shell;
 * passes a fixed environment (DESIGN §3) with ``HOME`` set to a fresh, empty
   temporary directory; only ``PATH`` is inherited, plus ``SYSTEMROOT`` on
   Windows (``os.name == "nt"``, I-11 C3);
@@ -31,7 +33,6 @@ can check the header size before reading the body).
 
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from collections.abc import Sequence
@@ -94,18 +95,72 @@ def _require_sha(value: str) -> str:
     return value
 
 
+def _trusted_path_entries() -> list[str]:
+    """The inherited ``PATH`` entries that may be searched for git (SR-013).
+
+    Only absolute entries are kept: empty entries, ``.`` and every other relative
+    entry would make the search depend on the current folder, which may be an
+    untrusted checkout.
+    """
+    raw = os.environ.get("PATH")
+    if raw is None:
+        return []
+    return [entry for entry in raw.split(os.pathsep) if entry and os.path.isabs(entry)]
+
+
+def _is_within(path: str, folder: str) -> bool:
+    """True iff the real ``path`` is ``folder`` or below it (both already resolved).
+
+    A filesystem root is never treated as a folder to refuse: everything is below
+    it, and absolute ``PATH`` entries carry no current-folder risk there.
+    """
+    path = os.path.normcase(path)
+    folder = os.path.normcase(folder)
+    if os.path.dirname(folder) == folder:
+        return False
+    try:
+        return os.path.commonpath([path, folder]) == folder
+    except ValueError:  # different drives on Windows
+        return False
+
+
+def _find_git(repo_dir: Path) -> str:
+    """The resolved absolute path of a trusted git executable (SR-013, I-11 C3).
+
+    Searches only absolute ``PATH`` entries, never the current folder, for ``git``
+    (``git.exe`` only on Windows, never ``.cmd``/``.bat``). The first match is
+    resolved once; if it lies inside the repository or the current folder the run
+    refuses it with a fixed-text ``GitUnavailable`` rather than run a binary that
+    the checkout may have supplied.
+    """
+    name = "git.exe" if os.name == "nt" else "git"
+    for entry in _trusted_path_entries():
+        candidate = os.path.join(entry, name)
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        real = os.path.realpath(candidate)
+        for folder in (os.path.realpath(repo_dir), os.path.realpath(os.getcwd())):
+            if _is_within(real, folder):
+                raise GitUnavailable("git executable is not trusted")
+        return real
+    raise GitUnavailable("git executable not found")
+
+
 def _environment(home: str) -> dict[str, str]:
     """The fixed git environment (DESIGN §3, I-11 C3).
 
-    The DESIGN §3 values and ``HOME``, plus ``PATH`` if set, plus ``SYSTEMROOT`` if
-    set and only when ``os.name == "nt"`` (Git for Windows needs it to start).
+    The DESIGN §3 values and ``HOME``, plus ``PATH`` (only its absolute entries,
+    the same filtered list :func:`_find_git` searched; SR-013) if set, plus
+    ``SYSTEMROOT`` if set and only when ``os.name == "nt"`` (Git for Windows
+    needs it to start).
     """
     env = dict(FIXED_ENV)
-    inherited = ["PATH", "SYSTEMROOT"] if os.name == "nt" else ["PATH"]
-    for name in inherited:
-        value = os.environ.get(name)
-        if value is not None:
-            env[name] = value
+    if "PATH" in os.environ:
+        env["PATH"] = os.pathsep.join(_trusted_path_entries())
+    if os.name == "nt":
+        systemroot = os.environ.get("SYSTEMROOT")
+        if systemroot is not None:
+            env["SYSTEMROOT"] = systemroot
     env["HOME"] = home
     return env
 
@@ -139,10 +194,7 @@ class GitReader:
         if any("\x00" in arg for arg in args):
             raise ComponentError(_COMPONENT, "NUL in git argument")
         # I-11 C3: GitUnavailable means only "git is missing or cannot start".
-        git = shutil.which("git")
-        if git is None:
-            raise GitUnavailable("git executable not found")
-        argv = [os.path.abspath(git)]
+        argv = [_find_git(self._repo_dir)]
         for setting in HARDENING_CONFIG:
             argv += ["-c", setting]
         argv.append(subcommand)
