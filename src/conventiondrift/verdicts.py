@@ -21,7 +21,8 @@ Threshold validation (``stale.overall <= migrating.overall <= holds`` and
 applies whatever ``Thresholds`` it is given.
 """
 
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from collections.abc import Set as AbstractSet
 from typing import Literal
 
 from conventiondrift.model import (
@@ -101,8 +102,8 @@ def side_result(
     rule: Rule,
     sites: Iterable[Site],
     *,
-    options: Collection[str],
-    recent_lines: Collection[tuple[str, int]] | None,
+    options: AbstractSet[str],
+    recent_lines: Iterable[tuple[str, int]] | None,
     thresholds: Thresholds,
 ) -> SideResult:
     """Build the C9 ``SideResult`` for one rule on one side.
@@ -130,9 +131,9 @@ def side_result(
     # gets its normal verdict here (it only stops counting for fail-on).
     match = rule.match if rule.checker is not None else None
     results: list[SiteResult] = []
-    # Build the lookup set once, so membership is O(1) per site (SR F2).
-    recent_set = frozenset(recent_lines) if recent_lines is not None else None
     if match is not None:
+        # Build the lookup set once, and only when we will walk sites (SR F2, CR2 N2).
+        recent_set = frozenset(recent_lines) if recent_lines is not None else None
         for s in sites:
             if s.option in options:
                 recent = recent_set is not None and (s.file, s.line) in recent_set

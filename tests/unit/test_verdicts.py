@@ -7,7 +7,7 @@ Test Engineer. The AC each case exercises is given in a comment instead.
 import ast
 import inspect
 import os
-from collections.abc import Collection
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 
@@ -324,7 +324,7 @@ def site(file: str, line: int, option: str, col: int = 0) -> Site:
 
 def build(
     sites: list[Site],
-    recent_lines: Collection[tuple[str, int]] | None,
+    recent_lines: Iterable[tuple[str, int]] | None,
     rule: Rule = RULE,
     t: Thresholds = DEFAULTS,
     options: frozenset[str] = HTTP,
@@ -446,7 +446,7 @@ class _NoLinearScan(list[tuple[str, int]]):
         raise AssertionError("recent_lines was scanned linearly")
 
 
-def test_side_result_recent_lines_list_is_converted_to_a_set_once() -> None:
+def test_side_result_does_not_scan_recent_lines_linearly() -> None:
     old = [site("src/old.py", i, "requests") for i in range(6)]
     new = [site("src/new.py", i, "httpx") for i in range(4)]
     recent = _NoLinearScan([("src/new.py", i) for i in range(4)] + [("src/new.py", 0)])
@@ -582,7 +582,7 @@ _MUTMUT_TRAMPOLINE_ALIASES = frozenset(
 )
 _MUTANT_UNDER_TEST_ENV = "MUTANT_UNDER_TEST"
 
-_PURE_PREAMBLE = """from collections.abc import Collection, Iterable, Sequence
+_PURE_PREAMBLE = """from collections.abc import Iterable, Sequence
 from typing import Literal
 
 from conventiondrift.model import (
