@@ -2,7 +2,6 @@
 
 Method: TEST-STRATEGY.md §4. Budgets: DESIGN.md §5. Stats schema: INTERFACES.md I-12.
 """
-# ruff: noqa: S603, S607  (test tooling: fixed argv lists to git/python, seeded non-crypto RNG by design)
 
 from __future__ import annotations
 
@@ -25,7 +24,22 @@ REGRESSION_LIMIT = 1.20  # AC-N2.3: more than 20% slower than main fails
 
 # I-12: names and order are fixed and map one-to-one to the DESIGN §5 rows.
 STAGES = ("startup", "discover", "head-analyze", "base-analyze", "history", "report")
-COUNT_KEYS = frozenset({"files_parsed", "ast_nodes", "git_calls", "changed_files", "workers"})
+# INTERFACES I-12: every counter is always present.
+SCAN_COUNT_KEYS = frozenset(
+    {
+        "scan_all_recent_line_limit",
+        "scan_all_recent_diff_budget",
+        "scan_diff_work",
+        "scan_walk_entries",
+        "scan_walk_skipped",
+        "gitignore_patterns_loaded",
+        "gitignore_patterns_skipped",
+    }
+)
+COUNT_KEYS = (
+    frozenset({"files_parsed", "ast_nodes", "git_calls", "changed_files", "workers"})
+    | SCAN_COUNT_KEYS
+)
 STAGE_BUDGET_S = {  # DESIGN §5 table
     "b10k": {
         "startup": 2,
@@ -52,7 +66,7 @@ class StatsSchemaError(AssertionError):
     pass
 
 
-def validate_stats(doc: object) -> dict:
+def validate_stats(doc: object, *, scan_mode: bool = False) -> dict:
     """Strict I-12 check. A renamed, missing, extra or reordered stage is a schema break."""
     if not isinstance(doc, dict):
         raise StatsSchemaError("stats file is not a JSON object")
@@ -81,6 +95,12 @@ def validate_stats(doc: object) -> dict:
     for k, v in counts.items():
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             raise StatsSchemaError(f"count {k}={v!r}")
+    if not scan_mode:
+        nonzero = sorted(k for k in SCAN_COUNT_KEYS if counts[k] != 0)
+        if nonzero:
+            raise StatsSchemaError(
+                f"scan/gitignore counters must be 0 outside scan mode: {nonzero}"
+            )
     return doc
 
 
@@ -131,7 +151,7 @@ def provision(profile: str, workdir: Path) -> tuple[Path, dict]:
                 return repo, m
     else:
         repo = workdir / profile
-    subprocess.run(
+    subprocess.run(  # noqa: S603 - argv list, no shell
         [
             sys.executable,
             str(GENERATOR),
@@ -190,7 +210,7 @@ def run_check(repo: Path, head_ref: str, outdir: Path, n: int, fmt: str = "json"
     ]
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "GIT_"))}
     t0 = time.monotonic()
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: S603 - argv list, no shell
         cmd,
         cwd=repo,
         env=env,
@@ -235,8 +255,8 @@ def probe_cli(workdir: Path) -> str | None:
     }
     if not (repo / ".git").exists():
         for args in (["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "p"]):
-            subprocess.run(
-                ["git", *args],
+            subprocess.run(  # noqa: S603 - argv list, no shell
+                ["git", *args],  # noqa: S607 - git from PATH by design
                 cwd=repo,
                 env=env,
                 check=True,

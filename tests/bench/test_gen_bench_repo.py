@@ -1,5 +1,4 @@
 """Tests for tools/gen_bench_repo.py (T-052): composition, determinism, E.12 labels."""
-# ruff: noqa: S603, S607  (test tooling: fixed argv lists to git/python, seeded non-crypto RNG by design)
 
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ GEN = benchlib.GENERATOR
 
 
 def _gen(profile: str, seed: int, out: Path) -> dict:
-    subprocess.run(
+    subprocess.run(  # noqa: S603 - argv list, no shell
         [
             sys.executable,
             str(GEN),
@@ -36,8 +35,8 @@ def _gen(profile: str, seed: int, out: Path) -> dict:
 
 
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args],
+    return subprocess.run(  # noqa: S603 - argv list, no shell
+        ["git", *args],  # noqa: S607 - git from PATH by design
         cwd=repo,
         check=True,
         capture_output=True,
@@ -144,7 +143,7 @@ def test_e12_labels_hold_by_construction(smoke: tuple) -> None:
     pr = m["composition"]["prs"]["bench-pr-5000"]
     assert pr["py_files_changed"] == m["profile_spec"]["large_pr_files"]
     grep = subprocess.run(
-        ["git", "grep", "-l", "requests.get(", "bench-pr-5000"],
+        ["git", "grep", "-l", "requests.get(", "bench-pr-5000"],  # noqa: S607 - git from PATH by design
         cwd=repo,
         capture_output=True,
         text=True,
@@ -158,3 +157,67 @@ def test_e12_labels_hold_by_construction(smoke: tuple) -> None:
     pct = 100 * share["requests"] / (share["requests"] + share["httpx"])
     assert 20 <= pct < 80  # base Contested on overall alone, whatever recent says
     assert m["expected_findings"]["bench-pr"] == []
+
+
+def test_root_commit_dated_at_start_of_span(b500_pair: tuple) -> None:
+    """D-PM-27 (2): the root commit carries the first date of the 730-day span."""
+    repo, m, _, _ = b500_pair
+    root = _git(repo, "rev-list", "--max-parents=0", "main").split()
+    assert len(root) == 1
+    root_ct = int(_git(repo, "show", "-s", "--format=%ct", root[0]))
+    all_ct = [int(x) for x in _git(repo, "log", "--format=%ct", "main").split()]
+    assert root_ct == min(all_ct)
+    assert max(all_ct) - root_ct == 730 * 86400
+    assert (
+        m["composition"]["root_commit"]["date_utc"] == m["composition"]["commits"]["first_date_utc"]
+    )
+
+
+def test_pr_changed_files_counts_every_path_and_rename_once(smoke: tuple) -> None:
+    """I-12: counts.changed_files = every path of changed_files(base, head), any type."""
+    repo, m = smoke
+    for ref, pr in m["composition"]["prs"].items():
+        mb = _git(repo, "merge-base", "main", ref).strip()
+        status = _git(repo, "diff", "--name-status", "-M", mb, ref).splitlines()
+        renames = [line for line in status if line.startswith("R")]
+        assert len(renames) == 1, ref
+        assert renames[0].split("\t")[1:] == ["docs/README.md", "docs/OVERVIEW.md"]
+        assert pr["files_changed"] == len(status) == pr["py_files_changed"] + 1
+        assert pr["non_py_paths_changed"] == 1
+
+
+def _except_census(repo: Path, ref: str) -> dict[str, int]:
+    """Independent recount with ast (the generator uses git grep on its templates)."""
+    counts = {"bare": 0, "Exception": 0, "all": 0}
+    paths = [
+        p for p in _git(repo, "ls-tree", "-r", "--name-only", ref).split() if p.endswith(".py")
+    ]
+    for path in paths:
+        tree = ast.parse(_git(repo, "show", f"{ref}:{path}"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ExceptHandler):
+                counts["all"] += 1
+                if node.type is None:
+                    counts["bare"] += 1
+                elif isinstance(node.type, ast.Name) and node.type.id == "Exception":
+                    counts["Exception"] += 1
+    return counts
+
+
+def test_exceptions_rules_have_separate_expected_verdicts(smoke: tuple) -> None:
+    """D-PM-27 (5): the paired exceptions rules are not a conflict; each has its own verdict."""
+    repo, m = smoke
+    verdicts = m["exception_rule_verdicts"]
+    narrow, wide = "Do not use bare except.", "Do not use bare except or catch Exception."
+    assert set(verdicts) == {narrow, wide}
+    for ref in ("main", *m["composition"]["prs"]):
+        c = _except_census(repo, ref)
+        assert c["Exception"] > 0, "the two rules must be distinguishable"
+        n, w = verdicts[narrow][ref], verdicts[wide][ref]
+        assert (n["relevant"], n["contradicting"]) == (c["all"], c["bare"])
+        assert (w["relevant"], w["contradicting"]) == (c["all"], c["bare"] + c["Exception"])
+        for v in (n, w):
+            assert v["following"] * 100 >= 80 * v["relevant"]
+            assert v["expected_verdict"] == "Holds"
+    findings = [f for per_ref in m["expected_findings"].values() for f in per_ref]
+    assert not {f["text"] for f in findings} & {narrow, wide}

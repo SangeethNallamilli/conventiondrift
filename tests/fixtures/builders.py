@@ -57,6 +57,33 @@ F5_1_OTHER_RULES = [
 ]
 F5_1_RULE = "Use requests for HTTP calls"
 
+# D-PM-27 (4): the 8 filler rules must add no finding of their own. Expected verdict at the
+# merge base and at the head, from SPEC §7.4 (Holds >= 80%, < 5 relevant sites -> Insufficient
+# data): the code is 40 fully annotated HTTP functions and nothing else (no print/logger calls,
+# no tests, no string formatting, no except clauses, no manifests). `preferred` is the option
+# the rule asks for; rules of one checker conflict only if their preferred options differ, so
+# the pytest pair and the f-strings pair do not conflict, and the exceptions rule prefers none.
+F5_1_OTHER_RULE_EXPECTATIONS = [
+    {"line": 1, "checker": "logging", "preferred": "logging", "verdict": "Insufficient data"},
+    {"line": 2, "checker": "test-framework", "preferred": "pytest", "verdict": "Insufficient data"},
+    {
+        "line": 3,
+        "checker": "string-format",
+        "preferred": "f-string",
+        "verdict": "Insufficient data",
+    },
+    {"line": 4, "checker": "exceptions", "preferred": None, "verdict": "Insufficient data"},
+    {"line": 5, "checker": "type-hints", "preferred": "annotated", "verdict": "Holds"},
+    {"line": 6, "checker": "package-manager", "preferred": "uv", "verdict": "Insufficient data"},
+    {"line": 7, "checker": "test-framework", "preferred": "pytest", "verdict": "Insufficient data"},
+    {
+        "line": 8,
+        "checker": "string-format",
+        "preferred": "f-string",
+        "verdict": "Insufficient data",
+    },
+]
+
 
 def f5_1_requests_to_httpx(root: Path, *, number: int = 1) -> Fixture:
     """AC-F5.1 (also F6.2, F6.3, F6.7, F6.8, F9.4, F9.8 ...).
@@ -137,6 +164,11 @@ def f5_1_requests_to_httpx(root: Path, *, number: int = 1) -> Fixture:
             "comments": 1,
             "rules_changed": 1,
             "rules_unchanged": 8,  # AC-F6.7 count line
+            "other_rules": [
+                {"text": t, "base_verdict": e["verdict"], "head_verdict": e["verdict"], **e}
+                for t, e in zip(F5_1_OTHER_RULES, F5_1_OTHER_RULE_EXPECTATIONS, strict=True)
+            ],
+            "annotated_defs": (40, 40),  # (base, head) all of them; supports type hints Holds
             "suggested_text": "Use httpx for HTTP calls",  # AC-F6.3 #7 / F6.7
             "window_end": T.isoformat(),
             "window_days": 90,

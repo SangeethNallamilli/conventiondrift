@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 __all__ = [
+    "REPLACEABLE_PARTS",
     "FaultyComponent",
     "InjectedFault",
     "components_class",
@@ -129,35 +130,8 @@ class FaultyComponent:
         return f"FaultyComponent({object.__getattribute__(self, '_wrapped')!r})"
 
 
-def replace_checker(registry: Any, checker_id: str, wrap: Callable[[Any], Any]) -> Any:
-    """Return a copy of a checker registry with one checker (by I-10 `id`) replaced by
-    `wrap(checker)`. Accepts a Mapping[id, Checker] or a sequence of checkers; I-11 does not
-    pin the registry type."""
-    if isinstance(registry, Mapping):
-        if checker_id not in registry:
-            raise KeyError(checker_id)
-        out = dict(registry)
-        out[checker_id] = wrap(registry[checker_id])
-        return type(registry)(out) if type(registry) is not dict else out
-    items = list(registry)
-    hits = [i for i, c in enumerate(items) if getattr(c, "id", None) == checker_id]
-    if len(hits) != 1:
-        raise KeyError(checker_id)
-    items[hits[0]] = wrap(items[hits[0]])
-    return type(registry)(items) if isinstance(registry, tuple | list) else tuple(items)
-
-
-def components_class() -> type:
-    """`Components` from the production seam (DESIGN §12 A-1: conventiondrift.components)."""
-    return importlib.import_module("conventiondrift.components").Components  # type: ignore[no-any-return]
-
-
-def make_components(base: Any = None, **replacements: Any) -> Any:
-    """Build a Components with some parts replaced (I-11 field names: git_reader, checkers,
-    extractor, history, renderer, github_client, github_base_url). With `base`, it is copied
-    with dataclasses.replace; otherwise `Components(**replacements)` is called, assuming
-    unspecified fields default to the production parts (not pinned by I-2/I-11)."""
-    unknown = set(replacements) - {
+REPLACEABLE_PARTS = frozenset(
+    {
         "git_reader",
         "checkers",
         "extractor",
@@ -166,8 +140,44 @@ def make_components(base: Any = None, **replacements: Any) -> Any:
         "github_client",
         "github_base_url",
     }
+)  # I-11
+
+
+def replace_checker(
+    registry: Mapping[str, Any], checker_id: str, wrap: Callable[[Any], Any]
+) -> dict[str, Any]:
+    """Copy of a checker registry with one checker replaced by `wrap(checker)`.
+
+    I-11: the registry is a `Mapping[str, Checker]` keyed by the I-10 checker id and iterated
+    in sorted id order; the copy keeps that order.
+    """
+    if not isinstance(registry, Mapping):
+        raise TypeError(
+            f"I-11 checker registry must be a Mapping[str, Checker], got {type(registry).__name__}"
+        )
+    if checker_id not in registry:
+        raise KeyError(checker_id)
+    return {cid: (wrap(c) if cid == checker_id else c) for cid, c in sorted(registry.items())}
+
+
+def components_class() -> type:
+    """`conventiondrift.Components` (defined in conventiondrift/components.py, DESIGN A-1)."""
+    pkg = importlib.import_module("conventiondrift")
+    cls = getattr(pkg, "Components", None)
+    if cls is None:
+        cls = importlib.import_module("conventiondrift.components").Components
+    return cls  # type: ignore[no-any-return]
+
+
+def make_components(base: Any = None, **replacements: Any) -> Any:
+    """A `Components` with some I-11 parts replaced, via `dataclasses.replace`.
+
+    I-11: `@dataclass(frozen=True, kw_only=True)`, `None` means "use the default". `base`
+    defaults to `Components()`, i.e. all production defaults.
+    """
+    unknown = set(replacements) - REPLACEABLE_PARTS
     if unknown:
         raise TypeError(f"not an I-11 replaceable part: {sorted(unknown)}")
-    if base is not None:
-        return dataclasses.replace(base, **replacements)
-    return components_class()(**replacements)
+    if base is None:
+        base = components_class()()
+    return dataclasses.replace(base, **replacements)

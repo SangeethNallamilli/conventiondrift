@@ -20,6 +20,7 @@ def _stats(**overrides: float) -> dict:
             "git_calls": 3,
             "changed_files": 50,
             "workers": 4,
+            **dict.fromkeys(sorted(benchlib.SCAN_COUNT_KEYS), 0),
         },
     }
 
@@ -98,3 +99,20 @@ def test_regression_statistic_median_vs_median() -> None:
     assert not benchlib.regression_verdict([12.5] * 5, history)[0]
     with pytest.raises(ValueError):
         benchlib.regression_verdict([1.0] * 4, main)
+
+
+def test_counts_has_all_twelve_i12_keys() -> None:
+    assert len(benchlib.COUNT_KEYS) == 12
+    doc = _stats()
+    del doc["counts"]["gitignore_patterns_skipped"]
+    with pytest.raises(benchlib.StatsSchemaError, match="counts keys"):
+        benchlib.validate_stats(doc)
+
+
+@pytest.mark.parametrize("key", sorted(benchlib.SCAN_COUNT_KEYS))
+def test_scan_counters_must_be_zero_in_compare_mode(key: str) -> None:
+    doc = _stats()
+    doc["counts"][key] = 1
+    with pytest.raises(benchlib.StatsSchemaError, match="outside scan mode"):
+        benchlib.validate_stats(doc)
+    benchlib.validate_stats(doc, scan_mode=True)

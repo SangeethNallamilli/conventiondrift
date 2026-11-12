@@ -8,7 +8,6 @@ Git runs with a fixed, isolated environment: no system or global config, a
 private HOME, fixed author/committer identity and explicit
 GIT_AUTHOR_DATE / GIT_COMMITTER_DATE on every commit.
 """
-# ruff: noqa: S603, S607  (test tooling: fixed argv lists to git/python, seeded non-crypto RNG by design)
 
 from __future__ import annotations
 
@@ -175,8 +174,8 @@ class GitRepo:
         stdin_data: bytes | None = None,
         cwd: Path | None = None,
     ) -> str:
-        proc = subprocess.run(
-            ["git", *args],
+        proc = subprocess.run(  # noqa: S603 - argv list, no shell
+            ["git", *args],  # noqa: S607 - git from PATH by design
             cwd=cwd or self.path,
             env=self.env(env),
             input=stdin_data,
@@ -306,8 +305,8 @@ class GitRepo:
 
     def has_object(self, sha: str) -> bool:
         return (
-            subprocess.run(
-                ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+            subprocess.run(  # noqa: S603 - argv list, no shell
+                ["git", "cat-file", "-e", f"{sha}^{{commit}}"],  # noqa: S607 - git from PATH by design
                 cwd=self.path,
                 env=self.env(),
                 capture_output=True,

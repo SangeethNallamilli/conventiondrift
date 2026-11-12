@@ -80,7 +80,12 @@ def _assert_runs(profile: str, head_ref: str, manifest: dict, runs: list[benchli
             problems.append(f"run {n}: I-12 stats: {exc}")
             continue
         problems += [f"run {n}: {v}" for v in benchlib.stage_budget_violations(run.stats, profile)]
-        expected_changed = manifest["composition"]["prs"][head_ref]["files_changed"]
+        # I-12: every changed path of any type, a rename once. The generator makes each PR
+        # rename one non-.py file, so a .py-only count is off by one and fails here.
+        pr = manifest["composition"]["prs"][head_ref]
+        expected_changed = pr["files_changed"]
+        if expected_changed != pr["py_files_changed"] + pr["non_py_paths_changed"]:
+            problems.append(f"manifest {head_ref}: files_changed is not py + non-py paths")
         if run.stats["counts"]["changed_files"] != expected_changed:
             problems.append(
                 f"run {n}: counts.changed_files "

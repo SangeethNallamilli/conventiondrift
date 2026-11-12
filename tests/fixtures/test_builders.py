@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
 import pytest
 
 from fixtures import builders as fx
-from fixtures.gitrepo import recent_lines
+from fixtures.gitrepo import GitRepo, recent_lines
 
 
 def _calls(text: str, lib: str) -> list[int]:
@@ -49,6 +50,70 @@ def test_f5_1_counts_from_ac_text(tmp_path: Path) -> None:
     # The base tip has sites the comparison must never see.
     tip = _http_census(r, pr.base_tip)
     assert tip["requests"] == 5 and pr.base_tip != pr.merge_base
+
+
+def _site_census(r: GitRepo, rev: str) -> dict[str, int]:
+    """Sites each filler rule's checker could see at `rev`, counted with ast."""
+    c = {"defs": 0, "annotated_defs": 0, "print_or_logger": 0, "tests": 0, "fmt": 0}
+    c.update({"except": 0, "manifests": 0})
+    for path in r.ls_files(rev):
+        if path in {"pyproject.toml", "uv.lock", "poetry.lock", "pdm.lock", "setup.py"} or (
+            path.startswith("requirements") and path.endswith(".txt")
+        ):
+            c["manifests"] += 1
+        if not path.endswith(".py"):
+            continue
+        if path.rsplit("/", 1)[-1].startswith("test_"):
+            c["tests"] += 1
+        for node in ast.walk(ast.parse(r.show_file(rev, path))):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                c["defs"] += 1
+                args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+                if node.returns is not None and all(a.annotation is not None for a in args):
+                    c["annotated_defs"] += 1
+            elif isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "print")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "format")
+            ):
+                c["print_or_logger" if getattr(node.func, "id", "") == "print" else "fmt"] += 1
+            elif isinstance(node, ast.JoinedStr) or (
+                isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
+            ):
+                c["fmt"] += 1
+            elif isinstance(node, ast.ExceptHandler):
+                c["except"] += 1
+            elif isinstance(node, ast.Import | ast.ImportFrom):
+                names = [n.name for n in node.names] + [getattr(node, "module", None) or ""]
+                if {"logging", "unittest", "pytest"} & set(names):
+                    c["print_or_logger" if "logging" in names else "tests"] += 1
+    return c
+
+
+def test_f5_1_filler_rules_add_no_finding(tmp_path: Path) -> None:
+    """D-PM-27 (4): no filler rule is Stale or Migrating, none changes, none conflict."""
+    f = fx.f5_1_requests_to_httpx(tmp_path)
+    others = f.facts["other_rules"]
+    assert [o["text"] for o in others] == fx.F5_1_OTHER_RULES
+    agents = f.repo.show_file(f.pr.head, "AGENTS.md").splitlines()
+    for o in others:
+        assert agents[o["line"] - 1] == f"- {o['text']}"
+        assert o["base_verdict"] not in {"Stale", "Migrating"}
+        assert o["head_verdict"] not in {"Stale", "Migrating"}
+        assert o["base_verdict"] == o["head_verdict"]  # so no "changed" entry either
+    preferred: dict[str, set[str]] = {}
+    for o in [*others, {"checker": "http-client", "preferred": "requests"}]:
+        if o["preferred"] is not None:
+            preferred.setdefault(o["checker"], set()).add(o["preferred"])
+    assert all(len(v) == 1 for v in preferred.values()), preferred  # no conflict
+    # The site census the verdicts rest on (< 5 relevant sites -> Insufficient data).
+    for rev, annotated in zip((f.pr.merge_base, f.pr.head), f.facts["annotated_defs"], strict=True):
+        c = _site_census(f.repo, rev)
+        assert c["defs"] == c["annotated_defs"] == annotated  # type hints: 100% -> Holds
+        assert c["print_or_logger"] == c["tests"] == c["fmt"] == c["except"] == 0
+        assert c["manifests"] == 0
+    verdicts = {o["checker"]: o["base_verdict"] for o in others}
+    assert verdicts["type-hints"] == "Holds"
+    assert {v for k, v in verdicts.items() if k != "type-hints"} == {"Insufficient data"}
 
 
 def test_f5_1_deterministic(tmp_path: Path) -> None:

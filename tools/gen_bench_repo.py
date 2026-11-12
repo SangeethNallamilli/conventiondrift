@@ -22,7 +22,6 @@ same seed gives the same tree and commit SHAs. The manifest (default
 `<DIR>.manifest.json`, outside the repo so scan mode never sees it) records
 the seed, this script's SHA-256 and the composition measured back from git.
 """
-# ruff: noqa: S311, S603, S607, S101  (test tooling: fixed argv lists to git/python, seeded non-crypto RNG by design)
 
 from __future__ import annotations
 
@@ -41,7 +40,7 @@ import tempfile
 import time
 from pathlib import Path
 
-GENERATOR_VERSION = "1"
+GENERATOR_VERSION = "2"
 KIB = 1024
 SIZE_CAP = 1_048_576  # DESIGN §5 / D-PM-05 #12 file cap; files must stay <= this
 TAIL_LOW = 512 * KIB
@@ -109,6 +108,12 @@ requires-python = ">=3.11"
 [tool.uv]
 dev-dependencies = []
 """
+# Every benchmark PR also renames one non-.py file, so I-12 `counts.changed_files` (every path
+# from changed_files(base, head), any type, a rename once) differs from the .py count.
+DOC_OLD, DOC_NEW = "docs/README.md", "docs/OVERVIEW.md"
+DOC_TEXT = "# Benchmark repository\n\nSynthetic code for conventiondrift benchmarks.\n"
+PR_RENAME = {DOC_OLD: DOC_NEW}
+
 UV_LOCK = """version = 1
 requires-python = ">=3.11"
 
@@ -132,7 +137,7 @@ class PyFile:
 
     def churn(self, seed: int) -> str:
         """The only region history commits touch. Never contains HTTP lines."""
-        r = random.Random(f"{seed}:churn:{self.index}:{self.rev}")
+        r = random.Random(f"{seed}:churn:{self.index}:{self.rev}")  # noqa: S311 - seeded PRNG for determinism, not crypto
         body = []
         for k in range(4):
             if r.random() < 0.05:
@@ -196,11 +201,21 @@ def _filler_module(r: random.Random, i: int, n: int) -> str:
             "    except:\n"
             "        return 0\n\n\n"
         )
+    if x < 0.995:
+        return (
+            f"def keyed_{tag}(d: dict[str, int], key: str) -> int:\n"
+            "    try:\n"
+            "        return d[key]\n"
+            "    except KeyError:\n"
+            f"        return {k2}\n\n\n"
+        )
+    # except Exception: follows "Do not use bare except." but contradicts the paired
+    # "... or catch Exception." rule, so the two exceptions rules get different counts.
     return (
-        f"def keyed_{tag}(d: dict[str, int], key: str) -> int:\n"
+        f"def guarded_{tag}(d: dict[str, int], key: str) -> int:\n"
         "    try:\n"
         "        return d[key]\n"
-        "    except KeyError:\n"
+        "    except Exception:\n"
         f"        return {k2}\n\n\n"
     )
 
@@ -224,7 +239,7 @@ def build_file(
     target: int,
     legacy_case: bool,
 ) -> PyFile:
-    r = random.Random(f"{seed}:file:{i}")
+    r = random.Random(f"{seed}:file:{i}")  # noqa: S311 - seeded PRNG for determinism, not crypto
     head = [f'"""Benchmark module {i} for {prof.name}."""', ""]
     if is_test:
         if legacy_case:
@@ -261,7 +276,7 @@ def build_file(
 
 
 def plan_sizes(seed: int, prof: Profile, modules: list[int]) -> dict[int, int]:
-    r = random.Random(f"{seed}:sizes")
+    r = random.Random(f"{seed}:sizes")  # noqa: S311 - seeded PRNG for determinism, not crypto
     target_mean = 16 * KIB
     sigma = 1.0
     mu = math.log(target_mean) - sigma * sigma / 2
@@ -287,7 +302,8 @@ class Stream:
     def __init__(self, proc: subprocess.Popen[bytes]) -> None:
         self.proc = proc
         self.mark = 0
-        assert proc.stdin is not None
+        if proc.stdin is None:
+            raise RuntimeError("git fast-import has no stdin pipe")
         self.w = proc.stdin
 
     def _data(self, payload: bytes) -> None:
@@ -303,6 +319,7 @@ class Stream:
         parent: int | None,
         merge: int | None,
         files: dict[str, bytes],
+        renames: dict[str, str] | None = None,
     ) -> int:
         self.mark += 1
         w = self.w
@@ -313,6 +330,8 @@ class Stream:
             w.write(f"from :{parent}\n".encode())
         if merge is not None:
             w.write(f"merge :{merge}\n".encode())
+        for old, new in sorted((renames or {}).items()):
+            w.write(f"R {old} {new}\n".encode())
         for path in sorted(files):
             w.write(f"M 100644 inline {path}\n".encode())
             self._data(files[path])
@@ -331,8 +350,8 @@ def git_env() -> dict[str, str]:
 
 
 def git(repo: Path, *args: str) -> str:
-    out = subprocess.run(
-        ["git", *args],
+    out = subprocess.run(  # noqa: S603 - argv list, no shell
+        ["git", *args],  # noqa: S607 - git from PATH by design
         cwd=repo,
         env=git_env(),
         check=True,
@@ -344,7 +363,7 @@ def git(repo: Path, *args: str) -> str:
 # ----------------------------------------------------------------------------- generator
 def generate(prof: Profile, seed: int, out: Path) -> dict:
     t0 = time.monotonic()
-    r = random.Random(f"{seed}:plan:{prof.name}")
+    r = random.Random(f"{seed}:plan:{prof.name}")  # noqa: S311 - seeded PRNG for determinism, not crypto
     n_test = max(1, round(prof.py_files * prof.test_share))
     modules = list(range(n_test, prof.py_files))
     paths = {}
@@ -382,7 +401,8 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
     kinds = ["root"]
     for t in tokens:
         kinds += ["linear"] if t == "L" else ["side", "main", "merge"]
-    assert len(kinds) == prof.commits
+    if len(kinds) != prof.commits:
+        raise RuntimeError(f"event plan has {len(kinds)} commits, expected {prof.commits}")
     start = END_EPOCH - prof.span_days * DAY
     step = prof.span_days * DAY / (prof.commits - 1)
     dates = [start + round(k * step) for k in range(prof.commits)]
@@ -392,7 +412,7 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
     out.mkdir(parents=True)
     git(out, "init", "-q", "-b", "main", ".")
     proc = subprocess.Popen(
-        ["git", "fast-import", "--quiet", "--done"],
+        ["git", "fast-import", "--quiet", "--done"],  # noqa: S607 - git from PATH by design
         cwd=out,
         env=git_env(),
         stdin=subprocess.PIPE,
@@ -423,6 +443,7 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
                     "AGENTS.md": agents.encode(),
                     "pyproject.toml": PYPROJECT.encode(),
                     "uv.lock": UV_LOCK.encode(),
+                    DOC_OLD: DOC_TEXT.encode(),
                 }
             )
             main_tip = s.commit("refs/heads/main", epoch, msg, None, None, tree)
@@ -450,7 +471,7 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
     # ---- PR branches (one commit each, dated one day after the main tip)
     pr_epoch = END_EPOCH + DAY
     neutral_pool = [i for i in modules if i not in req_set]
-    rp = random.Random(f"{seed}:pr:{prof.name}")
+    rp = random.Random(f"{seed}:pr:{prof.name}")  # noqa: S311 - seeded PRNG for determinism, not crypto
     bench_pr = sorted(rp.sample(neutral_pool, prof.pr_files))
     saved = {i: files[i].rev for i in bench_pr}
     changed = {}
@@ -464,6 +485,7 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
         main_tip,
         None,
         changed,
+        PR_RENAME,
     )
     for i, rev in saved.items():
         files[i].rev = rev
@@ -493,6 +515,7 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
             main_tip,
             None,
             changed,
+            PR_RENAME,
         )
         large = {"requests_files": n_req, "churn_files": len(extra)}
     s.w.write(b"done\n")
@@ -584,26 +607,40 @@ def measure(repo: Path, prof: Profile) -> dict:
         loggers += len(_LOGGER.findall(blob))
 
     def pr_stats(ref: str) -> dict:
-        names = git(repo, "diff", "--name-only", "main", ref).splitlines()
+        mb = git(repo, "merge-base", "main", ref)
+        status = git(repo, "diff", "--name-status", "-M", mb, ref).splitlines()
+        names = [line.split("\t")[-1] for line in status]
         return {
             "files_changed": len(names),
             "py_files_changed": sum(1 for n in names if n.endswith(".py")),
+            "non_py_paths_changed": sum(1 for n in names if not n.endswith(".py")),
+            "renames": sum(1 for line in status if line.startswith("R")),
             "sha": git(repo, "rev-parse", ref),
         }
 
     refs = {
         name: git(repo, "rev-parse", name)
         for name in ("main", "bench-pr", "bench-pr-5000")
-        if subprocess.run(
-            ["git", "rev-parse", "--verify", "-q", name],
+        if subprocess.run(  # noqa: S603 - argv list, no shell
+            ["git", "rev-parse", "--verify", "-q", name],  # noqa: S607 - git from PATH by design
             cwd=repo,
             env=git_env(),
             capture_output=True,
         ).returncode
         == 0
     }
+    root = git(repo, "rev-list", "--max-parents=0", "main")
+    root_epoch = int(git(repo, "show", "-s", "--format=%ct", root))
+    exc = {ref: exception_census(repo, ref) for ref in refs}
     mean = sum(sizes) / len(sizes)
     return {
+        "root_commit": {
+            "sha": root,
+            "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(root_epoch)),
+            "is_earliest": root_epoch == epochs[0],
+            "days_before_last_main_commit": round((epochs[-1] - root_epoch) / DAY, 2),
+        },
+        "exception_census": exc,
         "refs": refs,
         "trees": {k: git(repo, "rev-parse", f"{k}^{{tree}}") for k in refs},
         "py_files": len(py),
@@ -643,6 +680,55 @@ def measure(repo: Path, prof: Profile) -> dict:
     }
 
 
+_EXCEPT = {
+    "bare": r"^[[:space:]]+except:",
+    "Exception": r"^[[:space:]]+except Exception\b",
+    "all": r"^[[:space:]]+except\b",
+}
+
+
+def exception_census(repo: Path, ref: str) -> dict[str, int]:
+    """except-clause counts in all .py files at `ref` (regex on the controlled templates)."""
+    out = {}
+    for key, pattern in _EXCEPT.items():
+        proc = subprocess.run(  # noqa: S603 - argv list, no shell
+            ["git", "grep", "-c", "-E", pattern, ref, "--", "*.py"],  # noqa: S607 - git on PATH
+            cwd=repo,
+            env=git_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        out[key] = sum(int(line.rsplit(":", 1)[1]) for line in proc.stdout.splitlines())
+    return out
+
+
+EXCEPTION_RULES = {  # D-PM-27 (5): not a conflict; each rule is evaluated on its own
+    "Do not use bare except.": ("bare",),
+    "Do not use bare except or catch Exception.": ("bare", "Exception"),
+}
+
+
+def exception_rule_verdicts(census: dict[str, dict[str, int]]) -> dict[str, dict]:
+    """Expected verdict per exceptions rule and ref, from overall adherence (Holds >= 80%)."""
+    out = {}
+    for text, prohibited in EXCEPTION_RULES.items():
+        per_ref = {}
+        for ref, c in sorted(census.items()):
+            contradicting = sum(c[k] for k in prohibited)
+            following = c["all"] - contradicting
+            pct = 100 * following / c["all"] if c["all"] else 0.0
+            per_ref[ref] = {
+                "following": following,
+                "contradicting": contradicting,
+                "relevant": c["all"],
+                "overall_percent": round(pct, 2),
+                "expected_verdict": "Holds" if following * 100 >= 80 * c["all"] else None,
+            }
+        out[text] = per_ref
+    return out
+
+
 def check_composition(prof: Profile, comp: dict) -> list[str]:
     """The spec's composition rules; any message is a generator bug."""
     errs = []
@@ -664,6 +750,18 @@ def check_composition(prof: Profile, comp: dict) -> list[str]:
         errs.append(f"span {c['span_days']} days")
     if not 2.5 <= c["files_per_commit_mean_excl_root"] <= 3.5:
         errs.append(f"files/commit {c['files_per_commit_mean_excl_root']}")
+    rc = comp["root_commit"]
+    if not rc["is_earliest"] or abs(rc["days_before_last_main_commit"] - prof.span_days) > 0.01:
+        errs.append(f"root commit not dated at the start of the {prof.span_days}-day span")
+    for ref, pr in comp["prs"].items():
+        if pr["renames"] != 1 or pr["non_py_paths_changed"] != 1:
+            errs.append(f"{ref}: expected exactly one non-.py rename")
+        if pr["files_changed"] != pr["py_files_changed"] + 1:
+            errs.append(f"{ref}: files_changed must count the renamed non-.py path once")
+    for text, refs in exception_rule_verdicts(comp["exception_census"]).items():
+        for ref, v in refs.items():
+            if v["expected_verdict"] != "Holds":
+                errs.append(f"{text!r} at {ref}: {v['overall_percent']}% is not a clear Holds")
     if comp["prs"]["bench-pr"]["py_files_changed"] != prof.pr_files:
         errs.append("bench-pr file count")
     if (
@@ -701,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
         "script_sha256": script_sha256(),
         "composition": comp,
         "rules": gen["rules"],
+        "exception_rule_verdicts": exception_rule_verdicts(comp["exception_census"]),
         "expected_findings": gen["expected_findings"],
         "large_pr": gen["large_pr"],
         "oracle_http_sites_base": gen["oracle_http_sites_base"],
