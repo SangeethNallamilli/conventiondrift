@@ -12,8 +12,8 @@ dynamic = ["version"]
 description = "Checks whether a Python codebase still follows the rules written in its AGENTS.md / CLAUDE.md, and reports what a pull request changed."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
+license = "Apache-2.0 AND MIT"
+license-files = ["LICENSE", "src/conventiondrift/_vendor/LICENSE"]
 # No runtime dependencies (ADR-0002): stdlib plus vendored code under _vendor/ only.
 dependencies = []
 classifiers = [
