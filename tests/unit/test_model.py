@@ -3,7 +3,7 @@
 import dataclasses
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, get_args, get_type_hints
+from typing import Any, Literal, get_args, get_type_hints
 
 import pytest
 
@@ -343,8 +343,7 @@ def _different(value: Any) -> Any:
 
 
 def test_unhashable_types_declare_hash_none() -> None:
-    assert Policy.__hash__ is None
-    assert Result.__hash__ is None
+    assert all(cls.__hash__ is None for cls in (Policy, Result))
 
 
 def test_policy_mappings_are_read_only() -> None:
@@ -395,6 +394,7 @@ def test_skip_reasons_are_the_report_list() -> None:
         "walk limit",
         "manifest parse error",
         "unsupported path",
+        "unreadable",
     )
 
 
@@ -509,7 +509,9 @@ def test_policy_rejects_a_swapped_checker_key() -> None:
         ("any-stale", False, False),
     ],
 )
-def test_policy_gated_matches_fail_on(fail_on: str, gated: bool, ok: bool) -> None:
+def test_policy_gated_matches_fail_on(
+    fail_on: Literal["none", "new-stale", "any-stale"], gated: bool, ok: bool
+) -> None:
     if ok:
         policy = dataclasses.replace(POLICY, effective_fail_on=fail_on, gated=gated)
         assert policy.gated is gated
@@ -617,3 +619,32 @@ def test_rule_result_accepts_at_least_one_rule(
 def test_rule_result_rejects_neither_rule() -> None:
     with pytest.raises(ValueError, match="at least one of base_rule/head_rule"):
         dataclasses.replace(RULE_RESULT, head_rule=None, base_rule=None)
+
+
+def test_skipped_file_accepts_unreadable() -> None:
+    assert SkippedFile(path="src/gone.py", reason="unreadable").reason == "unreadable"
+
+
+def test_policy_allows_script_paths_only_for_logging() -> None:
+    assert POLICY.checkers["logging"].script_paths == ("**/tests/**",)
+    no_paths = {cid: CheckerPolicy(enabled=True, script_paths=()) for cid in CHECKER_IDS}
+    assert dataclasses.replace(POLICY, checkers=no_paths).checkers["logging"].script_paths == ()
+
+
+@pytest.mark.parametrize("checker", [cid for cid in CHECKER_IDS if cid != "logging"])
+def test_policy_rejects_script_paths_on_other_checkers(checker: CheckerId) -> None:
+    checkers = dict(POLICY.checkers)
+    checkers[checker] = CheckerPolicy(enabled=True, script_paths=("**/bin/**",))
+    with pytest.raises(ValueError, match="script_paths"):
+        dataclasses.replace(POLICY, checkers=checkers)
+
+
+@pytest.mark.parametrize("scope_dir", ["", "src", "src/billing", "a/b/c", "src.d"])
+def test_rule_accepts_scope_dir_without_edge_slashes(scope_dir: str) -> None:
+    assert dataclasses.replace(RULE, scope_dir=scope_dir).scope_dir == scope_dir
+
+
+@pytest.mark.parametrize("scope_dir", ["/", "/src", "src/", "/src/", "src/billing/", "//"])
+def test_rule_rejects_scope_dir_with_edge_slash(scope_dir: str) -> None:
+    with pytest.raises(ValueError, match="leading or trailing slash"):
+        dataclasses.replace(RULE, scope_dir=scope_dir)
