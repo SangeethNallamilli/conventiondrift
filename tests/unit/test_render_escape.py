@@ -538,6 +538,49 @@ def test_output_heredoc_regenerates_when_delimiter_in_value(
     assert delimiter not in delivered
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "before\nghadelimiter_aa\nafter",
+        "before\r\nghadelimiter_aa\r\nafter",
+        "before\nghadelimiter_aa  \nafter",
+        "before\nghadelimiter_aa\t\nafter",
+        "before\nghadelimiter_aa",
+    ],
+    ids=[
+        "own-line",
+        "own-line-crlf",
+        "own-line-trailing-spaces",
+        "own-line-trailing-tabs",
+        "at-end",
+    ],
+)
+def test_output_heredoc_regenerates_on_line_oriented_collision(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    tokens = iter(["aa", "bb"])
+    monkeypatch.setattr(esc, "_token", lambda n: next(tokens))
+    forced, chosen = "ghadelimiter_aa", "ghadelimiter_bb"
+    mapped = visible(value)
+    assert forced in mapped
+    entry = output_heredoc("report-path", value)
+    delimiter, delivered = _value_block(entry)
+    assert delimiter == chosen
+    assert chosen not in delivered
+    assert delivered == mapped
+    assert parse_output_file(entry) == {"report-path": mapped}
+    lines = entry.split("\n")
+    assert entry.endswith("\n")
+    assert lines[0] == f"report-path<<{chosen}"
+    assert lines[-1] == ""
+    assert lines[-2] == chosen
+    opening = [i for i, line in enumerate(lines) if line.startswith("report-path<<")]
+    closing = [i for i, line in enumerate(lines) if line == chosen]
+    assert opening == [0], "exactly one opening line"
+    assert closing == [len(lines) - 2], "exactly one closing line"
+
+
 def test_output_heredoc_gives_up_after_bounded_tries(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[int] = []
 
