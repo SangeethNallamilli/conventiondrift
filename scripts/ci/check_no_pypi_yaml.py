@@ -11,6 +11,7 @@ yaml_ft is never vendored and always fails if present.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import sys
 from pathlib import Path
@@ -52,6 +53,19 @@ def main() -> int:
             continue
         errors.append(
             f"top-level {name} is installed at {display} (allowed only in the mutation job)"
+        )
+    banned_dists = ("PyYAML", "pyyaml-ft")
+    for dist_name in banned_dists:
+        try:
+            dist = importlib.metadata.distribution(dist_name)
+        except importlib.metadata.PackageNotFoundError:
+            print(f"ok: no installed distribution named {dist_name}")
+            continue
+        loc = getattr(dist, "locate_file", None)
+        display = str(dist.locate_file(".")) if callable(loc) else dist_name
+        errors.append(
+            f"installed distribution {dist.metadata['Name']} {dist.version} at {display} "
+            "(allowed only in the mutation job)"
         )
     if errors:
         print("error: PyPI yaml leaked into this environment:", file=sys.stderr)

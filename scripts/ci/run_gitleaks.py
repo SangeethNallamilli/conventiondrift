@@ -41,10 +41,8 @@ def main() -> int:
             print(f"gitleaks sha256 mismatch: expected {SHA256}, got {digest}", file=sys.stderr)
             return 1
         with tarfile.open(archive, "r:gz") as tf:
-            try:
-                tf.extractall(tmp_path, filter="data")
-            except TypeError:
-                tf.extractall(tmp_path)
+            # PEP 706 data filter only; no unfiltered fallback (requires Python 3.12+).
+            tf.extractall(tmp_path, filter="data")
         binary = tmp_path / "gitleaks"
         if not binary.is_file():
             print("gitleaks binary missing from the archive", file=sys.stderr)

@@ -8,9 +8,10 @@ check fails unless:
 (a) conventiondrift's yaml import (policy.py's vendored import, or
     conventiondrift._vendor.yaml until policy.py exists) resolves to a file
     under src/conventiondrift/_vendor/yaml/;
-(b) none of `_yaml`, `yaml._yaml`, `yaml.cyaml`, or
-    `conventiondrift._vendor.yaml.cyaml` is in sys.modules after importing
-    conventiondrift and loading a policy when that API exists.
+(b) none of `_yaml`, `yaml._yaml`, `yaml.cyaml`,
+    `conventiondrift._vendor.yaml.cyaml`, `yaml_ft`, or a stray top-level
+    `yaml` is in sys.modules after importing conventiondrift and loading a
+    policy when that API exists.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from pathlib import Path
 
 FORBIDDEN_MODULES = (
     "_yaml",
+    "yaml",
+    "yaml_ft",
     "yaml._yaml",
     "yaml.cyaml",
     "conventiondrift._vendor.yaml.cyaml",
@@ -84,7 +87,7 @@ def check(modules: Iterable[str] | None = None) -> list[str]:
     if leaked:
         errors.append(f"forbidden yaml modules in sys.modules after import: {leaked}")
     else:
-        print("ok: no _yaml / cyaml modules in sys.modules")
+        print("ok: no _yaml / cyaml / yaml_ft / top-level yaml in sys.modules")
     return errors
 
 

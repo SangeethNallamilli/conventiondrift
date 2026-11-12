@@ -62,8 +62,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_sha256sums_asc(asc_path: Path, expected_fpr: str) -> str:
-    """Verify the clearsigned checksums file. Return the VALIDSIG status line."""
+def verify_and_decrypt_sha256sums(asc_path: Path, expected_fpr: str, plaintext_path: Path) -> str:
+    """Verify the clearsigned checksums file and write the signed plaintext.
+
+    The tarball hash must be read only from *plaintext_path* (gpg --decrypt
+    output after a VALIDSIG match). Unsigned lines outside the signed block
+    are not written there and must not be accepted.
+    """
     if not PINNED_KEY.is_file():
         raise SystemExit(f"pinned OpenPGP key missing: {PINNED_KEY}")
     if not FPR_RE.fullmatch(expected_fpr):
@@ -106,8 +111,19 @@ def verify_sha256sums_asc(asc_path: Path, expected_fpr: str) -> str:
             raise SystemExit(
                 f"pinned key fingerprint not in imported keyring (want {expected_fpr}, got {fps})"
             )
+        if plaintext_path.exists():
+            plaintext_path.unlink()
         verified = subprocess.run(
-            ["gpg", "--batch", "--status-fd", "1", "--verify", str(asc_path)],
+            [
+                "gpg",
+                "--batch",
+                "--status-fd",
+                "1",
+                "--output",
+                str(plaintext_path),
+                "--decrypt",
+                str(asc_path),
+            ],
             env=env,
             check=False,
             capture_output=True,
@@ -130,6 +146,8 @@ def verify_sha256sums_asc(asc_path: Path, expected_fpr: str) -> str:
                 f"VALIDSIG fingerprint mismatch: got sig={sig_fpr} primary={primary_fpr}, "
                 f"expected {expected_fpr}"
             )
+        if not plaintext_path.is_file() or plaintext_path.stat().st_size == 0:
+            raise SystemExit("gpg --decrypt wrote no verified plaintext")
         print(validsigs[0])
         return validsigs[0]
 
@@ -162,8 +180,9 @@ def main() -> int:
         archive = tmp_path / filename
         sums = tmp_path / "sha256sums.asc"
         download(sums_url, sums)
-        verify_sha256sums_asc(sums, signer)
-        listed = checksum_line(sums.read_text(encoding="utf-8", errors="replace"), filename)
+        plaintext = tmp_path / "sha256sums.verified"
+        verify_and_decrypt_sha256sums(sums, signer, plaintext)
+        listed = checksum_line(plaintext.read_text(encoding="utf-8"), filename)
         if listed != expected:
             print(
                 f"sha256sums.asc line for {filename} is {listed}, "
@@ -180,10 +199,8 @@ def main() -> int:
             return 1
         print(f"tarball sha256 ok: {digest}")
         with tarfile.open(archive, "r:xz") as tf:
-            try:
-                tf.extractall(tmp_path, filter="data")
-            except TypeError:
-                tf.extractall(tmp_path)
+            # PEP 706 data filter only; no unfiltered fallback (requires Python 3.12+).
+            tf.extractall(tmp_path, filter="data")
         src = tmp_path / f"git-{version}"
         if not src.is_dir():
             print(f"missing source directory {src}", file=sys.stderr)
