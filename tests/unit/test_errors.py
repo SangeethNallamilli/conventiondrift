@@ -2,7 +2,12 @@
 
 import pytest
 
-from conventiondrift.errors import ComponentError, FileSkipped, GitUnavailable
+from conventiondrift.errors import (
+    ComponentError,
+    FileSkipped,
+    GitUnavailable,
+    UnresolvableRevision,
+)
 
 
 def test_file_skipped_carries_reason() -> None:
@@ -39,3 +44,18 @@ def test_error_types_are_distinct() -> None:
 def test_component_error_requires_both_arguments() -> None:
     with pytest.raises(TypeError):
         ComponentError("render")  # type: ignore[call-arg]
+
+
+def test_unresolvable_revision_has_fixed_message_and_takes_no_input() -> None:
+    err = UnresolvableRevision()
+    assert str(err) == "unresolvable revision"
+    assert err.args == ("unresolvable revision",)
+    with pytest.raises(TypeError):
+        UnresolvableRevision("--output=/tmp/x")  # type: ignore[call-arg]
+
+
+def test_unresolvable_revision_is_its_own_error_type() -> None:
+    # C1/C2 map it to exit 2, so no other error handler may catch it (I-11 C3).
+    for other in (FileSkipped, ComponentError, GitUnavailable):
+        assert not issubclass(UnresolvableRevision, other)
+        assert not issubclass(other, UnresolvableRevision)

@@ -4,14 +4,20 @@ Every call goes through :meth:`GitReader._run`, which:
 
 * runs ``git`` from an absolute path, as an argv list, never through a shell;
 * passes a fixed environment (DESIGN §3) with ``HOME`` set to a fresh, empty
-  temporary directory; only ``PATH`` is inherited;
+  temporary directory; only ``PATH`` is inherited, plus ``SYSTEMROOT`` on
+  Windows (``os.name == "nt"``, I-11 C3);
 * puts the full ``-c`` hardening set before every subcommand;
 * allows only the eight read-only subcommands in DESIGN §3;
 * adds ``--no-ext-diff --no-textconv --no-color`` to diff and log calls;
 * never puts stderr or caller input in an error message.
 
 Revisions from input are resolved once by :meth:`GitReader.resolve`; every other
-operation accepts only validated hex SHAs, placed after ``--end-of-options``.
+operation accepts only validated lowercase hex SHAs, placed after ``--end-of-options``.
+
+Errors (I-11 C3): ``GitUnavailable`` only when git is missing or cannot start;
+``UnresolvableRevision`` only from ``resolve``; everything else, including "not a
+git repository" and ``safe.directory`` refusals, is ``ComponentError("gitread")``.
+Requires git >= 2.24 (``--end-of-options``); there is no runtime version check.
 
 Part 1 (T-007): the runner, ``resolve``, ``is_shallow``, ``has_object``,
 ``merge_base`` and ``commit_date``. ``tree``, ``blob``, ``changed_files``,
@@ -27,10 +33,10 @@ import subprocess
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
-from conventiondrift.errors import ComponentError, GitUnavailable
+from conventiondrift.errors import ComponentError, GitUnavailable, UnresolvableRevision
 
 _COMPONENT = "gitread"
 
@@ -64,9 +70,7 @@ FIXED_ENV: dict[str, str] = {
     "GIT_ATTR_NOSYSTEM": "1",
 }
 
-# QUESTION(A?): DESIGN §3 says "40 or 64 hex characters" without a case. Git always
-# prints lowercase and the event payload carries lowercase SHAs, so only lowercase
-# is accepted here (the stricter reading).
+# I-11 C3: SHAs are lowercase 40 or 64 hex only.
 _SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
 
 
@@ -82,13 +86,17 @@ def _require_sha(value: str) -> str:
 
 
 def _environment(home: str) -> dict[str, str]:
-    """The fixed git environment: DESIGN §3 values, ``HOME``, and ``PATH`` only if set."""
-    # QUESTION(A?): DESIGN §3 inherits PATH and nothing else. On Windows (the CLI
-    # supports it, D-PM-21) git may also need SYSTEMROOT; not added without a ruling.
+    """The fixed git environment (DESIGN §3, I-11 C3).
+
+    The DESIGN §3 values and ``HOME``, plus ``PATH`` if set, plus ``SYSTEMROOT`` if
+    set and only when ``os.name == "nt"`` (Git for Windows needs it to start).
+    """
     env = dict(FIXED_ENV)
-    path = os.environ.get("PATH")
-    if path is not None:
-        env["PATH"] = path
+    inherited = ["PATH", "SYSTEMROOT"] if os.name == "nt" else ["PATH"]
+    for name in inherited:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
     env["HOME"] = home
     return env
 
@@ -121,9 +129,7 @@ class GitReader:
             raise ComponentError(_COMPONENT, "git subcommand not allowed")
         if any("\x00" in arg for arg in args):
             raise ComponentError(_COMPONENT, "NUL in git argument")
-        # QUESTION(A?): T-008's row owns "GitUnavailable mapping". Here only "git is not
-        # installed or cannot start" maps to GitUnavailable; every nonzero exit is a
-        # ComponentError unless the operation defines its meaning (I-11 C3).
+        # I-11 C3: GitUnavailable means only "git is missing or cannot start".
         git = shutil.which("git")
         if git is None:
             raise GitUnavailable("git executable not found")
@@ -163,16 +169,21 @@ class GitReader:
     # -- operations -----------------------------------------------------------
 
     def resolve(self, rev: str) -> str:
-        """Resolve a user revision once to a commit SHA (I-4, I-11 C3)."""
-        # QUESTION(A?): I-4 makes an unresolvable REV exit 2, but I-11 C3 only names
-        # GitUnavailable and ComponentError("gitread"). Without a ruling this raises
-        # ComponentError, so the CLI (T-031) can't yet tell it apart from a git fault.
+        """Resolve a user revision once to a commit SHA (I-4, I-11 C3).
+
+        Raises ``UnresolvableRevision`` (fixed message, never the REV) if git can't
+        resolve it to exactly one commit; C1/C2 map that to exit 2.
+        """
         if "\x00" in rev:
-            raise ComponentError(_COMPONENT, "unresolvable revision")
+            raise UnresolvableRevision
         out = self._run("rev-parse", ["--verify", "--end-of-options", f"{rev}^{{commit}}"])
-        if out.returncode != 0:
-            raise ComponentError(_COMPONENT, "unresolvable revision")
-        return _require_sha(_one_line(out))
+        # I-4: the output must be exactly one 40/64-hex SHA, or the run fails with exit 2.
+        if out.returncode != 0 or not out.stdout.isascii():
+            raise UnresolvableRevision
+        line = out.stdout.decode("ascii")
+        if not line.endswith("\n") or not is_valid_sha(line[:-1]):
+            raise UnresolvableRevision
+        return line[:-1]
 
     def is_shallow(self) -> bool:
         """``rev-parse --is-shallow-repository`` (DESIGN §2 step 2)."""
@@ -203,9 +214,7 @@ class GitReader:
         return _require_sha(_one_line(out))
 
     def commit_date(self, sha: str) -> datetime:
-        """The committer date of a commit, timezone-aware (ISO 8601 with offset)."""
-        # QUESTION(A?): I-11 gives no return type for commit_date. A tz-aware datetime
-        # matches I-13 Window.end and the ISO-with-offset summary text (TEST-STRATEGY).
+        """The committer date of a commit as a timezone-aware UTC datetime (I-11 C3)."""
         out = self._run("log", ["--no-walk", "--format=%cI", "--end-of-options", _require_sha(sha)])
         if out.returncode != 0:
             raise self._fail("log", out)
@@ -215,4 +224,4 @@ class GitReader:
             raise ComponentError(_COMPONENT, "unexpected git output") from exc
         if when.tzinfo is None:
             raise ComponentError(_COMPONENT, "unexpected git output")
-        return when
+        return when.astimezone(UTC)

@@ -9,14 +9,14 @@ import os
 import shutil
 import subprocess
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from conventiondrift import gitread
-from conventiondrift.errors import ComponentError, GitUnavailable
+from conventiondrift.errors import ComponentError, GitUnavailable, UnresolvableRevision
 from conventiondrift.gitread import GitReader, is_valid_sha
 
 # Saved before any test patches subprocess.run, so fixture setup is never spied on.
@@ -198,6 +198,25 @@ def test_environment_without_path_passes_no_path(
     assert "PATH" not in seen[0]
 
 
+def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setenv("PATH", "/bin")
+    monkeypatch.setattr(gitread.os, "name", "nt")
+    nt_env = gitread._environment("/h")
+    monkeypatch.setattr(gitread.os, "name", "posix")
+    posix_env = gitread._environment("/h")
+    assert nt_env == dict(gitread.FIXED_ENV, PATH="/bin", SYSTEMROOT=r"C:\Windows", HOME="/h")
+    assert posix_env == dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h")
+
+
+def test_systemroot_absent_on_windows_is_not_invented(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYSTEMROOT", raising=False)
+    monkeypatch.setattr(gitread.os, "name", "nt")
+    env = gitread._environment("/h")
+    monkeypatch.setattr(gitread.os, "name", "posix")
+    assert "SYSTEMROOT" not in env
+
+
 def test_global_config_in_inherited_home_is_ignored(
     repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -317,10 +336,13 @@ def test_not_a_repository_is_a_component_error(tmp_path: Path) -> None:
 
 
 def test_error_message_never_quotes_input_or_stderr(repo: Path) -> None:
-    with pytest.raises(ComponentError) as info:
+    with pytest.raises(UnresolvableRevision) as info:
         GitReader(repo).resolve("secret-ref-name")
-    assert "secret-ref-name" not in str(info.value)
-    assert "fatal" not in info.value.message
+    assert str(info.value) == "unresolvable revision"
+    with pytest.raises(ComponentError) as info2:
+        GitReader(repo).has_object("ab" * 19 + "zz")
+    assert "zz" not in str(info2.value)
+    assert "fatal" not in info2.value.message
 
 
 # --- resolve --------------------------------------------------------------
@@ -352,21 +374,21 @@ def test_resolve_rejects_option_injection_and_shell_metacharacters(
     repo: Path, tmp_path: Path, rev: str
 ) -> None:
     out = tmp_path / "pwned"
-    with pytest.raises(ComponentError) as info:
+    with pytest.raises(UnresolvableRevision) as info:
         GitReader(repo).resolve(rev.format(out=out))
-    assert info.value.component == "gitread"
+    assert str(info.value) == "unresolvable revision"
     assert not out.exists()
 
 
 def test_resolve_rejects_nul_without_running_git(repo: Path, spy: list[Call]) -> None:
-    with pytest.raises(ComponentError):
+    with pytest.raises(UnresolvableRevision):
         GitReader(repo).resolve("HEAD\x00")
     assert spy == []
 
 
 def test_resolve_rejects_a_tree(repo: Path) -> None:
     tree = _git(repo, "rev-parse", "HEAD^{tree}")
-    with pytest.raises(ComponentError):
+    with pytest.raises(UnresolvableRevision):
         GitReader(repo).resolve(tree)
 
 
@@ -378,7 +400,7 @@ def test_resolve_rejects_malformed_output(
     repo: Path, monkeypatch: pytest.MonkeyPatch, stdout: bytes
 ) -> None:
     _fake_run(monkeypatch, 0, stdout)
-    with pytest.raises(ComponentError):
+    with pytest.raises(UnresolvableRevision):
         GitReader(repo).resolve("HEAD")
 
 
@@ -493,8 +515,9 @@ def test_merge_base_rejects_malformed_output(
 def test_commit_date_is_committer_date_with_offset(repo: Path) -> None:
     sha = _commit(repo, "dated", date="2025-06-07T08:09:10-04:00")
     got = GitReader(repo).commit_date(sha)
+    assert got == datetime(2025, 6, 7, 12, 9, 10, tzinfo=UTC)
     assert got == datetime(2025, 6, 7, 8, 9, 10, tzinfo=timezone(timedelta(hours=-4)))
-    assert got.utcoffset() == timedelta(hours=-4)
+    assert got.tzinfo is UTC
 
 
 def test_commit_date_argv(repo: Path, spy: list[Call]) -> None:

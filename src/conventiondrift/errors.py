@@ -27,3 +27,14 @@ class ComponentError(Exception):
 
 class GitUnavailable(Exception):
     """Git or a needed object is unavailable; the run falls back to head-only mode."""
+
+
+class UnresolvableRevision(Exception):
+    """A user revision could not be resolved to one commit; C1/C2 exit 2 (I-4, I-11 C3).
+
+    Raised only by ``gitread.GitReader.resolve``. The message is fixed text and
+    never contains the revision.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("unresolvable revision")
