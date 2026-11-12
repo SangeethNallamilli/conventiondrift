@@ -2,9 +2,10 @@
 
 Every call goes through :meth:`GitReader._run`, which:
 
-* runs ``git`` from a resolved absolute path found only on absolute ``PATH``
-  entries and never inside the repository or current folder (SR-013), as an
-  argv list, never through a shell;
+* runs ``git`` from one real absolute path, resolved once by the safe rule in
+  I-14 (SR-013: absolute ``PATH`` entries only, never inside the repository,
+  ``GITHUB_WORKSPACE`` or the current folder), as an argv list, never through a
+  shell;
 * passes a fixed environment (DESIGN §3) with ``HOME`` set to a fresh, empty
   temporary directory; only ``PATH`` is inherited, plus ``SYSTEMROOT`` on
   Windows (``os.name == "nt"``, I-11 C3);
@@ -22,7 +23,9 @@ operation accepts only validated lowercase hex SHAs, placed after ``--end-of-opt
 Errors (I-11 C3): ``GitUnavailable`` only when git is missing or cannot start;
 ``UnresolvableRevision`` only from ``resolve``; everything else, including "not a
 git repository" and ``safe.directory`` refusals, is ``ComponentError("gitread")``.
-Requires git >= 2.24 (``--end-of-options``); there is no runtime version check.
+Requires git >= 2.30 (``rev-parse --end-of-options``; D-TL-18): the first call of
+each reader runs ``git --version`` and anything older or unparsable raises
+``GitTooOld`` (I-14), failing closed.
 
 Part 1 (T-007): the runner, ``resolve``, ``is_shallow``, ``has_object``,
 ``merge_base`` and ``commit_date``. ``tree``, ``blob``, ``changed_files``,
@@ -34,6 +37,7 @@ can check the header size before reading the body).
 import io
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -43,9 +47,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from conventiondrift.errors import ComponentError, GitUnavailable, UnresolvableRevision
+from conventiondrift.errors import (
+    ComponentError,
+    GitTooOld,
+    GitUnavailable,
+    UnresolvableRevision,
+)
 
 _COMPONENT = "gitread"
+_UNTRUSTED_GIT = "git found only in the repository, workspace or current folder"
+
+#: D-TL-18 / I-14: the oldest supported git (``rev-parse --end-of-options``).
+MIN_GIT_VERSION: tuple[int, int] = (2, 30)
+_VERSION_RE = re.compile(r"^git version (\d+)\.(\d+)", re.ASCII)
 
 # QUESTION(A?): DESIGN.md, SECURITY-RULES.md and INTERFACES.md state no per-call git
 # timeout. 60 s is the whole-run limit of AC-N2.1 (B10k < 60 s), so no single git
@@ -108,68 +122,91 @@ def _require_sha(value: str) -> str:
     return value
 
 
-def _trusted_path_entries() -> list[str]:
-    """The inherited ``PATH`` entries that may be searched for git (SR-013).
-
-    Only absolute entries are kept: empty entries, ``.`` and every other relative
-    entry would make the search depend on the current folder, which may be an
-    untrusted checkout.
-    """
-    raw = os.environ.get("PATH")
-    if raw is None:
-        return []
-    return [entry for entry in raw.split(os.pathsep) if entry and os.path.isabs(entry)]
-
-
 def _is_within(path: str, folder: str) -> bool:
-    """True iff the real ``path`` is ``folder`` or below it (both already resolved).
-
-    A filesystem root is never treated as a folder to refuse: everything is below
-    it, and absolute ``PATH`` entries carry no current-folder risk there.
-    """
+    """True iff ``path`` is ``folder`` or below it (both already real, absolute paths)."""
     path = os.path.normcase(path)
     folder = os.path.normcase(folder)
-    if os.path.dirname(folder) == folder:
-        return False
     try:
         return os.path.commonpath([path, folder]) == folder
     except ValueError:  # different drives on Windows
         return False
 
 
-def _find_git(repo_dir: Path) -> str:
-    """The resolved absolute path of a trusted git executable (SR-013, I-11 C3).
+@dataclass(frozen=True)
+class _ResolvedGit:
+    """The git executable for a run and the ``PATH`` it runs with (I-14, SR-013)."""
 
-    Searches only absolute ``PATH`` entries, never the current folder, for ``git``
-    (``git.exe`` only on Windows, never ``.cmd``/``.bat``). The first match is
-    resolved once; if it lies inside the repository or the current folder the run
-    refuses it with a fixed-text ``GitUnavailable`` rather than run a binary that
-    the checkout may have supplied.
+    #: Absolute real path of git; every call, the version check included, runs it.
+    path: str
+    #: The filtered ``PATH`` (the kept entries) that git was found on and runs with.
+    search_path: str
+
+
+def _untrusted_folders(repo_dir: Path) -> list[str]:
+    """Real paths git must never come from: the repo, ``GITHUB_WORKSPACE`` and the cwd."""
+    folders = [os.path.realpath(repo_dir), os.path.realpath(os.getcwd())]
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if workspace:
+        folders.append(os.path.realpath(workspace))
+    return folders
+
+
+def _split_path(untrusted: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split ``PATH`` into kept entries and dropped ones (I-14 step 1).
+
+    Dropped: empty entries, ``.`` and every other relative entry (returned as the
+    absolute folder they would mean), and every entry whose real path is inside an
+    ``untrusted`` folder.
+    """
+    raw = os.environ.get("PATH")
+    kept: list[str] = []
+    dropped: list[str] = []
+    for entry in [] if raw is None else raw.split(os.pathsep):
+        if not entry or not os.path.isabs(entry):
+            dropped.append(os.path.abspath(entry or os.curdir))
+        elif any(_is_within(os.path.realpath(entry), f) for f in untrusted):
+            dropped.append(entry)
+        else:
+            kept.append(entry)
+    return kept, dropped
+
+
+def _find_git(repo_dir: Path) -> _ResolvedGit:
+    """Resolve git once, by the safe rule in INTERFACES I-14 (SR-013).
+
+    ``shutil.which`` searches only the kept ``PATH`` entries, given explicitly, for
+    ``git`` (``git.exe`` on Windows, never ``.cmd``/``.bat``). The match is made
+    absolute and real, and must not lie inside the repo, ``GITHUB_WORKSPACE`` or the
+    cwd (defence in depth: older Windows Pythons may still try the cwd first).
+
+    Raises ``GitUnavailable`` if no git exists anywhere on ``PATH`` (head-only mode),
+    and a fixed-text ``ComponentError("gitread")`` if the only git found is in a
+    dropped location (fail closed: a git inside the checkout is never run).
     """
     name = "git.exe" if os.name == "nt" else "git"
-    for entry in _trusted_path_entries():
-        candidate = os.path.join(entry, name)
-        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
-            continue
-        real = os.path.realpath(candidate)
-        for folder in (os.path.realpath(repo_dir), os.path.realpath(os.getcwd())):
-            if _is_within(real, folder):
-                raise GitUnavailable("git executable is not trusted")
-        return real
+    untrusted = _untrusted_folders(repo_dir)
+    kept, dropped = _split_path(untrusted)
+    found = shutil.which(name, path=os.pathsep.join(kept)) if kept else None
+    if found is not None:
+        real = os.path.realpath(os.path.abspath(found))
+        if not any(_is_within(real, f) for f in untrusted):
+            return _ResolvedGit(real, os.pathsep.join(kept))
+        raise ComponentError(_COMPONENT, _UNTRUSTED_GIT)
+    if dropped and shutil.which(name, path=os.pathsep.join(dropped)) is not None:
+        raise ComponentError(_COMPONENT, _UNTRUSTED_GIT)
     raise GitUnavailable("git executable not found")
 
 
-def _environment(home: str) -> dict[str, str]:
-    """The fixed git environment (DESIGN §3, I-11 C3).
+def _environment(home: str, search_path: str) -> dict[str, str]:
+    """The fixed git environment (DESIGN §3, I-11 C3, I-14).
 
-    The DESIGN §3 values and ``HOME``, plus ``PATH`` (only its absolute entries,
-    the same filtered list :func:`_find_git` searched; SR-013) if set, plus
-    ``SYSTEMROOT`` if set and only when ``os.name == "nt"`` (Git for Windows
-    needs it to start).
+    The DESIGN §3 values and ``HOME``, plus ``search_path`` as ``PATH`` (the
+    filtered ``PATH`` that git was resolved from), plus
+    ``SYSTEMROOT`` if set and only when ``os.name == "nt"`` (Git for Windows needs
+    it to start).
     """
     env = dict(FIXED_ENV)
-    if "PATH" in os.environ:
-        env["PATH"] = os.pathsep.join(_trusted_path_entries())
+    env["PATH"] = search_path
     if os.name == "nt":
         systemroot = os.environ.get("SYSTEMROOT")
         if systemroot is not None:
@@ -290,6 +327,14 @@ class GitReader:
 
     def __init__(self, repo_dir: str | os.PathLike[str]) -> None:
         self._repo_dir = Path(repo_dir)
+        self._git: _ResolvedGit | None = None
+        self._version_ok = False
+
+    def _resolved_git(self) -> _ResolvedGit:
+        """Git, resolved once per reader and cached (I-14 step 1)."""
+        if self._git is None:
+            self._git = _find_git(self._repo_dir)
+        return self._git
 
     # -- runner ---------------------------------------------------------------
 
@@ -300,7 +345,7 @@ class GitReader:
         if any("\x00" in arg for arg in args):
             raise ComponentError(_COMPONENT, "NUL in git argument")
         # I-11 C3: GitUnavailable means only "git is missing or cannot start".
-        argv = [_find_git(self._repo_dir)]
+        argv = [self._resolved_git().path]
         for setting in HARDENING_CONFIG:
             argv += ["-c", setting]
         argv.append(subcommand)
@@ -309,23 +354,49 @@ class GitReader:
         argv += args
         return argv
 
+    def _check_version(self, home: str) -> None:
+        """Run ``<git> --version`` once, before any other call (I-14 step 3, D-TL-18).
+
+        Fixed env, no ``-c`` flags, through the bounded runner. Below 2.30, or
+        output that doesn't parse, raises ``GitTooOld`` (fail closed). The version
+        found is never put in the error.
+        """
+        git = self._resolved_git()
+        out = _run_bounded(
+            [git.path, "--version"],
+            cwd=self._repo_dir,
+            env=_environment(home, git.search_path),
+            label="--version",
+            max_stdout=SMALL_OUTPUT_MAX_BYTES,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        text = out.stdout.decode("ascii", errors="replace")
+        match = _VERSION_RE.match(text) if out.returncode == 0 else None
+        if match is None or (int(match[1]), int(match[2])) < MIN_GIT_VERSION:
+            raise GitTooOld
+        self._version_ok = True
+
     def _run(
         self, subcommand: str, args: Sequence[str], *, max_stdout: int = SMALL_OUTPUT_MAX_BYTES
     ) -> _Output:
         """Run one allowed git subcommand and return its exit code and stdout.
 
-        Bounded by :data:`GIT_TIMEOUT_SECONDS` and ``max_stdout`` (SR-014, see
+        The first call checks the git version (:meth:`_check_version`). Bounded by
+        :data:`GIT_TIMEOUT_SECONDS` and ``max_stdout`` (SR-014, see
         :func:`_run_bounded`). Every T-007 call prints at most one short line, so
         the default :data:`SMALL_OUTPUT_MAX_BYTES` applies; T-008 passes larger caps.
         """
         argv = self._command(subcommand, args)
         if not self._repo_dir.is_dir():
             raise ComponentError(_COMPONENT, "repository directory not found")
+        git = self._resolved_git()
         with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
+            if not self._version_ok:
+                self._check_version(home)
             return _run_bounded(
                 argv,
                 cwd=self._repo_dir,
-                env=_environment(home),
+                env=_environment(home, git.search_path),
                 label=subcommand,
                 max_stdout=max_stdout,
                 timeout=GIT_TIMEOUT_SECONDS,

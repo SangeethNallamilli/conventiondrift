@@ -25,6 +25,18 @@ class ComponentError(Exception):
         self.message = message
 
 
+class GitTooOld(ComponentError):
+    """The git found is older than 2.30, or its version can't be read (I-14, D-TL-18).
+
+    Raised by ``gitread`` before its first other git call; it fails closed like any
+    ``ComponentError("gitread")``. It is the one error with public fixed text: the
+    message is always ``"git 2.30 or newer is required"`` and never the version found.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("gitread", "git 2.30 or newer is required")
+
+
 class GitUnavailable(Exception):
     """Git is missing or cannot start; the run falls back to head-only mode (I-11 C3).
 

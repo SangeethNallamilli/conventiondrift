@@ -5,6 +5,7 @@ import pytest
 from conventiondrift.errors import (
     ComponentError,
     FileSkipped,
+    GitTooOld,
     GitUnavailable,
     UnresolvableRevision,
 )
@@ -59,3 +60,16 @@ def test_unresolvable_revision_is_its_own_error_type() -> None:
     for other in (FileSkipped, ComponentError, GitUnavailable):
         assert not issubclass(UnresolvableRevision, other)
         assert not issubclass(other, UnresolvableRevision)
+
+
+def test_git_too_old_is_a_gitread_component_error_with_fixed_public_text() -> None:
+    # I-14 / D-TL-18: fails closed like any ComponentError("gitread").
+    err = GitTooOld()
+    assert isinstance(err, ComponentError)
+    assert err.component == "gitread"
+    assert err.message == "git 2.30 or newer is required"
+    assert err.args == ("gitread", "git 2.30 or newer is required")
+    with pytest.raises(TypeError):
+        GitTooOld("git version 2.29.0")  # type: ignore[call-arg]
+    for other in (FileSkipped, GitUnavailable, UnresolvableRevision):
+        assert not issubclass(GitTooOld, other)
