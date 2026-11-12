@@ -373,7 +373,8 @@ def test_side_result_drops_sites_outside_checker_options() -> None:
 
 
 def test_side_result_history_unavailable() -> None:
-    # AC-F4.12: overall only, "no history", never Migrating, no site marked recent.
+    # AC-F4.12 / I-13: a C8 failure (recent_lines is None) is "no history"
+    # per side; overall only, never Migrating, no site marked recent.
     sites = [site("src/a.py", i, "httpx") for i in range(1, 5)] + [
         site("src/b.py", i, "requests") for i in range(1, 7)
     ]
@@ -463,19 +464,28 @@ def test_side_result_zero_sites() -> None:
     ],
 )
 def test_side_result_not_verifiable(rule: Rule) -> None:
-    r = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), rule=rule)
-    assert r.verdict is NV
-    assert r.sites == ()
-    assert r.overall == Counts(0, 0, 0)
-    assert r.recent is None
-    assert r.recent_unavailable_reason == "no relevant sites in the window"
-    assert build(FIVE_REQUESTS, None, rule=rule).recent_unavailable_reason == "no history"
+    # I-13: recent does not apply, whether or not history is available.
+    with_history = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), rule=rule)
+    assert with_history.verdict is NV
+    assert with_history.sites == ()
+    assert with_history.overall == Counts(0, 0, 0)
+    assert with_history.recent is None
+    assert with_history.recent_unavailable_reason is None
+    no_history = build(FIVE_REQUESTS, None, rule=rule)
+    assert no_history.verdict is NV
+    assert no_history.sites == ()
+    assert no_history.overall == Counts(0, 0, 0)
+    assert no_history.recent is None
+    assert no_history.recent_unavailable_reason is None
 
 
 @pytest.mark.parametrize(
     "rule", [replace(RULE, ignored=True), replace(RULE, disabled=True)], ids=["ignored", "disabled"]
 )
 def test_side_result_ignored_and_disabled_still_get_a_verdict(rule: Rule) -> None:
+    # I-13: an ignored rule gets its normal verdict (fail-on counting is C10).
+    # A disabled rule is dropped by T-028 before C9; C9 does not special-case
+    # the flag, so a disabled rule that reached it would still get a verdict.
     assert build(FIVE_REQUESTS, None, rule=rule).verdict is S
 
 

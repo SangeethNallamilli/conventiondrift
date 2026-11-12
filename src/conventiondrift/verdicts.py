@@ -107,24 +107,27 @@ def side_result(
 ) -> SideResult:
     """Build the C9 ``SideResult`` for one rule on one side.
 
-    - ``sites``: this checker's sites on this side that fall inside the rule's scope.
+    - ``sites``: this checker's sites on this side that fall inside the rule's
+      scope. C9 counts every site it is given; T-028 filters by ``scope_dir``
+      (I-13).
     - ``options``: the checker's ``options`` (I-10). Only sites whose option is in
       it are relevant; any other site is dropped.
     - ``recent_lines``: the ``(file, line)`` pairs C8 dated as recent on this side,
       or None when recent adherence is unavailable for the run (head-only mode, no
-      ``HEAD`` in scan mode, or a C8 failure).
+      ``HEAD`` in scan mode, or a C8 failure). A C8 failure is reported here as
+      ``recent=None`` with reason ``"no history"``; the cause appears only in the
+      Internal error section (I-13).
     - ``thresholds``: the effective, already validated thresholds.
 
     A rule with no checker or no match (no mapping, or an ambiguous one) is
-    Not verifiable and carries no sites.
+    Not verifiable, carries no sites, and has ``recent=None`` and
+    ``recent_unavailable_reason=None``, because recent does not apply (I-13).
+    Disabled rules are dropped by T-028 before C9; an ignored rule gets its
+    normal verdict.
     """
-    # QUESTION: is scope filtering (rule.scope_dir, scope flags) done by the caller
-    # (T-028) before C9, as assumed here? C9 counts every site it is given.
-    # QUESTION: ignored and disabled rules get the normal verdict here (C7 gives a
-    # disabled checker no sites, so that is Insufficient data); is a distinct
-    # outcome wanted for AC-F3.14's "not evaluated"?
-    # QUESTION: a Not verifiable side still gets a recent_unavailable_reason
-    # ("no history" or "no relevant sites in the window") rather than None.
+    # I-13: C9 is pure and counts every site it is given. T-028 filters sites
+    # by scope_dir, and drops disabled rules, before C9. An ignored rule still
+    # gets its normal verdict here (it only stops counting for fail-on).
     match = rule.match if rule.checker is not None else None
     results: list[SiteResult] = []
     if match is not None:
@@ -136,11 +139,13 @@ def side_result(
 
     overall = _count(results)
     recent_counts: Counts | None = None
-    # QUESTION: SideResult's reason Literal has no "internal error"; a C8 failure
-    # (Window.unavailable_reason == "internal error") is reported here as
-    # "no history", with the run-wide reason left on Window.
     reason: RecentUnavailableReason | None
-    if recent_lines is None:
+    if match is None:
+        # I-13: recent does not apply to a Not verifiable side.
+        reason = None
+    elif recent_lines is None:
+        # I-13: a C8 failure (and head-only / no HEAD) is "no history" here.
+        # The cause of a C8 failure appears only in the Internal error section.
         reason = "no history"
     else:
         in_window = _count([r for r in results if r.recent])
