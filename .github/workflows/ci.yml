@@ -7,10 +7,17 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Schedule runs get their own group so a nightly does not share a slot
+  # with a push to main. cancel-in-progress is only true for pull_request,
+  # so in-progress main, nightly, and workflow_dispatch runs are never
+  # cancelled by a later run in the same group.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'schedule' && 'schedule' || (github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -38,8 +45,13 @@ jobs:
         run: python3 scripts/ci/check_action_pins.py
 
   dco:
+    # Runs on pull_request, and on workflow_dispatch when the ref is not
+    # main, so a manual run on a PR branch cannot produce a green `ci`
+    # while skipping the DCO gate. Push, schedule, and workflow_dispatch
+    # on main still skip this job; the aggregate allows that skip only
+    # on refs/heads/main for those events.
     name: dco
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -52,10 +64,35 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Check Signed-off-by on each PR commit
+      - name: Resolve the DCO range
+        # For pull_request, use the PR base/head SHAs. For workflow_dispatch
+        # on a non-main branch, fetch origin/main and check merge-base(origin/main, HEAD)..HEAD
+        # via the existing DCO_BASE_SHA / DCO_HEAD_SHA interface.
+        # github.* values are passed in as env; they are never interpolated
+        # into the script body. persist-credentials stays false; the token
+        # is used only for this one fetch and is not written to .git/config.
         env:
-          DCO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            printf '%s\n' "DCO_BASE_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_HEAD_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
+          else
+            AUTH="http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            git -c credential.helper= -c "$AUTH" fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            base="$(git merge-base origin/main HEAD)"
+            head="$(git rev-parse HEAD)"
+            printf '%s\n' "DCO_BASE_SHA=${base}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_HEAD_SHA=${head}" >> "$GITHUB_ENV"
+          fi
+      - name: Check Signed-off-by on each commit in the range
+        env:
+          DCO_BASE_SHA: ${{ env.DCO_BASE_SHA }}
+          DCO_HEAD_SHA: ${{ env.DCO_HEAD_SHA }}
         run: python3 scripts/ci/check_dco.py
 
   lockfile:
@@ -141,6 +178,13 @@ jobs:
         # macOS legs run in the report-only `test-macos` job below (D-TL-30).
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+        # On pull_request, Windows runs only 3.11 and 3.15 so the PR queue
+        # stays shorter. Ubuntu keeps the full 3.11–3.15 set. The full
+        # OS × Python matrix still runs on push to main, on the nightly
+        # schedule, and on workflow_dispatch, before any release. Excluded
+        # legs are omitted (they never start), so the `test` job result is
+        # the remaining legs and the required `ci` aggregate is unchanged.
+        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.13"},{"os":"windows-latest","python-version":"3.14"}]' || '[]') }}
     defaults:
       run:
         shell: bash
@@ -203,7 +247,13 @@ jobs:
     # needs and do not block merges. Same install and test steps as the
     # non-Windows `test` legs. FOLLOW-UP: move macOS back into `test` (and so
     # into `ci`) once macOS runners are reliably assigned.
+    # Run on every non-pull_request event (push to main, the nightly
+    # schedule, and workflow_dispatch), not on pull_request, so PR
+    # concurrency is not spent on report-only macOS legs. Because this
+    # job is not in `ci`'s needs, a skipped test-macos on a PR neither
+    # fails nor delays the required aggregate.
     name: test-macos (report-only) (${{ matrix.python-version }})
+    if: github.event_name != 'pull_request'
     needs: [lockfile]
     runs-on: macos-latest
     timeout-minutes: 10
@@ -431,9 +481,14 @@ jobs:
       - vendor-network
       - git-minimum
       # mutation is report-only (D-TL-29, TL decision): it still runs on
-      # every PR and push, but is not part of the required aggregate.
+      # every workflow event, but is not part of the required aggregate.
       # test-macos is report-only (D-TL-30, TL decision) until macOS
       # runners are reliably assigned; restore it to blocking then.
+      # It runs on push to main, the nightly schedule, and
+      # workflow_dispatch, not on pull_request. Leaving it out of needs
+      # means a skipped test-macos on a pull_request does not fail or
+      # delay this aggregate; do not add a skipped-is-ok exception here
+      # unless it is first restored to needs (and then only for test-macos).
       - secret-scan
       - dependency-scan
     runs-on: ubuntu-latest
@@ -444,17 +499,30 @@ jobs:
       - name: All required jobs passed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           needs = json.loads(os.environ["NEEDS_JSON"])
+          event = os.environ.get("EVENT_NAME", "")
+          ref = os.environ.get("GITHUB_REF", "")
           failed = []
           for name, data in needs.items():
               result = data.get("result")
-              # dco is skipped on push to main; every other required job must succeed.
+              # dco may be skipped only on refs/heads/main for push,
+              # schedule, or workflow_dispatch. A skipped dco on any
+              # other event or ref (including workflow_dispatch on a
+              # PR branch) is a gate bypass and fails this aggregate.
+              # Every other required job must succeed.
               if result == "success":
                   continue
-              if name == "dco" and result == "skipped":
+              if (
+                  name == "dco"
+                  and result == "skipped"
+                  and ref == "refs/heads/main"
+                  and event in ("push", "schedule", "workflow_dispatch")
+              ):
                   continue
               failed.append(f"{name}={result}")
           if failed:
