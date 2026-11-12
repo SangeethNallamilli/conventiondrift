@@ -24,16 +24,16 @@ from conventiondrift.github import (
     BOT_TYPE,
     MARKER,
     MAX_CONVERGE_DELETES,
+    OURS_CONDITIONS,
     RETRY_STATUSES,
     GitHubApiClient,
     HttpClientTransport,
     HttpResponse,
-    PublishContext,
     client_from_env,
+    failed_conditions,
     is_marked,
     is_ours,
     normalize_base_url,
-    publish_context,
 )
 
 TOKEN = "fake-token-for-tests-0000"  # noqa: S105 -- an obvious fake, never a real secret
@@ -57,6 +57,7 @@ class Req:
     url: str
     headers: Mapping[str, str]
     body: bytes | None
+    timeout: float = 0.0
 
     @property
     def path(self) -> str:
@@ -99,7 +100,7 @@ class FakeGitHub:
         body: bytes | None,
         timeout: float,
     ) -> HttpResponse:
-        req = Req(method, url, dict(headers), body)
+        req = Req(method, url, dict(headers), body, timeout)
         self.requests.append(req)
         for hook in self.hooks:
             reply = hook(req)
@@ -157,6 +158,9 @@ class FakeGitHub:
     def deletes(self) -> list[Req]:
         return [r for r in self.requests if r.method == "DELETE"]
 
+    def comment_requests(self) -> list[Req]:
+        return [r for r in self.requests if "/comments" in r.path or "/pulls/" in r.path]
+
 
 class Clock:
     def __init__(self) -> None:
@@ -171,22 +175,9 @@ class Clock:
         self.now += seconds
 
 
-def ctx(**kw: Any) -> PublishContext:
-    base: dict[str, Any] = {
-        "read_only": False,
-        "event_pr_number": PR,
-        "comment_enabled": True,
-        "sarif_enabled": True,
-        "sarif_commit_sha": GITHUB_SHA,
-        "sarif_ref": GITHUB_REF,
-    }
-    base.update(kw)
-    return PublishContext(**base)
-
-
-def make(api: FakeGitHub, clock: Clock | None = None, **kw: Any) -> GitHubApiClient:
+def make(api: FakeGitHub, clock: Clock | None = None) -> GitHubApiClient:
     c = clock or Clock()
-    return GitHubApiClient(BASE, TOKEN, context=ctx(**kw), transport=api, sleep=c.sleep, clock=c)
+    return GitHubApiClient(BASE, TOKEN, transport=api, sleep=c.sleep, clock=c)
 
 
 def publish(
@@ -211,7 +202,9 @@ DECOYS: dict[str, Callable[[dict[str, Any]], None]] = {
     "marker_not_on_line_1": lambda c: c.update(body=f"hello\n{MARKER}"),
     "other_issue_url": lambda c: c.update(issue_url=f"{BASE}/repos/{REPO}/issues/{PR + 1}"),
     "other_repo_issue_url": lambda c: c.update(issue_url=f"{BASE}/repos/octo/other/issues/{PR}"),
+    "longer_pr_in_issue_url": lambda c: c.update(issue_url=f"{BASE}/repos/{REPO}/issues/{PR}0"),
     "missing_issue_url": lambda c: c.pop("issue_url"),
+    "non_string_issue_url": lambda c: c.update(issue_url=PR),
     "string_id": lambda c: c.update(id=str(c["id"])),
     "bool_id": lambda c: c.update(id=True),
     "missing_user": lambda c: c.pop("user"),
@@ -226,6 +219,25 @@ def decoy(kind: str, cid: int) -> dict[str, Any]:
 
 def test_ours_requires_every_check() -> None:
     assert is_ours(bot_comment(5), repo=REPO, pr_number=PR)
+    assert failed_conditions(bot_comment(5), repo=REPO, pr_number=PR) == frozenset()
+    assert failed_conditions("x", repo=REPO, pr_number=PR) == frozenset(OURS_CONDITIONS)
+
+
+@pytest.mark.parametrize("kind", sorted(DECOYS))
+def test_each_decoy_breaks_exactly_one_condition(kind: str) -> None:
+    # Ruling 5 / D-TL-25: each decoy fails one ours-condition on its own and passes the rest.
+    assert len(failed_conditions(decoy(kind, 5), repo=REPO, pr_number=PR)) == 1
+
+
+def test_decoys_cover_every_ours_condition() -> None:
+    # D-TL-25: the decoy classes are checked against the code's own condition set.
+    broken = {
+        name
+        for kind in DECOYS
+        for name in failed_conditions(decoy(kind, 5), repo=REPO, pr_number=PR)
+    }
+    assert broken == set(OURS_CONDITIONS)
+    assert set(OURS_CONDITIONS) == {"id", "bot_identity", "marker", "issue_url"}
 
 
 @pytest.mark.parametrize("kind", sorted(DECOYS))
@@ -292,13 +304,13 @@ def test_normalize_base_url(url: str, allow_http: bool, expected: str | None) ->
 def test_env_http_base_url_is_refused_and_never_connects() -> None:
     api = FakeGitHub()
     env = {"GITHUB_API_URL": "http://api.github.test", "GITHUB_TOKEN": TOKEN}
-    client = client_from_env(env, context=ctx(), transport=api)
+    client = client_from_env(env, transport=api)
     assert publish(client) == ("skipped", github.NOTE_NO_BASE_URL)  # type: ignore[arg-type]
     assert api.requests == []
 
 
 def test_missing_env_base_url_is_refused() -> None:
-    client = client_from_env({"GITHUB_TOKEN": TOKEN}, context=ctx())
+    client = client_from_env({"GITHUB_TOKEN": TOKEN})
     outcome = client.publish(repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=BODY, sarif=None)
     assert outcome == ("skipped", github.NOTE_NO_BASE_URL)
     assert github._SkippingClient(github.NOTE_NO_BASE_URL).lookup(repo=REPO, pr_number=PR) == (
@@ -310,9 +322,7 @@ def test_missing_env_base_url_is_refused() -> None:
 def test_seam_base_url_allows_http() -> None:
     api = FakeGitHub()
     env = {"GITHUB_API_URL": "https://ignored.test", "GITHUB_TOKEN": TOKEN}
-    client = client_from_env(
-        env, context=ctx(), base_url_override="http://127.0.0.1:9", transport=api
-    )
+    client = client_from_env(env, base_url_override="http://127.0.0.1:9", transport=api)
     client.publish(repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=BODY, sarif=None)
     assert api.requests
     assert all(r.url.startswith("http://127.0.0.1:9/") for r in api.requests)
@@ -325,12 +335,15 @@ def test_factory_gets_env_base_and_token() -> None:
         def publish(self, **kw: Any) -> tuple[str, None]:
             return "skipped", None
 
+        def lookup(self, **kw: Any) -> tuple[bool, None]:
+            return False, None
+
     def factory(base: str, token: str) -> GitHubClient:
         seen.append((base, token))
         return Stub()  # type: ignore[return-value]
 
     env = {"GITHUB_API_URL": "https://api.github.test/", "GITHUB_TOKEN": TOKEN}
-    client_from_env(env, context=ctx(), factory=factory)
+    client_from_env(env, factory=factory)
     assert seen == [("https://api.github.test", TOKEN)]
     # The Components seam types line up with the factory.
     Components(github_client=factory, github_base_url="http://127.0.0.1:1")
@@ -339,7 +352,7 @@ def test_factory_gets_env_base_and_token() -> None:
 @pytest.mark.parametrize("token", ["", "has space", "line\nbreak", "tab\tx", "é"])
 def test_unusable_token_makes_no_request(token: str) -> None:
     api = FakeGitHub()
-    client = GitHubApiClient(BASE, token, context=ctx(), transport=api)
+    client = GitHubApiClient(BASE, token, transport=api)
     assert publish(client) == ("skipped", github.NOTE_NO_AUTH)
     assert client.lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_NO_AUTH)
     assert api.requests == []
@@ -495,7 +508,7 @@ def test_third_failure_gives_a_note_not_an_error(status: int | None) -> None:
     api = FakeGitHub(hooks=[_fail_first(99, status)])
     assert publish(make(api, clock)) == ("skipped", github.NOTE_API_ERROR)
     assert len(api.requests) == 3
-    assert sum(clock.sleeps) <= github.RETRY_BUDGET_SECONDS
+    assert sum(clock.sleeps) <= github.DEADLINE_SECONDS
 
 
 @pytest.mark.parametrize("status", [400, 401, 404, 410, 422])
@@ -515,10 +528,86 @@ def test_retries_stop_when_budget_would_be_exceeded() -> None:
         return HttpResponse(503, {}, b"")
 
     api = FakeGitHub(hooks=[slow])
-    assert publish(make(api, clock)) == ("skipped", github.NOTE_API_ERROR)
-    # attempt 1 ends at 1.8 s; 1.8 + 0.5 <= 3 so retry; attempt 2 ends at 4.1 s; stop.
+    assert publish(make(api, clock)) == ("skipped", github.NOTE_DEADLINE)
+    # attempt 1 ends at 1.8 s; its 0.5 s backoff ends at 2.3 s < 3 s, so retry with
+    # 0.7 s left; attempt 2 ends at 4.1 s; no time is left for another one.
     assert len(api.requests) == 2
+    assert [r.timeout for r in api.requests] == [3.0, pytest.approx(0.7)]
     assert clock.sleeps == [0.5]
+
+
+# -- the overall deadline (I-13 C12 ruling 3) ---------------------------------------------
+
+
+def _ticking(clock: Clock, seconds: float) -> Callable[[Req], HttpResponse | None]:
+    def hook(req: Req) -> HttpResponse | None:
+        clock.now += seconds
+        return None
+
+    return hook
+
+
+def test_socket_timeout_is_the_time_left_under_the_deadline() -> None:
+    clock = Clock()
+    api = FakeGitHub(hooks=[_ticking(clock, 0.25)])
+    assert publish(make(api, clock)) == ("posted", None)
+    expected = [github.DEADLINE_SECONDS - 0.25 * i for i in range(len(api.requests))]
+    assert [r.timeout for r in api.requests] == pytest.approx(expected)
+
+
+def test_socket_timeout_never_exceeds_the_request_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(github, "DEADLINE_SECONDS", 30.0)
+    clock = Clock()
+    api = FakeGitHub(hooks=[_ticking(clock, 15.0)])
+    make(api, clock).lookup(repo=REPO, pr_number=PR)
+    assert [r.timeout for r in api.requests] == [github.REQUEST_TIMEOUT_SECONDS]
+
+
+def test_publish_out_of_time_is_skipped_with_a_note() -> None:
+    clock = Clock()
+    api = FakeGitHub(hooks=[_ticking(clock, 1.0)])
+    assert publish(make(api, clock)) == ("skipped", github.NOTE_DEADLINE)
+    # PR head at 0 s, listing at 1 s, create at 2 s; nothing starts at or after 3 s.
+    assert [r.method for r in api.requests] == ["GET", "GET", "POST"]
+    assert api.deletes() == []
+
+
+def test_publish_out_of_time_before_any_write_writes_nothing() -> None:
+    clock = Clock()
+    api = FakeGitHub(comments=[bot_comment(5)], hooks=[_ticking(clock, 1.5)])
+    assert publish(make(api, clock)) == ("skipped", github.NOTE_DEADLINE)
+    assert api.writes() == []
+
+
+def test_lookup_out_of_time_returns_not_found_with_a_note() -> None:
+    clock = Clock()
+    comments = [decoy("user_with_marker", i) for i in range(1, 501)] + [bot_comment(501)]
+    api = FakeGitHub(comments=comments, hooks=[_ticking(clock, 1.0)])
+    assert make(api, clock).lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_DEADLINE)
+    assert len(api.requests) == 3
+    assert api.writes() == []
+
+
+def test_deadline_is_per_call() -> None:
+    clock = Clock()
+    api = FakeGitHub(hooks=[_ticking(clock, 0.6)])
+    client = make(api, clock)
+    assert client.lookup(repo=REPO, pr_number=PR) == (False, None)  # 0 s to 0.6 s
+    # publish starts a fresh 3 s at 0.6 s, so its 5th request still starts at 3.0 s.
+    assert publish(client) == ("posted", None)
+    assert len(api.requests) == 6
+    assert api.requests[1].timeout == pytest.approx(github.DEADLINE_SECONDS)
+    assert api.requests[5].timeout == pytest.approx(0.6)
+
+
+def test_lookup_never_raises() -> None:
+    def broken_clock() -> float:
+        raise RuntimeError("clock failed")
+
+    api = FakeGitHub(comments=[bot_comment(5)])
+    client = GitHubApiClient(BASE, TOKEN, transport=api, clock=broken_clock)
+    assert client.lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_LOOKUP_ERROR)
+    assert api.requests == []
 
 
 @pytest.mark.parametrize(
@@ -604,8 +693,10 @@ def test_lookup_ignores_each_decoy(kind: str) -> None:
 
 
 def test_lookup_works_with_read_only_token_and_writes_nothing() -> None:
+    # lookup has no read-only switch to honour: it only ever GETs.
     api = FakeGitHub(comments=[bot_comment(2)])
-    assert make(api, read_only=True).lookup(repo=REPO, pr_number=PR) == (True, None)
+    assert make(api).lookup(repo=REPO, pr_number=PR) == (True, None)
+    assert api.requests
     assert api.writes() == []
 
 
@@ -614,10 +705,10 @@ def test_lookup_error_is_a_note() -> None:
     assert make(api).lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_LOOKUP_ERROR)
 
 
-def test_lookup_rejects_wrong_pr_and_bad_repo() -> None:
+def test_lookup_rejects_bad_pr_and_bad_repo() -> None:
     api = FakeGitHub()
     client = make(api)
-    assert client.lookup(repo=REPO, pr_number=PR + 1) == (False, github.NOTE_PR_MISMATCH)
+    assert client.lookup(repo=REPO, pr_number=0) == (False, github.NOTE_BAD_REQUEST)
     assert client.lookup(repo="bad", pr_number=PR) == (False, github.NOTE_BAD_REQUEST)
     assert api.requests == []
 
@@ -749,6 +840,7 @@ def test_two_racing_runs_converge_on_one_comment() -> None:
     run_a, run_b = make(api), make(api)
     assert publish(run_a) == ("posted", None)
     # B now runs its own converge step for the comment it created.
+    run_b._start_deadline()
     assert run_b._converge(REPO, PR, HEAD, f"{MARKER}\nB", 101) == ("posted", None)
     assert [c["id"] for c in api.comments] == [100]
     assert api.comments[0]["body"] == BODY
@@ -813,9 +905,12 @@ def test_converge_relist_failure_is_a_note() -> None:
 # SR condition (1): deletes only on the current PR's issue number from the event payload.
 
 
+# T-028 reads the event payload and passes its PR number as ``pr_number`` (ruling 2).
+
+
 def test_converge_delete_only_on_event_payload_pr_number() -> None:
     api = FakeGitHub(next_id=50, on_create=race(60))
-    publish(make(api, event_pr_number=PR))
+    publish(make(api), pr=PR)
     assert api.deletes()
     lists = [r.path for r in api.requests if r.method == "GET" and "/comments" in r.path]
     assert set(lists) == {f"/repos/{REPO}/issues/{PR}/comments"}
@@ -823,15 +918,32 @@ def test_converge_delete_only_on_event_payload_pr_number() -> None:
 
 
 def test_converge_delete_refused_when_pr_number_differs_from_event_payload() -> None:
-    api = FakeGitHub(next_id=50, on_create=race(60), comments=[bot_comment(70)])
-    assert publish(make(api, event_pr_number=PR + 1)) == ("skipped", github.NOTE_PR_MISMATCH)
-    assert api.requests == []
+    # Duplicates of ours sit on PR 7; the run's event payload names PR 8. Even when the
+    # API (wrongly) hands PR 7's comments to PR 8's listing, none of them is touched.
+    other = PR + 1
+    ours_on_pr = [bot_comment(5), bot_comment(6), bot_comment(7)]
+
+    def route(req: Req) -> HttpResponse | None:
+        if req.method == "GET" and req.path == f"/repos/{REPO}/pulls/{other}":
+            return FakeGitHub.reply(200, {"number": other, "head": {"sha": HEAD}})
+        if req.method == "GET" and req.path == f"/repos/{REPO}/issues/{other}/comments":
+            return FakeGitHub.reply(200, ours_on_pr)
+        if req.method == "POST" and req.path == f"/repos/{REPO}/issues/{other}/comments":
+            return FakeGitHub.reply(201, {"id": 50})
+        return None
+
+    api = FakeGitHub(comments=list(ours_on_pr), hooks=[route])
+    assert publish(make(api), pr=other) == ("posted", None)
+    assert api.deletes() == []
+    assert not any(r.method == "PATCH" for r in api.requests)
+    assert {r.path for r in api.writes()} == {f"/repos/{REPO}/issues/{other}/comments"}
 
 
 @pytest.mark.parametrize("event_pr", [None, 0])
 def test_converge_delete_refused_without_event_payload_pr_number(event_pr: int | None) -> None:
     api = FakeGitHub(next_id=50, on_create=race(60))
-    assert publish(make(api, event_pr_number=event_pr)) == ("skipped", github.NOTE_PR_MISMATCH)
+    pr: Any = event_pr
+    assert publish(make(api), pr=pr) == ("skipped", github.NOTE_BAD_REQUEST)
     assert api.requests == []
 
 
@@ -928,39 +1040,75 @@ def test_converge_exactly_5_duplicates_all_deleted_no_note() -> None:
 
 
 # SR condition (5): fork and Dependabot runs make no writes, deletes included.
+# Ruling 2: C1 computes B6 read_only for both, and T-028 then passes comment=None and
+# sarif=None, so that is exactly what reaches publish.
+
+WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
 
 @pytest.mark.parametrize("who", ["fork", "dependabot"])
 def test_converge_fork_and_dependabot_make_no_writes_deletes_included(who: str) -> None:
-    # B6: C1 computes read_only for both a fork PR and a Dependabot run.
-    comments = [bot_comment(5), bot_comment(6), bot_comment(7)]
+    comments = [bot_comment(5), bot_comment(6), bot_comment(7)]  # duplicates a write run would fix
     api = FakeGitHub(comments=comments, next_id=50, on_create=race(60))
-    outcome, note = publish(make(api, read_only=True), sarif='{"version": "2.1.0"}')
-    assert (outcome, note) == ("skipped", github.NOTE_READ_ONLY)
-    assert api.writes() == []
-    assert api.deletes() == []
+    client = make(api)
+    outcome, note = client.publish(
+        repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=None, sarif=None
+    )
+    assert (outcome, note) == ("skipped", None)
+    assert [r for r in api.requests if r.method in WRITE_METHODS] == []
+    assert api.requests == []
     assert [c["id"] for c in api.comments] == [5, 6, 7]
+    # The read-only lookup T-028 still runs on such a run makes no write either.
+    assert client.lookup(repo=REPO, pr_number=PR) == (True, None)
+    assert [r for r in api.requests if r.method in WRITE_METHODS] == []
 
 
-# -- comment: false and SARIF (AC-F6.11, I-5) ------------------------------------------
+# -- comment=None, SARIF and skipped (AC-F6.11, I-5; rulings 2, 4, 6) ----------------------
 
 
 def test_comment_false_makes_no_comment_writes() -> None:
+    # comment: false reaches publish as comment=None (ruling 2).
     api = FakeGitHub(comments=[bot_comment(5), bot_comment(6)])
-    assert publish(make(api, comment_enabled=False), sarif=None) == ("skipped", None)
+    assert publish(make(api), comment=None, sarif=None) == ("skipped", None)
     assert api.requests == []
 
 
+def test_comment_none_is_skipped_even_with_sarif() -> None:
+    # Ruling 6: the outcome is about the comment, and comment=None is skipped.
+    api = FakeGitHub(comments=[bot_comment(5)])
+    out = publish(make(api), comment=None, sarif='{"version": "2.1.0"}')
+    assert out == ("skipped", github.NOTE_SARIF_NO_REF)
+    assert api.comment_requests() == []
+    assert api.writes() == []
+
+
+def test_api_failure_is_skipped_with_a_note() -> None:
+    # Ruling 6: an API failure is skipped with a note, never an exception.
+    api = FakeGitHub(hooks=[lambda r: HttpResponse(500, {}, b"")])
+    assert publish(make(api)) == ("skipped", github.NOTE_API_ERROR)
+    assert api.writes() == []
+
+
 def test_comment_false_still_uploads_sarif() -> None:
+    # Ruling 4: SARIF follows its own input, so comment=None does not stop the SARIF
+    # step. Until publish has a GITHUB_SHA source (open Architect question) that step
+    # is a fixed note and no request.
     api = FakeGitHub()
-    assert publish(make(api, comment_enabled=False), sarif="{}") == ("posted", None)
-    assert [r.method for r in api.requests] == ["POST"]
+    assert publish(make(api), comment=None, sarif="{}") == ("skipped", github.NOTE_SARIF_NO_REF)
+    assert api.requests == []
+
+
+def _sarif_client(api: FakeGitHub) -> GitHubApiClient:
+    client = make(api)
+    client._start_deadline()
+    return client
 
 
 def test_sarif_upload_payload() -> None:
     api = FakeGitHub()
     sarif = '{"version": "2.1.0", "runs": []}'
-    assert publish(make(api), comment=None, sarif=sarif) == ("posted", None)
+    client = _sarif_client(api)
+    assert client._upload_sarif(REPO, sarif, commit_sha=GITHUB_SHA, ref=GITHUB_REF) is None
     assert len(api.sarifs) == 1
     up = api.sarifs[0]
     assert up["commit_sha"] == GITHUB_SHA
@@ -969,8 +1117,9 @@ def test_sarif_upload_payload() -> None:
 
 
 def test_sarif_disabled_is_not_uploaded() -> None:
+    # sarif: false reaches publish as sarif=None (ruling 2).
     api = FakeGitHub()
-    assert publish(make(api, sarif_enabled=False), sarif="{}") == ("posted", None)
+    assert publish(make(api), sarif=None) == ("posted", None)
     assert all("code-scanning" not in r.path for r in api.requests)
 
 
@@ -986,8 +1135,8 @@ def test_sarif_disabled_is_not_uploaded() -> None:
 )
 def test_sarif_without_valid_sha_or_ref_is_skipped(sha: str | None, ref: str | None) -> None:
     api = FakeGitHub()
-    out = publish(make(api, sarif_commit_sha=sha, sarif_ref=ref), comment=None, sarif="{}")
-    assert out == ("skipped", github.NOTE_SARIF_NO_REF)
+    client = _sarif_client(api)
+    assert client._upload_sarif(REPO, "{}", commit_sha=sha, ref=ref) == github.NOTE_SARIF_NO_REF
     assert api.requests == []
 
 
@@ -995,36 +1144,16 @@ def test_sarif_failure_adds_note_and_keeps_comment_outcome() -> None:
     api = FakeGitHub(
         hooks=[lambda r: HttpResponse(403, {}, b"") if "code-scanning" in r.path else None]
     )
-    assert publish(make(api), sarif="{}") == ("posted", github.NOTE_SARIF_ERROR)
+    client = _sarif_client(api)
+    note = client._upload_sarif(REPO, "{}", commit_sha=GITHUB_SHA, ref=GITHUB_REF)
+    assert note == github.NOTE_SARIF_ERROR
+    assert publish(make(FakeGitHub()), sarif="{}") == ("posted", github.NOTE_SARIF_NO_REF)
 
 
 def test_comment_and_sarif_notes_are_joined() -> None:
     api = FakeGitHub(head_sha=OTHER_HEAD)
-    out = publish(make(api, sarif_ref=None), sarif="{}")
+    out = publish(make(api), sarif="{}")
     assert out == ("skipped", f"{github.NOTE_HEAD_MOVED} {github.NOTE_SARIF_NO_REF}")
-
-
-def test_publish_context_reads_sarif_fields_from_env() -> None:
-    env = {"GITHUB_SHA": GITHUB_SHA, "GITHUB_REF": GITHUB_REF}
-    c = publish_context(
-        env, read_only=False, event_pr_number=PR, comment_enabled=True, sarif_enabled=False
-    )
-    assert c == PublishContext(
-        read_only=False,
-        event_pr_number=PR,
-        comment_enabled=True,
-        sarif_enabled=False,
-        sarif_commit_sha=GITHUB_SHA,
-        sarif_ref=GITHUB_REF,
-    )
-    empty = publish_context(
-        {"GITHUB_SHA": ""},
-        read_only=True,
-        event_pr_number=None,
-        comment_enabled=False,
-        sarif_enabled=True,
-    )
-    assert empty.sarif_commit_sha is None and empty.sarif_ref is None
 
 
 def test_client_satisfies_protocol() -> None:
@@ -1033,6 +1162,10 @@ def test_client_satisfies_protocol() -> None:
         "skipped",
         None,
     )
+    assert client.lookup(repo=REPO, pr_number=PR) == (False, None)
+    # The production class itself fits the Components factory type, (base_url, token).
+    factory: Callable[[str, str], GitHubClient] = GitHubApiClient
+    assert Components(github_client=factory).github_client is GitHubApiClient
 
 
 # -- the stdlib transport (no network: http.client is patched) ------------------------------
@@ -1114,13 +1247,13 @@ def test_transport_caps_response_size(fake_conn: type[_FakeConn]) -> None:
 
 
 def test_default_transport_is_stdlib() -> None:
-    client = GitHubApiClient(BASE, TOKEN, context=ctx())
+    client = GitHubApiClient(BASE, TOKEN)
     assert isinstance(client._transport, HttpClientTransport)
 
 
 def test_constructor_with_bad_base_url_never_connects() -> None:
     api = FakeGitHub()
-    client = GitHubApiClient("http://api.github.test", TOKEN, context=ctx(), transport=api)
+    client = GitHubApiClient("http://api.github.test", TOKEN, transport=api)
     assert publish(client) == ("skipped", github.NOTE_NO_BASE_URL)
     assert api.requests == []
 

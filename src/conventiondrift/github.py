@@ -14,17 +14,24 @@ network connection. The rules it follows:
 - **Errors** never propagate. Every HTTP or transport failure becomes
   ``("skipped", note)`` with a fixed note; the run's result never depends on
   the API (§4, §8.3). Notes never quote a response, header or exception.
+- **Deadline (I-13 C12 ruling 3):** each ``lookup`` and each ``publish`` has
+  one overall deadline of ``DEADLINE_SECONDS`` covering every request, redirect
+  and retry. Each request's socket timeout is ``min(REQUEST_TIMEOUT_SECONDS,
+  time left)``. Running out gives ``("skipped", NOTE_DEADLINE)`` from
+  ``publish`` and ``(False, NOTE_DEADLINE)`` from ``lookup``; neither raises.
 - **Retries:** a retryable failure (transport error, 403, 429, 5xx) is retried
-  at most ``MAX_RETRIES`` times with backoff, and a retry is only started while
-  the elapsed time plus its backoff stays within ``RETRY_BUDGET_SECONDS``.
-- **Sticky comment (I-3, ADR-0005):** ours means ``user.login ==
-  "github-actions[bot]"``, ``user.type == "Bot"`` and body line 1 equal to the
-  marker. The client also requires the comment's ``issue_url`` to name the
-  current PR. Before writing, the PR's head SHA must equal the run's head SHA.
-  It updates the lowest-id match or creates one, and after a create it runs the
-  converge step under the Security Reviewer's five conditions.
-- **Read-only token (B6):** no write of any kind is attempted, deletes and
-  SARIF included.
+  at most ``MAX_RETRIES`` times with backoff, and only while the backoff ends
+  before the deadline.
+- **Sticky comment (I-3, ADR-0005, ruling 5):** ours means ``user.login ==
+  "github-actions[bot]"``, ``user.type == "Bot"``, an integer id, body line 1
+  equal to the marker, **and** an ``issue_url`` naming this repo (ignoring
+  case) and this PR. Before writing, the PR's head SHA must equal the run's
+  head SHA. It updates the lowest-id match or creates one, and after a create
+  it runs the converge step under the Security Reviewer's five conditions.
+- **Run facts (ruling 2):** ``publish`` acts only on its arguments. T-028
+  passes the event payload's PR number as ``pr_number``, and ``comment=None``
+  / ``sarif=None`` when the input is off or the token is read-only (B6), so a
+  fork or Dependabot run reaches ``publish`` with nothing to write.
 """
 
 import base64
@@ -50,10 +57,10 @@ MAX_RETRIES: Final = 2
 """Retries after the first attempt (DESIGN §4)."""
 BACKOFF_SECONDS: Final = (0.5, 1.0)
 """Sleep before retry 1 and retry 2."""
-RETRY_BUDGET_SECONDS: Final = 3.0
-"""A retry starts only if elapsed time plus its backoff stays within this budget."""
+DEADLINE_SECONDS: Final = 3.0
+"""One overall deadline per ``lookup`` / ``publish`` call, retries included (ruling 3)."""
 REQUEST_TIMEOUT_SECONDS: Final = 10.0
-"""Socket timeout for one HTTP request."""
+"""Upper bound on one request's socket timeout; the deadline usually caps it lower."""
 RETRY_STATUSES: Final = frozenset({403, 429, 500, 502, 503, 504})
 """HTTP statuses that are retried: rate limit, 403 and 5xx (DESIGN §4)."""
 REDIRECT_STATUSES: Final = frozenset({301, 302, 303, 307, 308})
@@ -70,14 +77,8 @@ NOTE_NO_BASE_URL: Final = (
     "GitHub API access was skipped because GITHUB_API_URL is not a valid https URL."
 )
 NOTE_NO_AUTH: Final = "GitHub API access was skipped because no usable token was provided."
-NOTE_READ_ONLY: Final = (
-    "The PR comment and SARIF upload were skipped because the token is read-only."
-)
 NOTE_BAD_REQUEST: Final = (
     "GitHub API access was skipped because the repository, PR number or head SHA is invalid."
-)
-NOTE_PR_MISMATCH: Final = (
-    "The PR comment was skipped because the PR number does not match the event payload."
 )
 NOTE_BAD_BODY: Final = "The PR comment was skipped because its body has no sticky marker."
 NOTE_API_ERROR: Final = (
@@ -96,6 +97,9 @@ NOTE_DELETE_CAP: Final = (
 NOTE_SARIF_ERROR: Final = "The SARIF upload to code scanning failed."
 NOTE_SARIF_NO_REF: Final = (
     "The SARIF upload was skipped because GITHUB_SHA or GITHUB_REF is missing or invalid."
+)
+NOTE_DEADLINE: Final = (
+    "GitHub API access stopped because it did not finish within its 3 second limit."
 )
 
 _SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
@@ -164,43 +168,6 @@ class HttpClientTransport:
             conn.close()
 
 
-@dataclass(frozen=True, slots=True)
-class PublishContext:
-    """Run facts C12 needs beyond the I-14 ``publish`` arguments.
-
-    ``read_only`` is DESIGN §10 B6 (fork or Dependabot), computed by C1.
-    ``event_pr_number`` is the PR number from the event payload (SR condition 1).
-    ``comment_enabled`` and ``sarif_enabled`` are the Action inputs.
-    ``sarif_commit_sha`` and ``sarif_ref`` are ``GITHUB_SHA`` and ``GITHUB_REF`` (I-5).
-    """
-
-    read_only: bool
-    event_pr_number: int | None
-    comment_enabled: bool = True
-    sarif_enabled: bool = True
-    sarif_commit_sha: str | None = None
-    sarif_ref: str | None = None
-
-
-def publish_context(
-    env: Mapping[str, str],
-    *,
-    read_only: bool,
-    event_pr_number: int | None,
-    comment_enabled: bool,
-    sarif_enabled: bool,
-) -> PublishContext:
-    """Build a ``PublishContext``, taking the SARIF ``commit_sha``/``ref`` from the env (I-5)."""
-    return PublishContext(
-        read_only=read_only,
-        event_pr_number=event_pr_number,
-        comment_enabled=comment_enabled,
-        sarif_enabled=sarif_enabled,
-        sarif_commit_sha=env.get("GITHUB_SHA") or None,
-        sarif_ref=env.get("GITHUB_REF") or None,
-    )
-
-
 def _origin(url: str) -> tuple[str, str, int] | None:
     try:
         parts = urlsplit(url)
@@ -240,29 +207,55 @@ def is_marked(body: str) -> bool:
     return first == MARKER
 
 
-def is_ours(comment: object, *, repo: str, pr_number: int) -> bool:
-    """Both I-3 identity checks, plus a valid integer id and an ``issue_url`` naming this PR."""
-    if not isinstance(comment, dict):
-        return False
+def _has_id(comment: Mapping[str, object], repo: str, pr_number: int) -> bool:
     cid = comment.get("id")
-    if type(cid) is not int or cid < 1:
-        return False
+    return type(cid) is int and cid >= 1
+
+
+def _has_bot_identity(comment: Mapping[str, object], repo: str, pr_number: int) -> bool:
     user = comment.get("user")
-    if not isinstance(user, dict):
-        return False
-    if user.get("login") != BOT_LOGIN or user.get("type") != BOT_TYPE:
-        return False
+    return (
+        isinstance(user, dict) and user.get("login") == BOT_LOGIN and user.get("type") == BOT_TYPE
+    )
+
+
+def _has_marker(comment: Mapping[str, object], repo: str, pr_number: int) -> bool:
     body = comment.get("body")
-    if not isinstance(body, str) or not is_marked(body):
-        return False
+    return isinstance(body, str) and is_marked(body)
+
+
+def _names_this_pr(comment: Mapping[str, object], repo: str, pr_number: int) -> bool:
     issue_url = comment.get("issue_url")
     if not isinstance(issue_url, str):
-        return False
+        return False  # a comment without issue_url is never edited or deleted (ruling 5)
     try:
         path = urlsplit(issue_url).path
     except ValueError:
         return False
     return path.casefold().endswith(f"/repos/{repo}/issues/{pr_number}".casefold())
+
+
+OURS_CONDITIONS: Final[Mapping[str, Callable[[Mapping[str, object], str, int], bool]]] = {
+    "id": _has_id,
+    "bot_identity": _has_bot_identity,
+    "marker": _has_marker,
+    "issue_url": _names_this_pr,
+}
+"""Every condition a comment must pass to count as ours (I-3; I-13 C12 ruling 5)."""
+
+
+def failed_conditions(comment: object, *, repo: str, pr_number: int) -> frozenset[str]:
+    """The names in ``OURS_CONDITIONS`` that ``comment`` fails (all of them for a non-dict)."""
+    if not isinstance(comment, dict):
+        return frozenset(OURS_CONDITIONS)
+    return frozenset(
+        name for name, check in OURS_CONDITIONS.items() if not check(comment, repo, pr_number)
+    )
+
+
+def is_ours(comment: object, *, repo: str, pr_number: int) -> bool:
+    """Both I-3 identity checks, the marker, a valid integer id and ``issue_url`` naming this PR."""
+    return not failed_conditions(comment, repo=repo, pr_number=pr_number)
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,14 +274,22 @@ class GitHubApiClient:
     base URL or token makes every call return ``skipped`` with a fixed note.
     """
 
-    __slots__ = ("_base", "_clock", "_context", "_sleep", "_token", "_transport", "_unusable")
+    __slots__ = (
+        "_base",
+        "_clock",
+        "_deadline",
+        "_expired",
+        "_sleep",
+        "_token",
+        "_transport",
+        "_unusable",
+    )
 
     def __init__(
         self,
         base_url: str,
         token: str,
         *,
-        context: PublishContext,
         allow_http: bool = False,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -297,10 +298,11 @@ class GitHubApiClient:
         base = normalize_base_url(base_url, allow_http=allow_http)
         self._base = base or ""
         self._token = token if _TOKEN.fullmatch(token or "") else ""
-        self._context = context
         self._transport: Transport = transport or HttpClientTransport()
         self._sleep = sleep
         self._clock = clock
+        self._deadline = 0.0
+        self._expired = False
         self._unusable: str | None = None
         if base is None:
             self._unusable = NOTE_NO_BASE_URL
@@ -329,17 +331,28 @@ class GitHubApiClient:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
+    def _start_deadline(self) -> None:
+        self._deadline = self._clock() + DEADLINE_SECONDS
+        self._expired = False
+
+    def _time_left(self) -> float:
+        return self._deadline - self._clock()
+
     def _once(self, method: Method, url: str, body: bytes | None) -> HttpResponse | None:
         for _ in range(MAX_REDIRECTS + 1):
             if _origin(url) != _origin(self._base):
                 return None  # never contact, let alone send the token to, another origin
+            left = self._time_left()
+            if left <= 0:
+                self._expired = True
+                return None
             try:
                 resp = self._transport.request(
                     method,
                     url,
                     self._headers(url, has_body=body is not None),
                     body,
-                    REQUEST_TIMEOUT_SECONDS,
+                    min(REQUEST_TIMEOUT_SECONDS, left),
                 )
             except Exception:  # noqa: BLE001 -- §4: any transport failure is a note, never a crash
                 return None
@@ -357,16 +370,16 @@ class GitHubApiClient:
     def _call(self, method: Method, path: str, payload: object = None) -> HttpResponse | None:
         url = self._base + path
         body = None if payload is None else json.dumps(payload).encode("utf-8")
-        start = self._clock()
         attempt = 0
         while True:
             resp = self._once(method, url, body)
             if resp is not None and resp.status not in RETRY_STATUSES:
                 return resp
-            if attempt >= MAX_RETRIES:
+            if self._expired or attempt >= MAX_RETRIES:
                 return resp
             delay = BACKOFF_SECONDS[attempt]
-            if self._clock() - start + delay > RETRY_BUDGET_SECONDS:
+            if self._time_left() - delay <= 0:
+                self._expired = True  # the retry could not start before the deadline
                 return resp
             self._sleep(delay)
             attempt += 1
@@ -422,19 +435,26 @@ class GitHubApiClient:
             not isinstance(run_head_sha, str) or not _SHA.fullmatch(run_head_sha)
         ):
             return NOTE_BAD_REQUEST
-        if self._context.event_pr_number != pr_number:
-            return NOTE_PR_MISMATCH
         return None
 
     def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]:
-        """Read-only: does our sticky comment already exist on this PR? (§2 step 8, S7)."""
-        note = self._check(repo, pr_number, None)
-        if note is not None:
-            return False, note
-        ours = self._list_ours(repo, pr_number)
-        if ours is None:
+        """Read-only: does our sticky comment already exist on this PR? (§2 step 8, S7).
+
+        It only GETs and never raises (I-13 C12 ruling 1).
+        """
+        try:
+            note = self._check(repo, pr_number, None)
+            if note is not None:
+                return False, note
+            self._start_deadline()
+            ours = self._list_ours(repo, pr_number)
+            if self._expired:
+                return False, NOTE_DEADLINE
+            if ours is None:
+                return False, NOTE_LOOKUP_ERROR
+            return bool(ours), None
+        except Exception:  # noqa: BLE001 -- the Protocol promises lookup never raises
             return False, NOTE_LOOKUP_ERROR
-        return bool(ours), None
 
     # -- writes ---------------------------------------------------------------
 
@@ -447,25 +467,32 @@ class GitHubApiClient:
         comment: str | None,
         sarif: str | None,
     ) -> tuple[PublishOutcome, str | None]:
-        """Write the sticky comment and upload SARIF; never raises for HTTP errors."""
+        """Write the sticky comment and upload SARIF; never raises for HTTP errors.
+
+        It acts only on its arguments (ruling 2): ``comment=None`` makes no
+        comment request of any kind (no list, create, update or delete), and
+        ``sarif=None`` makes no SARIF request. The outcome describes the
+        comment, so ``comment=None`` is ``skipped`` (ruling 6); T-028 writes the
+        summary note saying why the comment was off.
+        """
         note = self._check(repo, pr_number, run_head_sha)
         if note is not None:
             return "skipped", note
-        if self._context.read_only:
-            return "skipped", NOTE_READ_ONLY
+        if comment is None and sarif is None:
+            return "skipped", None
+        self._start_deadline()
         notes: list[str] = []
         outcome: PublishOutcome = "skipped"
-        want_comment = comment is not None and self._context.comment_enabled
-        if want_comment and comment is not None:
+        if comment is not None:
             outcome, cnote = self._publish_comment(repo, pr_number, run_head_sha.lower(), comment)
             if cnote:
                 notes.append(cnote)
-        if sarif is not None and self._context.sarif_enabled:
-            snote = self._upload_sarif(repo, sarif)
+        if sarif is not None:
+            snote = self._upload_sarif(repo, sarif, commit_sha=None, ref=None)
             if snote:
                 notes.append(snote)
-            if not want_comment:
-                outcome = "skipped" if snote else "posted"
+        if self._expired:
+            return "skipped", NOTE_DEADLINE
         return outcome, " ".join(notes) or None
 
     def _publish_comment(
@@ -544,13 +571,16 @@ class GitHubApiClient:
         # A 404 means another run already removed it: success, never an error (I-3).
         return resp is not None and resp.status in (200, 204, 404)
 
-    def _upload_sarif(self, repo: str, sarif: str) -> str | None:
-        sha = self._context.sarif_commit_sha
-        ref = self._context.sarif_ref
-        if not sha or not _SHA.fullmatch(sha) or not ref or not _REF.fullmatch(ref):
+    def _upload_sarif(
+        self, repo: str, sarif: str, *, commit_sha: str | None, ref: str | None
+    ) -> str | None:
+        # I-5 pins commit_sha = GITHUB_SHA and ref = GITHUB_REF, and no publish()
+        # parameter carries GITHUB_SHA yet (open Architect question), so publish
+        # passes None and the upload is skipped with a note rather than guessed.
+        if not commit_sha or not _SHA.fullmatch(commit_sha) or not ref or not _REF.fullmatch(ref):
             return NOTE_SARIF_NO_REF
         packed = base64.b64encode(gzip.compress(sarif.encode("utf-8"), mtime=0)).decode("ascii")
-        payload = {"commit_sha": sha.lower(), "ref": ref, "sarif": packed}
+        payload = {"commit_sha": commit_sha.lower(), "ref": ref, "sarif": packed}
         resp = self._call("POST", f"/repos/{repo}/code-scanning/sarifs", payload)
         if resp is None or resp.status not in _OK:
             return NOTE_SARIF_ERROR
@@ -586,16 +616,18 @@ class _SkippingClient:
 def client_from_env(
     env: Mapping[str, str],
     *,
-    context: PublishContext,
     base_url_override: str | None = None,
     factory: Callable[[str, str], GitHubClient] | None = None,
     transport: Transport | None = None,
 ) -> GitHubClient:
-    """Build C12 from the environment: the only place the token is read.
+    """Build C12 from the environment, for the CLI only (I-13 C12 ruling 2).
 
-    The base URL is ``GITHUB_API_URL`` (https only), or ``base_url_override``
-    from ``Components.github_base_url`` (http allowed, tests only). ``factory``
-    is ``Components.github_client``; ``None`` means ``GitHubApiClient``.
+    The Action path (T-028) reads the token itself and calls the
+    ``Components.github_client`` factory, ``(base_url, token)``, or
+    ``GitHubApiClient`` directly. Here the base URL is ``GITHUB_API_URL``
+    (https only), or ``base_url_override`` from ``Components.github_base_url``
+    (http allowed, tests only). ``factory`` is ``Components.github_client``;
+    ``None`` means ``GitHubApiClient``.
     """
     allow_http = base_url_override is not None
     raw = base_url_override if base_url_override is not None else env.get("GITHUB_API_URL", "")
@@ -605,16 +637,14 @@ def client_from_env(
     token = env.get("GITHUB_TOKEN", "")
     if factory is not None:
         return factory(base, token)
-    return GitHubApiClient(base, token, context=context, allow_http=allow_http, transport=transport)
+    return GitHubApiClient(base, token, allow_http=allow_http, transport=transport)
 
 
 ALL_NOTES: Final = frozenset(
     {
         NOTE_NO_BASE_URL,
         NOTE_NO_AUTH,
-        NOTE_READ_ONLY,
         NOTE_BAD_REQUEST,
-        NOTE_PR_MISMATCH,
         NOTE_BAD_BODY,
         NOTE_API_ERROR,
         NOTE_LOOKUP_ERROR,
@@ -623,6 +653,7 @@ ALL_NOTES: Final = frozenset(
         NOTE_DELETE_CAP,
         NOTE_SARIF_ERROR,
         NOTE_SARIF_NO_REF,
+        NOTE_DEADLINE,
     }
 )
 """Every fixed note C12 can return. Notes never quote a response, header or exception."""
