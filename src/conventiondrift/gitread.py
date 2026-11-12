@@ -42,6 +42,7 @@ import io
 import ntpath
 import os
 import re
+import signal
 import string
 import subprocess
 import tempfile
@@ -51,6 +52,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from conventiondrift.components import ChangedFile, TreeEntry
 from conventiondrift.errors import (
@@ -488,6 +490,62 @@ def _drain(
         return
 
 
+#: Windows ``CREATE_NEW_PROCESS_GROUP`` (the constant exists only on Windows Pythons).
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+#: Wall-clock limit for ``taskkill`` itself, in seconds.
+_TASKKILL_TIMEOUT_SECONDS = 10.0
+
+
+def _process_group_kwargs() -> dict[str, Any]:
+    """Popen options that put git and everything it starts in one killable group (SR N-4).
+
+    POSIX: a new session, so its process group id is git's pid. Windows: a new
+    process group, so ``taskkill /T`` can end the ``git.exe`` launcher's children.
+    """
+    if os.name == "nt":
+        return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _system32() -> str:
+    """The absolute Windows system folder, from the OS, never from ``PATH`` or env."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(260)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, 260)  # type: ignore[attr-defined,unused-ignore]
+    if not 0 < length < 260:
+        raise OSError("system directory not found")
+    return buffer.value
+
+
+def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill git and every process it started, then reap git (SR N-4).
+
+    POSIX: ``SIGKILL`` to git's process group (its own session, see
+    :func:`_process_group_kwargs`); this also reaches a grandchild that outlived
+    git. Windows: ``<System32>\\taskkill.exe /T /F /PID <pid>`` by absolute path,
+    never looked up on ``PATH``. Either way ``proc.kill()`` follows as a fallback,
+    and git is always reaped.
+    """
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(  # noqa: S603 (absolute System32 path, fixed argv, no shell)
+                [os.path.join(_system32(), "taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                timeout=_TASKKILL_TIMEOUT_SECONDS,
+                check=False,
+            )
+    else:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
+    proc.wait()
+
+
 def _run_bounded(
     argv: Sequence[str],
     *,
@@ -554,6 +612,7 @@ def _bounded_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
+            **_process_group_kwargs(),
         )
     except OSError as exc:
         raise GitUnavailable("git could not be started") from exc
@@ -590,9 +649,8 @@ def _bounded_process(
             except subprocess.TimeoutExpired:
                 failure = "timed out"
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
+        if failure is not None or proc.poll() is None:
+            _kill_tree(proc)
         for reader in readers:
             reader.join(1.0)
         proc.stdout.close()
