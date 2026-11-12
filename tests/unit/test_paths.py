@@ -294,7 +294,13 @@ def test_origin_is_a_required_keyword() -> None:
 
 
 def test_read_tree_name_with_backslash_is_unsupported(tmp_path: Path, opened: list[object]) -> None:
-    (tmp_path / "a\\b.py").write_bytes(b"x = 1\n")
+    # Plant the file the name would reach: one file named "a\\b.py" on POSIX, and on
+    # Windows (where "\\" is a separator and that name cannot exist) the file a/b.py.
+    if os.name == "nt":
+        (tmp_path / "a").mkdir()
+        (tmp_path / "a" / "b.py").write_bytes(b"x = 1\n")
+    else:
+        (tmp_path / "a\\b.py").write_bytes(b"x = 1\n")
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
         read_worktree_file(tmp_path, "a\\b.py", "python", origin="tree")
@@ -480,6 +486,68 @@ def test_unknown_origin_name_too_long_is_outside_repository(origin: object, tmp_
     with pytest.raises(FileSkipped) as exc:
         read_worktree_file(tmp_path, "n" * 5000 + ".py", "python", origin=origin)  # type: ignore[arg-type]
     assert exc.value.reason == REASON_OUTSIDE
+
+
+# ---- Windows names too long for the OS (I-13 ENAMETOOLONG split, PR #23 windows-latest) ----
+# Windows refuses a segment over 255 UTF-16 code units with an error Python maps to
+# EINVAL/ENOENT, so safefs checks the length on the string before any file system call.
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [("tree", REASON_UNSUPPORTED), ("input", REASON_OUTSIDE), ("Tree", REASON_OUTSIDE)],
+)
+@pytest.mark.parametrize(
+    "value",
+    ["n" * 256, "n" * 253 + ".py", "src/" + "n" * 256 + "/a.py", "\U0001f600" * 128],
+    ids=["256", "256-ext", "middle-segment", "128-astral"],
+)
+def test_windows_segment_over_255_units_is_refused_before_any_open(
+    origin: str, expected: str, value: str, opened: list[object]
+) -> None:
+    got = _reason_as("nt", read_worktree_file, "/nonexistent", value, "python", origin=origin)
+    assert got == expected
+    assert opened == [], "nothing may be opened for a rejected path"
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        ["n" * 255],
+        ["n" * 252 + ".py"],
+        ["\U0001f600" * 127 + "n"],
+        ["src", "n" * 255],
+        ["\uffff" * 255],
+    ],
+    ids=["255", "255-ext", "255-units-astral", "nested-255", "255-bmp-max"],
+)
+def test_windows_segment_of_255_units_is_not_too_long(parts: list[str]) -> None:
+    """At the limit the length check passes (a string check only: no file system call)."""
+    with _as_os("nt"):
+        too_long = safefs._name_too_long(parts)
+    assert too_long is False
+
+
+def test_long_segment_is_not_checked_by_length_off_windows() -> None:
+    """POSIX leaves the length to the OS, which reports ENAMETOOLONG."""
+    with _as_os("posix"):
+        too_long = safefs._name_too_long(["n" * 256])
+    assert too_long is False
+
+
+@pytest.mark.parametrize(
+    ("origin", "expected"), [("tree", REASON_UNSUPPORTED), ("input", REASON_OUTSIDE)]
+)
+def test_windows_path_too_long_error_is_split_like_enametoolong(origin: str, expected: str) -> None:
+    """ERROR_FILENAME_EXCED_RANGE (206) arrives as errno ENOENT; it gets the ENAMETOOLONG split."""
+    import errno
+
+    exc = OSError(errno.ENOENT, "The filename or extension is too long")
+    exc.winerror = 206  # type: ignore[attr-defined,unused-ignore]
+    assert safefs._os_reason(exc, origin) == expected  # type: ignore[arg-type]
+    other = OSError(errno.ENOENT, "missing")
+    other.winerror = 2  # type: ignore[attr-defined,unused-ignore]  # ERROR_FILE_NOT_FOUND
+    assert safefs._os_reason(other, origin) == safefs.REASON_UNREADABLE  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)

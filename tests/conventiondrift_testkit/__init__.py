@@ -4,13 +4,14 @@ Never shipped (R8.1, AC-N3.15): the identifiers `conventiondrift_testkit`,
 `InjectedFault` and `FaultyComponent` must not appear in any released file.
 
 The only way a fault gets into the tool is in-process, through
-`conventiondrift.core.run(argv, env, components=...)`: there is no environment
+`conventiondrift.core.run(argv, env, *, entry=..., components=...)` (I-14: `entry`
+is required and is never inferred from `env`): there is no environment
 variable, input, flag, config key or file trigger. Typical use (AC-F7.4):
 
     from conventiondrift_testkit import FaultyComponent, InjectedFault, replace_checker
     comps = make_components(checkers=replace_checker(default.checkers, "logging",
                             lambda c: FaultyComponent(c, fail_on={"ast_handlers"})))
-    rc = run(argv, env, components=comps)
+    rc = run(argv, env, entry="cli", components=comps)
 
 A FaultyComponent delegates everything to the wrapped component except the
 methods named in `fail_on`, which raise `InjectedFault` (after `after_calls`
