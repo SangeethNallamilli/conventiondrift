@@ -178,7 +178,11 @@ jobs:
         run: python scripts/ci/check_no_pypi_yaml.py
       - name: pytest with coverage (offline paths, fixed seed)
         run: |
-          python -c "import pathlib, site; pathlib.Path(site.getsitepackages()[0]).joinpath('coverage_startup.pth').write_text('import coverage; coverage.process_startup()\\n')"
+          # Write the startup .pth into purelib (site-packages). On Windows,
+          # site.getsitepackages()[0] is the venv root, which site processes
+          # before site-packages is on sys.path, so `import coverage` failed
+          # there and leaked a traceback into child-process stderr.
+          python -c "import pathlib, sysconfig; pathlib.Path(sysconfig.get_path('purelib')).joinpath('coverage_startup.pth').write_text('import coverage; coverage.process_startup()\\n')"
           export COVERAGE_PROCESS_START="${PWD}/pyproject.toml"
           # Full offline suite: unit/spec/snapshot/property/fixtures/harness/
           # release (non-network) / security when present. Network tests are
@@ -329,6 +333,7 @@ jobs:
 
 
   mutation:
+    # Report-only since D-TL-29: not in the `ci` aggregate's needs.
     # Needs SR review: new dependency mutmut==3.8.1, separate hashed lock.
     # GATES.md / D-TL-17: overall ≥80%, critical modules ≥90% when present.
     # Runs on pull_request and on push to main (same triggers as this workflow).
@@ -376,7 +381,8 @@ jobs:
       - build
       - vendor-network
       - git-minimum
-      - mutation
+      # mutation is report-only (D-TL-29, TL decision): it still runs on
+      # every PR and push, but is not part of the required aggregate.
       - secret-scan
       - dependency-scan
     runs-on: ubuntu-latest

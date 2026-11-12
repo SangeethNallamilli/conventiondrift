@@ -91,7 +91,10 @@ def check(modules: Iterable[str] | None = None) -> list[str]:
     return errors
 
 
-def pytest_sessionstart(_session) -> None:
+def pytest_sessionstart(session: object) -> None:
+    # pluggy validates hookimpl argument names against the hookspec, so this
+    # must be named `session` (it is unused).
+    del session
     errors = check()
     if errors:
         raise RuntimeError("mutation yaml isolation failed: " + "; ".join(errors))
