@@ -885,12 +885,257 @@ def test_is_within() -> None:
     assert gitread._is_within("/a", "/a") is True
 
 
-def test_different_windows_drives_are_not_within(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_is_within_fails_closed_when_commonpath_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(_paths: Any) -> str:
-        raise ValueError("Paths don't have the same drive")
+        raise ValueError("Can't mix absolute and relative paths")
 
     monkeypatch.setattr(os.path, "commonpath", boom)
-    assert gitread._is_within("/x/git", "/y") is False
+    assert gitread._is_within("/x/git", "/y") is True
+
+
+def test_is_within_posix_is_case_sensitive_and_ignores_windows_forms() -> None:
+    assert gitread._is_within("/A/git", "/a") is False
+    assert gitread._is_within("/a/.//b/git", "/a") is True
+
+
+# --- SR N-7 / N-8: Windows containment forms ---------------------------------------
+
+
+def _undo_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "path", os.path)
+    monkeypatch.setattr(os, "pathsep", os.pathsep)
+
+
+def _nt_is_within(monkeypatch: pytest.MonkeyPatch, path: str, folder: str) -> bool:
+    """``_is_within`` evaluated with Windows path rules."""
+    _windows_paths(monkeypatch, "C:\\")
+    try:
+        return gitread._is_within(path, folder)
+    finally:
+        _undo_windows(monkeypatch)
+
+
+def _nt_comparable(monkeypatch: pytest.MonkeyPatch, path: str) -> str | None:
+    _windows_paths(monkeypatch, "C:\\")
+    try:
+        return gitread._nt_comparable(path)
+    finally:
+        _undo_windows(monkeypatch)
+
+
+# (folder, path, expected): every expected value is written by hand from the
+# rule "path is folder or below it, on the same drive or share", not computed.
+_NT_CONTAINMENT_CASES: list[tuple[str, str, bool]] = [
+    # \\?\ drive form, either side
+    (r"\\?\C:\Repo", r"C:\Repo\bin\git.exe", True),
+    (r"C:\Repo", r"\\?\C:\Repo\bin\git.exe", True),
+    (r"\\?\C:\Repo", r"C:\tools\git.exe", False),
+    (r"C:\Repo", r"\\?\C:\tools\git.exe", False),
+    (r"\\?\C:\Repo", r"D:\Repo\git.exe", False),
+    # \\.\ device drive form, either side
+    (r"\\.\C:\Repo", r"C:\Repo\bin\git.exe", True),
+    (r"C:\Repo", r"\\.\C:\Repo\bin\git.exe", True),
+    (r"\\.\C:\Repo", r"C:\tools\git.exe", False),
+    (r"C:\Repo", r"\\.\C:\tools\git.exe", False),
+    # \\?\UNC\ share form, either side
+    (r"\\?\UNC\server\share\repo", r"\\server\share\repo\git.exe", True),
+    (r"\\server\share\repo", r"\\?\UNC\server\share\repo\bin\git.exe", True),
+    (r"\\?\UNC\server\share\repo", r"\\server\share\tools\git.exe", False),
+    (r"\\server\share\repo", r"\\?\UNC\server\share\tools\git.exe", False),
+    (r"\\?\UNC\server\share\repo", r"\\server\other\repo\git.exe", False),
+    # \\.\UNC\ share form, either side
+    (r"\\.\UNC\server\share\repo", r"\\server\share\repo\git.exe", True),
+    (r"\\server\share\repo", r"\\.\UNC\server\share\repo\bin\git.exe", True),
+    (r"\\.\UNC\server\share\repo", r"\\server\share\tools\git.exe", False),
+    (r"\\server\share\repo", r"\\.\UNC\server\share\tools\git.exe", False),
+    # share root as the checkout (the N-7 case)
+    (r"\\server\share", r"\\server\share\git.exe", True),
+    (r"\\server\share", r"\\server\share\tools\git.exe", True),
+    (r"\\server\share", r"\\server\share", True),
+    (r"\\server\share" + "\\", r"\\server\share\tools\git.exe", True),
+    (r"\\?\UNC\server\share", r"\\server\share\tools\git.exe", True),
+    (r"\\server\share", r"\\?\UNC\server\share\tools\git.exe", True),
+    (r"\\server\share", r"\\server\other\git.exe", False),
+    (r"\\server\share", r"\\elsewhere\share\git.exe", False),
+    (r"\\server\share", r"C:\git.exe", False),
+    # drive roots
+    ("C:\\", r"C:\tools\git.exe", True),
+    ("D:\\", r"C:\tools\git.exe", False),
+    # case and slash folding (N-8)
+    (r"C:\Repo", r"c:\repo\git.exe", True),
+    (r"c:\Repo", r"c:\repo\git.exe", True),  # case differs only below the drive
+    (r"c:\repo", r"c:\REPO\bin\git.exe", True),
+    (r"\\server\Share", r"\\server\share\git.exe", True),
+    (r"c:\repo", r"C:\REPO\GIT.EXE", True),
+    (r"c:\repo", "C:/Repo/bin/git.exe", True),
+    (r"\\server\share", r"\\SERVER\Share\git.exe", True),
+    (r"\\SERVER\SHARE\Repo", r"\\?\unc\server\share\repo\git.exe", True),
+    # plain prefix-free cases stay as before
+    (r"C:\repo", r"C:\repox\git.exe", False),
+    (r"C:\repo", r"D:\repo\git.exe", False),
+]
+
+
+def test_prefix_table_is_the_extended_and_device_forms_longest_first() -> None:
+    prefixes = [prefix for prefix, _plain in gitread._NT_PATH_PREFIXES]
+    assert set(prefixes) == {"\\\\?\\unc\\", "\\\\.\\unc\\", "\\\\?\\", "\\\\.\\"}
+    for i, prefix in enumerate(prefixes):
+        for later in prefixes[i + 1 :]:
+            assert not later.startswith(prefix), "a shorter prefix would shadow a longer one"
+
+
+def test_containment_cases_cover_every_prefix_form_on_both_sides() -> None:
+    for prefix, _plain in gitread._NT_PATH_PREFIXES:
+        on_folder = {e for f, _p, e in _NT_CONTAINMENT_CASES if f.lower().startswith(prefix)}
+        on_path = {e for _f, p, e in _NT_CONTAINMENT_CASES if p.lower().startswith(prefix)}
+        assert on_folder == {True, False}, prefix
+        assert on_path == {True, False}, prefix
+    assert any(f.lower() != f and p.lower() == p for f, p, _e in _NT_CONTAINMENT_CASES)
+    assert any(f.lower() == f and p.lower() != p for f, p, _e in _NT_CONTAINMENT_CASES)
+
+
+@pytest.mark.parametrize(("folder", "path", "expected"), _NT_CONTAINMENT_CASES)
+def test_windows_containment(
+    monkeypatch: pytest.MonkeyPatch, folder: str, path: str, expected: bool
+) -> None:
+    assert _nt_is_within(monkeypatch, path, folder) is expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (r"\\?\C:\Repo", r"c:\repo"),
+        (r"\\.\C:\Repo", r"c:\repo"),
+        (r"\\?\UNC\Server\Share\Repo", r"\\server\share\repo"),
+        (r"\\.\UNC\Server\Share\Repo", r"\\server\share\repo"),
+        (r"\\server\share", "\\\\server\\share\\"),
+        (r"\\?\UNC\server\share", "\\\\server\\share\\"),
+        ("C:", "c:\\"),
+        (r"\\?\C:", "c:\\"),
+        ("C:/Repo/./bin/", r"c:\repo\bin"),
+    ],
+)
+def test_windows_comparable_form(monkeypatch: pytest.MonkeyPatch, raw: str, expected: str) -> None:
+    assert _nt_comparable(monkeypatch, raw) == expected
+
+
+@pytest.mark.parametrize(
+    "odd",
+    [
+        "\\\\?\\Volume{0b1d}\\git.exe",
+        "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\git.exe",
+        "\\\\.\\pipe\\git.exe",
+        "C:repo\\git.exe",
+        "\\git.exe",
+        "\\\\server",
+        r"\\?\\\?\C:\git.exe",  # a prefix left after one strip
+        r"\\.\\\.\C:\git.exe",
+        r"\\?\\\.\C:\git.exe",  # only one prefix is ever stripped
+        r"1:\git.exe",  # not a drive letter
+    ],
+)
+@pytest.mark.parametrize("odd_side", ["path", "folder"])
+def test_undecidable_windows_form_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, odd: str, odd_side: str
+) -> None:
+    assert _nt_comparable(monkeypatch, odd) is None
+    path, folder = (odd, "D:\\repo") if odd_side == "path" else ("D:\\tools\\git.exe", odd)
+    assert _nt_is_within(monkeypatch, path, folder) is True
+
+
+def test_windows_commonpath_error_on_one_drive_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(_paths: Any) -> str:
+        raise ValueError("Can't mix absolute and relative paths")
+
+    monkeypatch.setattr(ntpath, "commonpath", boom)
+    assert _nt_is_within(monkeypatch, "C:\\tools\\git.exe", "C:\\repo") is True
+    assert _nt_is_within(monkeypatch, "D:\\tools\\git.exe", "C:\\repo") is False
+
+
+_SHARE_ROOT = "\\\\server\\share"
+_EXTENDED_REPO = "\\\\?\\C:\\Repo"
+
+
+@pytest.mark.parametrize(
+    ("untrusted", "git_dir"),
+    [(_SHARE_ROOT, _SHARE_ROOT + "\\tools"), (_EXTENDED_REPO, "C:\\Repo\\tools")],
+)
+@pytest.mark.parametrize("where", ["repo", "workspace"])
+def test_git_under_share_root_or_extended_checkout_is_never_used(
+    monkeypatch: pytest.MonkeyPatch, untrusted: str, git_dir: str, where: str
+) -> None:
+    repo = Path(untrusted if where == "repo" else "D:\\repo")  # built before os.name changes
+    _windows_paths(monkeypatch, "C:\\")
+    if where == "workspace":
+        monkeypatch.setenv("GITHUB_WORKSPACE", untrusted)
+    monkeypatch.setenv("PATH", git_dir)
+    _accept_as_git(monkeypatch, git_dir + "\\git.exe")
+    try:
+        kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+        with pytest.raises(ComponentError) as info:
+            gitread._find_git(repo)
+    finally:
+        _undo_windows(monkeypatch)
+    assert kept == []
+    assert git_dir in dropped
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+@pytest.mark.parametrize(
+    ("untrusted", "git_dir"),
+    [(_SHARE_ROOT, _SHARE_ROOT + "\\tools"), (_EXTENDED_REPO, "C:\\Repo\\tools")],
+)
+@pytest.mark.parametrize("where", ["repo", "workspace"])
+def test_realpath_check_refuses_git_under_share_root_or_extended_checkout(
+    monkeypatch: pytest.MonkeyPatch, untrusted: str, git_dir: str, where: str
+) -> None:
+    repo = Path(untrusted if where == "repo" else "D:\\repo")  # built before os.name changes
+    _windows_paths(monkeypatch, "C:\\")
+    if where == "workspace":
+        monkeypatch.setenv("GITHUB_WORKSPACE", untrusted)
+    monkeypatch.setenv("PATH", "E:\\tools")
+    monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: git_dir + "\\git.exe")
+    try:
+        with pytest.raises(ComponentError) as info:
+            gitread._find_git(repo)
+    finally:
+        _undo_windows(monkeypatch)
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+def test_git_under_extended_length_cwd_is_never_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = Path("D:\\repo")
+    _windows_paths(monkeypatch, _EXTENDED_REPO)
+    monkeypatch.setenv("PATH", "c:\\repo\\tools")
+    _accept_as_git(monkeypatch, "c:\\repo\\tools\\git.exe")
+    try:
+        kept, _dropped = gitread._split_path(gitread._untrusted_folders(repo))
+        with pytest.raises(ComponentError) as info:
+            gitread._find_git(repo)
+    finally:
+        _undo_windows(monkeypatch)
+    assert kept == []
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+def test_share_root_cwd_is_a_filesystem_root_like_a_drive_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # I-14: the cwd rule is skipped when the cwd equals its anchor, and the
+    # anchor of \\server\share is the share root, as C:\ is for C:.
+    repo = Path("D:\\repo")
+    _windows_paths(monkeypatch, _SHARE_ROOT)
+    tools = _SHARE_ROOT + "\\tools"
+    monkeypatch.setenv("PATH", tools)
+    _accept_as_git(monkeypatch, tools + "\\git.exe")
+    try:
+        found = gitread._find_git(repo)
+    finally:
+        _undo_windows(monkeypatch)
+    assert found.search_path == tools
 
 
 # --- I-14: cwd filesystem-root exemption ---------------------------------------

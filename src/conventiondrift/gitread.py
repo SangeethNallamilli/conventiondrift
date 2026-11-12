@@ -37,8 +37,10 @@ can check the header size before reading the body).
 """
 
 import io
+import ntpath
 import os
 import re
+import string
 import subprocess
 import tempfile
 import threading
@@ -182,14 +184,74 @@ def _is_filesystem_root(path: str) -> bool:
     return resolved == Path(resolved.anchor)
 
 
-def _is_within(path: str, folder: str) -> bool:
-    """True iff ``path`` is ``folder`` or below it (both already real, absolute paths)."""
+# Win32 prefixes that name the same file as a plain path (SR N-7), matched
+# after normcase and in this order (the UNC forms first). Each is replaced by
+# the plain form, so ``\\?\C:\repo`` compares as ``c:\repo`` and
+# ``\\?\UNC\server\share`` as ``\\server\share``.
+_NT_PATH_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("\\\\?\\unc\\", "\\\\"),
+    ("\\\\.\\unc\\", "\\\\"),
+    ("\\\\?\\", ""),
+    ("\\\\.\\", ""),
+)
+
+
+def _is_plain_nt_drive(drive: str) -> bool:
+    """True iff ``drive`` is ``x:`` or ``\\\\server\\share`` (normcased, prefix-free)."""
+    if len(drive) == 2 and drive[1] == ":" and drive[0] in string.ascii_lowercase:
+        return True
+    if not drive.startswith("\\\\"):
+        return False
+    parts = drive[2:].split("\\")
+    return len(parts) == 2 and all(parts) and parts[0] not in ("?", ".")
+
+
+def _nt_comparable(path: str) -> str | None:
+    """``path`` in one canonical Windows form for containment, or ``None`` if unsure.
+
+    Case is folded and ``/`` becomes ``\\`` (normcase), the extended-length
+    and device prefixes are removed, and a bare drive or share root gains its
+    root separator, because ``ntpath.commonpath`` raises on ``\\\\server\\share``
+    against a path below it. Anything that is still not a plain absolute
+    drive or share path (``\\\\?\\Volume{...}``, pipes, drive-relative forms)
+    gives ``None``.
+    """
     path = os.path.normcase(path)
-    folder = os.path.normcase(folder)
+    for prefix, plain in _NT_PATH_PREFIXES:
+        if path.startswith(prefix):
+            path = plain + path[len(prefix) :]
+            break
+    drive, tail = os.path.splitdrive(path)
+    if not _is_plain_nt_drive(drive):
+        return None
+    if not tail:
+        tail = "\\"
+    elif not tail.startswith("\\"):
+        return None
+    return os.path.normpath(drive + tail)
+
+
+def _is_within(path: str, folder: str) -> bool:
+    """True iff ``path`` is ``folder`` or below it (both already real, absolute paths).
+
+    Fails closed (SR N-7): when the answer can't be decided, ``path`` counts
+    as inside, so a PATH entry is dropped and a found git is refused. Only a
+    really different drive or share is "not within". On Windows both sides
+    are first put in one form by ``_nt_comparable`` (keyed on the path module,
+    which is ``ntpath`` exactly when ``os.name == "nt"``).
+    """
+    if os.path is ntpath:
+        nt_path = _nt_comparable(path)
+        nt_folder = _nt_comparable(folder)
+        if nt_path is None or nt_folder is None:
+            return True
+        if os.path.splitdrive(nt_path)[0] != os.path.splitdrive(nt_folder)[0]:
+            return False
+        path, folder = nt_path, nt_folder
     try:
         return os.path.commonpath([path, folder]) == folder
-    except ValueError:  # different drives on Windows
-        return False
+    except ValueError:  # undecidable: fail closed
+        return True
 
 
 @dataclass(frozen=True)
