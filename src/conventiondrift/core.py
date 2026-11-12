@@ -72,7 +72,7 @@ def exit_code(outcome: RunOutcome) -> int:
     return EXIT_FAIL_ON_MET if met else EXIT_OK
 
 
-_COMPONENT = re.compile(r"[a-z][a-z0-9_]*(:[a-z0-9_]+)?")
+_COMPONENT = re.compile(r"[a-z][a-z0-9_]*(:[a-z0-9_-]+)?")
 
 
 def internal_error(exc: Exception | SystemExit | GeneratorExit) -> InternalError:

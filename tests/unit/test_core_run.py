@@ -1,7 +1,7 @@
 """Unit tests for run(), the InternalError helper and error-time fail-on (T-006a, I-2, I-14)."""
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import pytest
 
@@ -18,7 +18,7 @@ from conventiondrift.core import (
     run,
 )
 from conventiondrift.errors import ComponentError, GitUnavailable
-from conventiondrift.model import InternalError
+from conventiondrift.model import CheckerId, InternalError
 
 PLANTED = "ghp_FAKE0000planted/src/secret.py contents"
 SUFFIX = ": this part of the analysis could not finish; details are withheld"
@@ -39,7 +39,10 @@ def test_other_exceptions_are_reported_as_core(exc: Exception) -> None:
     assert PLANTED not in error.message
 
 
-@pytest.mark.parametrize("component", ["core", "render", "git_reader", "checker:logging", "a1:b_2"])
+@pytest.mark.parametrize(
+    "component",
+    ["core", "render", "git_reader", "a1:b_2", *(f"checker:{cid}" for cid in get_args(CheckerId))],
+)
 def test_valid_components_are_kept(component: str) -> None:
     assert internal_error(ComponentError(component, PLANTED)).component == component
 
@@ -57,8 +60,10 @@ def test_valid_components_are_kept(component: str) -> None:
         "core\n",
         "core x",
         "ćore",
-        # I-14's regex has no hyphen, so a hyphenated checker id falls back too (flagged).
-        "checker:http-client",
+        "checker:a b",
+        "-core",
+        "core-x:logging",
+        "checker:HTTP-client",
     ],
 )
 def test_invalid_components_become_core(component: str) -> None:
