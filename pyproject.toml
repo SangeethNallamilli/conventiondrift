@@ -88,3 +88,11 @@ relative_files = true
 
 [tool.coverage.report]
 omit = ["*/conventiondrift/_vendor/*"]
+
+
+# T-003 mutation job. mutmut==3.8.1 is a new dependency and needs SR review.
+# GATES.md thresholds are enforced by scripts/ci/check_mutation.py, not here.
+[tool.mutmut]
+source_paths = ["src/conventiondrift"]
+do_not_mutate = ["src/conventiondrift/_vendor/*"]
+pytest_add_cli_args_test_selection = ["tests"]

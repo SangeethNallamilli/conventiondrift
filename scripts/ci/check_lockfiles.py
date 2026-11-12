@@ -22,6 +22,7 @@ UV_CMD = [
 PAIRS = (
     ("requirements/build.in", "requirements/build.txt"),
     ("requirements/dev.in", "requirements/dev.txt"),
+    ("requirements/mutation.in", "requirements/mutation.txt"),
 )
 
 

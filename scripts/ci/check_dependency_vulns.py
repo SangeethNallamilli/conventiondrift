@@ -13,6 +13,7 @@ REPO = Path(__file__).resolve().parents[2]
 LOCKFILES = (
     REPO / "requirements" / "build.txt",
     REPO / "requirements" / "dev.txt",
+    REPO / "requirements" / "mutation.txt",
 )
 # Always scan the vendored library, even though it is not a lockfile entry (ADR-0002).
 VENDOR_PACKAGES = (("PyYAML", "6.0.3"),)
