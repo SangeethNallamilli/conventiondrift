@@ -13,15 +13,15 @@ from pathlib import Path
 
 import pytest
 
-import conventiondrift.discover as d
-from conventiondrift.discover import (
+import conventiondrift.discover.safefs as d
+from conventiondrift.discover.safefs import (
     CONFIG_MAX_BYTES,
     FILE_MAX_BYTES,
     REASON_BINARY,
     REASON_NOT_DECODABLE,
-    REASON_NOT_REGULAR,
     REASON_OUTSIDE,
     REASON_SIZE,
+    REASON_SPECIAL,
     REASON_SYMLINK,
     FileKind,
     check_size,
@@ -333,7 +333,7 @@ def test_sibling_prefix_is_not_contained(tmp_path: Path) -> None:
 def test_fifo_skipped_without_opening(tmp_path: Path, strategy: str) -> None:
     os.mkfifo(tmp_path / "AGENTS.md")
     # Opening a FIFO for reading without O_NONBLOCK would hang; reaching here proves it wasn't.
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_NOT_REGULAR
+    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SPECIAL
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="POSIX")
@@ -342,14 +342,14 @@ def test_socket_skipped(strategy: str) -> None:
         s = socket.socket(socket.AF_UNIX)
         try:
             s.bind(os.path.join(t, "x.py"))
-            assert _reason(read_worktree_file, t, "x.py", "python") == REASON_NOT_REGULAR
+            assert _reason(read_worktree_file, t, "x.py", "python") == REASON_SPECIAL
         finally:
             s.close()
 
 
 def test_directory_where_file_expected(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "AGENTS.md").mkdir()
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_NOT_REGULAR
+    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SPECIAL
 
 
 def test_fstat_must_show_regular_file(
@@ -360,7 +360,7 @@ def test_fstat_must_show_regular_file(
     fake = os.stat_result((stat.S_IFIFO | 0o644, *real_fstat(0)[1:]))
     monkeypatch.setattr(os, "fstat", lambda fd: fake)
     assert _reason(read_worktree_file, tmp_path, "a.py", "python") in (
-        REASON_NOT_REGULAR,
+        REASON_SPECIAL,
         REASON_SYMLINK,  # by_path compares inodes first
     )
 

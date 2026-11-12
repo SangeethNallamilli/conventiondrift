@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from conventiondrift.discover import REASON_OUTSIDE, read_worktree_file, validate_relpath
+from conventiondrift.discover.safefs import REASON_OUTSIDE, read_worktree_file, validate_relpath
 from conventiondrift.errors import FileSkipped
 
 # The AC-N3.8 values, one per bullet (TRACEABILITY row AC-N3.8). For the
