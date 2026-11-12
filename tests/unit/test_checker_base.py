@@ -39,7 +39,7 @@ class _PrintChecker:
 
 
 def test_checker_is_a_protocol() -> None:
-    assert issubclass(Checker, Protocol)  # type: ignore[arg-type]
+    assert issubclass(Checker, Protocol)
     assert base.__all__ == ["Checker", "CheckerId", "FileContext", "RuleMatch", "Site"]
 
 

@@ -26,6 +26,7 @@ the seed, this script's SHA-256 and the composition measured back from git.
 from __future__ import annotations
 
 import argparse
+import atexit
 import dataclasses
 import hashlib
 import json
@@ -339,14 +340,48 @@ class Stream:
         return self.mark
 
 
+# Unique per-process home; never reuse gettempdir()/cd-bench-git-home, which
+# older revisions shared across runs and only created isolated.gitconfig once.
+_GIT_HOME: Path | None = None
+
+
+def _bench_git_home() -> Path:
+    global _GIT_HOME
+    if _GIT_HOME is None:
+        _GIT_HOME = Path(tempfile.mkdtemp(prefix="cd-bench-git-home-"))
+        atexit.register(shutil.rmtree, _GIT_HOME, ignore_errors=True)
+    return _GIT_HOME
+
+
 def git_env() -> dict[str, str]:
-    return {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": tempfile.gettempdir(),
+    """Isolated git env that still starts git.exe on Windows."""
+    home = _bench_git_home()
+    cfg = home / "isolated.gitconfig"
+    cfg.write_text("", encoding="utf-8")
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(home),
+        "USERPROFILE": str(home),
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": str(cfg),
+        "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
+        "TZ": "UTC",
     }
+    for key in (
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
 
 
 def git(repo: Path, *args: str) -> str:
@@ -604,16 +639,12 @@ def measure(repo: Path, prof: Profile) -> dict:
             cur += 1
     if cur is not None:
         per.append(cur)
-    mraw = git(
-        repo,
-        "log",
-        "--merges",
-        "--diff-merges=first-parent",
-        "--format=format:@@%H",
-        "--name-only",
-        "main",
-    )
-    mper = [len([x for x in chunk.splitlines()[1:] if x]) for chunk in mraw.split("@@")[1:]]
+    # `git log --diff-merges=first-parent` needs git 2.36+; diff each merge
+    # against its first parent, which exists in 2.30 (D-TL-18).
+    mper = []
+    for sha in git(repo, "rev-list", "--merges", "main").split():
+        names = git(repo, "diff", "--name-only", f"{sha}^1", sha)
+        mper.append(len([line for line in names.splitlines() if line]))
     # rough site census at the tip (regex on the controlled templates)
     prints = loggers = 0
     for _, path in py:
