@@ -1,0 +1,4 @@
+# Changes to CI and the Action entry point need the repo owner's review.
+/.github/workflows/ @SangeethNallamilli
+/action.yml @SangeethNallamilli
+/.github/CODEOWNERS @SangeethNallamilli
