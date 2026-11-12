@@ -7,6 +7,7 @@ tests of the runner and the first five operations.
 
 import contextlib
 import io
+import ntpath
 import os
 import shutil
 import subprocess
@@ -358,10 +359,9 @@ def test_popen_uses_pipes_devnull_stdin_and_no_shell(repo: Path, spy: list[Call]
 
 
 def test_limits_are_conservative_constants() -> None:
-    # AC-N2.1: a whole B10k run finishes in under 60 s, so no single call may take longer.
-    assert 0 < gitread.GIT_TIMEOUT_SECONDS <= 60
-    # One 64-hex SHA or ISO date line fits many times over.
-    assert 128 <= gitread.SMALL_OUTPUT_MAX_BYTES <= 65536
+    # I-14 bounds: 60 s per call, 4096 bytes on small-output calls.
+    assert gitread.GIT_TIMEOUT_SECONDS == 60
+    assert gitread.SMALL_OUTPUT_MAX_BYTES == 4096
 
 
 def _py(code: str) -> list[str]:
@@ -717,6 +717,208 @@ def test_different_windows_drives_are_not_within(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(gitread.os.path, "commonpath", boom)
     assert gitread._is_within("/x/git", "/y") is False
+
+
+# --- I-14: cwd filesystem-root exemption ---------------------------------------
+
+
+def test_is_filesystem_root_posix() -> None:
+    assert gitread._is_filesystem_root("/") is True
+    assert gitread._is_filesystem_root("/usr/bin") is False
+
+
+def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(gitread.os, "path", ntpath)
+    try:
+        assert gitread._is_filesystem_root("C:\\") is True
+        assert gitread._is_filesystem_root("C:/") is True
+        assert gitread._is_filesystem_root("C:") is True
+        assert gitread._is_filesystem_root("Z:\\") is True
+        assert gitread._is_filesystem_root("C:\\Windows") is False
+        assert gitread._is_filesystem_root("Z:\\tools") is False
+        assert gitread._is_filesystem_root("git") is False
+    finally:
+        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(gitread.os, "path", os.path)
+
+
+def _posix_root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Simulate cwd=/ without chdir or creating a repo at /."""
+    monkeypatch.setattr(gitread.os, "getcwd", lambda: "/")
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+
+
+def _which_for(locations: dict[str, str]):
+    """Return a shutil.which stand-in that maps a PATH entry to an executable."""
+
+    def which(name: str, path: str | None = None) -> str | None:
+        if not path:
+            return None
+        for entry in path.split(gitread.os.pathsep):
+            if entry in locations:
+                return locations[entry]
+        return None
+
+    return which
+
+
+def test_cwd_at_posix_root_keeps_usr_bin(
+    repo: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _posix_root_cwd(monkeypatch)
+    _set_path(monkeypatch, "/usr/bin")
+    kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+    assert "/usr/bin" in kept
+    assert "/usr/bin" not in dropped
+    monkeypatch.setattr(gitread.shutil, "which", _which_for({"/usr/bin": "/usr/bin/git"}))
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath("/usr/bin/git")
+    assert found.search_path == "/usr/bin"
+
+
+def test_git_inside_the_repo_is_refused_when_cwd_is_posix_root(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _posix_root_cwd(monkeypatch)
+    _fake_git_in(repo / "tools")
+    _set_path(monkeypatch, repo / "tools")
+    with pytest.raises(ComponentError) as info:
+        gitread._find_git(repo)
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+def test_repo_at_posix_root_refuses_usr_bin_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Repo itself is /. The cwd exemption must not keep a git under the repo.
+    _posix_root_cwd(monkeypatch)
+    _set_path(monkeypatch, "/usr/bin")
+    kept, dropped = gitread._split_path(gitread._untrusted_folders(Path("/")))
+    assert kept == []
+    assert "/usr/bin" in dropped
+    monkeypatch.setattr(gitread.shutil, "which", _which_for({"/usr/bin": "/usr/bin/git"}))
+    with pytest.raises(ComponentError) as info:
+        gitread._find_git(Path("/"))
+    assert info.value.message == gitread._UNTRUSTED_GIT
+    assert info.value.component == "gitread"
+
+
+def test_repo_at_posix_root_with_no_git_is_git_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _posix_root_cwd(monkeypatch)
+    _set_path(monkeypatch, "/usr/bin")
+    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: None)
+    with pytest.raises(GitUnavailable):
+        gitread._find_git(Path("/"))
+
+
+def test_realpath_check_refuses_git_inside_repo_at_posix_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Defence in depth: even if which() returned a kept-path hit under /, refuse it.
+    _posix_root_cwd(monkeypatch)
+    _set_path(monkeypatch, "/usr/bin")
+    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: "/usr/bin/git")
+    with pytest.raises(ComponentError) as info:
+        gitread._find_git(Path("/"))
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+def test_workspace_at_posix_root_still_drops_usr_bin(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gitread.os, "getcwd", lambda: "/")
+    monkeypatch.setenv("GITHUB_WORKSPACE", "/")
+    _set_path(monkeypatch, "/usr/bin")
+    kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+    assert "/usr/bin" not in kept
+    assert "/usr/bin" in dropped
+    monkeypatch.setattr(gitread.shutil, "which", _which_for({"/usr/bin": "/usr/bin/git"}))
+    with pytest.raises(ComponentError) as info:
+        gitread._find_git(repo)
+    assert info.value.message == gitread._UNTRUSTED_GIT
+
+
+def _windows_paths(monkeypatch: pytest.MonkeyPatch, cwd: str) -> None:
+    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(gitread.os, "path", ntpath)
+    monkeypatch.setattr(gitread.os, "pathsep", ";")
+    monkeypatch.setattr(gitread.os, "getcwd", lambda: cwd)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+
+
+def test_cwd_at_windows_drive_root_keeps_git_on_that_drive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _windows_paths(monkeypatch, "C:\\")
+    monkeypatch.setenv("PATH", "C:\\Program Files\\Git\\cmd")
+    repo = Path("D:\\repo")
+    kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+    assert kept == ["C:\\Program Files\\Git\\cmd"]
+    assert "C:\\Program Files\\Git\\cmd" not in dropped
+    exe = "C:\\Program Files\\Git\\cmd\\git.exe"
+    monkeypatch.setattr(gitread.shutil, "which", _which_for({"C:\\Program Files\\Git\\cmd": exe}))
+    try:
+        found = gitread._find_git(repo)
+    finally:
+        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(gitread.os, "path", os.path)
+        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+    assert found.path == ntpath.realpath(exe)
+    assert found.search_path == "C:\\Program Files\\Git\\cmd"
+
+
+@pytest.mark.parametrize("root", ["C:\\", "Z:\\"])
+def test_repo_at_windows_drive_root_never_uses_git_inside_it(
+    monkeypatch: pytest.MonkeyPatch, root: str
+) -> None:
+    _windows_paths(monkeypatch, root)
+    tools = root + "tools"
+    monkeypatch.setenv("PATH", tools)
+    monkeypatch.setattr(gitread.shutil, "which", _which_for({tools: tools + "\\git.exe"}))
+    kept, dropped = gitread._split_path(gitread._untrusted_folders(Path(root)))
+    try:
+        assert kept == []
+        assert tools in dropped
+        with pytest.raises(ComponentError) as info:
+            gitread._find_git(Path(root))
+    finally:
+        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(gitread.os, "path", os.path)
+        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+    assert info.value.message == gitread._UNTRUSTED_GIT
+    assert info.value.component == "gitread"
+
+
+def test_repo_at_windows_drive_root_with_no_git_is_git_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _windows_paths(monkeypatch, "C:\\")
+    monkeypatch.setenv("PATH", "C:\\tools")
+    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: None)
+    try:
+        with pytest.raises(GitUnavailable):
+            gitread._find_git(Path("C:\\"))
+    finally:
+        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(gitread.os, "path", os.path)
+        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+
+
+def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _windows_paths(monkeypatch, "C:\\")
+    monkeypatch.setenv("PATH", "C:\\tools")
+    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: "C:\\tools\\git.exe")
+    try:
+        with pytest.raises(ComponentError) as info:
+            gitread._find_git(Path("C:\\"))
+    finally:
+        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(gitread.os, "path", os.path)
+        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+    assert info.value.message == gitread._UNTRUSTED_GIT
 
 
 # --- I-14 / D-TL-18: version check ---------------------------------------------

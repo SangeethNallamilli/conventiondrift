@@ -4,7 +4,8 @@ Every call goes through :meth:`GitReader._run`, which:
 
 * runs ``git`` from one real absolute path, resolved once by the safe rule in
   I-14 (SR-013: absolute ``PATH`` entries only, never inside the repository,
-  ``GITHUB_WORKSPACE`` or the current folder), as an argv list, never through a
+  ``GITHUB_WORKSPACE`` or the current folder; the cwd rule is skipped when the
+  cwd is a filesystem root), as an argv list, never through a
   shell;
 * passes a fixed environment (DESIGN §3) with ``HOME`` set to a fresh, empty
   temporary directory; only ``PATH`` is inherited, plus ``SYSTEMROOT`` on
@@ -56,23 +57,21 @@ from conventiondrift.errors import (
 )
 
 _COMPONENT = "gitread"
+# Debug-only ComponentError message (I-14). Only GitTooOld has public text;
+# this string is never written to any user-facing output.
 _UNTRUSTED_GIT = "git found only in the repository, workspace or current folder"
 
 #: D-TL-18 / I-14: the oldest supported git (``rev-parse --end-of-options``).
 MIN_GIT_VERSION: tuple[int, int] = (2, 30)
 _VERSION_RE = re.compile(r"^git version (\d+)\.(\d+)", re.ASCII)
 
-# QUESTION(A?): DESIGN.md, SECURITY-RULES.md and INTERFACES.md state no per-call git
-# timeout. 60 s is the whole-run limit of AC-N2.1 (B10k < 60 s), so no single git
-# call may take longer; the calls in this module normally take milliseconds.
-#: Wall-clock limit for one git call, in seconds (SR-014).
+#: Wall-clock limit for one git call, in seconds (I-14 bounds, SR-014).
+#: Hitting the limit kills git and raises ``ComponentError("gitread")``.
 GIT_TIMEOUT_SECONDS: float = 60.0
 
-# QUESTION(A?): R2.6 (DESIGN §10 S4) caps only patch bytes (256 MiB, T-008's
-# ``patches``). No cap is stated for the one-line plumbing calls; every T-007 call
-# prints at most one 64-hex SHA or ISO date line, so 4 KiB is far above any valid
-# output and far below anything that could hurt memory.
-#: Default stdout cap for one git call, in bytes; more is a fixed-text error (SR-014).
+#: Default stdout cap for small-output calls (``--version``, ``rev-parse`` and
+#: the like), in bytes (I-14 bounds, SR-014). Hitting the cap kills git and
+#: raises ``ComponentError("gitread")``. T-008 passes a larger cap for patches.
 SMALL_OUTPUT_MAX_BYTES: int = 4096
 
 #: Read size for the stdout and stderr pipes; also the most stderr held at once.
@@ -166,6 +165,22 @@ def _require_sha(value: str) -> str:
     return value
 
 
+def _is_filesystem_root(path: str) -> bool:
+    """True iff ``path`` is a filesystem root (``/``, or a drive root such as ``C:\\``).
+
+    I-14: the cwd PATH-drop rule (and the matching real-path check) is skipped
+    when ``Path(cwd).resolve()`` equals its anchor, because containers often
+    run with ``WORKDIR /``. The repo and ``GITHUB_WORKSPACE`` rules still apply,
+    including when they themselves are a filesystem root.
+    """
+    if os.name == "nt":
+        real = os.path.realpath(path)
+        drive, tail = os.path.splitdrive(real)
+        return bool(drive) and tail in ("\\", "/", "")
+    resolved = Path(path).resolve()
+    return resolved == Path(resolved.anchor)
+
+
 def _is_within(path: str, folder: str) -> bool:
     """True iff ``path`` is ``folder`` or below it (both already real, absolute paths)."""
     path = os.path.normcase(path)
@@ -187,11 +202,18 @@ class _ResolvedGit:
 
 
 def _untrusted_folders(repo_dir: Path) -> list[str]:
-    """Real paths git must never come from: the repo, ``GITHUB_WORKSPACE`` and the cwd."""
-    folders = [os.path.realpath(repo_dir), os.path.realpath(os.getcwd())]
+    """Real paths git must never come from: the repo, ``GITHUB_WORKSPACE`` and the cwd.
+
+    The cwd rule is skipped when the cwd is a filesystem root (I-14). The repo
+    and ``GITHUB_WORKSPACE`` rules still apply, including when they equal a root.
+    """
+    folders = [os.path.realpath(repo_dir)]
     workspace = os.environ.get("GITHUB_WORKSPACE")
     if workspace:
         folders.append(os.path.realpath(workspace))
+    cwd = os.path.realpath(os.getcwd())
+    if not _is_filesystem_root(cwd):
+        folders.append(cwd)
     return folders
 
 
@@ -221,7 +243,9 @@ def _find_git(repo_dir: Path) -> _ResolvedGit:
     ``shutil.which`` searches only the kept ``PATH`` entries, given explicitly, for
     ``git`` (``git.exe`` on Windows, never ``.cmd``/``.bat``). The match is made
     absolute and real, and must not lie inside the repo, ``GITHUB_WORKSPACE`` or the
-    cwd (defence in depth: older Windows Pythons may still try the cwd first).
+    cwd (defence in depth: older Windows Pythons may still try the cwd first). The
+    cwd real-path check is skipped only when the cwd is a filesystem root; the
+    repo and ``GITHUB_WORKSPACE`` checks still apply when they equal a root.
 
     Raises ``GitUnavailable`` if no git exists anywhere on ``PATH`` (head-only mode),
     and a fixed-text ``ComponentError("gitread")`` if the only git found is in a
@@ -370,7 +394,13 @@ def _run_bounded(
 
 
 class GitReader:
-    """Read-only, hardened access to the git repository at ``repo_dir`` (I-11 C3)."""
+    """Read-only, hardened access to the git repository at ``repo_dir`` (I-11 C3).
+
+    ``repo_dir`` must be the repository root itself, not a subfolder (I-14).
+    Callers pass that root: ``GITHUB_WORKSPACE`` in the Action, and whatever
+    T-031 resolves in the CLI. ``GIT_CEILING_DIRECTORIES`` is set to its parent,
+    so a subfolder is treated as not a git repository.
+    """
 
     def __init__(self, repo_dir: str | os.PathLike[str]) -> None:
         self._repo_dir = Path(repo_dir)
