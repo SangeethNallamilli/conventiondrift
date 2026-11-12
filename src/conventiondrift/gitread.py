@@ -541,6 +541,10 @@ def _drain(
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 #: Wall-clock limit for ``taskkill`` itself, in seconds.
 _TASKKILL_TIMEOUT_SECONDS = 10.0
+#: Longest wait to reap git after the kill, and for each reader thread to finish
+#: (CR2 S1: no kill or close path waits without a bound).
+_REAP_TIMEOUT_SECONDS = 5.0
+_READER_JOIN_SECONDS = 1.0
 
 
 def _process_group_kwargs() -> dict[str, Any]:
@@ -572,7 +576,9 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
     :func:`_process_group_kwargs`); this also reaches a grandchild that outlived
     git. Windows: ``<System32>\\taskkill.exe /T /F /PID <pid>`` by absolute path,
     never looked up on ``PATH``. Either way ``proc.kill()`` follows as a fallback,
-    and git is always reaped.
+    and git is reaped, waiting at most :data:`_REAP_TIMEOUT_SECONDS`. Every kill
+    path calls this, also when git itself has already exited (CR2 S1), because a
+    grandchild may still hold its pipes.
     """
     if os.name == "nt":
         with contextlib.suppress(OSError, subprocess.SubprocessError):
@@ -590,7 +596,21 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
             os.killpg(proc.pid, signal.SIGKILL)
     with contextlib.suppress(OSError):
         proc.kill()
-    proc.wait()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(_REAP_TIMEOUT_SECONDS)
+
+
+def _close_when_done(stream: object, reader: threading.Thread) -> None:
+    """Close a pipe only once its reader thread is done (CR2 S1).
+
+    Closing a buffered pipe waits on the lock a blocked reader holds, so while a
+    process outside git's group still holds the pipe, the pipe is left to the
+    daemon thread, which ends at that process's EOF; nothing here blocks.
+    """
+    reader.join(_READER_JOIN_SECONDS)
+    if not reader.is_alive():
+        with contextlib.suppress(OSError):
+            cast(io.BufferedIOBase, stream).close()
 
 
 def _run_bounded(
@@ -652,10 +672,8 @@ def _run_bounded(
     finally:
         if failure is not None or proc.poll() is None:
             _kill_tree(proc)
-        for reader in readers:
-            reader.join(1.0)
-        proc.stdout.close()
-        proc.stderr.close()
+        _close_when_done(proc.stdout, readers[0])
+        _close_when_done(proc.stderr, readers[1])
     if failure is not None:
         # Fixed text: never the argv (which may hold a REV), stdout or stderr.
         raise ComponentError(_COMPONENT, f"git {label} {failure}")
@@ -768,15 +786,16 @@ class _BatchProcess:
             raise self._error("timed out") from None
 
     def kill(self) -> None:
-        """Kill git's process tree if it still runs (N-4), reap it and stop the threads."""
+        """Kill git's process tree (N-4, CR2 S1), reap it and stop the threads.
+
+        The group is killed even when git has exited, since a grandchild may hold
+        the pipes; no step waits without a bound.
+        """
         self._stop.set()
-        if self._proc.poll() is None:
-            _kill_tree(self._proc)
+        _kill_tree(self._proc)
         self.close_stdin()
-        for thread in self._threads:
-            thread.join(1.0)
-        for stream in (self._proc.stdout, self._proc.stderr):
-            cast(io.BufferedIOBase, stream).close()
+        _close_when_done(self._proc.stdout, self._threads[0])
+        _close_when_done(self._proc.stderr, self._threads[1])
 
 
 def _start_batch(

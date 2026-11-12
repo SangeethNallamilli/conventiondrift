@@ -89,17 +89,22 @@ def test_process_group_kwargs_per_os(monkeypatch: pytest.MonkeyPatch) -> None:
 class _Proc:
     pid = 4242
 
-    def __init__(self, kill_error: bool = False) -> None:
+    def __init__(self, kill_error: bool = False, wait_hangs: bool = False) -> None:
         self.events: list[str] = []
         self.kill_error = kill_error
+        self.wait_hangs = wait_hangs
+        self.wait_timeouts: list[float | None] = []
 
     def kill(self) -> None:
         self.events.append("kill")
         if self.kill_error:
             raise ProcessLookupError
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
         self.events.append("wait")
+        self.wait_timeouts.append(timeout)
+        if self.wait_hangs:
+            raise subprocess.TimeoutExpired("git", timeout or 0.0)
         return -9
 
 
@@ -191,3 +196,11 @@ def test_system32_failure_is_an_os_error(monkeypatch: pytest.MonkeyPatch, length
     monkeypatch.setattr(ctypes, "windll", _WinDLL(_Kernel32("", length)), raising=False)
     with pytest.raises(OSError, match="system directory not found"):
         gitread._system32()
+
+
+def test_reaping_waits_a_bounded_time_and_never_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "killpg", lambda _pid, _sig: None, raising=False)
+    proc = _Proc(wait_hangs=True)
+    gitread._kill_tree(proc)  # type: ignore[arg-type]  # returns despite the timeout
+    assert proc.wait_timeouts == [5.0]  # _REAP_TIMEOUT_SECONDS, by hand
