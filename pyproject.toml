@@ -48,7 +48,12 @@ version = { attr = "conventiondrift.__version__" }
 testpaths = ["tests"]
 # Lets tests import conventiondrift_testkit (under tests/, never shipped).
 pythonpath = ["tests"]
-addopts = "-p no:cacheprovider"
+# -m "not network" keeps CONTRIBUTING's plain `pytest` offline. Run
+# `pytest -m network` in the T-003 network CI job (D-TL-14).
+addopts = ["-p", "no:cacheprovider", "--strict-markers", "-m", "not network"]
+markers = [
+    "network: needs network access to a pinned download; deselected by default, run with `pytest -m network`",
+]
 
 [tool.ruff]
 target-version = "py311"
