@@ -39,7 +39,6 @@ can check the header size before reading the body).
 import io
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -84,6 +83,8 @@ ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset(
 
 #: DESIGN §3 "On every call", in the design's order.
 HARDENING_CONFIG: tuple[str, ...] = (
+    # Needed defence: plain `diff-tree` runs a repo's fsmonitor (confirmed on
+    # git 2.30, 2.37 and 2.47). A load-bearing behaviour test belongs to T-008.
     "core.fsmonitor=false",
     "core.hooksPath=/dev/null",
     "core.untrackedCache=false",
@@ -237,30 +238,68 @@ def _split_path(untrusted: Sequence[str]) -> tuple[list[str], list[str]]:
     return kept, dropped
 
 
-def _find_git(repo_dir: Path) -> _ResolvedGit:
-    """Resolve git once, by the safe rule in INTERFACES I-14 (SR-013).
+def _git_executable_name() -> str:
+    """``git.exe`` on Windows; ``git`` elsewhere. ``PATHEXT`` is ignored (I-14)."""
+    return "git.exe" if os.name == "nt" else "git"
 
-    ``shutil.which`` searches only the kept ``PATH`` entries, given explicitly, for
-    ``git`` (``git.exe`` on Windows, never ``.cmd``/``.bat``). The match is made
-    absolute and real, and must not lie inside the repo, ``GITHUB_WORKSPACE`` or the
-    cwd (defence in depth: older Windows Pythons may still try the cwd first). The
-    cwd real-path check is skipped only when the cwd is a filesystem root; the
-    repo and ``GITHUB_WORKSPACE`` checks still apply when they equal a root.
 
-    Raises ``GitUnavailable`` if no git exists anywhere on ``PATH`` (head-only mode),
-    and a fixed-text ``ComponentError("gitread")`` if the only git found is in a
-    dropped location (fail closed: a git inside the checkout is never run).
+def _is_runnable_git(path: str) -> bool:
+    """True iff ``path`` is a file and, outside Windows, is executable (I-14)."""
+    if not os.path.isfile(path):
+        return False
+    if os.name != "nt" and not os.access(path, os.X_OK):
+        return False
+    return True
+
+
+def _look_for_git(folders: Sequence[str]) -> str | None:
+    """First runnable git in ``folders``, in PATH order, or ``None``.
+
+    Each folder is probed for exactly one name (``git.exe`` on Windows, ``git``
+    otherwise). The current folder is never prepended; it is only considered
+    when it appears as an absolute kept ``PATH`` entry (I-14, SR N-6).
     """
-    name = "git.exe" if os.name == "nt" else "git"
+    name = _git_executable_name()
+    for folder in folders:
+        candidate = os.path.join(folder, name)
+        if _is_runnable_git(candidate):
+            return candidate
+    return None
+
+
+def _find_git(repo_dir: Path) -> _ResolvedGit:
+    """Resolve git once, by the safe rule in INTERFACES I-14 (SR-013, SR N-6).
+
+    The kept ``PATH`` entries are walked in order, without ``shutil.which``.
+    ``shutil.which`` prepends the current folder even when ``path=`` is given
+    (Python 3.11 and 3.13 on Windows), so a ``git.exe`` at the checkout root
+    would win, fail the containment re-check, and knock the run out. For each
+    kept folder, exactly one name is tested: ``git.exe`` when ``os.name == "nt"``
+    (``PATHEXT`` is ignored; ``.cmd``, ``.bat`` and ``.com`` are never used)
+    and ``git`` elsewhere. A candidate is accepted when it is a file and,
+    outside Windows, is executable (``os.X_OK``). The first accepted candidate
+    wins. The current folder is never searched unless it appears as an
+    absolute kept ``PATH`` entry that survived the drops above.
+
+    The match is made absolute and real, and must not lie inside the repo,
+    ``GITHUB_WORKSPACE`` or the cwd (defence in depth). The cwd real-path
+    check is skipped only when the cwd is a filesystem root; the repo and
+    ``GITHUB_WORKSPACE`` checks still apply when they equal a root.
+
+    Raises ``GitUnavailable`` if no git exists anywhere on ``PATH`` (head-only
+    mode), and a fixed-text ``ComponentError("gitread")`` if the only git
+    found is in a dropped location (fail closed: a git inside the checkout is
+    never run).
+    """
     untrusted = _untrusted_folders(repo_dir)
     kept, dropped = _split_path(untrusted)
-    found = shutil.which(name, path=os.pathsep.join(kept)) if kept else None
+    found = _look_for_git(kept)
     if found is not None:
         real = os.path.realpath(os.path.abspath(found))
         if not any(_is_within(real, f) for f in untrusted):
             return _ResolvedGit(real, os.pathsep.join(kept))
         raise ComponentError(_COMPONENT, _UNTRUSTED_GIT)
-    if dropped and shutil.which(name, path=os.pathsep.join(dropped)) is not None:
+    if dropped and _look_for_git(dropped) is not None:
         raise ComponentError(_COMPONENT, _UNTRUSTED_GIT)
     raise GitUnavailable("git executable not found")
 

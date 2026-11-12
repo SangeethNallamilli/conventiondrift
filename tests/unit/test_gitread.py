@@ -92,7 +92,7 @@ def spy(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Call]]:
         )
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(gitread.subprocess, "Popen", recorder)
+    monkeypatch.setattr(subprocess, "Popen", recorder)
     yield calls
 
 
@@ -203,9 +203,9 @@ def test_environment_is_fixed_and_nothing_else_leaks(
 def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
     repo_dir = Path("/r/repo")  # built before os.name changes, so it stays a PosixPath
-    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(os, "name", "nt")
     nt_env = gitread._environment("/h", "/bin", repo_dir)
-    monkeypatch.setattr(gitread.os, "name", "posix")
+    monkeypatch.setattr(os, "name", "posix")
     posix_env = gitread._environment("/h", "/bin", repo_dir)
     base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES="/r")
     assert nt_env == dict(base, SYSTEMROOT=r"C:\Windows")
@@ -215,9 +215,9 @@ def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> N
 def test_systemroot_absent_on_windows_is_not_invented(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SYSTEMROOT", raising=False)
     repo_dir = Path("/r/repo")
-    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(os, "name", "nt")
     env = gitread._environment("/h", "/bin", repo_dir)
-    monkeypatch.setattr(gitread.os, "name", "posix")
+    monkeypatch.setattr(os, "name", "posix")
     assert "SYSTEMROOT" not in env
 
 
@@ -321,7 +321,7 @@ def test_git_that_cannot_start_raises_git_unavailable(
     def boom(*_a: Any, **_k: Any) -> Any:
         raise PermissionError("exec")
 
-    monkeypatch.setattr(gitread.subprocess, "Popen", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
     with pytest.raises(GitUnavailable):
         GitReader(repo).is_shallow()
 
@@ -454,14 +454,10 @@ def test_drain_discards_everything_with_keep_minus_one() -> None:
     assert chunks == [] and not over.is_set()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
 def test_hanging_git_is_killed_after_the_timeout(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake_git = tmp_path / "bin" / "git"
-    fake_git.parent.mkdir()
-    fake_git.write_text("#!/bin/sh\nexec sleep 30\n")
-    fake_git.chmod(0o755)
+    fake_git = _sleeping_git(tmp_path)
     resolved = gitread._ResolvedGit(str(fake_git), os.environ["PATH"])
     monkeypatch.setattr(gitread, "_find_git", lambda _repo: resolved)
     monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
@@ -475,11 +471,85 @@ def test_hanging_git_is_killed_after_the_timeout(
 # --- SR-013 / I-14: locating git ------------------------------------------------
 
 
-def _fake_git_in(folder: Path, name: str = "git") -> Path:
+def _platform_git_name() -> str:
+    return "git.exe" if os.name == "nt" else "git"
+
+
+def _run_tool(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run ``argv`` if the executable is on PATH; ``None`` if it is missing."""
+    resolved = shutil.which(argv[0])
+    if resolved is None:
+        return None
+    return _REAL_RUN([resolved, *argv[1:]], check=False, capture_output=True, text=True)
+
+
+def _compile_windows_exe(dest: Path, c_source: str, csharp_source: str) -> None:
+    """Compile a tiny console exe so a planted git.exe is actually runnable.
+
+    Tries gcc, clang, cl, then PowerShell Add-Type. Raises if none succeed,
+    rather than skipping.
+    """
+    src = dest.with_suffix(".c")
+    src.write_text(c_source, encoding="utf-8")
+    compilers = (
+        ["gcc", "-O0", "-s", "-o", str(dest), str(src)],
+        ["clang", "-O0", "-s", "-o", str(dest), str(src)],
+        ["cl", "/nologo", "/Fe" + str(dest), str(src)],
+    )
+    errors: list[str] = []
+    for argv in compilers:
+        completed = _run_tool(argv)
+        if completed is None:
+            continue
+        if completed.returncode == 0 and dest.exists():
+            return
+        errors.append(f"{argv[0]}: {completed.stderr or completed.stdout}")
+    csharp = dest.with_suffix(".cs")
+    csharp.write_text(csharp_source, encoding="utf-8")
+    ps = (
+        "Add-Type -OutputType ConsoleApplication "
+        f"-OutputAssembly '{dest}' "
+        f"-TypeDefinition (Get-Content -Raw '{csharp}')"
+    )
+    completed = _run_tool(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+    if completed is not None and completed.returncode == 0 and dest.exists():
+        return
+    if completed is not None:
+        errors.append(f"powershell: {completed.stderr or completed.stdout}")
+    raise RuntimeError(
+        "could not compile a runnable git.exe test stub; tried gcc, clang, cl, "
+        "and PowerShell Add-Type. " + " | ".join(errors)
+    )
+
+
+def _sleeping_git(tmp_path: Path) -> Path:
+    """A fake git that hangs, used by the timeout-kill test. Runnable on Windows."""
+    dest = tmp_path / "bin" / _platform_git_name()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        _compile_windows_exe(
+            dest,
+            "#include <windows.h>\nint main(void) { Sleep(30000); return 0; }\n",
+            "using System.Threading;\n"
+            "class FakeGit { static void Main() { Thread.Sleep(30000); } }\n",
+        )
+    else:
+        dest.write_text("#!/bin/sh\nexec sleep 30\n")
+        dest.chmod(0o755)
+    return dest
+
+
+def _fake_git_in(folder: Path, name: str | None = None) -> Path:
+    """Plant a git named for this platform. Resolution tests never execute it."""
     folder.mkdir(parents=True, exist_ok=True)
-    exe = folder / name
-    exe.write_text("#!/bin/sh\nexit 0\n")
-    exe.chmod(0o755)
+    exe = folder / (name if name is not None else _platform_git_name())
+    # Resolution tests only need the right filename for the PATH walk. A
+    # Windows .exe cannot be a shell script, and these files are never run.
+    if exe.suffix.lower() == ".exe":
+        exe.write_bytes(b"")
+    else:
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
     return exe
 
 
@@ -497,6 +567,16 @@ def _set_path(monkeypatch: pytest.MonkeyPatch, *entries: str | Path) -> None:
     monkeypatch.setenv("PATH", os.pathsep.join(str(e) for e in entries))
 
 
+def test_fake_git_helper_plants_git_exe_when_os_name_is_nt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "name", "nt")
+    exe = _fake_git_in(tmp_path / "trusted")
+    assert exe.name == "git.exe"
+    assert exe.is_file()
+    assert _platform_git_name() == "git.exe"
+
+
 def test_valid_absolute_path_entry_is_used(
     repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,22 +592,72 @@ def test_symlinked_git_is_resolved_to_its_real_path(
     exe = _fake_git_in(tmp_path / "real")
     link_dir = tmp_path / "links"
     link_dir.mkdir()
-    (link_dir / "git").symlink_to(exe)
+    (link_dir / _platform_git_name()).symlink_to(exe)
     _set_path(monkeypatch, link_dir)
     assert gitread._find_git(repo).path == os.path.realpath(exe)
 
 
 @pytest.mark.parametrize("entry", ["", ".", "bin", "./bin", "../cwd/bin"])
+@pytest.mark.parametrize("windows", [False, True], ids=["posix", "nt"])
 def test_empty_dot_and_relative_path_entries_are_dropped(
-    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+    repo: Path,
+    tmp_path: Path,
+    elsewhere: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    windows: bool,
 ) -> None:
-    _fake_git_in(elsewhere)  # ./git, reachable through "" and "."
-    _fake_git_in(elsewhere / "bin")  # ./bin/git, reachable through the relative entries
-    trusted = _fake_git_in(tmp_path / "trusted")
+    if windows:
+        # shutil.which on Windows would search the cwd first and refuse the
+        # planted git.exe, knocking out a later trusted git (SR N-6).
+        monkeypatch.setattr(os, "name", "nt")
+    name = "git.exe" if windows else "git"
+    _fake_git_in(elsewhere, name)  # ./git, reachable through "" and "."
+    _fake_git_in(elsewhere / "bin", name)  # ./bin/git, reachable through the relative entries
+    trusted = _fake_git_in(tmp_path / "trusted", name)
     _set_path(monkeypatch, entry, tmp_path / "trusted")
     found = gitread._find_git(repo)
     assert found.path == os.path.realpath(trusted)
     assert found.search_path == str(tmp_path / "trusted")  # the PATH git runs with
+
+
+def test_relative_bin_entry_outside_untrusted_folders_is_never_chosen(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-3: a relative PATH entry must be dropped even when it resolves
+    # outside the repo, workspace and cwd. A bare "bin" is still inside the
+    # cwd, so the containment check would hide a missing isabs() drop; use
+    # ../bin from a sibling cwd so only the relative-entry rule applies.
+    # If relative entries were kept, the planted git would beat the trusted one.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    planted = _fake_git_in(tmp_path / "bin")
+    trusted = _fake_git_in(tmp_path / "trusted")
+    _set_path(monkeypatch, "../bin", tmp_path / "trusted")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    assert found.path != os.path.realpath(planted)
+    assert found.search_path == str(tmp_path / "trusted")
+    assert "../bin" not in found.search_path.split(os.pathsep)
+
+
+def test_symlink_path_entry_into_the_repo_is_dropped_when_trusted_git_follows(
+    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-3: per-entry realpath must drop a PATH folder that is a symlink into
+    # the repo. Without realpath the entry looks innocent, which() / the walk
+    # would hit the planted git first, and the binary re-check would fail
+    # closed instead of using the later trusted git.
+    _fake_git_in(repo / "tools")
+    innocent = tmp_path / "innocent"
+    innocent.symlink_to(repo / "tools")
+    trusted = _fake_git_in(tmp_path / "trusted")
+    _set_path(monkeypatch, innocent, tmp_path / "trusted")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    assert found.search_path == str(tmp_path / "trusted")
 
 
 @pytest.mark.parametrize("entry", ["", ".", "bin"])
@@ -579,14 +709,14 @@ def test_windows_looks_only_for_git_exe(
     for name in ("git", "git.cmd", "git.bat"):
         _fake_git_in(trusted, name)
     _set_path(monkeypatch, trusted)
-    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(os, "name", "nt")
     try:
         with pytest.raises(GitUnavailable):
             gitread._find_git(repo)
         exe = _fake_git_in(trusted, "git.exe")
         found = gitread._find_git(repo)
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(os, "name", "posix")
     assert found.path == os.path.realpath(exe)
 
 
@@ -596,12 +726,12 @@ def test_windows_git_exe_in_cwd_is_never_run(
     # Windows' own lookup can search the current folder first; ours never does.
     _fake_git_in(elsewhere, "git.exe")
     _set_path(monkeypatch, ".")
-    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(os, "name", "nt")
     try:
         with pytest.raises(ComponentError) as info:
             gitread._find_git(repo)
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
+        monkeypatch.setattr(os, "name", "posix")
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
@@ -654,39 +784,83 @@ def test_trusted_entry_with_git_symlinked_into_the_repo_fails_closed(
     exe = _fake_git_in(repo / "tools")
     link_dir = tmp_path / "links"
     link_dir.mkdir()
-    (link_dir / "git").symlink_to(exe)
+    (link_dir / _platform_git_name()).symlink_to(exe)
     _set_path(monkeypatch, link_dir)
     with pytest.raises(ComponentError) as info:
         gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
-def test_which_result_in_cwd_is_refused(
+def test_windows_cwd_git_exe_does_not_beat_a_trusted_path_entry(
     repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Older Windows Pythons' which() may still return a cwd match; it is refused.
-    _fake_git_in(tmp_path / "trusted")
-    cwd_git = _fake_git_in(elsewhere)
+    # N-6 (a): shutil.which on Windows searches the cwd first even when path=
+    # is given. A planted git.exe in the cwd must not hide a trusted PATH git.
+    monkeypatch.setattr(os, "name", "nt")
+    _fake_git_in(elsewhere, "git.exe")
+    trusted = _fake_git_in(tmp_path / "trusted", "git.exe")
     _set_path(monkeypatch, tmp_path / "trusted")
-    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: str(cwd_git))
-    with pytest.raises(ComponentError, match="git found only"):
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    assert found.search_path == str(tmp_path / "trusted")
+
+
+def test_windows_git_cmd_bat_and_com_are_never_picked(
+    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-6 (b): PATHEXT is ignored; only git.exe counts on Windows.
+    monkeypatch.setattr(os, "name", "nt")
+    folder = tmp_path / "trusted"
+    for name in ("git.cmd", "git.bat", "git.com"):
+        _fake_git_in(folder, name)
+    _set_path(monkeypatch, folder)
+    with pytest.raises(GitUnavailable):
         gitread._find_git(repo)
 
 
-def test_which_gets_the_filtered_path_explicitly(
+def test_non_executable_posix_git_is_skipped_for_a_later_folder(
     repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    exe = _fake_git_in(tmp_path / "trusted")
-    _set_path(monkeypatch, ".", tmp_path / "trusted")
-    seen: list[Any] = []
+    # N-6 (c): on POSIX a non-executable `git` is not accepted.
+    first = _fake_git_in(tmp_path / "first")
+    first.chmod(0o644)
+    trusted = _fake_git_in(tmp_path / "second")
+    _set_path(monkeypatch, tmp_path / "first", tmp_path / "second")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    assert found.search_path == os.pathsep.join([str(tmp_path / "first"), str(tmp_path / "second")])
 
-    def which(name: str, path: str | None = None) -> str:
-        seen.append((name, path))
-        return str(exe)
 
-    monkeypatch.setattr(gitread.shutil, "which", which)
-    gitread._find_git(repo)
-    assert seen == [("git", str(tmp_path / "trusted"))]
+def test_directory_named_git_is_skipped(
+    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-6 (d): a directory named git / git.exe is not a candidate.
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "git").mkdir()
+    (first / "git.exe").mkdir()
+    trusted = _fake_git_in(tmp_path / "second")
+    trusted_win = _fake_git_in(tmp_path / "second", "git.exe")
+    _set_path(monkeypatch, first, tmp_path / "second")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    monkeypatch.setattr(os, "name", "nt")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted_win)
+
+
+def test_path_order_is_respected(
+    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-6 (e): the first runnable git on the kept PATH wins.
+    first = _fake_git_in(tmp_path / "first")
+    second = _fake_git_in(tmp_path / "second")
+    _set_path(monkeypatch, tmp_path / "first", tmp_path / "second")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(first)
+    _set_path(monkeypatch, tmp_path / "second", tmp_path / "first")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(second)
 
 
 def test_git_is_resolved_once_per_reader(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -715,7 +889,7 @@ def test_different_windows_drives_are_not_within(monkeypatch: pytest.MonkeyPatch
     def boom(_paths: Any) -> str:
         raise ValueError("Paths don't have the same drive")
 
-    monkeypatch.setattr(gitread.os.path, "commonpath", boom)
+    monkeypatch.setattr(os.path, "commonpath", boom)
     assert gitread._is_within("/x/git", "/y") is False
 
 
@@ -728,8 +902,8 @@ def test_is_filesystem_root_posix() -> None:
 
 
 def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gitread.os, "name", "nt")
-    monkeypatch.setattr(gitread.os, "path", ntpath)
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "path", ntpath)
     try:
         assert gitread._is_filesystem_root("C:\\") is True
         assert gitread._is_filesystem_root("C:/") is True
@@ -739,28 +913,24 @@ def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch)
         assert gitread._is_filesystem_root("Z:\\tools") is False
         assert gitread._is_filesystem_root("git") is False
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
-        monkeypatch.setattr(gitread.os, "path", os.path)
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "path", os.path)
 
 
 def _posix_root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
     """Simulate cwd=/ without chdir or creating a repo at /."""
-    monkeypatch.setattr(gitread.os, "getcwd", lambda: "/")
+    monkeypatch.setattr(os, "getcwd", lambda: "/")
     monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
 
 
-def _which_for(locations: dict[str, str]):
-    """Return a shutil.which stand-in that maps a PATH entry to an executable."""
+def _accept_as_git(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
+    """Treat each path as a runnable git, for filesystem-root simulations."""
+    accepted = set(paths)
 
-    def which(name: str, path: str | None = None) -> str | None:
-        if not path:
-            return None
-        for entry in path.split(gitread.os.pathsep):
-            if entry in locations:
-                return locations[entry]
-        return None
+    def is_runnable(path: str) -> bool:
+        return path in accepted
 
-    return which
+    monkeypatch.setattr(gitread, "_is_runnable_git", is_runnable)
 
 
 def test_cwd_at_posix_root_keeps_usr_bin(
@@ -771,7 +941,7 @@ def test_cwd_at_posix_root_keeps_usr_bin(
     kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
     assert "/usr/bin" in kept
     assert "/usr/bin" not in dropped
-    monkeypatch.setattr(gitread.shutil, "which", _which_for({"/usr/bin": "/usr/bin/git"}))
+    _accept_as_git(monkeypatch, "/usr/bin/git")
     found = gitread._find_git(repo)
     assert found.path == os.path.realpath("/usr/bin/git")
     assert found.search_path == "/usr/bin"
@@ -795,7 +965,7 @@ def test_repo_at_posix_root_refuses_usr_bin_git(monkeypatch: pytest.MonkeyPatch)
     kept, dropped = gitread._split_path(gitread._untrusted_folders(Path("/")))
     assert kept == []
     assert "/usr/bin" in dropped
-    monkeypatch.setattr(gitread.shutil, "which", _which_for({"/usr/bin": "/usr/bin/git"}))
+    _accept_as_git(monkeypatch, "/usr/bin/git")
     with pytest.raises(ComponentError) as info:
         gitread._find_git(Path("/"))
     assert info.value.message == gitread._UNTRUSTED_GIT
@@ -807,7 +977,7 @@ def test_repo_at_posix_root_with_no_git_is_git_unavailable(
 ) -> None:
     _posix_root_cwd(monkeypatch)
     _set_path(monkeypatch, "/usr/bin")
-    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setattr(gitread, "_is_runnable_git", lambda _path: False)
     with pytest.raises(GitUnavailable):
         gitread._find_git(Path("/"))
 
@@ -815,10 +985,10 @@ def test_repo_at_posix_root_with_no_git_is_git_unavailable(
 def test_realpath_check_refuses_git_inside_repo_at_posix_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Defence in depth: even if which() returned a kept-path hit under /, refuse it.
+    # Defence in depth: even if a kept-path walk returned a hit under /, refuse it.
     _posix_root_cwd(monkeypatch)
     _set_path(monkeypatch, "/usr/bin")
-    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: "/usr/bin/git")
+    monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: "/usr/bin/git")
     with pytest.raises(ComponentError) as info:
         gitread._find_git(Path("/"))
     assert info.value.message == gitread._UNTRUSTED_GIT
@@ -827,23 +997,23 @@ def test_realpath_check_refuses_git_inside_repo_at_posix_root(
 def test_workspace_at_posix_root_still_drops_usr_bin(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(gitread.os, "getcwd", lambda: "/")
+    monkeypatch.setattr(os, "getcwd", lambda: "/")
     monkeypatch.setenv("GITHUB_WORKSPACE", "/")
     _set_path(monkeypatch, "/usr/bin")
     kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
     assert "/usr/bin" not in kept
     assert "/usr/bin" in dropped
-    monkeypatch.setattr(gitread.shutil, "which", _which_for({"/usr/bin": "/usr/bin/git"}))
+    _accept_as_git(monkeypatch, "/usr/bin/git")
     with pytest.raises(ComponentError) as info:
         gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
 def _windows_paths(monkeypatch: pytest.MonkeyPatch, cwd: str) -> None:
-    monkeypatch.setattr(gitread.os, "name", "nt")
-    monkeypatch.setattr(gitread.os, "path", ntpath)
-    monkeypatch.setattr(gitread.os, "pathsep", ";")
-    monkeypatch.setattr(gitread.os, "getcwd", lambda: cwd)
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "path", ntpath)
+    monkeypatch.setattr(os, "pathsep", ";")
+    monkeypatch.setattr(os, "getcwd", lambda: cwd)
     monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
 
 
@@ -857,13 +1027,13 @@ def test_cwd_at_windows_drive_root_keeps_git_on_that_drive(
     assert kept == ["C:\\Program Files\\Git\\cmd"]
     assert "C:\\Program Files\\Git\\cmd" not in dropped
     exe = "C:\\Program Files\\Git\\cmd\\git.exe"
-    monkeypatch.setattr(gitread.shutil, "which", _which_for({"C:\\Program Files\\Git\\cmd": exe}))
+    _accept_as_git(monkeypatch, exe)
     try:
         found = gitread._find_git(repo)
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
-        monkeypatch.setattr(gitread.os, "path", os.path)
-        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "path", os.path)
+        monkeypatch.setattr(os, "pathsep", os.pathsep)
     assert found.path == ntpath.realpath(exe)
     assert found.search_path == "C:\\Program Files\\Git\\cmd"
 
@@ -875,7 +1045,7 @@ def test_repo_at_windows_drive_root_never_uses_git_inside_it(
     _windows_paths(monkeypatch, root)
     tools = root + "tools"
     monkeypatch.setenv("PATH", tools)
-    monkeypatch.setattr(gitread.shutil, "which", _which_for({tools: tools + "\\git.exe"}))
+    _accept_as_git(monkeypatch, tools + "\\git.exe")
     kept, dropped = gitread._split_path(gitread._untrusted_folders(Path(root)))
     try:
         assert kept == []
@@ -883,9 +1053,9 @@ def test_repo_at_windows_drive_root_never_uses_git_inside_it(
         with pytest.raises(ComponentError) as info:
             gitread._find_git(Path(root))
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
-        monkeypatch.setattr(gitread.os, "path", os.path)
-        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "path", os.path)
+        monkeypatch.setattr(os, "pathsep", os.pathsep)
     assert info.value.message == gitread._UNTRUSTED_GIT
     assert info.value.component == "gitread"
 
@@ -895,14 +1065,14 @@ def test_repo_at_windows_drive_root_with_no_git_is_git_unavailable(
 ) -> None:
     _windows_paths(monkeypatch, "C:\\")
     monkeypatch.setenv("PATH", "C:\\tools")
-    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: None)
+    monkeypatch.setattr(gitread, "_is_runnable_git", lambda _path: False)
     try:
         with pytest.raises(GitUnavailable):
             gitread._find_git(Path("C:\\"))
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
-        monkeypatch.setattr(gitread.os, "path", os.path)
-        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "path", os.path)
+        monkeypatch.setattr(os, "pathsep", os.pathsep)
 
 
 def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
@@ -910,14 +1080,14 @@ def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
 ) -> None:
     _windows_paths(monkeypatch, "C:\\")
     monkeypatch.setenv("PATH", "C:\\tools")
-    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: "C:\\tools\\git.exe")
+    monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: "C:\\tools\\git.exe")
     try:
         with pytest.raises(ComponentError) as info:
             gitread._find_git(Path("C:\\"))
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
-        monkeypatch.setattr(gitread.os, "path", os.path)
-        monkeypatch.setattr(gitread.os, "pathsep", os.pathsep)
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "path", os.path)
+        monkeypatch.setattr(os, "pathsep", os.pathsep)
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
@@ -926,13 +1096,44 @@ def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
 
 def _git_printing(tmp_path: Path) -> Path:
     """A fake git whose ``--version`` prints $GIT_FAKE_VERSION and exits $GIT_FAKE_CODE."""
-    exe = tmp_path / "fakebin" / "git"
+    exe = tmp_path / "fakebin" / _platform_git_name()
     exe.parent.mkdir(parents=True, exist_ok=True)
-    exe.write_bytes(
-        b'#!/bin/sh\nif [ "$1" = --version ]; then printf \'%s\' "$GIT_FAKE_VERSION"; '
-        b'exit "$GIT_FAKE_CODE"; fi\nexit 0\n'
-    )
-    exe.chmod(0o755)
+    if os.name == "nt":
+        _compile_windows_exe(
+            exe,
+            (
+                "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+                "int main(int argc, char **argv) {\n"
+                '    if (argc >= 2 && strcmp(argv[1], "--version") == 0) {\n'
+                '        const char *v = getenv("GIT_FAKE_VERSION");\n'
+                '        const char *c = getenv("GIT_FAKE_CODE");\n'
+                "        if (v) fputs(v, stdout);\n"
+                "        return c ? atoi(c) : 0;\n"
+                "    }\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            (
+                "using System;\n"
+                "class FakeGit {\n"
+                "  static int Main(string[] args) {\n"
+                '    if (args.Length >= 1 && args[0] == "--version") {\n'
+                "      string v = Environment.GetEnvironmentVariable(\n"
+                '          "GIT_FAKE_VERSION"); Console.Write(v ?? "");\n'
+                '      string c = Environment.GetEnvironmentVariable("GIT_FAKE_CODE") ?? "0";\n'
+                "      int code; return int.TryParse(c, out code) ? code : 0;\n"
+                "    }\n"
+                "    return 0;\n"
+                "  }\n"
+                "}\n"
+            ),
+        )
+    else:
+        exe.write_bytes(
+            b'#!/bin/sh\nif [ "$1" = --version ]; then printf \'%s\' "$GIT_FAKE_VERSION"; '
+            b'exit "$GIT_FAKE_CODE"; fi\nexit 0\n'
+        )
+        exe.chmod(0o755)
     return exe
 
 
@@ -957,7 +1158,6 @@ def fake_version(repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     yield set_version
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
 @pytest.mark.parametrize(
     "text",
     [
@@ -977,7 +1177,6 @@ def test_supported_git_versions_pass(repo: Path, fake_version: Any, text: str) -
     assert reader._version_ok is True
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
 @pytest.mark.parametrize(
     ("text", "code"),
     [
@@ -1379,13 +1578,16 @@ def test_max_count_is_not_allowed_where_it_is_not_needed() -> None:
 #   GIT_NO_REPLACE_OBJECTS=1        -> test_no_replace_objects_is_load_bearing
 #   GIT_CEILING_DIRECTORIES         -> test_ceiling_directories_is_load_bearing
 #   HOME (fresh temp dir)           -> test_global_config_in_inherited_home_is_ignored
-# Not observable through the allowed subcommands, so kept as defence in depth
-# (a test can't fail when they are removed): core.fsmonitor, core.hooksPath,
-# core.untrackedCache, GIT_OPTIONAL_LOCKS (no allowed subcommand reads the index or
-# runs hooks); diff.external= and --no-ext-diff (log/show/diff-tree run an external
-# diff only with --ext-diff, which the option allowlist refuses); core.pager=cat
-# (stdout is never a tty); GIT_TERMINAL_PROMPT (no transport is allowed);
-# GIT_CONFIG_GLOBAL (HOME is empty and XDG_CONFIG_HOME is not passed);
+# core.fsmonitor=false is needed defence: plain diff-tree runs a repo's
+# fsmonitor (git 2.30, 2.37 and 2.47). The load-bearing behaviour test is
+# due in T-008, so it is not added here.
+# Not observable through T-007's allowed subcommands, so kept as defence in
+# depth (a test can't fail when they are removed): core.hooksPath,
+# core.untrackedCache, GIT_OPTIONAL_LOCKS (no T-007 subcommand reads the index
+# or runs hooks); diff.external= and --no-ext-diff (log/show/diff-tree run an
+# external diff only with --ext-diff, which the option allowlist refuses);
+# core.pager=cat (stdout is never a tty); GIT_TERMINAL_PROMPT (no transport is
+# allowed); GIT_CONFIG_GLOBAL (HOME is empty and XDG_CONFIG_HOME is not passed);
 # GIT_CONFIG_NOSYSTEM and GIT_ATTR_NOSYSTEM (need root to plant system files).
 
 
