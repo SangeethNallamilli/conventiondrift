@@ -1,0 +1,161 @@
+"""C9 verdict engine: counts plus thresholds give one verdict per rule per side.
+
+Pure (DESIGN §1, I-11 C9): no I/O, no subprocess, no clock, and it never raises
+for any input the model types allow. Everything is integer math on site counts;
+percentages exist only for display and are computed by C11 (I-9, I-13 ``Counts``).
+
+The algorithm is DESIGN §10 S1, applied in its fixed order:
+
+1. No checker, or ambiguous: Not verifiable.
+2. ``relevant < min-sites``: Insufficient data.
+3. ``overall >= holds``: Holds.
+4. Recent available (at least one recent relevant site):
+   Stale if ``overall < stale.overall`` and ``recent < stale.recent``;
+   else Migrating if ``overall < migrating.overall`` and ``recent >= migrating.recent``;
+   else Contested.
+5. Recent unavailable: Stale if ``overall < stale.overall``, else Contested.
+   Migrating is unreachable here, because it needs recent adherence (AC-F4.12).
+
+Threshold validation (``stale.overall <= migrating.overall <= holds`` and
+``stale.recent <= migrating.recent``, falling back to defaults) is C5's job; C9
+applies whatever ``Thresholds`` it is given.
+"""
+
+from collections.abc import Collection, Iterable, Sequence
+from typing import Literal
+
+from conventiondrift.model import (
+    Counts,
+    Rule,
+    RuleMatch,
+    SideResult,
+    Site,
+    SiteResult,
+    Thresholds,
+    Verdict,
+)
+
+__all__ = ["decide", "follows", "pct_ge", "side_result"]
+
+RecentUnavailableReason = Literal["no history", "no relevant sites in the window"]
+
+
+def pct_ge(following: int, relevant: int, threshold: int) -> bool:
+    """True when ``following / relevant`` is at least ``threshold`` percent.
+
+    Exact integer form from S1 and I-9: ``following*100 >= threshold*relevant``.
+    With ``relevant == 0`` this is ``0 >= 0``, i.e. True; step 2 normally stops an
+    empty count before any threshold is compared.
+    """
+    return following * 100 >= threshold * relevant
+
+
+def follows(option: str, match: RuleMatch) -> bool:
+    """I-10: a site follows when its option is preferred, or, when nothing is
+    preferred, when its option is not prohibited. Otherwise it contradicts."""
+    if match.preferred:
+        return option in match.preferred
+    return option not in match.prohibited
+
+
+def decide(
+    *,
+    verifiable: bool,
+    overall: Counts,
+    recent: Counts | None,
+    thresholds: Thresholds,
+) -> Verdict:
+    """Apply S1 in its fixed order.
+
+    ``recent`` is None when recent adherence is unavailable (no history, or no
+    relevant site in the window). A ``Counts`` with zero relevant sites is treated
+    the same way, since S1 defines "available" as at least one recent relevant site.
+    """
+    t = thresholds
+    if not verifiable:
+        return Verdict.NOT_VERIFIABLE
+    if overall.relevant < t.min_sites:
+        return Verdict.INSUFFICIENT
+    if pct_ge(overall.following, overall.relevant, t.holds):
+        return Verdict.HOLDS
+    overall_below_stale = not pct_ge(overall.following, overall.relevant, t.stale_overall)
+    if recent is None or recent.relevant < 1:
+        return Verdict.STALE if overall_below_stale else Verdict.CONTESTED
+    if overall_below_stale and not pct_ge(recent.following, recent.relevant, t.stale_recent):
+        return Verdict.STALE
+    if not pct_ge(overall.following, overall.relevant, t.migrating_overall) and pct_ge(
+        recent.following, recent.relevant, t.migrating_recent
+    ):
+        return Verdict.MIGRATING
+    return Verdict.CONTESTED
+
+
+def _count(results: Sequence[SiteResult]) -> Counts:
+    following = sum(1 for r in results if r.follows)
+    return Counts(
+        following=following, contradicting=len(results) - following, relevant=len(results)
+    )
+
+
+def side_result(
+    rule: Rule,
+    sites: Iterable[Site],
+    *,
+    options: Collection[str],
+    recent_lines: Collection[tuple[str, int]] | None,
+    thresholds: Thresholds,
+) -> SideResult:
+    """Build the C9 ``SideResult`` for one rule on one side.
+
+    - ``sites``: this checker's sites on this side that fall inside the rule's scope.
+    - ``options``: the checker's ``options`` (I-10). Only sites whose option is in
+      it are relevant; any other site is dropped.
+    - ``recent_lines``: the ``(file, line)`` pairs C8 dated as recent on this side,
+      or None when recent adherence is unavailable for the run (head-only mode, no
+      ``HEAD`` in scan mode, or a C8 failure).
+    - ``thresholds``: the effective, already validated thresholds.
+
+    A rule with no checker or no match (no mapping, or an ambiguous one) is
+    Not verifiable and carries no sites.
+    """
+    # QUESTION: is scope filtering (rule.scope_dir, scope flags) done by the caller
+    # (T-028) before C9, as assumed here? C9 counts every site it is given.
+    # QUESTION: ignored and disabled rules get the normal verdict here (C7 gives a
+    # disabled checker no sites, so that is Insufficient data); is a distinct
+    # outcome wanted for AC-F3.14's "not evaluated"?
+    # QUESTION: a Not verifiable side still gets a recent_unavailable_reason
+    # ("no history" or "no relevant sites in the window") rather than None.
+    match = rule.match if rule.checker is not None else None
+    results: list[SiteResult] = []
+    if match is not None:
+        for s in sites:
+            if s.option in options:
+                recent = recent_lines is not None and (s.file, s.line) in recent_lines
+                results.append(SiteResult(site=s, follows=follows(s.option, match), recent=recent))
+    results.sort(key=lambda r: (r.site.file, r.site.line, r.site.col, r.site.option))
+
+    overall = _count(results)
+    recent_counts: Counts | None = None
+    # QUESTION: SideResult's reason Literal has no "internal error"; a C8 failure
+    # (Window.unavailable_reason == "internal error") is reported here as
+    # "no history", with the run-wide reason left on Window.
+    reason: RecentUnavailableReason | None
+    if recent_lines is None:
+        reason = "no history"
+    else:
+        in_window = _count([r for r in results if r.recent])
+        if in_window.relevant:
+            recent_counts = in_window
+            reason = None
+        else:
+            reason = "no relevant sites in the window"
+    verdict = decide(
+        verifiable=match is not None, overall=overall, recent=recent_counts, thresholds=thresholds
+    )
+    return SideResult(
+        verdict=verdict,
+        sites=tuple(results),
+        overall=overall,
+        recent=recent_counts,
+        recent_unavailable_reason=reason,
+    )
