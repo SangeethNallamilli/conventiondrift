@@ -10,7 +10,8 @@ import os
 import socket
 import stat
 import tempfile
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -343,11 +344,62 @@ def test_sibling_prefix_is_not_contained(tmp_path: Path) -> None:
 # ---- A-3 #2: FIFOs, sockets, devices are never opened ---------------------------------
 
 
+FIFO_TIMEOUT_S = 10.0
+
+
+def _within(seconds: float, fn: Callable[[], str]) -> str:
+    """Run ``fn`` in a daemon thread; fail (instead of hanging pytest) if it blocks."""
+    out: list[str] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            out.append(fn())
+        except BaseException as exc:  # noqa: BLE001 - pytest.fail is a BaseException; re-raised below
+            errors.append(exc)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        pytest.fail(f"blocked for over {seconds}s: a FIFO was opened without O_NONBLOCK")
+    if errors:
+        raise errors[0]
+    return out[0]
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX")
 def test_fifo_skipped_without_opening(tmp_path: Path, strategy: str) -> None:
     os.mkfifo(tmp_path / "AGENTS.md")
-    # Opening a FIFO for reading without O_NONBLOCK would hang; reaching here proves it wasn't.
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SPECIAL
+    reason = _within(
+        FIFO_TIMEOUT_S,
+        lambda: _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction"),
+    )
+    assert reason == REASON_SPECIAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX")
+def test_fifo_swapped_in_before_open_does_not_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    """lstat saw a regular file, but a FIFO is what os.open gets: O_NONBLOCK keeps it
+    from blocking, and the fstat on the handle refuses it (SR-012 F6)."""
+    os.mkfifo(tmp_path / "a.py")
+    (tmp_path / "regular").write_text("x")
+    real_lstat = os.lstat
+    regular = real_lstat(tmp_path / "regular")
+
+    def fake_lstat(p: str, *, dir_fd: int | None = None) -> os.stat_result:
+        st = real_lstat(p, dir_fd=dir_fd)
+        if str(p).endswith("a.py"):
+            return os.stat_result((regular.st_mode, *st[1:]))  # FIFO's inode, file's mode
+        return st
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    reason = _within(
+        FIFO_TIMEOUT_S, lambda: _reason(read_worktree_file, tmp_path, "a.py", "python")
+    )
+    assert reason == REASON_SPECIAL
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="POSIX")
