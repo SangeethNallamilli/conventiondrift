@@ -1,11 +1,69 @@
-# Changes to CI and the Action entry point need the repo owner's review.
+# CODEOWNERS: INFORMATIONAL ROUTING ONLY (D-RD-01).
+#
+# Every agent pushes and reviews as the one shared account @SangeethNallamilli,
+# so every entry names that account and the comment above each group names the
+# ROLE that must review it. "Require review from Code Owners" stays OFF in
+# branch protection: with one account, the PR author is the only code owner and
+# GitHub never lets an author approve their own PR, so it would deadlock every
+# merge. The enforced gate is the required `approval-check` job
+# (.github/workflows/approval.yml), whose path rules live in
+# .github/approval-policy.json. Keep the two in step: change both together.
+#
+# Code review: every PR needs one Code Reviewer (CR1 or CR2, routed by the TL);
+# both CRs if INTERFACES.md changes or the PR has > 400 changed lines.
+
+# ---- Security Reviewer (SR): CI, workflows, the approval gate itself --------
 /.github/workflows/ @SangeethNallamilli
-/action.yml @SangeethNallamilli
+/.github/scripts/ @SangeethNallamilli
+/.github/actions/ @SangeethNallamilli
 /.github/CODEOWNERS @SangeethNallamilli
-# Supply chain and security docs (SR, 2026-11-12). Add /entry/ once it exists (T-24).
+/.github/approval-policy.json @SangeethNallamilli
+/.github/dependabot.yml @SangeethNallamilli
+/action.yml @SangeethNallamilli
+/action.yaml @SangeethNallamilli
+/scripts/ci/ @SangeethNallamilli
+
+# ---- SR: dependencies and supply chain ---------------------------------------
 /pyproject.toml @SangeethNallamilli
 /requirements/ @SangeethNallamilli
+requirements*.txt @SangeethNallamilli
+requirements*.in @SangeethNallamilli
+*.lock @SangeethNallamilli
+/setup.py @SangeethNallamilli
+/setup.cfg @SangeethNallamilli
 /src/conventiondrift/_vendor/ @SangeethNallamilli
-/scripts/ci/ @SangeethNallamilli
+
+# ---- SR: inputs and file handling (discovery, safefs, paths, config/policy) --
+/src/conventiondrift/discover/ @SangeethNallamilli
+/src/conventiondrift/**/safefs*.py @SangeethNallamilli
+/src/conventiondrift/**/paths.py @SangeethNallamilli
+/src/conventiondrift/policy/ @SangeethNallamilli
+/src/conventiondrift/**/config.py @SangeethNallamilli
+/src/conventiondrift/gitread*.py @SangeethNallamilli
+/src/conventiondrift/render/escape.py @SangeethNallamilli
+
+# ---- SR: network, credentials, permissions -----------------------------------
+/src/conventiondrift/github*.py @SangeethNallamilli
+/src/conventiondrift/**/http*.py @SangeethNallamilli
+/src/conventiondrift/**/net/ @SangeethNallamilli
+/src/conventiondrift/**/*auth*.py @SangeethNallamilli
+/src/conventiondrift/**/*token*.py @SangeethNallamilli
+/src/conventiondrift/**/*credential*.py @SangeethNallamilli
+/src/conventiondrift/**/*secret*.py @SangeethNallamilli
+/src/conventiondrift/**/*permission*.py @SangeethNallamilli
+/src/conventiondrift/entry/ @SangeethNallamilli
+
+# ---- SR: security docs -------------------------------------------------------
 /SECURITY.md @SangeethNallamilli
 /THREAT-MODEL.md @SangeethNallamilli
+
+# ---- Test Engineer (TE): spec tests, fixtures, strategy, coverage settings ---
+# (Coverage settings in pyproject.toml are also routed to TE by the policy's
+# patch trigger; the pyproject line above already routes the file to SR.)
+/tests/spec/ @SangeethNallamilli
+/tests/fixtures/ @SangeethNallamilli
+/tests/snapshot/approved/ @SangeethNallamilli
+/TEST-STRATEGY.md @SangeethNallamilli
+/.coveragerc @SangeethNallamilli
+/scripts/ci/check_coverage.py @SangeethNallamilli
+/scripts/ci/check_mutation.py @SangeethNallamilli

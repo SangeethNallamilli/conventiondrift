@@ -1,0 +1,174 @@
+# Approval gate (D-RD-01). Every agent uses ONE shared GitHub account, so
+# GitHub reviews/CODEOWNERS cannot tell roles apart. Reviewers record
+# approvals as PR conversation comments instead:
+#   APPROVED-BY: <Role> @ <full 40-char head SHA>
+#   CHANGES-REQUESTED-BY: <Role>        (optional "@ <sha>")
+# The `approval-check` job verifies the required roles' approvals are
+# RECORDED for the exact current head. It proves recording, not identity.
+#
+# Design (least privilege):
+# - Workflow-level permissions are {}; each job asks only for what it needs.
+# - `approval-check` (pull_request only): contents/pull-requests/issues READ.
+#   It checks out the PR's BASE commit and runs the BASE copy of
+#   .github/scripts/approval_check.py and .github/approval-policy.json, so a
+#   PR cannot weaken its own gate by editing them. It never checks out or
+#   runs PR code. Event data reaches scripts through env vars only.
+# - `approval-script-tests` (pull_request only): runs the PR's own unit
+#   tests for the checker with contents: read only and no secrets, the same
+#   trust level as CI. It is not the gate.
+# - `approval-rerun` (issue_comment on a PR only): a comment-triggered run's
+#   check is attached to main, not the PR head, so it cannot satisfy a
+#   required check. This job holds the ONLY write scope here,
+#   `actions: write`, and uses it for one thing: re-running the latest
+#   `approval-check` job of the latest pull_request run for the PR's current
+#   head SHA (found via the API from the PR number). No checkout, no
+#   third-party action, and no comment/PR text is ever interpolated into a
+#   script. issue_comment always runs the default-branch copy of this file.
+#   No zero-write alternative exists: a commit status needs statuses: write,
+#   and nothing else can make a pull_request check re-evaluate.
+# This file never uses the banned base-context trigger (see check_action_pins.py).
+name: Approval
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions: {}
+
+concurrency:
+  group: approval-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  approval-check:
+    name: approval-check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Check out the BASE commit's gate script and policy (never PR code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          path: gate
+          sparse-checkout: |
+            .github/scripts
+            .github/approval-policy.json
+          sparse-checkout-cone-mode: false
+      - name: Require the gate on the base commit
+        run: |
+          if [ ! -f gate/.github/scripts/approval_check.py ] || [ ! -f gate/.github/approval-policy.json ]; then
+            echo "::error::The base commit has no approval_check.py/approval-policy.json." \
+              "This is expected only for the PR that introduces the gate; its approvals" \
+              "are verified by hand (D-RD-01)."
+            exit 1
+          fi
+      - name: Verify recorded approvals for the head SHA
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 gate/.github/scripts/approval_check.py --policy gate/.github/approval-policy.json
+
+  approval-script-tests:
+    name: approval-script-tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests for the approval checker (outside tests/, no coverage impact)
+        run: python3 -m unittest discover -s .github/scripts/tests -v
+
+  approval-rerun:
+    name: approval-rerun
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    concurrency:
+      group: approval-rerun-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Re-run approval-check for the PR's current head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, time, urllib.error, urllib.request
+
+          API = "https://api.github.com"
+          repo = os.environ["REPO"]
+          pr = os.environ["PR_NUMBER"]
+          if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo) or not pr.isdigit():
+              sys.exit("bad REPO or PR_NUMBER")
+
+          def call(method, path, auth=True):
+              req = urllib.request.Request(API + path, method=method)  # noqa: S310
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              if auth:
+                  req.add_header("Authorization", "Bearer " + os.environ["GH_TOKEN"])
+              with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+                  body = resp.read()
+              return json.loads(body) if body else None
+
+          # Head SHA from the API, by PR number only. This job's token has no
+          # pull-requests scope; if it can't read the PR, fall back to an
+          # anonymous read (the repo is public).
+          try:
+              info = call("GET", f"/repos/{repo}/pulls/{pr}")
+          except urllib.error.HTTPError:
+              info = call("GET", f"/repos/{repo}/pulls/{pr}", auth=False)
+          if info.get("state") != "open":
+              print(f"PR #{pr} is not open; nothing to re-run")
+              sys.exit(0)
+          head = info["head"]["sha"]
+          if not re.fullmatch(r"[0-9a-f]{40}", head):
+              sys.exit("unexpected head sha")
+
+          def latest_run():
+              runs = call(
+                  "GET",
+                  f"/repos/{repo}/actions/workflows/approval.yml/runs"
+                  f"?event=pull_request&head_sha={head}&per_page=50",
+              )["workflow_runs"]
+              runs = [r for r in runs if r.get("head_sha") == head]
+              return max(runs, key=lambda r: r["created_at"]) if runs else None
+
+          run = latest_run()
+          if run is None:
+              print(f"::warning::No pull_request Approval run for {head}; push or edit the PR to start one.")
+              sys.exit(0)
+          deadline = time.time() + 8 * 60
+          while run["status"] != "completed" and time.time() < deadline:
+              print(f"run {run['id']} is {run['status']}; waiting")
+              time.sleep(15)
+              run = call("GET", f"/repos/{repo}/actions/runs/{int(run['id'])}")
+          if run["status"] != "completed":
+              sys.exit(f"run {run['id']} did not finish in time; re-run approval-check by hand")
+          jobs = call("GET", f"/repos/{repo}/actions/runs/{int(run['id'])}/jobs?per_page=100")["jobs"]
+          job = next((j for j in jobs if j["name"] == "approval-check"), None)
+          if job is None:
+              sys.exit(f"run {run['id']} has no approval-check job")
+          call("POST", f"/repos/{repo}/actions/jobs/{int(job['id'])}/rerun")
+          print(f"re-ran approval-check job {job['id']} (run {run['id']}) for head {head}")
+          PY

@@ -1,0 +1,162 @@
+{
+  "_comment": "Approval-check policy (D-RD-01). Read by .github/scripts/approval_check.py from the PR BASE commit, so a PR cannot loosen its own gate. Globs: '**' matches across '/', '*' and '?' stay within one path segment. Paths are repo-relative with '/' separators.",
+  "version": 1,
+  "roles": [
+    "Code Reviewer 1",
+    "Code Reviewer 2",
+    "Security Reviewer",
+    "Test Engineer",
+    "QA / Verifier",
+    "Tech Lead",
+    "Architect",
+    "Product Manager",
+    "Technical Writer",
+    "Release/DevOps",
+    "Software Engineer 1",
+    "Software Engineer 2",
+    "Software Engineer 3"
+  ],
+  "aliases": {
+    "CR1": "Code Reviewer 1",
+    "CR 1": "Code Reviewer 1",
+    "CR2": "Code Reviewer 2",
+    "CR 2": "Code Reviewer 2",
+    "SR": "Security Reviewer",
+    "TE": "Test Engineer",
+    "QA": "QA / Verifier",
+    "QA Verifier": "QA / Verifier",
+    "Verifier": "QA / Verifier",
+    "TL": "Tech Lead",
+    "Arch": "Architect",
+    "PM": "Product Manager",
+    "TW": "Technical Writer",
+    "RD": "Release/DevOps",
+    "Release DevOps": "Release/DevOps",
+    "Release/DevOps Engineer": "Release/DevOps",
+    "SE1": "Software Engineer 1",
+    "SE2": "Software Engineer 2",
+    "SE3": "Software Engineer 3"
+  },
+  "branch_prefixes": {
+    "se1/": "Software Engineer 1",
+    "se2/": "Software Engineer 2",
+    "se3/": "Software Engineer 3",
+    "rd/": "Release/DevOps",
+    "te/": "Test Engineer",
+    "qa/": "QA / Verifier",
+    "sr/": "Security Reviewer",
+    "cr1/": "Code Reviewer 1",
+    "cr2/": "Code Reviewer 2",
+    "tw/": "Technical Writer",
+    "pm/": "Product Manager",
+    "tl/": "Tech Lead",
+    "arch/": "Architect"
+  },
+  "_comment_trusted": "Only comments from these author_association values count. The repo is public, so outside commenters must never be able to approve.",
+  "trusted_associations": [
+    "OWNER",
+    "MEMBER",
+    "COLLABORATOR"
+  ],
+  "_comment_substitutes": "Process hint, not enforcement: everyone posts as one shared GitHub account, so the check proves an approval was RECORDED, not who gave it. A role's approval of a PR it authored is not counted; if a rule needs that role, the substitute below must approve instead.",
+  "self_review_substitutes": {
+    "Code Reviewer 1": "Tech Lead",
+    "Code Reviewer 2": "Tech Lead",
+    "Security Reviewer": "Tech Lead",
+    "Test Engineer": "QA / Verifier"
+  },
+  "code_review": {
+    "_comment": "At least one CR always. Which CR (alternation, the other CR when one has 3+ open reviews) is human routing by the TL and is NOT enforced here. Both CRs are required when an interfaces file changes or the PR has more than both_cr_line_threshold changed lines (additions + deletions).",
+    "any_of": [
+      "Code Reviewer 1",
+      "Code Reviewer 2"
+    ],
+    "both_cr_line_threshold": 400,
+    "interfaces_paths": [
+      "INTERFACES.md",
+      "**/INTERFACES.md"
+    ]
+  },
+  "path_rules": [
+    {
+      "id": "security",
+      "role": "Security Reviewer",
+      "reason": "security-sensitive path",
+      "paths": [
+        "src/conventiondrift/discover/**",
+        "src/conventiondrift/**/safefs*.py",
+        "src/conventiondrift/**/paths.py",
+        "src/conventiondrift/**/paths/**",
+        "src/conventiondrift/policy/**",
+        "src/conventiondrift/**/config.py",
+        "src/conventiondrift/**/config/**",
+        "src/conventiondrift/gitread*.py",
+        "src/conventiondrift/**/gitread/**",
+        "src/conventiondrift/render/escape.py",
+        "src/conventiondrift/github*.py",
+        "src/conventiondrift/**/github/**",
+        "src/conventiondrift/**/http*.py",
+        "src/conventiondrift/**/net/**",
+        "src/conventiondrift/**/*auth*.py",
+        "src/conventiondrift/**/*token*.py",
+        "src/conventiondrift/**/*credential*.py",
+        "src/conventiondrift/**/*secret*.py",
+        "src/conventiondrift/**/*permission*.py",
+        "src/conventiondrift/_vendor/**",
+        "src/conventiondrift/entry/**",
+        "pyproject.toml",
+        "requirements/**",
+        "**/requirements*.txt",
+        "**/requirements*.in",
+        "**/*.lock",
+        "**/Pipfile",
+        "**/Pipfile.lock",
+        "setup.py",
+        "setup.cfg",
+        ".github/workflows/**",
+        ".github/scripts/**",
+        ".github/actions/**",
+        ".github/CODEOWNERS",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+        ".github/approval-policy.json",
+        ".github/dependabot.yml",
+        "action.yml",
+        "action.yaml",
+        "scripts/ci/**",
+        "SECURITY.md",
+        "THREAT-MODEL.md"
+      ]
+    },
+    {
+      "id": "tests",
+      "role": "Test Engineer",
+      "reason": "spec tests, fixtures, test strategy or coverage settings",
+      "paths": [
+        "tests/spec/**",
+        "tests/fixtures/**",
+        "tests/snapshot/approved/**",
+        "TEST-STRATEGY*",
+        "**/TEST-STRATEGY*",
+        ".coveragerc",
+        "scripts/ci/check_coverage.py",
+        "scripts/ci/check_mutation.py"
+      ],
+      "_comment_patch": "Also required when one of these files changes and its diff (added/removed lines or hunk headers) mentions one of these words, e.g. the [tool.coverage] tables in pyproject.toml.",
+      "patch_triggers": [
+        {
+          "paths": [
+            "pyproject.toml",
+            "setup.cfg",
+            "tox.ini"
+          ],
+          "contains": [
+            "coverage",
+            "mutmut"
+          ]
+        }
+      ]
+    }
+  ],
+  "_comment_sha": "Every APPROVED-BY must name the full 40-character head SHA ('APPROVED-BY: <Role> @ <sha>'), compared exactly with the PR head on every run (SR requirement). Short, mismatched or missing SHAs never count. There is no posted-after-push timing rule."
+}
