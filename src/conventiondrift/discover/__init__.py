@@ -64,7 +64,7 @@ REASON_BINARY: Final = "binary"
 REASON_NOT_DECODABLE: Final = "not decodable"
 # PROVISIONAL: I-9 has no reason for FIFOs, sockets or devices (open question
 # for the Architect). Kept in one constant so it is a one-line change.
-REASON_NOT_REGULAR: Final = "not a regular file"
+REASON_NOT_REGULAR: Final = "special file"
 
 _DRIVE: Final = re.compile(r"[A-Za-z]:")  # anchored with .match; linear, no repetition
 # BOMs that mean "this is not UTF-8 text" (UTF-32 first: its LE BOM starts with UTF-16's).
