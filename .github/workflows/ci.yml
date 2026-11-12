@@ -7,6 +7,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -141,6 +143,13 @@ jobs:
         # macOS legs run in the report-only `test-macos` job below (D-TL-30).
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+        # On pull_request, Windows runs only 3.11 and 3.15 so the PR queue
+        # stays shorter. Ubuntu keeps the full 3.11–3.15 set. The full
+        # OS × Python matrix still runs on push to main and on the nightly
+        # schedule, before any release. Excluded legs are omitted (they
+        # never start), so the `test` job result is the remaining legs
+        # and the required `ci` aggregate is unchanged.
+        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.13"},{"os":"windows-latest","python-version":"3.14"}]' || '[]') }}
     defaults:
       run:
         shell: bash
@@ -203,7 +212,12 @@ jobs:
     # needs and do not block merges. Same install and test steps as the
     # non-Windows `test` legs. FOLLOW-UP: move macOS back into `test` (and so
     # into `ci`) once macOS runners are reliably assigned.
+    # Run only on push to main and on the nightly schedule, not on
+    # pull_request, so PR concurrency is not spent on report-only macOS
+    # legs. Because this job is not in `ci`'s needs, a skipped test-macos
+    # on a PR neither fails nor delays the required aggregate.
     name: test-macos (report-only) (${{ matrix.python-version }})
+    if: github.event_name == 'push' || github.event_name == 'schedule'
     needs: [lockfile]
     runs-on: macos-latest
     timeout-minutes: 10
@@ -434,6 +448,11 @@ jobs:
       # every PR and push, but is not part of the required aggregate.
       # test-macos is report-only (D-TL-30, TL decision) until macOS
       # runners are reliably assigned; restore it to blocking then.
+      # It now runs only on push to main and on the nightly schedule.
+      # Leaving it out of needs means a skipped test-macos on a
+      # pull_request does not fail or delay this aggregate; do not add
+      # a skipped-is-ok exception here unless it is first restored to
+      # needs (and then only for test-macos).
       - secret-scan
       - dependency-scan
     runs-on: ubuntu-latest
