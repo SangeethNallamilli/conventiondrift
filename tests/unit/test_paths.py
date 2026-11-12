@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import sys
 from collections.abc import Iterator
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import conventiondrift.discover.safefs as safefs
 from conventiondrift.discover.safefs import (
     REASON_OUTSIDE,
     REASON_UNSUPPORTED,
@@ -96,6 +98,13 @@ def test_reject_edge_forms(value: str, origin: PathOrigin) -> None:
         (".hidden/.x", ".hidden/.x"),
         ("console.py", "console.py"),  # starts like CON, but is not a device name
         ("com10.py", "com10.py"),  # only COM1-COM9 are reserved
+        ("com0.py", "com0.py"),
+        ("COM\u2074.py", "COM\u2074.py"),  # superscript 4: only 1-3 are reserved
+        ("lpt\u2070", "lpt\u2070"),  # superscript 0
+        ("conin.py", "conin.py"),  # CONIN$ needs the '$'
+        ("CONIN$$.py", "CONIN$$.py"),
+        ("conout$x/a.py", "conout$x/a.py"),
+        ("$conin$.py", "$conin$.py"),
         ("lpt0/x.py", "lpt0/x.py"),
         ("connul/auxprn.py", "connul/auxprn.py"),
         ("a b/c d.py", "a b/c d.py"),  # inner spaces are fine, only a trailing one is not
@@ -138,6 +147,16 @@ ALWAYS_WINDOWS_ONLY = [
     "a/nul.d/b.py",
     "NUL .txt",  # Windows ignores the trailing space before the extension
     "src/c:x/nul.py",  # a device name still wins on POSIX next to a ':'
+    # SR N2 (I-13): the rest of the Python 3.13 set, any case, with an extension
+    *[
+        n
+        for d in (
+            "CONIN$",
+            "CONOUT$",
+            *(f"{p}{c}" for p in ("COM", "LPT") for c in "\u00b9\u00b2\u00b3"),
+        )
+        for n in (d, d.lower(), d.title(), f"{d.lower()}.py", f"src/{d} .log", f"{d}.tar.gz")
+    ],
 ]
 
 # A ':' in any segment: always rejected when typed; for a tree name, only on Windows.
@@ -342,3 +361,52 @@ def test_real_non_utf8_tree_name_is_unsupported(tmp_path: Path, opened: list[obj
         read_worktree_file(tmp_path, name, "python", origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
     assert opened == [], "nothing may be opened for a rejected path"
+
+
+# The Python 3.13 ``ntpath._reserved_names`` set, written out (SR N2, I-13).
+PY313_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{c}" for c in "123456789\u00b9\u00b2\u00b3"]
+    + [f"LPT{c}" for c in "123456789\u00b9\u00b2\u00b3"]
+)
+
+
+def test_device_names_match_python_313() -> None:
+    assert len(PY313_DEVICE_NAMES) == 30
+    assert safefs._DEVICE_NAMES == PY313_DEVICE_NAMES
+    if sys.version_info >= (3, 13):  # the stdlib's own set, where it exists
+        assert ntpath._reserved_names == PY313_DEVICE_NAMES  # type: ignore[attr-defined]
+
+
+DEVICE_PROBES = [
+    f"{stem}{tail}"
+    for stem in (
+        *PY313_DEVICE_NAMES,
+        *(n.lower() for n in PY313_DEVICE_NAMES),
+        "COM0",
+        "COM10",
+        "COM\u2074",
+        "LPT\u2070",
+        "CONIN",
+        "CONOUT",
+        "CONIN$$",
+        "XCON",
+        "CONX",
+        "console",
+    )
+    for tail in ("", ".py", ".tar.gz", " .txt", "  .x", ".")
+]
+
+
+@pytest.mark.skipif(not hasattr(ntpath, "isreserved"), reason="ntpath.isreserved is 3.13+")
+@pytest.mark.parametrize("name", DEVICE_PROBES)
+def test_tree_name_agrees_with_ntpath_isreserved(name: str, os_name: str) -> None:
+    """Our device-name and trailing-dot checks say what Python 3.13's ``isreserved`` says."""
+    reserved: bool = ntpath.isreserved(name)  # type: ignore[attr-defined,unused-ignore]
+    try:
+        validate_relpath(name, origin="tree")
+    except FileSkipped as exc:
+        assert exc.reason == REASON_UNSUPPORTED
+        assert reserved, name
+    else:
+        assert not reserved, name

@@ -79,12 +79,14 @@ REASON_UNSUPPORTED: Final = "unsupported path"
 # Permission denied, I/O error, a file that vanished after listing, any other OS error (I-13).
 REASON_UNREADABLE: Final = "unreadable"
 
-# Windows reserved device names (D-PM-28 #5, SR-012 F5): a segment whose part before
-# the first dot, without trailing spaces, is one of these, in any case: "nul.txt", "Com1.py".
+# Windows reserved device names (D-PM-28 #5, SR-012 F5, SR N2 / I-13): the Python 3.13
+# ``ntpath`` set, superscript digits and console names included. A segment whose part
+# before the first dot, without trailing spaces, is one of these, in any case, is a
+# device name on every OS: "nul.txt", "Com1.py", "conin$.log", "lpt\u00b2".
 _DEVICE_NAMES: Final = frozenset(
-    ["CON", "PRN", "AUX", "NUL"]
-    + [f"COM{i}" for i in range(1, 10)]
-    + [f"LPT{i}" for i in range(1, 10)]
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{c}" for c in "123456789\u00b9\u00b2\u00b3"]
+    + [f"LPT{c}" for c in "123456789\u00b9\u00b2\u00b3"]
 )
 # SECURITY-RULES R2.5: every regex this module applies to repo text is listed here
 # and gets a ReDoS unit test. There are none today: path checks are plain string
