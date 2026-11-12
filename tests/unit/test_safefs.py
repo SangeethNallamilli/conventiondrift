@@ -4,6 +4,7 @@ AC-E.16, DESIGN §12 A-3 security conditions 1-2)."""
 from __future__ import annotations
 
 import codecs
+import encodings.aliases
 import errno
 import os
 import socket
@@ -789,3 +790,31 @@ def test_non_oserror_propagates(
     _fail_on(monkeypatch, "fstat", _track_fds(monkeypatch, "a.py"), RuntimeError("bug"))
     with pytest.raises(RuntimeError, match="bug"):
         read_worktree_file(tmp_path, "a.py", "python", origin="tree")
+
+
+# ---- SR-012 F1: a hostile coding cookie never escapes as an exception (R2.4) ----------
+
+
+def test_coding_undefined_is_not_decodable() -> None:
+    """``undefined`` raises a bare UnicodeError (a ValueError), not UnicodeDecodeError."""
+    with pytest.raises(FileSkipped) as info:
+        decode_text(b"# coding: undefined\nx = 1\n", "python")
+    assert info.value.reason == REASON_NOT_DECODABLE
+    assert info.value.__context__ is None and info.value.__cause__ is None
+
+
+CODEC_NAMES = sorted(
+    set(encodings.aliases.aliases) | set(encodings.aliases.aliases.values()) | {"undefined"}
+)
+
+
+@pytest.mark.parametrize("name", CODEC_NAMES)
+def test_every_stdlib_codec_cookie_decodes_or_is_skipped(name: str) -> None:
+    for spelling in {name, name.replace("_", "-")}:
+        data = f"# -*- coding: {spelling} -*-\nx = 'caf\xe9'\n".encode("latin-1")
+        try:
+            out = decode_text(data, "python")
+        except FileSkipped as exc:
+            assert exc.reason == REASON_NOT_DECODABLE
+        else:
+            assert isinstance(out, str)

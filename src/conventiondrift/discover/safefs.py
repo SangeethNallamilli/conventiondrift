@@ -319,6 +319,8 @@ def decode_text(data: bytes, kind: FileKind) -> str:
     text is full of NULs). Otherwise any NUL byte means "binary". ``.py``
     files follow PEP 263 (UTF-8 default, a UTF-8 BOM, or a coding cookie on
     line 1 or 2); every other kind is strict UTF-8 with an optional UTF-8 BOM.
+    Any cookie that names a codec which is unknown, not an ASCII superset or
+    that fails to decode (``undefined``, ``hex``, ``utf-16``, ...) is "not decodable".
     """
     if data.startswith(_FOREIGN_BOMS):
         raise FileSkipped(REASON_NOT_DECODABLE)
@@ -332,5 +334,8 @@ def decode_text(data: bytes, kind: FileKind) -> str:
         else:
             encoding = "utf-8-sig"
         return data.decode(encoding)
-    except (SyntaxError, LookupError, UnicodeDecodeError) as exc:
-        raise FileSkipped(REASON_NOT_DECODABLE) from exc
+    except (SyntaxError, LookupError, ValueError):
+        # ValueError covers UnicodeDecodeError and the bare UnicodeError that a
+        # hostile cookie such as ``# coding: undefined`` raises (R2.4, SR-012 F1).
+        pass
+    raise FileSkipped(REASON_NOT_DECODABLE) from None
