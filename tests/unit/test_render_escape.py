@@ -1,12 +1,14 @@
 """T-023 unit and property tests for render/escape.py (critical module).
 
-Covers DESIGN §3a, SECURITY-RULES R3.1, and the unit halves of AC-N3.10,
-AC-N3.13 and AC-E.17. Spec tests named ``test_ac_*`` belong to the Test Engineer.
+Covers DESIGN §3a, SECURITY-RULES R3.1, I-14, and the unit halves of
+AC-N3.10, AC-N3.13 and AC-E.17. Spec tests named ``test_ac_*`` belong to
+the Test Engineer. This file does not use that prefix.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 
 import pytest
 from hypothesis import given, settings
@@ -15,6 +17,7 @@ from hypothesis import strategies as st
 import conventiondrift.render.escape as esc
 from conventiondrift.render.escape import (
     md,
+    md_cell,
     output_heredoc,
     sarif_text,
     workflow_cmd,
@@ -34,6 +37,33 @@ INJECT_RULE = (
 )
 INJECT_PATH = "src/::warning::%0A.py"
 
+# One representative per character class the mappings care about.
+C0_NUL = "\x00"
+C0_TAB = "\t"
+C0_LF = "\n"
+C0_CR = "\r"
+C0_US = "\x1f"
+DEL = "\x7f"
+C1_PAD = "\x80"
+C1_NEL = "\x85"
+C1_APC = "\x9f"
+CF_BIDI = "\u202e"  # RIGHT-TO-LEFT OVERRIDE
+CF_RLI = "\u2067"
+CF_ZWSP = "\u200b"
+CF_ZWJ = "\u200d"
+CF_BOM = "\ufeff"
+CF_ALM = "\u061c"
+CF_SHY = "\xad"  # SOFT HYPHEN: Cf, not in the illustrative list
+ZL = "\u2028"
+ZP = "\u2029"
+CS_LOW = "\ud800"
+CS_HIGH = "\udfff"
+# ZWJ emoji (R3 accepted cost: the joiner becomes a visible label).
+ZWJ_EMOJI = "👨‍👩‍👧‍👦"  # U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466
+ZWJ_EMOJI_VISIBLE = "👨U+200D👩U+200D👧U+200D👦"
+
+_HIDDEN = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
 
 def unspan(s: str) -> str:
     """Parse one CommonMark inline code span back to its literal content."""
@@ -48,9 +78,30 @@ def unspan(s: str) -> str:
 
 
 def visible(text: str) -> str:
-    """What md() must show: the text with C0/DEL as Control Pictures."""
-    return "".join(
-        chr(0x2400 + ord(c)) if ord(c) < 0x20 else ("\u2421" if c == "\x7f" else c) for c in text
+    """Independent expected I-14 visible form (Control Pictures / U+XXXX)."""
+    parts: list[str] = []
+    for char in text:
+        code = ord(char)
+        if code < 32:
+            parts.append(chr(0x2400 + code))
+        elif code == 127:
+            parts.append("\u2421")
+        elif unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp", "Cs"}:
+            parts.append("U+" + format(code, "04X"))
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def hidden_chars(text: str) -> list[str]:
+    return [char for char in text if unicodedata.category(char) in _HIDDEN]
+
+
+def _unescaped_pipe_count(row: str) -> int:
+    return sum(
+        1
+        for index, char in enumerate(row)
+        if char == "|" and (index == 0 or row[index - 1] != "\\")
     )
 
 
@@ -81,6 +132,7 @@ def test_md_hostile_rule_and_path_are_one_literal_code_span(text: str) -> None:
         ("nul\x00del\x7f", "`nul\u2400del\u2421`"),
         ("tab\there", "`tab\u2409here`"),
         ("@someone #123", "`@someone #123`"),
+        ("keep :: and %0A", "`keep :: and %0A`"),
     ],
 )
 def test_md_exact(text: str, expected: str) -> None:
@@ -104,8 +156,8 @@ def test_md_long_fence_never_opens_a_code_block() -> None:
             assert "`" in out[len(fence.group()) :]
 
 
-def test_md_does_not_mutate_unicode() -> None:
-    s = "ünïcode ファイル \u202e bidi \u2028 sep"
+def test_md_printable_unicode_and_sc251_strings_stay_verbatim() -> None:
+    s = "ünïcode ファイル :: %0A"
     assert unspan(md(s)) == s
 
 
@@ -118,6 +170,171 @@ def test_md_roundtrip_property(text: str) -> None:
         return
     assert "\n" not in out and "\r" not in out
     assert unspan(out) == visible(text)
+    assert hidden_chars(out) == []
+
+
+# ---- md_cell() ----------------------------------------------------------------------
+
+
+def test_md_cell_is_md_plus_escaped_pipes() -> None:
+    assert md_cell("plain") == md("plain") == "`plain`"
+    assert md_cell("a|b") == "`a\\|b`"
+    assert md_cell("|both|") == r"`\|both\|`"
+    assert md_cell("") == ""
+    # backticks and pipes together: fence from md(), pipes then escaped
+    assert md_cell("a`b|c") == "``a`b\\|c``"
+
+
+def test_md_cell_keeps_gfm_table_column_count() -> None:
+    left, right = md_cell("a|b"), md_cell("c")
+    row = f"| {left} | {right} |"
+    assert left == "`a\\|b`"
+    assert right == "`c`"
+    assert row == "| `a\\|b` | `c` |"
+    assert _unescaped_pipe_count(row) == 3  # start, mid, end => two cells
+
+
+def test_md_cell_without_pipe_escape_would_split_the_row() -> None:
+    raw = f"| {md('a|b')} | {md('c')} |"
+    assert _unescaped_pipe_count(raw) == 4  # the unescaped content pipe adds a column
+
+
+@settings(max_examples=400, derandomize=True)
+@given(st.text())
+def test_md_cell_roundtrip_property(text: str) -> None:
+    out = md_cell(text)
+    if not text:
+        assert out == ""
+        return
+    assert out == md(text).replace("|", "\\|")
+    assert hidden_chars(out) == []
+
+
+# ---- per-class mapping, applied to each affected function ---------------------------
+
+
+# (label, sample, expected visible form with CR/LF also mapped)
+_CLASS_CASES: list[tuple[str, str, str]] = [
+    ("Cc C0 NUL", f"A{C0_NUL}B", "A\u2400B"),
+    ("Cc C0 TAB", f"A{C0_TAB}B", "A\u2409B"),
+    ("Cc C0 US", f"A{C0_US}B", "A\u241fB"),
+    ("Cc C0 LF", f"A{C0_LF}B", "A\u240aB"),
+    ("Cc C0 CR", f"A{C0_CR}B", "A\u240dB"),
+    ("DEL", f"A{DEL}B", "A\u2421B"),
+    ("C1 PAD", f"A{C1_PAD}B", "AU+0080B"),
+    ("C1 NEL", f"A{C1_NEL}B", "AU+0085B"),
+    ("C1 APC", f"A{C1_APC}B", "AU+009FB"),
+    ("Cf bidi RLO", f"A{CF_BIDI}B", "AU+202EB"),
+    ("Cf bidi RLI", f"A{CF_RLI}B", "AU+2067B"),
+    ("Cf bidi ALM", f"A{CF_ALM}B", "AU+061CB"),
+    ("Cf zero-width ZWSP", f"A{CF_ZWSP}B", "AU+200BB"),
+    ("Cf zero-width ZWJ", f"A{CF_ZWJ}B", "AU+200DB"),
+    ("Cf zero-width BOM", f"A{CF_BOM}B", "AU+FEFFB"),
+    ("Cf soft hyphen (by category, not a list)", f"A{CF_SHY}B", "AU+00ADB"),
+    ("Zl", f"A{ZL}B", "AU+2028B"),
+    ("Zp", f"A{ZP}B", "AU+2029B"),
+    ("Cs low", f"A{CS_LOW}B", "AU+D800B"),
+    ("Cs high", f"A{CS_HIGH}B", "AU+DFFFB"),
+]
+
+_CLASS_IDS = [label for label, _sample, _mapped in _CLASS_CASES]
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_md_per_character_class(label: str, sample: str, mapped: str) -> None:
+    out = md(sample)
+    assert "\n" not in out and "\r" not in out
+    assert unspan(out) == mapped
+    assert hidden_chars(out) == []
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_md_cell_per_character_class(label: str, sample: str, mapped: str) -> None:
+    out = md_cell(sample)
+    assert unspan(out.replace("\\|", "|")) == mapped
+    assert hidden_chars(out) == []
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_workflow_cmd_per_character_class(label: str, sample: str, mapped: str) -> None:
+    # Mapping runs first, so CR/LF are already pictures; then % is encoded.
+    out = workflow_cmd(sample)
+    assert out == mapped.replace("%", "%25")
+    assert "\n" not in out and "\r" not in out
+    assert hidden_chars(out) == []
+    if C0_LF in sample:
+        assert "\u240a" in out and "%0A" not in out
+    if C0_CR in sample:
+        assert "\u240d" in out and "%0D" not in out
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_workflow_prop_per_character_class(label: str, sample: str, mapped: str) -> None:
+    out = workflow_prop(sample)
+    expected = mapped.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+    assert out == expected
+    assert hidden_chars(out) == []
+    assert ":" not in out and "," not in out and "\n" not in out and "\r" not in out
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_sarif_text_per_character_class(label: str, sample: str, mapped: str) -> None:
+    out = sarif_text(sample)
+    assert sarif_unescape(out) == mapped
+    assert hidden_chars(out) == []
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_output_heredoc_per_character_class(label: str, sample: str, mapped: str) -> None:
+    entry = output_heredoc("report-path", sample)
+    delivered = parse_output_file(entry)["report-path"]
+    assert delivered == mapped
+    assert hidden_chars(delivered) == []
+
+
+def test_label_format_is_uppercase_at_least_four_digits() -> None:
+    # The I-14 spelling is still open; this pins the current helper's format.
+    assert unspan(md(CF_BIDI)) == "U+202E"
+    assert unspan(md(CF_SHY)) == "U+00AD"
+    assert unspan(md(CS_LOW)) == "U+D800"
+    assert "u+" not in md(CF_BIDI)
+    assert "U+202e" not in md(CF_BIDI)
+    # I-14's own example, and a tag character that needs more than four digits.
+    begin_beam = "\U0001d173"
+    tag_space = "\U000e0020"
+    assert unicodedata.category(begin_beam) == "Cf"
+    assert unicodedata.category(tag_space) == "Cf"
+    assert unspan(md(begin_beam)) == "U+1D173"
+    assert unspan(md(tag_space)) == "U+E0020"
+
+
+def test_zwj_emoji_shows_joiners_as_labels() -> None:
+    assert unspan(md(ZWJ_EMOJI)) == ZWJ_EMOJI_VISIBLE
+    assert unspan(md_cell(ZWJ_EMOJI)) == ZWJ_EMOJI_VISIBLE
+    assert workflow_cmd(ZWJ_EMOJI) == ZWJ_EMOJI_VISIBLE
+    assert workflow_prop(ZWJ_EMOJI) == ZWJ_EMOJI_VISIBLE
+    assert sarif_text(ZWJ_EMOJI) == ZWJ_EMOJI_VISIBLE
+
+
+def test_lone_surrogates_do_not_crash() -> None:
+    for sample in (CS_LOW, CS_HIGH, f"ok{CS_LOW}{CS_HIGH}ok", CS_LOW * 3):
+        assert unspan(md(sample)) == visible(sample)
+        assert md_cell(sample) == md(sample)
+        assert workflow_cmd(sample) == visible(sample)
+        assert workflow_prop(sample) == visible(sample)
+        assert sarif_text(sample) == visible(sample)
+        assert output_heredoc("report-path", sample).endswith("\n")
+
+
+def test_control_picture_boundaries() -> None:
+    # Space (U+0020) and U+00A0 stay; U+001F / U+007F / U+0080 / U+009F map.
+    assert unspan(md("A B")) == "A B"
+    assert unspan(md("A\u00a0B")) == "A\u00a0B"
+    assert unspan(md("\x1f")) == "\u241f"
+    assert unspan(md("\x7f")) == "\u2421"
+    assert unspan(md("\x80")) == "U+0080"
+    assert unspan(md("\x9f")) == "U+009F"
+    assert unspan(md("\xa0")) == "\xa0"
 
 
 # ---- workflow_cmd() / workflow_prop() -----------------------------------------------
@@ -128,13 +345,15 @@ def test_md_roundtrip_property(text: str) -> None:
     [
         ("plain", "plain"),
         ("100%", "100%25"),
-        ("%0A", "%250A"),
-        ("a\nb", "a%0Ab"),
-        ("a\rb", "a%0Db"),
-        ("a\r\nb", "a%0D%0Ab"),
+        ("%0A", "%250A"),  # printable %0A stays, then % is encoded
+        ("a\nb", "a\u240ab"),
+        ("a\rb", "a\u240db"),
+        ("a\r\nb", "a\u240d\u240ab"),
         ("a:b,c", "a:b,c"),  # data keeps ':' and ','
         ("::warning::x", "::warning::x"),
-        ("%%\n", "%25%25%0A"),
+        ("%%\n", "%25%25\u240a"),
+        ("tab\there", "tab\u2409here"),
+        ("nul\x00del\x7f", "nul\u2400del\u2421"),
     ],
 )
 def test_workflow_cmd_exact(text: str, expected: str) -> None:
@@ -148,8 +367,8 @@ def test_workflow_cmd_exact(text: str, expected: str) -> None:
         ("a:b", "a%3Ab"),
         ("a,b", "a%2Cb"),
         ("100%", "100%25"),
-        ("x\ny", "x%0Ay"),
-        ("x\ry", "x%0Dy"),
+        ("x\ny", "x\u240ay"),
+        ("x\ry", "x\u240dy"),
         ("%3A", "%253A"),
         (INJECT_PATH, "src/%3A%3Awarning%3A%3A%250A.py"),
     ],
@@ -171,19 +390,31 @@ def test_injected_rule_and_path_form_one_annotation_line() -> None:
     assert "\n" not in line and "\r" not in line
     m = re.fullmatch(r"::warning file=([^,:]*),line=9::(.*)", line)
     assert m, "properties must not be split by injected ':' or ','"
-    assert runner_unescape_prop(m.group(1)) == INJECT_PATH
-    assert runner_unescape_data(m.group(2)) == INJECT_RULE
+    assert runner_unescape_prop(m.group(1)) == visible(INJECT_PATH)
+    assert runner_unescape_data(m.group(2)) == visible(INJECT_RULE)
 
 
 @settings(max_examples=500, derandomize=True)
 @given(st.text())
-def test_workflow_escapes_roundtrip_and_stay_on_one_line(text: str) -> None:
+def test_workflow_escapes_stay_on_one_line_and_hide_specials(text: str) -> None:
     data, prop = workflow_cmd(text), workflow_prop(text)
     for out in (data, prop):
         assert "\n" not in out and "\r" not in out
+        assert hidden_chars(out) == []
     assert ":" not in prop and "," not in prop
-    assert runner_unescape_data(data) == text
-    assert runner_unescape_prop(prop) == text
+    assert runner_unescape_data(data) == visible(text)
+    assert runner_unescape_prop(prop) == visible(text)
+
+
+@settings(max_examples=400, derandomize=True)
+@given(st.text())
+def test_no_hidden_categories_in_md_cell_or_workflow_outputs(text: str) -> None:
+    # Protocol percent-encodings are ASCII, so they are not an exception in
+    # the output itself; the check is simply "none of these categories remain".
+    for out in (md(text), md_cell(text), workflow_cmd(text), workflow_prop(text), sarif_text(text)):
+        assert hidden_chars(out) == []
+    delivered = parse_output_file(output_heredoc("report-path", text))["report-path"]
+    assert hidden_chars(delivered) == []
 
 
 # ---- output_heredoc() ---------------------------------------------------------------
@@ -209,7 +440,7 @@ def parse_output_file(content: str) -> dict[str, str]:
 def test_output_heredoc_roundtrip(value: str) -> None:
     entry = output_heredoc("report-path", value)
     assert entry.endswith("\n")
-    assert parse_output_file(entry) == {"report-path": value}
+    assert parse_output_file(entry) == {"report-path": visible(value)}
 
 
 def test_four_outputs_exact_even_with_injection() -> None:
@@ -223,7 +454,7 @@ def test_four_outputs_exact_even_with_injection() -> None:
     assert parse_output_file(content) == {
         "stale-count": "3",
         "new-stale-count": "1",
-        "report-path": hostile,
+        "report-path": visible(hostile),
         "sarif-path": "",
     }
 
@@ -303,9 +534,11 @@ def test_output_heredoc_accepts_names(name: str) -> None:
 
 
 @settings(max_examples=300, derandomize=True)
-@given(st.text(alphabet=st.characters(blacklist_characters="\r")))
+@given(st.text())
 def test_output_heredoc_roundtrip_property(value: str) -> None:
-    assert parse_output_file(output_heredoc("report-path", value)) == {"report-path": value}
+    delivered = parse_output_file(output_heredoc("report-path", value))["report-path"]
+    assert delivered == visible(value)
+    assert hidden_chars(delivered) == []
 
 
 # ---- sarif_text() -------------------------------------------------------------------
@@ -319,7 +552,8 @@ def test_output_heredoc_roundtrip_property(value: str) -> None:
         ("a\\b", "a\\\\b"),
         ("\\[", "\\\\\\["),
         ("**bold** <b>x</b> @someone #123", "**bold** <b>x</b> @someone #123"),
-        ("line\nbreak", "line\nbreak"),
+        ("line\nbreak", "line\u240abreak"),
+        ("keep :: and %0A", "keep :: and %0A"),
     ],
 )
 def test_sarif_text_exact(text: str, expected: str) -> None:
@@ -334,7 +568,8 @@ def sarif_unescape(s: str) -> str:
 @given(st.text())
 def test_sarif_text_no_embedded_link_and_roundtrip(text: str) -> None:
     out = sarif_text(text)
-    assert sarif_unescape(out) == text
+    assert sarif_unescape(out) == visible(text)
+    assert hidden_chars(out) == []
     # every '[' / ']' in the output is preceded by an odd number of backslashes
     for m in re.finditer(r"[\[\]]", out):
         run = len(out[: m.start()]) - len(out[: m.start()].rstrip("\\"))
@@ -351,6 +586,7 @@ def test_sarif_text_hostile_rule_visible_verbatim() -> None:
 def test_public_surface_is_exactly_one_function_per_sink() -> None:
     assert sorted(esc.__all__) == [
         "md",
+        "md_cell",
         "output_heredoc",
         "sarif_text",
         "workflow_cmd",
