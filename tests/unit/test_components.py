@@ -2,11 +2,11 @@
 
 import dataclasses
 import inspect
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, get_args
+from typing import Any, get_args, get_type_hints
 
 import pytest
 
@@ -113,6 +113,19 @@ def test_components_default_to_none() -> None:
     components = Components()
     assert tuple(f.name for f in dataclasses.fields(components)) == FIELDS
     assert all(getattr(components, name) is None for name in FIELDS)
+
+
+def test_components_field_types_are_pinned() -> None:
+    # Runtime pin of I-14's Components types, e.g. a one-arg github_client factory fails here.
+    assert get_type_hints(Components) == {
+        "git_reader": Callable[[Path], GitReaderProtocol] | None,
+        "checkers": Mapping[str, Checker] | None,
+        "extractor": Extractor | None,
+        "history": History | None,
+        "renderer": Renderer | None,
+        "github_client": Callable[[str, str], GitHubClient] | None,
+        "github_base_url": str | None,
+    }
 
 
 def test_components_are_frozen_and_keyword_only() -> None:

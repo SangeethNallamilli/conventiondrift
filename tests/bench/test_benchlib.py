@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -116,3 +118,58 @@ def test_scan_counters_must_be_zero_in_compare_mode(key: str) -> None:
     with pytest.raises(benchlib.StatsSchemaError, match="outside scan mode"):
         benchlib.validate_stats(doc)
     benchlib.validate_stats(doc, scan_mode=True)
+
+
+def test_not_implemented_reason_requires_skeleton_marker() -> None:
+    """Only the T-001 skeleton is an xfail/skip reason; a plain exit 2 is a failure."""
+    skeleton = benchlib.Run(
+        0.0, 2, {}, None, "conventiondrift: not implemented yet (package skeleton)\n"
+    )
+    reason = benchlib.not_implemented_reason(skeleton)
+    assert reason is not None and "T-031/T-033" in reason
+
+    regression = benchlib.Run(0.0, 2, {}, None, "conventiondrift: error: unknown flag\n")
+    assert benchlib.not_implemented_reason(regression) is None
+
+    # Stats were written: not the skeleton, even if stderr mentions the marker.
+    with_stats = benchlib.Run(
+        0.0, 2, {"schema": "conventiondrift-stats/1"}, None, "not implemented yet"
+    )
+    assert benchlib.not_implemented_reason(with_stats) is None
+
+    success = benchlib.Run(0.1, 0, {"schema": "conventiondrift-stats/1"}, {}, "")
+    assert benchlib.not_implemented_reason(success) is None
+
+
+def test_probe_cli_init_without_dash_b_for_old_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git < 2.28 has no `git init -b`; probe_cli uses the same symbolic-ref fallback."""
+    from fixtures import gitrepo
+
+    monkeypatch.setattr(gitrepo, "git_version", lambda: (2, 27, 0))
+    calls: list[tuple[str, ...]] = []
+    real = gitrepo.init_with_branch
+
+    def wrapped(run, default_branch="main", *, version=None):  # type: ignore[no-untyped-def]
+        def spy(*args: str) -> object:
+            calls.append(args)
+            return run(*args)
+
+        return real(spy, default_branch, version=version)
+
+    monkeypatch.setattr(gitrepo, "init_with_branch", wrapped)
+    reason = benchlib.probe_cli(tmp_path)
+    assert reason is not None and "not implemented yet" in reason
+    repo = tmp_path / "probe"
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],  # noqa: S607
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branch == "main"
+    assert ("init", "-q", ".") in calls
+    assert not any(args[:2] == ("init", "-q") and "-b" in args for args in calls)
+    assert any(args[:1] == ("symbolic-ref",) for args in calls)

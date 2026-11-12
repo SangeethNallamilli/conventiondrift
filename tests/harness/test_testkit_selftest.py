@@ -115,22 +115,16 @@ def test_make_components_uses_dataclasses_replace() -> None:
         make_components(base, fault_hook=True)
 
 
-def _production_components() -> type | None:
-    try:
-        import conventiondrift
-    except ImportError:
-        return None
-    return getattr(conventiondrift, "Components", None)
-
-
-@pytest.mark.skipif(
-    _production_components() is None, reason="conventiondrift.Components does not exist yet (T-006)"
-)
 def test_production_components_documented_shape() -> None:
-    """I-11: frozen, keyword-only dataclass; None = default; dataclasses.replace for variants;
-    the I-11 replaceable parts are fields."""
-    cls = _production_components()
-    assert cls is not None and dataclasses.is_dataclass(cls)
+    """I-11/I-14: frozen, keyword-only dataclass; None = default; dataclasses.replace for variants;
+    the I-11 replaceable parts are fields.
+
+    Imports `conventiondrift.components` directly (I-14). A failed import fails this test.
+    """
+    from conventiondrift.components import Components
+
+    cls = Components
+    assert dataclasses.is_dataclass(cls)
     assert cls.__dataclass_params__.frozen  # type: ignore[attr-defined]
     fields = {f.name: f for f in dataclasses.fields(cls)}
     assert REPLACEABLE_PARTS <= set(fields)
