@@ -7,10 +7,17 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Schedule runs get their own group so a nightly does not share a slot
+  # with a push to main. cancel-in-progress is only true for pull_request,
+  # so in-progress main, nightly, and workflow_dispatch runs are never
+  # cancelled by a later run in the same group.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'schedule' && 'schedule' || (github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -19,6 +26,7 @@ env:
   PYTHONHASHSEED: "0"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   HYPOTHESIS_SEED: "20261112"
+  UV_VERSION: "0.13.7"
 
 jobs:
   pin-lint:
@@ -38,8 +46,13 @@ jobs:
         run: python3 scripts/ci/check_action_pins.py
 
   dco:
+    # Runs on pull_request, and on workflow_dispatch when the ref is not
+    # main, so a manual run on a PR branch cannot produce a green `ci`
+    # while skipping the DCO gate. Push, schedule, and workflow_dispatch
+    # on main still skip this job; the aggregate allows that skip only
+    # on refs/heads/main for those events.
     name: dco
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -52,10 +65,33 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Check Signed-off-by on each PR commit
+      - name: Resolve the DCO range
+        # For pull_request, use the PR base/head SHAs. For workflow_dispatch
+        # on a non-main branch, fetch origin/main anonymously (the repo is
+        # public) and check merge-base(origin/main, HEAD)..HEAD via the
+        # existing DCO_BASE_SHA / DCO_HEAD_SHA interface. github.* values
+        # are passed in as env; they are never interpolated into the
+        # script body. persist-credentials stays false and this fetch is
+        # unauthenticated, so no token is written to .git/config.
         env:
-          DCO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            printf '%s\n' "DCO_BASE_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_HEAD_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
+          else
+            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            base="$(git merge-base origin/main HEAD)"
+            head="$(git rev-parse HEAD)"
+            printf '%s\n' "DCO_BASE_SHA=${base}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_HEAD_SHA=${head}" >> "$GITHUB_ENV"
+          fi
+      - name: Check Signed-off-by on each commit in the range
+        env:
+          DCO_BASE_SHA: ${{ env.DCO_BASE_SHA }}
+          DCO_HEAD_SHA: ${{ env.DCO_HEAD_SHA }}
         run: python3 scripts/ci/check_dco.py
 
   lockfile:
@@ -70,7 +106,11 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.13.7"
+          version: "${{ env.UV_VERSION }}"
+          # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
+          # for the archive this runner downloads. A missing OS/arch key yields
+          # a sentinel that fails verification rather than skipping the check.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
           enable-cache: false
       - name: Recompile lockfiles and require a match
         run: python3 scripts/ci/check_lockfiles.py
@@ -141,6 +181,13 @@ jobs:
         # macOS legs run in the report-only `test-macos` job below (D-TL-30).
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+        # On pull_request, Windows runs only 3.11 and 3.15 so the PR queue
+        # stays shorter. Ubuntu keeps the full 3.11–3.15 set. The full
+        # OS × Python matrix still runs on push to main, on the nightly
+        # schedule, and on workflow_dispatch, before any release. Excluded
+        # legs are omitted (they never start), so the `test` job result is
+        # the remaining legs and the required `ci` aggregate is unchanged.
+        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.13"},{"os":"windows-latest","python-version":"3.14"}]' || '[]') }}
     defaults:
       run:
         shell: bash
@@ -151,30 +198,67 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "${{ env.UV_VERSION }}"
+          # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
+          # for the archive this runner downloads. A missing OS/arch key yields
+          # a sentinel that fails verification rather than skipping the check.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
+          enable-cache: false
+      # Test/test-macos only (contents: read, no secrets or id-token).
+      # Restore on pull_request; restore and save on push, schedule, and
+      # workflow_dispatch. Key is runner.os, runner.arch, UV_VERSION, the
+      # Python version, and hashFiles of the committed lockfiles. uv does
+      # not re-hash wheels from its cache; cache integrity relies on
+      # GitHub cache scoping (PR runs restore only; only
+      # main/schedule/dispatch runs save). Installs still use
+      # --require-hashes and --only-binary=:all:. UV_CACHE_DIR is set on
+      # the install steps (runner.* is not available in job env).
+      - name: Restore the uv package cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+      - name: Restore and save the uv package cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
       - name: CONTRIBUTING setup (Windows)
         if: runner.os == 'Windows'
         # Job default is bash -e -o pipefail, so a failed native command
         # stops the step (L-5). Do not use pwsh here.
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           # Translation of the CONTRIBUTING.md Unix setup (TW-OPEN). This is
           # the Windows install path for this matrix leg. The job fails if
           # install or later tests fail (AC-N5.2); no continue-on-error.
+          # Keep the .venv layout and PATH so later steps still use
+          # .venv/Scripts/python and .venv/Scripts/conventiondrift.
+          # uv on Windows needs the python.exe path, not the extensionless shim.
           python -m venv .venv
-          .venv/Scripts/python scripts/ci/install_pinned_pip.py
-          .venv/Scripts/python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
-          .venv/Scripts/python -m pip install --no-deps --no-build-isolation -e .
+          uv pip install --python .venv/Scripts/python.exe --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python .venv/Scripts/python.exe --no-deps --no-build-isolation -e .
           echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
           .venv/Scripts/conventiondrift --version
-      - name: Install hash-pinned pip, then hashed locks
+      - name: Install hashed locks with uv
         if: runner.os != 'Windows'
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
-          python3 scripts/ci/install_pinned_pip.py
-          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         if: runner.os != 'Windows'
-        run: python -m pip install --no-deps --no-build-isolation -e .
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
+        run: |
+          uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
       - name: Confirm no PyPI PyYAML in this environment
         run: python scripts/ci/check_no_pypi_yaml.py
       - name: pytest with coverage (offline paths, fixed seed)
@@ -203,7 +287,13 @@ jobs:
     # needs and do not block merges. Same install and test steps as the
     # non-Windows `test` legs. FOLLOW-UP: move macOS back into `test` (and so
     # into `ci`) once macOS runners are reliably assigned.
+    # Run on every non-pull_request event (push to main, the nightly
+    # schedule, and workflow_dispatch), not on pull_request, so PR
+    # concurrency is not spent on report-only macOS legs. Because this
+    # job is not in `ci`'s needs, a skipped test-macos on a PR neither
+    # fails nor delays the required aggregate.
     name: test-macos (report-only) (${{ matrix.python-version }})
+    if: github.event_name != 'pull_request'
     needs: [lockfile]
     runs-on: macos-latest
     timeout-minutes: 10
@@ -224,14 +314,47 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "${{ env.UV_VERSION }}"
+          # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
+          # for the archive this runner downloads. A missing OS/arch key yields
+          # a sentinel that fails verification rather than skipping the check.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
+          enable-cache: false
+      # Test/test-macos only (contents: read, no secrets or id-token).
+      # Restore on pull_request; restore and save on push, schedule, and
+      # workflow_dispatch. Key is runner.os, runner.arch, UV_VERSION, the
+      # Python version, and hashFiles of the committed lockfiles. uv does
+      # not re-hash wheels from its cache; cache integrity relies on
+      # GitHub cache scoping (PR runs restore only; only
+      # main/schedule/dispatch runs save). Installs still use
+      # --require-hashes and --only-binary=:all:. UV_CACHE_DIR is set on
+      # the install steps (runner.* is not available in job env).
+      - name: Restore the uv package cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+      - name: Restore and save the uv package cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
-      - name: Install hash-pinned pip, then hashed locks
+      - name: Install hashed locks with uv
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
-          python3 scripts/ci/install_pinned_pip.py
-          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
-        run: python -m pip install --no-deps --no-build-isolation -e .
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
+        run: |
+          uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
       - name: Confirm no PyPI PyYAML in this environment
         run: python scripts/ci/check_no_pypi_yaml.py
       - name: pytest with coverage (offline paths, fixed seed)
@@ -431,9 +554,14 @@ jobs:
       - vendor-network
       - git-minimum
       # mutation is report-only (D-TL-29, TL decision): it still runs on
-      # every PR and push, but is not part of the required aggregate.
+      # every workflow event, but is not part of the required aggregate.
       # test-macos is report-only (D-TL-30, TL decision) until macOS
       # runners are reliably assigned; restore it to blocking then.
+      # It runs on push to main, the nightly schedule, and
+      # workflow_dispatch, not on pull_request. Leaving it out of needs
+      # means a skipped test-macos on a pull_request does not fail or
+      # delay this aggregate; do not add a skipped-is-ok exception here
+      # unless it is first restored to needs (and then only for test-macos).
       - secret-scan
       - dependency-scan
     runs-on: ubuntu-latest
@@ -444,17 +572,30 @@ jobs:
       - name: All required jobs passed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           needs = json.loads(os.environ["NEEDS_JSON"])
+          event = os.environ.get("EVENT_NAME", "")
+          ref = os.environ.get("GITHUB_REF", "")
           failed = []
           for name, data in needs.items():
               result = data.get("result")
-              # dco is skipped on push to main; every other required job must succeed.
+              # dco may be skipped only on refs/heads/main for push,
+              # schedule, or workflow_dispatch. A skipped dco on any
+              # other event or ref (including workflow_dispatch on a
+              # PR branch) is a gate bypass and fails this aggregate.
+              # Every other required job must succeed.
               if result == "success":
                   continue
-              if name == "dco" and result == "skipped":
+              if (
+                  name == "dco"
+                  and result == "skipped"
+                  and ref == "refs/heads/main"
+                  and event in ("push", "schedule", "workflow_dispatch")
+              ):
                   continue
               failed.append(f"{name}={result}")
           if failed:
