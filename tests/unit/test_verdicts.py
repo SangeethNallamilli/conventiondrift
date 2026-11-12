@@ -249,8 +249,9 @@ def test_decide_holds_does_not_look_at_recent() -> None:
 def test_decide_rejects_min_sites_below_one() -> None:
     # I-13 decide() guards (CR2 S1, SR F1): never return a verdict, including NV.
     t0 = replace(DEFAULTS, min_sites=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as min_sites_err:
         v(c(0, 0), None, t0)
+    assert min_sites_err.value.args == ("thresholds.min_sites and thresholds.holds must be >= 1",)
     with pytest.raises(ValueError):
         decide(verifiable=False, overall=c(0, 0), recent=None, thresholds=t0)
     t1 = replace(DEFAULTS, min_sites=1)
@@ -287,8 +288,9 @@ def test_decide_rejects_holds_below_one() -> None:
     ],
 )
 def test_decide_rejects_inconsistent_overall_counts(overall: Counts) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as err:
         v(overall, None)
+    assert err.value.args == ("overall counts are inconsistent",)
     with pytest.raises(ValueError):
         decide(verifiable=False, overall=overall, recent=None, thresholds=DEFAULTS)
 
@@ -309,8 +311,9 @@ def test_decide_accepts_following_boundaries() -> None:
 )
 def test_decide_rejects_inconsistent_recent_counts(recent: Counts) -> None:
     overall = c(4, 10)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as err:
         v(overall, recent)
+    assert err.value.args == ("recent counts are inconsistent",)
     with pytest.raises(ValueError):
         decide(verifiable=False, overall=overall, recent=recent, thresholds=DEFAULTS)
 
@@ -471,6 +474,20 @@ def test_side_result_match_outside_options_is_not_verifiable(match: RuleMatch) -
     _assert_not_verifiable_side(no_history)
     assert with_history.verdict is not H
     assert no_history.verdict is not H
+
+
+def test_side_result_match_equal_to_options_is_valid() -> None:
+    # I-10: each set may equal the checker's options (subset, not a proper subset).
+    preferred_all = RuleMatch(preferred=HTTP, prohibited=frozenset(), specificity=1)
+    preferred_side = build(FIVE_REQUESTS, None, rule=replace(RULE, match=preferred_all))
+    assert preferred_side.verdict is H
+    assert preferred_side.verdict is not NV
+    assert preferred_side.overall == Counts(5, 0, 5)
+    prohibited_all = RuleMatch(preferred=frozenset(), prohibited=HTTP, specificity=1)
+    prohibited_side = build(FIVE_REQUESTS, None, rule=replace(RULE, match=prohibited_all))
+    assert prohibited_side.verdict is S
+    assert prohibited_side.verdict is not NV
+    assert prohibited_side.overall == Counts(0, 5, 5)
 
 
 @given(
