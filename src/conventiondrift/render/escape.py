@@ -4,7 +4,8 @@ One function per sink (R3.2). Everything shown to a user that comes from the
 repo, the event payload or another user goes through exactly one of these:
 
 * :func:`md` - comment and job summary (GitHub Flavored Markdown), outside tables.
-* :func:`md_cell` - same as :func:`md`, plus ``|`` escaped as ``\\|`` for GFM tables.
+* :func:`md_cell` - same as :func:`md`, then each ``\\`` becomes ``\\\\``,
+  then each ``|`` becomes ``\\|``.
 * :func:`workflow_cmd` - the message part of a workflow command (annotations).
 * :func:`workflow_prop` - a property value of a workflow command (``file=``, ``title=``).
 * :func:`output_heredoc` - one ``GITHUB_OUTPUT`` entry with a random delimiter.
@@ -87,8 +88,13 @@ def md(text: str) -> str:
 
 
 def md_cell(text: str) -> str:
-    """Return :func:`md` of ``text`` with ``|`` escaped as ``\\|`` for GFM table cells."""
-    return md(text).replace("|", "\\|")
+    """Return :func:`md` of ``text``, then double each ``\\``, then escape ``|`` as ``\\|``.
+
+    The backslash pass runs first so a source ``\\|`` cannot close a GFM
+    table cell early (I-14, SR F1). A doubled backslash may show inside
+    the code span; that is accepted.
+    """
+    return md(text).replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _reject_residual_controls(text: str) -> str:

@@ -201,6 +201,55 @@ def test_md_cell_without_pipe_escape_would_split_the_row() -> None:
     assert _unescaped_pipe_count(raw) == 4  # the unescaped content pipe adds a column
 
 
+def _gfm_row_cells(row: str) -> list[str]:
+    """Split a GFM table row on ``|`` not preceded by an odd number of backslashes."""
+    cells: list[str] = []
+    start = 0
+    for index, char in enumerate(row):
+        if char != "|":
+            continue
+        count = 0
+        pos = index - 1
+        while pos >= start and row[pos] == "\\":
+            count += 1
+            pos -= 1
+        if count % 2 == 0:
+            cells.append(row[start:index])
+            start = index + 1
+    cells.append(row[start:])
+    if cells and cells[0] == "":
+        cells = cells[1:]
+    if cells and cells[-1] == "":
+        cells = cells[:-1]
+    return cells
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a\\|b", "`a\\\\\\|b`"),
+        ("trail\\", "`trail\\\\`"),
+        ("\\", "`\\\\`"),
+        ("\\\\|", "`\\\\\\\\\\|`"),
+        ("|", "`\\|`"),
+        ("a|b|c", "`a\\|b\\|c`"),
+    ],
+    ids=[
+        "a-backslash-pipe-b",
+        "trailing-backslash",
+        "lone-backslash",
+        "two-backslashes-pipe",
+        "pipe",
+        "a-pipe-b-pipe-c",
+    ],
+)
+def test_md_cell_backslash_before_pipe_stays_one_cell(text: str, expected: str) -> None:
+    out = md_cell(text)
+    assert out == expected
+    row = f"| x | {out} | y |"
+    assert _gfm_row_cells(row) == [" x ", f" {out} ", " y "]
+
+
 @settings(max_examples=400, derandomize=True)
 @given(st.text())
 def test_md_cell_roundtrip_property(text: str) -> None:
@@ -208,7 +257,7 @@ def test_md_cell_roundtrip_property(text: str) -> None:
     if not text:
         assert out == ""
         return
-    assert out == md(text).replace("|", "\\|")
+    assert out == md(text).replace("\\", "\\\\").replace("|", "\\|")
     assert hidden_chars(out) == []
 
 
