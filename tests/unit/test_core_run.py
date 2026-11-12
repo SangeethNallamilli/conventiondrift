@@ -39,6 +39,41 @@ def test_other_exceptions_are_reported_as_core(exc: Exception) -> None:
     assert PLANTED not in error.message
 
 
+@pytest.mark.parametrize("component", ["core", "render", "git_reader", "checker:logging", "a1:b_2"])
+def test_valid_components_are_kept(component: str) -> None:
+    assert internal_error(ComponentError(component, PLANTED)).component == component
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        "",
+        "Core",
+        "1core",
+        "_core",
+        "checker:",
+        "a:b:c",
+        "checker:Logging",
+        "core\n",
+        "core x",
+        "ćore",
+    ],
+)
+def test_invalid_components_become_core(component: str) -> None:
+    assert internal_error(ComponentError(component, PLANTED)).component == "core"
+
+
+@pytest.mark.parametrize("name", ["Ërror", "Bad Name", "Bad\nName", "1Error", "", "a-b"])
+def test_class_names_that_are_not_ascii_identifiers_become_exception(name: str) -> None:
+    exc = type(name, (Exception,), {})()
+    assert internal_error(exc) == InternalError("core", "Exception" + SUFFIX)
+
+
+def test_system_exit_and_generator_exit_are_reported_by_class_name() -> None:
+    assert internal_error(SystemExit(0)).message == "SystemExit" + SUFFIX
+    assert internal_error(GeneratorExit()).message == "GeneratorExit" + SUFFIX
+
+
 def test_exact_message_text() -> None:
     assert internal_error(RuntimeError()).message == (
         "RuntimeError: this part of the analysis could not finish; details are withheld"
@@ -170,8 +205,23 @@ def test_run_reports_non_component_exceptions_as_core(monkeypatch: pytest.Monkey
     assert pipeline.context.internal_errors == (InternalError("core", "ValueError" + SUFFIX),)
 
 
-def test_run_does_not_swallow_base_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(core, "_pipeline", _Recorder(KeyboardInterrupt()))
+@pytest.mark.parametrize("exc", [SystemExit(0), SystemExit(), SystemExit(1), GeneratorExit()])
+@pytest.mark.parametrize(("fail_on", "expected"), [("none", 0), ("new-stale", 3), ("any-stale", 3)])
+def test_component_system_exit_and_generator_exit_become_internal_errors(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException, fail_on: str, expected: int
+) -> None:
+    # A component's SystemExit(0) must never pass the gate (I-14).
+    pipeline = _Recorder(exc, explicit_fail_on=fail_on)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="action") == expected
+    assert pipeline.context is not None
+    assert pipeline.context.internal_errors == (InternalError("core", type(exc).__name__ + SUFFIX),)
+
+
+def test_run_lets_keyboard_interrupt_propagate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        core, "_pipeline", _Recorder(KeyboardInterrupt(), explicit_fail_on="any-stale")
+    )
     with pytest.raises(KeyboardInterrupt):
         run([], {}, entry="cli")
 

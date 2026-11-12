@@ -6,6 +6,7 @@ error happens before policy loads. The pipeline itself is T-028; writing the
 Internal error section is T-006b.
 """
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, get_args
@@ -71,16 +72,26 @@ def exit_code(outcome: RunOutcome) -> int:
     return EXIT_FAIL_ON_MET if met else EXIT_OK
 
 
-def internal_error(exc: Exception) -> InternalError:
-    """The reportable form of a caught exception (I-14 Q6).
+_COMPONENT = re.compile(r"[a-z][a-z0-9_]*(:[a-z0-9_]+)?")
+
+
+def internal_error(exc: Exception | SystemExit | GeneratorExit) -> InternalError:
+    """The reportable form of a caught exception (I-14 Q6, sanitizing).
 
     Only the component name and the exception class are used; the exception's
-    own message (including ``ComponentError.message``) is never written.
+    own message (including ``ComponentError.message``) is never written. A class
+    name that isn't an ASCII identifier becomes ``Exception``; a component that
+    doesn't match the I-14 pattern becomes ``core``.
     """
     component = exc.component if isinstance(exc, ComponentError) else "core"
+    if not _COMPONENT.fullmatch(component):
+        component = "core"
+    name = type(exc).__name__
+    if not (name.isascii() and name.isidentifier()):
+        name = "Exception"
     return InternalError(
         component,
-        f"{type(exc).__name__}: this part of the analysis could not finish; details are withheld",
+        f"{name}: this part of the analysis could not finish; details are withheld",
     )
 
 
@@ -132,13 +143,16 @@ def run(
     """The single entrypoint for ``conventiondrift.action`` and ``conventiondrift.cli`` (I-2).
 
     ``entry`` is passed by the caller and never inferred from ``env``. Any
-    exception from the pipeline becomes an ``InternalError`` and the run exits
-    per I-4 with the ``fail-on`` known so far.
+    ``Exception``, ``SystemExit`` or ``GeneratorExit`` from the pipeline becomes an
+    ``InternalError`` and the run exits per I-4 with the ``fail-on`` known so far
+    (I-14). Only ``KeyboardInterrupt`` propagates.
     """
     context = RunContext()
     try:
         outcome = _pipeline(argv, env, entry, components or Components(), context)
-    except Exception as exc:  # noqa: BLE001 -- I-14: every exception in run() is reported
+    # I-14: argument parsing never raises SystemExit, so a SystemExit or GeneratorExit here
+    # came from a component and must not pass the gate. Only KeyboardInterrupt propagates.
+    except (Exception, SystemExit, GeneratorExit) as exc:  # noqa: BLE001 -- I-14: all but KeyboardInterrupt become an InternalError
         context.internal_errors += (internal_error(exc),)
         outcome = AnalysisOutcome(
             fail_on=error_fail_on(context.explicit_fail_on, context.base_fail_on),
