@@ -473,6 +473,15 @@ _RESIDUALS = ["\r", "\n", "\x00", "\x7f", "\x85", "\u202e", "\u2028", "\u2029", 
 _RESIDUAL_IDS = ["CR", "LF", "NUL", "DEL", "C1", "Cf bidi", "Zl", "Zp", "Cs"]
 
 
+# Written independently from INTERFACES.md I-14 (L493), not read from the code.
+_I14_LABELLED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
+
+def test_guarded_categories_match_i14() -> None:
+    """The code's category set must equal I-14's written list, so they can't drift together."""
+    assert esc._LABEL_CATEGORIES == _I14_LABELLED_CATEGORIES
+
+
 def test_residual_cases_cover_every_guarded_category() -> None:
     """D-TL-25: the residual cases must span exactly the categories the guard rejects."""
     assert {unicodedata.category(c) for c in _RESIDUALS} == set(esc._LABEL_CATEGORIES)
