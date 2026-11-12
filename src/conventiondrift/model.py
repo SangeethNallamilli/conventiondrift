@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import StrEnum
 from itertools import pairwise
 from types import MappingProxyType
-from typing import Any, Literal, get_args
+from typing import Any, Literal, cast, get_args
 
 CheckerId = Literal[
     "logging",
@@ -173,8 +173,8 @@ class Policy:
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkers", _read_only(self.checkers))
         object.__setattr__(self, "markers", _read_only(self.markers))
-        if not _CHECKER_IDS <= self.checkers.keys():
-            raise ValueError("Policy.checkers must have all 8 checker ids")
+        if self.checkers.keys() != _CHECKER_IDS:
+            raise ValueError("Policy.checkers must have exactly the 8 checker ids")
         if self.gated != (self.effective_fail_on != "none"):
             raise ValueError('Policy.gated must equal effective_fail_on != "none"')
 
@@ -294,6 +294,10 @@ class RuleResult:
     causing_files: tuple[CausingFile, ...]
     suggestion: Suggestion
 
+    def __post_init__(self) -> None:
+        if self.base_rule is None and self.head_rule is None:
+            raise ValueError("RuleResult must have at least one of base_rule/head_rule")
+
 
 @dataclass(frozen=True, slots=True)
 class Window:
@@ -354,7 +358,6 @@ class Result:
 
 
 def _rule_result_key(result: RuleResult) -> tuple[str, int]:
-    rule = result.head_rule or result.base_rule
-    if rule is None:
-        raise ValueError("a RuleResult in Result needs a head_rule or a base_rule to be sorted")
+    # RuleResult.__post_init__ guarantees at least one of the two rules.
+    rule = cast(Rule, result.head_rule or result.base_rule)
     return (rule.file, rule.line)

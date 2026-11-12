@@ -312,6 +312,7 @@ OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
     },
     ("Policy", "markers"): {"markers": {}},
     ("Conflict", "rules"): {"rules": ("AGENTS.md:1", "AGENTS.md:2")},
+    ("RuleResult", "head_rule"): {"head_rule": dataclasses.replace(RULE, line=10)},
 }
 
 
@@ -476,7 +477,24 @@ def test_policy_wraps_mappings_in_read_only_copies() -> None:
 @pytest.mark.parametrize("missing", CHECKER_IDS)
 def test_policy_rejects_a_missing_checker_id(missing: CheckerId) -> None:
     checkers = {cid: p for cid, p in POLICY.checkers.items() if cid != missing}
-    with pytest.raises(ValueError, match="all 8 checker ids"):
+    with pytest.raises(ValueError, match="exactly the 8 checker ids"):
+        dataclasses.replace(POLICY, checkers=checkers)
+
+
+@pytest.mark.parametrize("extra", ["print", "Logging", "logging ", ""])
+def test_policy_rejects_an_extra_checker_key(extra: str) -> None:
+    checkers: dict[Any, CheckerPolicy] = dict(POLICY.checkers)
+    checkers[extra] = CheckerPolicy(enabled=True, script_paths=())
+    with pytest.raises(ValueError, match="exactly the 8 checker ids"):
+        dataclasses.replace(POLICY, checkers=checkers)
+
+
+def test_policy_rejects_a_swapped_checker_key() -> None:
+    checkers: dict[Any, CheckerPolicy] = {
+        cid: p for cid, p in POLICY.checkers.items() if cid != "money"
+    }
+    checkers["print"] = CheckerPolicy(enabled=False, script_paths=())
+    with pytest.raises(ValueError, match="exactly the 8 checker ids"):
         dataclasses.replace(POLICY, checkers=checkers)
 
 
@@ -588,7 +606,14 @@ def test_result_rejects_unsorted_rule_results(results: tuple[tuple[str, int, str
         dataclasses.replace(RESULT, rule_results=rule_results)
 
 
-def test_result_rejects_rule_result_without_any_rule() -> None:
-    orphan = dataclasses.replace(RULE_RESULT, head_rule=None, base_rule=None)
-    with pytest.raises(ValueError, match="needs a head_rule or a base_rule"):
-        dataclasses.replace(RESULT, rule_results=(orphan,))
+@pytest.mark.parametrize(("base_rule", "head_rule"), [(RULE, None), (None, RULE), (RULE, RULE)])
+def test_rule_result_accepts_at_least_one_rule(
+    base_rule: Rule | None, head_rule: Rule | None
+) -> None:
+    result = dataclasses.replace(RULE_RESULT, base_rule=base_rule, head_rule=head_rule)
+    assert (result.base_rule, result.head_rule) == (base_rule, head_rule)
+
+
+def test_rule_result_rejects_neither_rule() -> None:
+    with pytest.raises(ValueError, match="at least one of base_rule/head_rule"):
+        dataclasses.replace(RULE_RESULT, head_rule=None, base_rule=None)
