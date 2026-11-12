@@ -21,6 +21,7 @@ of the I-9 ``skipped_files`` reasons. Nothing here runs git.
 from __future__ import annotations
 
 import codecs
+import errno
 import io
 import os
 import re
@@ -29,6 +30,7 @@ import tokenize
 from typing import Final, Literal
 
 from conventiondrift.errors import FileSkipped
+from conventiondrift.model import SkipReason
 
 __all__ = [
     "CONFIG_MAX_BYTES",
@@ -39,6 +41,7 @@ __all__ = [
     "REASON_SIZE",
     "REASON_SPECIAL",
     "REASON_SYMLINK",
+    "REASON_UNREADABLE",
     "REASON_UNSUPPORTED",
     "EntryKind",
     "FileKind",
@@ -70,6 +73,8 @@ REASON_NOT_DECODABLE: Final = "not decodable"
 REASON_SPECIAL: Final = "special file"
 # Backslash or drive-form names found in the repo tree, e.g. ``a\\b.py`` (D-PM-28).
 REASON_UNSUPPORTED: Final = "unsupported path"
+# Permission denied, I/O error, a file that vanished after listing, any other OS error (I-13).
+REASON_UNREADABLE: Final = "unreadable"
 
 _DRIVE: Final = re.compile(r"[A-Za-z]:")  # anchored with .match; linear, no repetition
 # BOMs that mean "this is not UTF-8 text" (UTF-32 first: its LE BOM starts with UTF-16's).
@@ -144,7 +149,7 @@ def _reject_link_or_other(st: os.stat_result, *, final: bool) -> None:
     if final and kind != "file":
         raise FileSkipped(REASON_SPECIAL)
     if not final and kind != "dir":
-        raise NotADirectoryError(f"not a directory: {kind}")
+        raise FileSkipped(REASON_SPECIAL)  # a file, FIFO, ... used as a parent folder
 
 
 def _contained(root_real: str, full: str) -> bool:
@@ -173,25 +178,48 @@ _USE_DIR_FD: bool = (
 )
 
 
+def _os_reason(exc: OSError, origin: PathOrigin) -> SkipReason:
+    """The fixed skip reason for an ``OSError`` (INTERFACES "OS errors in safefs")."""
+    code = exc.errno
+    # ELOOP (Linux, macOS), EMLINK (FreeBSD) and EFTYPE (NetBSD, some macOS calls)
+    # are what O_NOFOLLOW returns for a symlink.
+    if code is not None and code in (
+        errno.ELOOP,
+        getattr(errno, "EMLINK", None),
+        getattr(errno, "EFTYPE", None),
+    ):
+        return REASON_SYMLINK
+    if code == errno.ENOTDIR:
+        return REASON_SPECIAL
+    if code == errno.ENAMETOOLONG:
+        return REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE
+    return REASON_UNREADABLE  # EACCES, EPERM, EIO, ENOENT (vanished) and every other errno
+
+
+def _open_subdir(name: str, dir_fd: int) -> int:
+    try:
+        return os.open(name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno != errno.ENOTDIR:
+            raise
+    # Linux returns ENOTDIR, not ELOOP, for O_NOFOLLOW | O_DIRECTORY on a symlink, so a
+    # folder swapped for a symlink after the lstat is told apart from one swapped for a file.
+    _reject_link_or_other(os.lstat(name, dir_fd=dir_fd), final=False)
+    raise FileSkipped(REASON_SPECIAL)
+
+
 def _open_dir_fd(root_real: str, parts: list[str]) -> int:
     """Open the file's final component through no-follow handles; return its fd."""
     dir_fd = os.open(root_real, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
     try:
         for name in parts[:-1]:
             _reject_link_or_other(os.lstat(name, dir_fd=dir_fd), final=False)
-            try:
-                child = os.open(
-                    name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=dir_fd
-                )
-            except OSError as exc:  # swapped for a symlink after the lstat
-                raise FileSkipped(REASON_SYMLINK) from exc
+            child = _open_subdir(name, dir_fd)
             os.close(dir_fd)
             dir_fd = child
         _reject_link_or_other(os.lstat(parts[-1], dir_fd=dir_fd), final=True)
-        try:
-            return os.open(parts[-1], _FILE_FLAGS, dir_fd=dir_fd)
-        except OSError as exc:  # ELOOP: swapped for a symlink after the lstat
-            raise FileSkipped(REASON_SYMLINK) from exc
+        # ELOOP here means the file was swapped for a symlink after the lstat.
+        return os.open(parts[-1], _FILE_FLAGS, dir_fd=dir_fd)
     finally:
         os.close(dir_fd)
 
@@ -230,15 +258,31 @@ def read_worktree_file(
     never more than limit + 1 bytes (a file that grew is still "size limit").
     ``origin`` is required so every caller states whether ``relpath`` was typed
     by the user or found in the repo tree (D-PM-28; see :func:`validate_relpath`).
-    Other ``OSError`` (missing file, permission) propagates to the caller.
+
+    No ``OSError`` ever escapes (INTERFACES "OS errors in discover/safefs.py"):
+    ELOOP/EMLINK/EFTYPE are "symlink", ENOTDIR is "special file", ENAMETOOLONG
+    is "unsupported path" for a tree name and "outside repository" for a typed
+    value, and every other errno (EACCES, EPERM, EIO, ENOENT, ...) is
+    "unreadable". The ``FileSkipped`` carries only the fixed reason: no OS
+    message, errno text or host path, and no ``__cause__``/``__context__``.
+    Exceptions that are not ``OSError`` are bugs and propagate.
     """
-    parts = validate_relpath(relpath, origin).split("/")
+    parts = validate_relpath(relpath, origin=origin).split("/")
+    limit = size_limit(kind, max_file_bytes)
+    try:
+        return _read(root, parts, limit)
+    except OSError as exc:
+        reason = _os_reason(exc, origin)
+    # Raised outside the handler, so the OSError is not even kept as __context__.
+    raise FileSkipped(reason) from None
+
+
+def _read(root: str | os.PathLike[str], parts: list[str], limit: int) -> bytes:
     root_real = os.path.realpath(root)
     if not _contained(root_real, os.path.join(root_real, *parts)):
         # Only reached for a symlinked parent that the component walk below
         # would also refuse; kept as the design's defence in depth.
         raise FileSkipped(REASON_SYMLINK if _has_link(root_real, parts) else REASON_OUTSIDE)
-    limit = size_limit(kind, max_file_bytes)
     fd = (_open_dir_fd if _USE_DIR_FD else _open_by_path)(root_real, parts)
     try:
         st = os.fstat(fd)

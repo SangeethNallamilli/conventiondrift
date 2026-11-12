@@ -4,6 +4,7 @@ AC-E.16, DESIGN §12 A-3 security conditions 1-2)."""
 from __future__ import annotations
 
 import codecs
+import errno
 import os
 import socket
 import stat
@@ -23,7 +24,10 @@ from conventiondrift.discover.safefs import (
     REASON_SIZE,
     REASON_SPECIAL,
     REASON_SYMLINK,
+    REASON_UNREADABLE,
+    REASON_UNSUPPORTED,
     FileKind,
+    PathOrigin,
     check_size,
     decode_text,
     entry_kind,
@@ -268,7 +272,7 @@ def test_swap_to_symlink_after_lstat_dir(
 
     def racing_lstat(name: str, *, dir_fd: int | None = None) -> os.stat_result:
         st = real_lstat(name, dir_fd=dir_fd)
-        if name == "docs":
+        if name == "docs" and not os.path.islink(tmp_path / "docs"):  # swap once
             os.rmdir(tmp_path / "docs")
             os.symlink(outside, tmp_path / "docs")
         return st
@@ -393,14 +397,6 @@ def test_entry_kind_symlink(tmp_path: Path) -> None:
     assert entry_kind(stat.S_IFBLK) == "other"
 
 
-def test_missing_file_and_file_as_parent_propagate(tmp_path: Path, strategy: str) -> None:
-    (tmp_path / "f").write_text("x")
-    with pytest.raises(FileNotFoundError):
-        read_worktree_file(tmp_path, "nope.py", "python", origin="tree")
-    with pytest.raises(NotADirectoryError):
-        read_worktree_file(tmp_path, "f/x.py", "python", origin="tree")
-
-
 def test_normal_nested_read(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "src/pkg").mkdir(parents=True)
     (tmp_path / "src/pkg/m.py").write_bytes(b"x = 1\n")
@@ -421,8 +417,10 @@ def test_no_fd_leak(tmp_path: Path, strategy: str) -> None:
         for bad in ("a/big.py", "a/fifo.py"):
             with pytest.raises(FileSkipped):
                 read_worktree_file(tmp_path, bad, "python", origin="tree")
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(FileSkipped):
             read_worktree_file(tmp_path, "a/none.py", "python", origin="tree")
+        with pytest.raises(FileSkipped):
+            read_worktree_file(tmp_path, "a/ok.py/x.py", "python", origin="tree")
     assert len(os.listdir("/proc/self/fd")) == before
 
 
@@ -530,3 +528,264 @@ def test_uncomparable_paths_are_not_contained(monkeypatch: pytest.MonkeyPatch) -
     """commonpath raises ValueError for mixed absolute/relative (or, on Windows, drives)."""
     monkeypatch.setattr(os.path, "realpath", lambda p: "relative/x")
     assert not d._contained("/x/repo", "/x/repo/a.py")
+
+
+# ---- CR S2, SR-012 F2/F3: no OSError escapes; fixed reasons, no host path ------------
+
+
+def _chain(exc: BaseException) -> Iterator[BaseException]:
+    seen: set[int] = set()
+    todo: list[BaseException | None] = [exc]
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        yield e
+        todo += [e.__cause__, e.__context__]
+
+
+def _skip_without_leak(root: Path, rel: str, *, origin: PathOrigin = "tree") -> str:
+    """Read ``rel``; it must be skipped with nothing but the fixed reason in the exception."""
+    with pytest.raises(FileSkipped) as info:
+        read_worktree_file(root, rel, "python", origin=origin)
+    exc = info.value
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
+    assert exc.args == (exc.reason,)
+    host = str(root)
+    for e in _chain(exc):
+        for text in (str(e), repr(e), *map(str, e.args)):
+            assert host not in text, "host path leaked"
+            assert "Errno" not in text and "denied" not in text.lower()
+    return exc.reason
+
+
+def test_missing_file_is_unreadable(tmp_path: Path, strategy: str) -> None:
+    """ENOENT from lstat: the file vanished after listing."""
+    assert _skip_without_leak(tmp_path, "nope.py") == REASON_UNREADABLE
+    assert _skip_without_leak(tmp_path, "no/dir/x.py") == REASON_UNREADABLE
+
+
+def test_file_used_as_parent_is_special_file(tmp_path: Path, strategy: str) -> None:
+    (tmp_path / "f").write_text("x")
+    assert _skip_without_leak(tmp_path, "f/x.py") == REASON_SPECIAL
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX")
+def test_fifo_used_as_parent_is_special_file(tmp_path: Path, strategy: str) -> None:
+    os.mkfifo(tmp_path / "p")
+    assert _skip_without_leak(tmp_path, "p/x.py") == REASON_SPECIAL
+
+
+@pytest.mark.parametrize("where", ["x.py", "d/x.py"])
+def test_name_too_long_split_by_origin(tmp_path: Path, strategy: str, where: str) -> None:
+    """ENAMETOOLONG (a real one: 300 bytes > NAME_MAX on every common file system)."""
+    (tmp_path / "d").mkdir()
+    long = "a" * 300
+    rel = where.replace("x", long, 1) if where == "x.py" else f"{long}/x.py"
+    assert _skip_without_leak(tmp_path, rel, origin="tree") == REASON_UNSUPPORTED
+    assert _skip_without_leak(tmp_path, rel, origin="input") == REASON_OUTSIDE
+
+
+needs_non_root = pytest.mark.skipif(
+    not POSIX or os.geteuid() == 0, reason="chmod 000 needs POSIX and a non-root user"
+)
+
+
+@needs_non_root
+def test_unreadable_file_chmod_000(tmp_path: Path, strategy: str) -> None:
+    f = tmp_path / "a.py"
+    f.write_text("x")
+    f.chmod(0)
+    try:
+        assert _skip_without_leak(tmp_path, "a.py") == REASON_UNREADABLE
+    finally:
+        f.chmod(0o644)
+
+
+@needs_non_root
+def test_unreadable_folder_chmod_000(tmp_path: Path, strategy: str) -> None:
+    (tmp_path / "locked").mkdir()
+    (tmp_path / "locked/a.py").write_text("x")
+    (tmp_path / "locked").chmod(0)
+    try:
+        assert _skip_without_leak(tmp_path, "locked/a.py") == REASON_UNREADABLE
+    finally:
+        (tmp_path / "locked").chmod(0o755)
+
+
+def _os_error(code: int, path: Path) -> OSError:
+    return OSError(code, os.strerror(code), str(path / "leak"))
+
+
+ERRNO_CASES = [
+    ("ELOOP", REASON_SYMLINK),
+    ("EMLINK", REASON_SYMLINK),
+    ("ENOTDIR", REASON_SPECIAL),
+    ("ENAMETOOLONG", REASON_UNSUPPORTED),
+    ("EACCES", REASON_UNREADABLE),
+    ("EPERM", REASON_UNREADABLE),
+    ("EIO", REASON_UNREADABLE),
+    ("ENOENT", REASON_UNREADABLE),
+    ("EBUSY", REASON_UNREADABLE),  # "any other errno"
+]
+
+
+@pytest.mark.parametrize(("name", "expected"), ERRNO_CASES)
+@pytest.mark.parametrize("step", ["final open", "parent open", "fstat", "read"])
+def test_every_errno_maps_to_a_fixed_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    strategy: str,
+    name: str,
+    expected: str,
+    step: str,
+) -> None:
+    """The lstat-to-open race and later failures: each errno, on each step, on both paths."""
+    if step == "parent open" and strategy == "by_path":
+        pytest.skip("by_path opens only the final component")
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d/a.py").write_text("x = 1\n")
+    code = getattr(errno, name)
+    err = _os_error(code, tmp_path)
+    real_open = os.open
+    target_fds: set[int] = set()
+
+    def fake_open(path: str, flags: int, *a: object, **kw: object) -> int:
+        target = "d" if step == "parent open" else "a.py"
+        if step.endswith("open") and str(path).endswith(target):
+            raise err
+        fd = real_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+        if str(path).endswith("a.py"):
+            target_fds.add(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", fake_open)
+    if step in ("fstat", "read"):
+        _fail_on(monkeypatch, step, target_fds, err)
+    if step == "parent open" and code == errno.ENOTDIR:
+        expected = REASON_SPECIAL  # re-lstat still sees a folder, not a symlink
+    assert _skip_without_leak(tmp_path, "d/a.py") == expected
+    if code == errno.ENAMETOOLONG:
+        assert _skip_without_leak(tmp_path, "d/a.py", origin="input") == REASON_OUTSIDE
+
+
+def _fail_on(
+    monkeypatch: pytest.MonkeyPatch, step: str, fds: set[int] | None, err: BaseException
+) -> None:
+    """Make ``os.fstat``/``os.read`` raise ``err`` for the file under test only."""
+    real = getattr(os, step)
+
+    def fake(fd: int, *a: object) -> object:
+        if fds is None or fd in fds:
+            raise err
+        return real(fd, *a)
+
+    monkeypatch.setattr(os, step, fake)
+
+
+def _track_fds(monkeypatch: pytest.MonkeyPatch, suffix: str) -> set[int]:
+    fds: set[int] = set()
+    real_open = os.open
+
+    def spy(path: str, flags: int, *a: object, **kw: object) -> int:
+        fd = real_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+        if str(path).endswith(suffix):
+            fds.add(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", spy)
+    return fds
+
+
+@pytest.mark.parametrize("name", ["ENOENT", "EACCES"])
+def test_race_lstat_then_open_is_unreadable_not_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str, name: str
+) -> None:
+    """SR-012 F3: the file vanishing or losing permission after lstat is not a "symlink"."""
+    (tmp_path / "a.py").write_text("x")
+    real_open = os.open
+
+    def racing_open(path: str, flags: int, *a: object, **kw: object) -> int:
+        if str(path).endswith("a.py"):
+            raise _os_error(getattr(errno, name), tmp_path)
+        return real_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", racing_open)
+    assert _skip_without_leak(tmp_path, "a.py") == REASON_UNREADABLE
+
+
+@pytest.mark.skipif(not d._USE_DIR_FD, reason="needs openat")
+@pytest.mark.parametrize("name", ["ENOENT", "EACCES"])
+def test_race_on_parent_folder_is_unreadable_not_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setattr(d, "_USE_DIR_FD", True)
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d/a.py").write_text("x")
+    real_open = os.open
+
+    def racing_open(path: str, flags: int, *a: object, **kw: object) -> int:
+        if path == "d":
+            raise _os_error(getattr(errno, name), tmp_path)
+        return real_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", racing_open)
+    assert _skip_without_leak(tmp_path, "d/a.py") == REASON_UNREADABLE
+
+
+@pytest.mark.skipif(not d._USE_DIR_FD, reason="needs openat")
+def test_folder_swapped_for_file_after_lstat_is_special_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real ENOTDIR from O_DIRECTORY; the re-lstat sees a file, so "special file"."""
+    monkeypatch.setattr(d, "_USE_DIR_FD", True)
+    (tmp_path / "docs").mkdir()
+    real_lstat = os.lstat
+    calls: list[str] = []
+
+    def racing_lstat(name: str, *, dir_fd: int | None = None) -> os.stat_result:
+        st = real_lstat(name, dir_fd=dir_fd)
+        if name == "docs" and not calls:
+            calls.append(name)
+            os.rmdir(tmp_path / "docs")
+            (tmp_path / "docs").write_text("not a folder")
+        return st
+
+    monkeypatch.setattr(os, "lstat", racing_lstat)
+    assert _skip_without_leak(tmp_path, "docs/AGENTS.md") == REASON_SPECIAL
+
+
+def test_eftype_where_it_exists_is_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    """EFTYPE exists on BSDs only; simulate it with a free errno number."""
+    monkeypatch.setattr(errno, "EFTYPE", 10_079, raising=False)
+    (tmp_path / "a.py").write_text("x")
+    real_open = os.open
+
+    def fake_open(path: str, flags: int, *a: object, **kw: object) -> int:
+        if str(path).endswith("a.py"):
+            raise OSError(10_079, "Inappropriate file type", str(tmp_path / "a.py"))
+        return real_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", fake_open)
+    assert _skip_without_leak(tmp_path, "a.py") == REASON_SYMLINK
+
+
+def test_oserror_without_errno_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    (tmp_path / "a.py").write_text("x")
+    _fail_on(monkeypatch, "fstat", _track_fds(monkeypatch, "a.py"), OSError("no errno"))
+    assert _skip_without_leak(tmp_path, "a.py") == REASON_UNREADABLE
+
+
+def test_non_oserror_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    (tmp_path / "a.py").write_text("x")
+    _fail_on(monkeypatch, "fstat", _track_fds(monkeypatch, "a.py"), RuntimeError("bug"))
+    with pytest.raises(RuntimeError, match="bug"):
+        read_worktree_file(tmp_path, "a.py", "python", origin="tree")
