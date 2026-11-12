@@ -92,7 +92,7 @@ def spy(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Call]]:
         )
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(gitread.subprocess, "Popen", recorder)
+    monkeypatch.setattr(subprocess, "Popen", recorder)
     yield calls
 
 
@@ -203,9 +203,9 @@ def test_environment_is_fixed_and_nothing_else_leaks(
 def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
     repo_dir = Path("/r/repo")  # built before os.name changes, so it stays a PosixPath
-    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(os, "name", "nt")
     nt_env = gitread._environment("/h", "/bin", repo_dir)
-    monkeypatch.setattr(gitread.os, "name", "posix")
+    monkeypatch.setattr(os, "name", "posix")
     posix_env = gitread._environment("/h", "/bin", repo_dir)
     base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES="/r")
     assert nt_env == dict(base, SYSTEMROOT=r"C:\Windows")
@@ -215,9 +215,9 @@ def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> N
 def test_systemroot_absent_on_windows_is_not_invented(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SYSTEMROOT", raising=False)
     repo_dir = Path("/r/repo")
-    monkeypatch.setattr(gitread.os, "name", "nt")
+    monkeypatch.setattr(os, "name", "nt")
     env = gitread._environment("/h", "/bin", repo_dir)
-    monkeypatch.setattr(gitread.os, "name", "posix")
+    monkeypatch.setattr(os, "name", "posix")
     assert "SYSTEMROOT" not in env
 
 
@@ -321,7 +321,7 @@ def test_git_that_cannot_start_raises_git_unavailable(
     def boom(*_a: Any, **_k: Any) -> Any:
         raise PermissionError("exec")
 
-    monkeypatch.setattr(gitread.subprocess, "Popen", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
     with pytest.raises(GitUnavailable):
         GitReader(repo).is_shallow()
 
@@ -889,7 +889,7 @@ def test_different_windows_drives_are_not_within(monkeypatch: pytest.MonkeyPatch
     def boom(_paths: Any) -> str:
         raise ValueError("Paths don't have the same drive")
 
-    monkeypatch.setattr(gitread.os.path, "commonpath", boom)
+    monkeypatch.setattr(os.path, "commonpath", boom)
     assert gitread._is_within("/x/git", "/y") is False
 
 
@@ -902,8 +902,8 @@ def test_is_filesystem_root_posix() -> None:
 
 
 def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gitread.os, "name", "nt")
-    monkeypatch.setattr(gitread.os, "path", ntpath)
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "path", ntpath)
     try:
         assert gitread._is_filesystem_root("C:\\") is True
         assert gitread._is_filesystem_root("C:/") is True
@@ -913,8 +913,8 @@ def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch)
         assert gitread._is_filesystem_root("Z:\\tools") is False
         assert gitread._is_filesystem_root("git") is False
     finally:
-        monkeypatch.setattr(gitread.os, "name", "posix")
-        monkeypatch.setattr(gitread.os, "path", os.path)
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os, "path", os.path)
 
 
 def _posix_root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
