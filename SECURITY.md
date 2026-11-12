@@ -21,6 +21,8 @@ Report it privately through GitHub's **"Report a vulnerability"** button on the 
 
 Never include real secrets or tokens in a report.
 
+If the "Report a vulnerability" button isn't available, open a public issue with the **"Security contact request"** form and leave out every detail of the problem. A maintainer will reply with a private way to send the report.
+
 ## What to expect
 
 - **Acknowledgement:** within 3 business days.
