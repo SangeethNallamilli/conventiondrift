@@ -29,13 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"
 TIMEOUT_S = 60
 
-SR011_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SR-011: PR #9 cyaml.py absolute import of yaml._yaml; "
-        "fix pending (drop or declared patch, PR #11)"
-    ),
-)
 
 DECOY_MODULE = textwrap.dedent(
     """\
@@ -137,7 +130,6 @@ def _under(path: str | None, root: Path) -> bool:
 POSITIONS = pytest.mark.parametrize("position", ["front", "back"])
 
 
-@SR011_XFAIL
 @POSITIONS
 def test_vendor_import_resolution(tmp_path: Path, position: str) -> None:
     result, markers = run_probe(tmp_path, position)
@@ -168,7 +160,6 @@ def test_vendor_import_resolution(tmp_path: Path, position: str) -> None:
     assert result["entry_point_callable"], "conventiondrift.cli:main is not callable"
 
 
-@SR011_XFAIL
 @POSITIONS
 def test_vendor_no_libyaml(tmp_path: Path, position: str) -> None:
     # The decoy yaml._yaml provides fake CParser/CEmitter classes (DECOY_MODULE).
