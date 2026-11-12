@@ -66,24 +66,22 @@ jobs:
           python-version: "3.11"
       - name: Resolve the DCO range
         # For pull_request, use the PR base/head SHAs. For workflow_dispatch
-        # on a non-main branch, fetch origin/main and check merge-base(origin/main, HEAD)..HEAD
-        # via the existing DCO_BASE_SHA / DCO_HEAD_SHA interface.
-        # github.* values are passed in as env; they are never interpolated
-        # into the script body. persist-credentials stays false; the token
-        # is used only for this one fetch and is not written to .git/config.
+        # on a non-main branch, fetch origin/main anonymously (the repo is
+        # public) and check merge-base(origin/main, HEAD)..HEAD via the
+        # existing DCO_BASE_SHA / DCO_HEAD_SHA interface. github.* values
+        # are passed in as env; they are never interpolated into the
+        # script body. persist-credentials stays false and this fetch is
+        # unauthenticated, so no token is written to .git/config.
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set +x
           if [ "$EVENT_NAME" = "pull_request" ]; then
             printf '%s\n' "DCO_BASE_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
             printf '%s\n' "DCO_HEAD_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
           else
-            AUTH="http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-            git -c credential.helper= -c "$AUTH" fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
             base="$(git merge-base origin/main HEAD)"
             head="$(git rev-parse HEAD)"
             printf '%s\n' "DCO_BASE_SHA=${base}" >> "$GITHUB_ENV"
@@ -195,30 +193,64 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
+          # for the archive this runner downloads. A missing OS/arch key yields
+          # a sentinel that fails verification rather than skipping the check.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
+          enable-cache: false
+      # Test/test-macos only (contents: read, no secrets or id-token).
+      # Restore on pull_request; restore and save on push, schedule, and
+      # workflow_dispatch. Key is runner.os, the Python version, and
+      # hashFiles of the committed lockfiles. Hash-checked uv installs
+      # still use --require-hashes and --only-binary=:all:. UV_CACHE_DIR
+      # is set on the install steps (runner.* is not available in job env).
+      - name: Restore the uv package cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+      - name: Restore and save the uv package cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
       - name: CONTRIBUTING setup (Windows)
         if: runner.os == 'Windows'
         # Job default is bash -e -o pipefail, so a failed native command
         # stops the step (L-5). Do not use pwsh here.
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           # Translation of the CONTRIBUTING.md Unix setup (TW-OPEN). This is
           # the Windows install path for this matrix leg. The job fails if
           # install or later tests fail (AC-N5.2); no continue-on-error.
+          # Keep the .venv layout and PATH so later steps still use
+          # .venv/Scripts/python and .venv/Scripts/conventiondrift.
+          # uv on Windows needs the python.exe path, not the extensionless shim.
           python -m venv .venv
-          .venv/Scripts/python scripts/ci/install_pinned_pip.py
-          .venv/Scripts/python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
-          .venv/Scripts/python -m pip install --no-deps --no-build-isolation -e .
+          uv pip install --python .venv/Scripts/python.exe --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python .venv/Scripts/python.exe --no-deps --no-build-isolation -e .
           echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
           .venv/Scripts/conventiondrift --version
-      - name: Install hash-pinned pip, then hashed locks
+      - name: Install hashed locks with uv
         if: runner.os != 'Windows'
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
-          python3 scripts/ci/install_pinned_pip.py
-          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         if: runner.os != 'Windows'
-        run: python -m pip install --no-deps --no-build-isolation -e .
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
+        run: |
+          uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
       - name: Confirm no PyPI PyYAML in this environment
         run: python scripts/ci/check_no_pypi_yaml.py
       - name: pytest with coverage (offline paths, fixed seed)
@@ -274,14 +306,44 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
+          # for the archive this runner downloads. A missing OS/arch key yields
+          # a sentinel that fails verification rather than skipping the check.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
+          enable-cache: false
+      # Test/test-macos only (contents: read, no secrets or id-token).
+      # Restore on pull_request; restore and save on push, schedule, and
+      # workflow_dispatch. Key is runner.os, the Python version, and
+      # hashFiles of the committed lockfiles. Hash-checked uv installs
+      # still use --require-hashes and --only-binary=:all:. UV_CACHE_DIR
+      # is set on the install steps (runner.* is not available in job env).
+      - name: Restore the uv package cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+      - name: Restore and save the uv package cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
-      - name: Install hash-pinned pip, then hashed locks
+      - name: Install hashed locks with uv
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
-          python3 scripts/ci/install_pinned_pip.py
-          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
-        run: python -m pip install --no-deps --no-build-isolation -e .
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
+        run: |
+          uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
       - name: Confirm no PyPI PyYAML in this environment
         run: python scripts/ci/check_no_pypi_yaml.py
       - name: pytest with coverage (offline paths, fixed seed)
