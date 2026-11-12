@@ -20,15 +20,11 @@ import sys
 import zipfile
 from pathlib import Path, PurePosixPath
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VENDOR_DIR = REPO_ROOT / "src" / "conventiondrift" / "_vendor"
 WHEEL_VENDOR = "conventiondrift/_vendor"
 TIMEOUT_S = 300
 FORBIDDEN_SUFFIXES = (".so", ".pyd", ".pyc", ".pyo", ".pyx", ".pxd", ".c", ".h")
-
-VENDORED_TREE_ABSENT = not (VENDOR_DIR / "yaml").is_dir()
 
 
 def _manifest_paths() -> list[str]:
@@ -81,9 +77,6 @@ def build_wheel(tmp_path: Path) -> Path:
     return wheels[0]
 
 
-@pytest.mark.xfail(
-    condition=VENDORED_TREE_ABSENT, strict=True, reason="T-004 (PR #9 / PR #11) not merged"
-)
 def test_wheel_vendor_contents(tmp_path: Path) -> None:
     wheel = build_wheel(tmp_path)
     with zipfile.ZipFile(wheel) as zf:

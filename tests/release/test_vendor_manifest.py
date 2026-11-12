@@ -56,7 +56,6 @@ HEADER_LINE = re.compile(r"^#\s*([A-Za-z0-9-]+):\s*(.*)$")
 PATCHED_LINE = re.compile(r"^#\s*patched:\s*(\S+)\s+(\S.*)$")
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+")
 
-VENDORED_TREE_ABSENT = not (VENDOR_DIR / "yaml").is_dir()
 
 # Deselected by default (addopts -m "not network"). Fails, never skips, if run
 # offline under ``pytest -m network`` with no valid cached sdist.
@@ -184,9 +183,6 @@ def load_sdist(manifest: Manifest) -> dict[str, bytes]:
     return files
 
 
-@pytest.mark.xfail(
-    condition=VENDORED_TREE_ABSENT, strict=True, reason="T-004 (PR #9 / PR #11) not merged"
-)
 def test_vendor_manifest() -> None:
     manifest = load_manifest()
     sdist_files = load_sdist(manifest)
