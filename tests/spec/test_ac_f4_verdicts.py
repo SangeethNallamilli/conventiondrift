@@ -7,50 +7,19 @@ unit-test predicates.
 
 ACs that need C8, C10, C11 or the Action (window dating, comments,
 annotations, summary text) are listed in TRACEABILITY.md and are not claimed
-here. Until T-021 / PR #25 merges, every test in this module is a strict xfail
-on ImportError naming T-021.
+here. T-021 / PR #25 is on main, so every case runs against
+conventiondrift.verdicts for real; a failing case is a T-021 finding.
 """
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
-from typing import Any, cast
 
 import pytest
 
 from conventiondrift.model import Counts, Rule, RuleMatch, SideResult, Site, Thresholds, Verdict
-
-# T-021 / PR #25 is not on main yet. Guard with a strict xfail on ImportError
-# naming T-021 (not importorskip) so the cases are visible as expected
-# failures and become real tests the moment conventiondrift.verdicts lands.
-# importlib keeps mypy --strict clean while the module is absent.
-
-
-def _load_verdicts() -> tuple[Any, Any] | None:
-    try:
-        module = importlib.import_module("conventiondrift.verdicts")
-    except ImportError:
-        return None
-    return (module.decide, module.side_result)
-
-
-_loaded = _load_verdicts()
-if _loaded is None:
-    pytestmark = pytest.mark.xfail(
-        strict=True,
-        reason="needs T-021 verdict engine",
-        raises=ImportError,
-    )
-
-    def decide(*args: Any, **kwargs: Any) -> Any:
-        raise ImportError("conventiondrift.verdicts (needs T-021)")
-
-    def side_result(*args: Any, **kwargs: Any) -> Any:
-        raise ImportError("conventiondrift.verdicts (needs T-021)")
-else:
-    decide, side_result = _loaded
+from conventiondrift.verdicts import decide, side_result
 
 # SPEC.md §5 conventions (defaults apply unless an AC states otherwise) and I-6:
 # Holds: overall >= 80; Stale: overall < 20 and recent < 20;
@@ -112,10 +81,7 @@ def _verdict(
     *,
     verifiable: bool = True,
 ) -> Verdict:
-    return cast(
-        Verdict,
-        decide(verifiable=verifiable, overall=overall, recent=recent, thresholds=thresholds),
-    )
+    return decide(verifiable=verifiable, overall=overall, recent=recent, thresholds=thresholds)
 
 
 def _site(file: str, line: int, option: str) -> Site:
@@ -133,9 +99,8 @@ def _side(
     thresholds: Thresholds = DEFAULTS,
     options: frozenset[str] = HTTP,
 ) -> SideResult:
-    return cast(
-        SideResult,
-        side_result(rule, sites, options=options, recent_lines=recent_lines, thresholds=thresholds),
+    return side_result(
+        rule, sites, options=options, recent_lines=recent_lines, thresholds=thresholds
     )
 
 
