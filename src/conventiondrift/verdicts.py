@@ -98,6 +98,18 @@ def _count(results: Sequence[SiteResult]) -> Counts:
     )
 
 
+def _match_is_valid(match: RuleMatch, options: AbstractSet[str]) -> bool:
+    """I-10: non-empty disjoint preferred | prohibited, both subsets of options."""
+    preferred = match.preferred
+    prohibited = match.prohibited
+    return (
+        bool(preferred | prohibited)
+        and not (preferred & prohibited)
+        and preferred <= options
+        and prohibited <= options
+    )
+
+
 def side_result(
     rule: Rule,
     sites: Iterable[Site],
@@ -123,13 +135,19 @@ def side_result(
     A rule with no checker or no match (no mapping, or an ambiguous one) is
     Not verifiable, carries no sites, and has ``recent=None`` and
     ``recent_unavailable_reason=None``, because recent does not apply (I-13).
-    Disabled rules are dropped by T-028 before C9; an ignored rule gets its
-    normal verdict.
+    The same path is taken for an invalid match (I-10): an empty
+    ``preferred | prohibited``, a non-empty ``preferred & prohibited``, or any
+    option in either set that is outside the checker's ``options``. That is a
+    defensive backstop and is never Holds. Disabled rules are dropped by T-028
+    before C9; an ignored rule gets its normal verdict.
     """
     # I-13: C9 is pure and counts every site it is given. T-028 filters sites
     # by scope_dir, and drops disabled rules, before C9. An ignored rule still
     # gets its normal verdict here (it only stops counting for fail-on).
     match = rule.match if rule.checker is not None else None
+    # I-10 defence in depth: an invalid stand-in match is Not verifiable, never Holds.
+    if match is not None and not _match_is_valid(match, options):
+        match = None
     results: list[SiteResult] = []
     if match is not None:
         # Build the lookup set once, and only when we will walk sites (SR F2, CR2 N2).

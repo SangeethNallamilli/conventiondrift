@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from conventiondrift import verdicts
@@ -310,9 +310,27 @@ def test_follows_preferred_wins_over_prohibited() -> None:
     assert follows("warnings", both) is False
 
 
-def test_follows_empty_match() -> None:
-    empty = RuleMatch(preferred=frozenset(), prohibited=frozenset(), specificity=0)
-    assert follows("anything", empty) is True
+def _stand_in_invalid_match(*, preferred: frozenset[str], prohibited: frozenset[str]) -> RuleMatch:
+    """Plant a degenerate RuleMatch to exercise C9's defence in depth (I-10).
+
+    A valid instance is built first, then ``preferred`` / ``prohibited`` are
+    overwritten with ``object.__setattr__``. That works both before and after
+    ``RuleMatch.__post_init__`` starts rejecting an empty union or an overlap
+    (SE1, not yet merged). An option outside the checker's ``options`` is
+    still constructed normally, because the model does not know the checker.
+    """
+    match = RuleMatch(preferred=frozenset({"httpx"}), prohibited=frozenset(), specificity=0)
+    object.__setattr__(match, "preferred", preferred)
+    object.__setattr__(match, "prohibited", prohibited)
+    return match
+
+
+def _assert_not_verifiable_side(result: SideResult) -> None:
+    assert result.verdict is NV
+    assert result.sites == ()
+    assert result.overall == Counts(0, 0, 0)
+    assert result.recent is None
+    assert result.recent_unavailable_reason is None
 
 
 # --- side_result: building SideResult --------------------------------------------------
@@ -333,6 +351,92 @@ def build(
 
 
 FIVE_REQUESTS = [site("src/a.py", i, "requests") for i in range(1, 6)]
+
+
+def test_side_result_empty_match_is_not_verifiable() -> None:
+    """C9 defence in depth (I-10): empty preferred and prohibited is Not verifiable, never Holds."""
+    rule = replace(
+        RULE, match=_stand_in_invalid_match(preferred=frozenset(), prohibited=frozenset())
+    )
+    with_history = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), rule=rule)
+    no_history = build(FIVE_REQUESTS, None, rule=rule)
+    _assert_not_verifiable_side(with_history)
+    _assert_not_verifiable_side(no_history)
+    assert with_history.verdict is not H
+    assert no_history.verdict is not H
+
+
+def test_side_result_overlapping_match_is_not_verifiable() -> None:
+    """C9 defence in depth (I-10): preferred ∩ prohibited is Not verifiable, never Holds."""
+    rule = replace(
+        RULE,
+        match=_stand_in_invalid_match(
+            preferred=frozenset({"httpx"}), prohibited=frozenset({"httpx"})
+        ),
+    )
+    with_history = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), rule=rule)
+    no_history = build(FIVE_REQUESTS, None, rule=rule)
+    _assert_not_verifiable_side(with_history)
+    _assert_not_verifiable_side(no_history)
+    assert with_history.verdict is not H
+    assert no_history.verdict is not H
+
+
+@pytest.mark.parametrize(
+    "match",
+    [
+        RuleMatch(preferred=frozenset({"logging"}), prohibited=frozenset(), specificity=0),
+        RuleMatch(preferred=frozenset(), prohibited=frozenset({"print"}), specificity=0),
+        RuleMatch(preferred=frozenset({"httpx"}), prohibited=frozenset({"print"}), specificity=0),
+    ],
+    ids=["preferred-outside", "prohibited-outside", "preferred-in-prohibited-outside"],
+)
+def test_side_result_match_outside_options_is_not_verifiable(match: RuleMatch) -> None:
+    """C9 defence in depth (I-10): an option outside the checker's options is Not verifiable.
+
+    These matches are constructed normally; ``RuleMatch`` does not know the checker.
+    """
+    rule = replace(RULE, match=match)
+    with_history = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), rule=rule)
+    no_history = build(FIVE_REQUESTS, None, rule=rule)
+    _assert_not_verifiable_side(with_history)
+    _assert_not_verifiable_side(no_history)
+    assert with_history.verdict is not H
+    assert no_history.verdict is not H
+
+
+@given(
+    preferred=st.frozensets(
+        st.sampled_from(["requests", "httpx", "urllib3", "logging", "print", "x"]), max_size=4
+    ),
+    prohibited=st.frozensets(
+        st.sampled_from(["requests", "httpx", "urllib3", "logging", "print", "x"]), max_size=4
+    ),
+)
+def test_degenerate_match_never_gives_holds(
+    preferred: frozenset[str], prohibited: frozenset[str]
+) -> None:
+    """C9 defence in depth (I-10): a degenerate match is Not verifiable, never Holds."""
+    options = HTTP
+    valid = (
+        bool(preferred | prohibited)
+        and not (preferred & prohibited)
+        and preferred <= options
+        and prohibited <= options
+    )
+    assume(not valid)
+    if not (preferred | prohibited) or (preferred & prohibited):
+        match = _stand_in_invalid_match(preferred=preferred, prohibited=prohibited)
+    else:
+        match = RuleMatch(preferred=preferred, prohibited=prohibited, specificity=0)
+    result = build(
+        FIVE_REQUESTS,
+        frozenset({("src/a.py", 1)}),
+        rule=replace(RULE, match=match),
+        options=options,
+    )
+    _assert_not_verifiable_side(result)
+    assert result.verdict is not H
 
 
 def test_side_result_counts_and_flags() -> None:
