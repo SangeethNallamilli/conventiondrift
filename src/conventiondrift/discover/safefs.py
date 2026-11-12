@@ -39,8 +39,10 @@ __all__ = [
     "REASON_SIZE",
     "REASON_SPECIAL",
     "REASON_SYMLINK",
+    "REASON_UNSUPPORTED",
     "EntryKind",
     "FileKind",
+    "PathOrigin",
     "check_size",
     "decode_text",
     "entry_kind",
@@ -51,6 +53,8 @@ __all__ = [
 
 FileKind = Literal["instruction", "python", "manifest", "lockfile", "config"]
 EntryKind = Literal["file", "dir", "symlink", "other"]
+# Where a path string came from (D-PM-28): a value the user typed, or a name in the repo tree.
+PathOrigin = Literal["input", "tree"]
 
 # SECURITY-RULES R2.3, AC-N3.7.
 FILE_MAX_BYTES: Final = 1_048_576  # instruction, .py, manifest, lockfile (1 MiB)
@@ -64,6 +68,8 @@ REASON_BINARY: Final = "binary"
 REASON_NOT_DECODABLE: Final = "not decodable"
 # FIFOs, sockets, devices, and a folder where a file was expected (I-13).
 REASON_SPECIAL: Final = "special file"
+# Backslash or drive-form names found in the repo tree, e.g. ``a\\b.py`` (D-PM-28).
+REASON_UNSUPPORTED: Final = "unsupported path"
 
 _DRIVE: Final = re.compile(r"[A-Za-z]:")  # anchored with .match; linear, no repetition
 # BOMs that mean "this is not UTF-8 text" (UTF-32 first: its LE BOM starts with UTF-16's).
@@ -76,22 +82,26 @@ _FOREIGN_BOMS: Final = (
 _READ_CHUNK: Final = 65_536
 
 
-def validate_relpath(value: str) -> str:
+def validate_relpath(value: str, origin: PathOrigin = "input") -> str:
     """Return ``value`` as a normalized repo-relative POSIX path, or reject it.
 
     Rejected with ``FileSkipped("outside repository")`` (R2.1, AC-N3.8):
-    absolute paths, any ``..`` segment, a Windows drive prefix (``C:``), any
-    backslash, a NUL character, and values that normalize to nothing. ``.``
-    and empty segments are dropped, so ``./a//b/`` becomes ``a/b``. Glob
+    absolute paths, any ``..`` segment, a NUL character, and values that
+    normalize to nothing. A backslash anywhere or a Windows drive prefix
+    (``C:``) is also "outside repository" for a value the user typed
+    (``origin="input"``: ``paths``, ``config``, ``exclude``, ignore entries),
+    but "unsupported path" for a name found in the repo tree
+    (``origin="tree"``), such as ``a\\b.py`` or ``c:x.py`` (D-PM-28).
+    ``.`` and empty segments are dropped, so ``./a//b/`` becomes ``a/b``. Glob
     characters are left alone, so the same check serves ``exclude`` entries.
     """
-    if not value or "\x00" in value or "\\" in value:
-        raise FileSkipped(REASON_OUTSIDE)
-    if value.startswith("/") or _DRIVE.match(value):
+    if not value or "\x00" in value or value.startswith("/"):
         raise FileSkipped(REASON_OUTSIDE)
     parts = [p for p in value.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
+    if "\\" in value or _DRIVE.match(value):
+        raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
 
 
@@ -199,6 +209,7 @@ def read_worktree_file(
     kind: FileKind,
     *,
     max_file_bytes: int | None = None,
+    origin: PathOrigin,
 ) -> bytes:
     """Read one working-tree file under ``root`` safely, or raise ``FileSkipped``.
 
@@ -208,9 +219,11 @@ def read_worktree_file(
     require the ``realpath`` to stay under the repo root; open, then ``fstat``
     the same handle for a regular file and the size limit; only then read, and
     never more than limit + 1 bytes (a file that grew is still "size limit").
+    ``origin`` is required so every caller states whether ``relpath`` was typed
+    by the user or found in the repo tree (D-PM-28; see :func:`validate_relpath`).
     Other ``OSError`` (missing file, permission) propagates to the caller.
     """
-    parts = validate_relpath(relpath).split("/")
+    parts = validate_relpath(relpath, origin).split("/")
     root_real = os.path.realpath(root)
     if not _contained(root_real, os.path.join(root_real, *parts)):
         # Only reached for a symlinked parent that the component walk below

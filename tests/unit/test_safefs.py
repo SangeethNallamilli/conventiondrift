@@ -55,6 +55,9 @@ def outside() -> Iterator[Path]:
 
 
 def _reason(fn: object, *args: object, **kw: object) -> str:
+    if fn is read_worktree_file and "origin" not in kw:
+        # The config file path is typed by the user; every other kind is a tree name.
+        kw["origin"] = "input" if "config" in args else "tree"
     with pytest.raises(FileSkipped) as exc:
         fn(*args, **kw)  # type: ignore[operator]
     return exc.value.reason
@@ -77,7 +80,7 @@ def test_read_size_limit_boundary(case: str, tmp_path: Path, strategy: str) -> N
     f = tmp_path / rel
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_bytes(b"a" * limit)  # exactly the limit: read
-    assert read_worktree_file(tmp_path, rel, kind) == b"a" * limit
+    assert read_worktree_file(tmp_path, rel, kind, origin="tree") == b"a" * limit
     f.write_bytes(b"a" * (limit + 1))  # one byte over: skipped
     assert _reason(read_worktree_file, tmp_path, rel, kind) == REASON_SIZE
     check_size(limit, kind)
@@ -120,7 +123,7 @@ def test_read_never_requests_more_than_limit_plus_one(
         return real_read(fd, n)
 
     monkeypatch.setattr(os, "read", spy)
-    assert len(read_worktree_file(tmp_path, "c.yml", "config")) == CONFIG_MAX_BYTES
+    assert len(read_worktree_file(tmp_path, "c.yml", "config", origin="input")) == CONFIG_MAX_BYTES
     assert sum(asked) <= CONFIG_MAX_BYTES + 1
 
 
@@ -146,12 +149,15 @@ def test_lowered_limit_applies_to_reads(tmp_path: Path, strategy: str) -> None:
     assert (
         _reason(read_worktree_file, tmp_path, "m.py", "python", max_file_bytes=1024) == REASON_SIZE
     )
-    assert len(read_worktree_file(tmp_path, "m.py", "python", max_file_bytes=1025)) == 1025
+    assert (
+        len(read_worktree_file(tmp_path, "m.py", "python", max_file_bytes=1025, origin="tree"))
+        == 1025
+    )
 
 
 def test_empty_file_reads_empty(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "AGENTS.md").write_bytes(b"")
-    assert read_worktree_file(tmp_path, "AGENTS.md", "instruction") == b""
+    assert read_worktree_file(tmp_path, "AGENTS.md", "instruction", origin="tree") == b""
 
 
 # ---- AC-N3.9 symlinks (R2.2, A-3 #1) --------------------------------------------------
@@ -205,7 +211,7 @@ def test_symlinked_parent_inside_repo_is_still_symlink(tmp_path: Path, strategy:
     (tmp_path / "real/a.py").write_text("x = 1\n")
     _symlink(tmp_path / "alias", tmp_path / "real")
     assert _reason(read_worktree_file, tmp_path, "alias/a.py", "python") == REASON_SYMLINK
-    assert read_worktree_file(tmp_path, "real/a.py", "python") == b"x = 1\n"
+    assert read_worktree_file(tmp_path, "real/a.py", "python", origin="tree") == b"x = 1\n"
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX")
@@ -226,7 +232,10 @@ def test_repo_root_given_through_symlink_is_fine(tmp_path: Path, strategy: str) 
     (tmp_path / "repo").mkdir()
     (tmp_path / "repo/AGENTS.md").write_text("- Use httpx\n")
     _symlink(tmp_path / "rootlink", tmp_path / "repo")
-    assert read_worktree_file(tmp_path / "rootlink", "AGENTS.md", "instruction") == b"- Use httpx\n"
+    assert (
+        read_worktree_file(tmp_path / "rootlink", "AGENTS.md", "instruction", origin="tree")
+        == b"- Use httpx\n"
+    )
 
 
 @pytest.mark.skipif(not d._USE_DIR_FD, reason="needs openat")
@@ -387,16 +396,16 @@ def test_entry_kind_symlink(tmp_path: Path) -> None:
 def test_missing_file_and_file_as_parent_propagate(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "f").write_text("x")
     with pytest.raises(FileNotFoundError):
-        read_worktree_file(tmp_path, "nope.py", "python")
+        read_worktree_file(tmp_path, "nope.py", "python", origin="tree")
     with pytest.raises(NotADirectoryError):
-        read_worktree_file(tmp_path, "f/x.py", "python")
+        read_worktree_file(tmp_path, "f/x.py", "python", origin="tree")
 
 
 def test_normal_nested_read(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "src/pkg").mkdir(parents=True)
     (tmp_path / "src/pkg/m.py").write_bytes(b"x = 1\n")
-    assert read_worktree_file(tmp_path, "./src//pkg/m.py", "python") == b"x = 1\n"
-    assert read_worktree_file(str(tmp_path), "src/pkg/m.py", "python") == b"x = 1\n"
+    assert read_worktree_file(tmp_path, "./src//pkg/m.py", "python", origin="tree") == b"x = 1\n"
+    assert read_worktree_file(str(tmp_path), "src/pkg/m.py", "python", origin="tree") == b"x = 1\n"
 
 
 def test_no_fd_leak(tmp_path: Path, strategy: str) -> None:
@@ -408,12 +417,12 @@ def test_no_fd_leak(tmp_path: Path, strategy: str) -> None:
     os.mkfifo(tmp_path / "a/fifo.py")
     before = len(os.listdir("/proc/self/fd"))
     for _ in range(20):
-        read_worktree_file(tmp_path, "a/ok.py", "python")
+        read_worktree_file(tmp_path, "a/ok.py", "python", origin="tree")
         for bad in ("a/big.py", "a/fifo.py"):
             with pytest.raises(FileSkipped):
-                read_worktree_file(tmp_path, bad, "python")
+                read_worktree_file(tmp_path, bad, "python", origin="tree")
         with pytest.raises(FileNotFoundError):
-            read_worktree_file(tmp_path, "a/none.py", "python")
+            read_worktree_file(tmp_path, "a/none.py", "python", origin="tree")
     assert len(os.listdir("/proc/self/fd")) == before
 
 
@@ -497,5 +506,5 @@ def test_bomless_utf16_is_binary() -> None:
 
 def test_read_then_decode_end_to_end(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "x.py").write_bytes(b"\x00\x01")
-    raw = read_worktree_file(tmp_path, "x.py", "python")
+    raw = read_worktree_file(tmp_path, "x.py", "python", origin="tree")
     assert _reason(decode_text, raw, "python") == REASON_BINARY
