@@ -93,6 +93,8 @@ jobs:
         run: |
           python3 scripts/ci/install_pinned_pip.py
           python -m pip install --require-hashes --no-deps -r requirements/build.txt -r requirements/dev.txt
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python3 scripts/ci/check_no_pypi_yaml.py
       - name: ruff format --check
         run: ruff format --check .
       - name: ruff check
@@ -118,8 +120,10 @@ jobs:
         run: |
           python3 scripts/ci/install_pinned_pip.py
           python -m pip install --require-hashes --no-deps -r requirements/build.txt -r requirements/dev.txt
-      - name: mypy --strict src
-        run: mypy --strict src
+      - name: mypy --strict src and tests/unit (D-TL-21)
+        env:
+          MYPYPATH: src
+        run: mypy --strict src tests/unit
 
 
   test:
@@ -169,6 +173,8 @@ jobs:
       - name: Install the package (no deps, no build isolation)
         if: runner.os != 'Windows'
         run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python scripts/ci/check_no_pypi_yaml.py
       - name: pytest with coverage (offline paths, fixed seed)
         run: |
           python -c "import pathlib, site; pathlib.Path(site.getsitepackages()[0]).joinpath('coverage_startup.pth').write_text('import coverage; coverage.process_startup()\\n')"
@@ -226,18 +232,12 @@ jobs:
           python -m pip install --require-hashes --no-deps -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         run: python -m pip install --no-deps --no-build-isolation -e .
-      # test_vendor_manifest is marked network and fetches the pinned sdist.
-      # This job has network; the offline test job deselects that marker.
-      - name: Network vendor checks (TE tests if present, otherwise scripts/ci)
-        run: |
-          if [ -f tests/release/test_vendor_manifest.py ]; then
-            echo "Using tests/release from the tree (PR #12); running -m network"
-            python -m pytest -m network tests/release --hypothesis-seed="${HYPOTHESIS_SEED}"
-          else
-            echo "tests/release not on this tree yet; using scripts/ci fallback"
-            python3 scripts/ci/check_vendor.py
-            python3 -I scripts/ci/check_import_resolution.py
-          fi
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python3 scripts/ci/check_no_pypi_yaml.py
+      # tests/release is on main (#12). test_vendor_manifest is marked network
+      # and fetches the pinned sdist; this job has network.
+      - name: Network vendor checks (pytest -m network tests/release)
+        run: python -m pytest -m network tests/release --hypothesis-seed="${HYPOTHESIS_SEED}"
 
   secret-scan:
     name: secret-scan
@@ -286,6 +286,8 @@ jobs:
     env:
       GIT_MIN_VERSION: "2.30.9"
       GIT_MIN_SHA256: "4e3985a641d9ebdfec9e56b370cdbe362a672d9b45270c1acb1406cdab0f5bb4"
+      # Kernel.org checksum autosigner (not Junio C Hamano). See scripts/ci/keys/.
+      GIT_MIN_SIGNER_FPR: "B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
     # Digest of python:3.11-bookworm (tag updated 2026-11-06). A pinned
     # container keeps the compiler toolchain stable for the 2.30.9 source.
     container:
@@ -298,9 +300,9 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential ca-certificates gettext libcurl4-openssl-dev \
+            build-essential ca-certificates gettext gnupg libcurl4-openssl-dev \
             libexpat1-dev libssl-dev make zlib1g-dev
-      - name: Build checksum-pinned minimum Git
+      - name: GPG-verify and build checksum-pinned minimum Git
         run: python3 scripts/ci/install_git_min.py
       - name: Confirm PATH git is the pinned minimum
         run: |
@@ -336,6 +338,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # No cache input: do not share a pip/setup-python cache with any
+      # release or publish job. PyPI PyYAML is allowed only in this job.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
@@ -345,7 +349,13 @@ jobs:
           python -m pip install --require-hashes --no-deps -r requirements/mutation.txt
       - name: Install the package (no deps, no build isolation)
         run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Vendored yaml isolation (PyPI PyYAML is installed here)
+        env:
+          PYTHONPATH: scripts/ci
+        run: python3 scripts/ci/check_mutation_yaml.py
       - name: Mutation gate (80 overall / 90 critical; needs SR review)
+        env:
+          PYTHONPATH: scripts/ci
         run: python3 scripts/ci/check_mutation.py
 
 

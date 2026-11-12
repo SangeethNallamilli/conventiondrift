@@ -3,3 +3,6 @@
 # GATES.md / TEST-STRATEGY.md §2: overall mutation ≥80%; critical modules ≥90%.
 # Thresholds are not lowered.
 mutmut==3.8.1
+# Build backend, same pin as pyproject [build-system], required for
+# pip install --no-deps --no-build-isolation -e . in the mutation job.
+setuptools==84.2.1
