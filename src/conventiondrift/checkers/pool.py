@@ -251,6 +251,15 @@ def context_changed_paths(
     return frozenset(p for p in paths if p in flipped)
 
 
+def _checker_set(analysis: Analysis) -> frozenset[str]:
+    """Ids of every checker that produced this analysis, including failed ones."""
+    return (
+        frozenset(analysis.py_sites)
+        | frozenset(analysis.manifest_sites)
+        | frozenset(analysis.failed)
+    )
+
+
 def incremental_base(
     head: Analysis, base_changed: Analysis, changed_head_paths: frozenset[str]
 ) -> Analysis:
@@ -266,9 +275,14 @@ def incremental_base(
     outside that set are reused as they are. A checker that failed on either
     side is dropped.
 
-    Raises ``ValueError`` if ``base_changed`` covers a path that head reuses,
-    which means the changed set is incomplete (a caller bug).
+    Raises ``ComponentError("checkers")`` if ``head`` and ``base_changed``
+    were not produced by the same checker set, so a missing checker cannot
+    silently drop base sites. Raises ``ValueError`` if ``base_changed``
+    covers a path that head reuses, which means the changed set is
+    incomplete (a caller bug).
     """
+    if _checker_set(head) != _checker_set(base_changed):
+        raise ComponentError("checkers", "incremental base used different checker sets")
     reused_paths = {
         path for files in head.py_sites.values() for path in files if path not in changed_head_paths
     } | {s.path for s in head.skipped if s.path not in changed_head_paths}

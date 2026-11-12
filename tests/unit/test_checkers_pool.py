@@ -298,10 +298,9 @@ CHANGED_HEAD = frozenset({"src/mod.py", "src/new.py", "src/renamed_new.py"})
 
 
 def test_incremental_base_is_head_minus_changed_plus_base_changed() -> None:
-    head = analyze(HEAD, checkers=reg(PRINT), is_script=never, manifests=MANIFESTS[:1])
-    base_changed = analyze(
-        BASE_CHANGED, checkers=reg(PRINT, ManifestChecker()), is_script=never, manifests=MANIFESTS
-    )
+    checkers = reg(PRINT, ManifestChecker())
+    head = analyze(HEAD, checkers=checkers, is_script=never, manifests=MANIFESTS[:1])
+    base_changed = analyze(BASE_CHANGED, checkers=checkers, is_script=never, manifests=MANIFESTS)
     base = incremental_base(head, base_changed, CHANGED_HEAD)
     # Written by hand: same.py reused from head; mod.py, gone.py, renamed_old.py from base.
     assert base.sites("logging") == (
@@ -358,17 +357,52 @@ def test_incremental_base_equals_full_base_on_random_trees(
 
 def test_incremental_base_drops_a_checker_that_failed_on_either_side() -> None:
     files = [py("src/a.py", "f()\nprint(1)\n")]
-    ok = analyze(files, checkers=reg(PRINT, FaultyChecker("not a site")), is_script=never)
+    failing = reg(PRINT, HTTP, FaultyChecker("not a site"))
+    ok = analyze(files, checkers=failing, is_script=never)
     assert ok.failed == ("exceptions",)
-    clean = analyze([], checkers=reg(PRINT, HTTP), is_script=never)
+    # Same checker set, but no files for the faulty checker to fail on.
+    clean = analyze([], checkers=failing, is_script=never)
+    assert clean.failed == ()
     broken = analyze(
         files, checkers=reg(PRINT, FaultyChecker("handler raises"), HTTP), is_script=never
     )
     assert incremental_base(ok, clean, frozenset()).failed == ("exceptions",)
-    head = analyze(files, checkers=reg(PRINT, HTTP), is_script=never)
+    # Same ids as broken; a healthy stand-in keeps exceptions alive on head.
+    head = analyze(
+        files,
+        checkers=reg(PRINT, HTTP, CallChecker("exceptions", frozenset({"print"}))),
+        is_script=never,
+    )
+    assert head.failed == ()
     base = incremental_base(head, broken, frozenset({"src/a.py"}))
     assert base.failed == ("exceptions",)
     assert base.checker_ids() == ("http-client", "logging")
+
+
+@pytest.mark.parametrize(
+    ("head_checkers", "base_checkers"),
+    [
+        (reg(PRINT, HTTP), reg(PRINT)),  # http-client missing from base
+        (reg(PRINT), reg(PRINT, HTTP)),  # http-client missing from head
+        (reg(PRINT, ManifestChecker()), reg(PRINT)),  # package-manager extra on head
+        (reg(PRINT), reg(PRINT, ManifestChecker())),  # package-manager extra on base
+    ],
+    ids=[
+        "missing-from-base",
+        "missing-from-head",
+        "extra-on-head",
+        "extra-on-base",
+    ],
+)
+def test_incremental_base_rejects_a_mismatched_checker_set(
+    head_checkers: Mapping[str, Checker], base_checkers: Mapping[str, Checker]
+) -> None:
+    files = [py("src/a.py", "print(1)\n")]
+    head = analyze(files, checkers=head_checkers, is_script=never)
+    base_changed = analyze(files, checkers=base_checkers, is_script=never)
+    with pytest.raises(ComponentError) as info:
+        incremental_base(head, base_changed, frozenset({"src/a.py"}))
+    assert info.value.component == "checkers"
 
 
 def test_an_incomplete_changed_set_is_a_caller_bug() -> None:
