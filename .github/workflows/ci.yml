@@ -233,9 +233,10 @@ jobs:
           # install or later tests fail (AC-N5.2); no continue-on-error.
           # Keep the .venv layout and PATH so later steps still use
           # .venv/Scripts/python and .venv/Scripts/conventiondrift.
+          # uv on Windows needs the python.exe path, not the extensionless shim.
           python -m venv .venv
-          uv pip install --python .venv/Scripts/python --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
-          uv pip install --python .venv/Scripts/python --no-deps --no-build-isolation -e .
+          uv pip install --python .venv/Scripts/python.exe --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python .venv/Scripts/python.exe --no-deps --no-build-isolation -e .
           echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
           .venv/Scripts/conventiondrift --version
       - name: Install hashed locks with uv
