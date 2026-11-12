@@ -47,6 +47,28 @@ _TEST_GIT_ENV = {
     **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),
 }
 
+#: The temp-dir variables git reads: TMPDIR (git's tempfile.c), and on Windows
+#: TMP then TEMP, which Git for Windows copies into TMPDIR when that is unset.
+_TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+
+
+def _temp_env(folder: str) -> dict[str, str]:
+    return dict.fromkeys(_TEMP_VARS, folder)
+
+
+@pytest.fixture(autouse=True)
+def _fixture_git_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fixture git gets a test-owned temp dir.
+
+    Git for Windows has no ``/tmp``: with none of the variables set, textconv,
+    external diff and signature checks fail with "unable to create temp-file".
+    """
+    folder = tmp_path / "git-temp"
+    folder.mkdir()
+    for name, value in _temp_env(str(folder)).items():
+        monkeypatch.setitem(_TEST_GIT_ENV, name, value)
+
+
 #: Every fixture git call: no CRLF conversion, so objects and files are byte-exact.
 _TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 
@@ -142,6 +164,51 @@ def test_sentinel_driver_command_runs_and_echoes_its_input(tmp_path: Path) -> No
     out = _REAL_RUN(argv, capture_output=True, check=False)
     assert (out.returncode, out.stdout) == (0, b"payload\n")
     assert sentinel.read_text() == "ran\n"
+
+
+@pytest.fixture
+def git_temp_in_private_home(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Give gitread's git a temp dir, in this test only, so a planted program CAN run.
+
+    Production's env (I-11 C3 at this head) carries no TEMP/TMP/TMPDIR, so on
+    Windows git can't create the temp file that textconv, external diff and
+    signature checks need, and such a program could never start there anyway.
+    A load-bearing test must show the hardening flag, not a missing temp dir,
+    is what stops it. This wraps the real ``_environment`` and adds the three
+    variables set to ``<private HOME>/tmp`` (created inside the private HOME, so
+    removed with it): the form of the INTERFACES I-13 ruling. Runner, argv and
+    every other variable are unchanged. Yields the temp dirs handed out.
+    """
+    real = gitread._environment
+    handed_out: list[str] = []
+
+    def with_temp(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
+        env = real(home, search_path, repo_dir)
+        folder = os.path.join(home, "tmp")
+        os.makedirs(folder, exist_ok=True)
+        handed_out.append(folder)
+        return {**env, **_temp_env(folder)}
+
+    monkeypatch.setattr(gitread, "_environment", with_temp)
+    yield handed_out
+
+
+def test_production_environment_passes_no_temp_dir(tmp_path: Path) -> None:
+    # I-11 C3 at this head: the fixed env plus SYSTEMROOT on Windows, nothing else.
+    env = gitread._environment(str(tmp_path), "/bin", tmp_path)
+    assert [name for name in _TEMP_VARS if name in env] == []
+
+
+def test_git_temp_in_private_home_adds_only_the_temp_dir(
+    git_temp_in_private_home: list[str], tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    env = gitread._environment(str(home), "/bin", tmp_path)
+    folder = os.path.join(str(home), "tmp")
+    assert {name: env[name] for name in _TEMP_VARS} == dict.fromkeys(_TEMP_VARS, folder)
+    assert os.path.isdir(folder)
+    assert git_temp_in_private_home == [folder]
 
 
 @pytest.fixture
@@ -328,7 +395,11 @@ def test_global_config_in_inherited_home_is_ignored(
     assert not (repo / "SENTINEL").exists()
 
 
-def test_hostile_repo_config_runs_nothing(repo: Path, tmp_path: Path) -> None:
+def test_hostile_repo_config_runs_nothing(
+    repo: Path, tmp_path: Path, git_temp_in_private_home: list[str]
+) -> None:
+    # git_temp_in_private_home: git could create the temp files a planted
+    # program needs, so only the hardening stops it (not a missing temp dir).
     # Shell-run settings get the portable Python driver (shown to run under
     # git by test_plain_git_control_runs_the_hostile_textconv); hooks and
     # gpg.program, which git starts without a shell, get an LF sh program.
@@ -2191,7 +2262,9 @@ def test_plain_git_control_runs_the_hostile_textconv(textconv_repo: tuple[Path, 
     assert sentinel.exists()
 
 
-def test_hardened_patch_calls_run_nothing(textconv_repo: tuple[Path, Path, str]) -> None:
+def test_hardened_patch_calls_run_nothing(
+    textconv_repo: tuple[Path, Path, str], git_temp_in_private_home: list[str]
+) -> None:
     repo, sentinel, head = textconv_repo
     parent = _git(repo, "rev-parse", "HEAD~1")
     reader = GitReader(repo)
@@ -2204,7 +2277,10 @@ def test_hardened_patch_calls_run_nothing(textconv_repo: tuple[Path, Path, str])
 
 @pytest.mark.parametrize("sub", ["log", "show"])
 def test_no_textconv_is_load_bearing(
-    textconv_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch, sub: str
+    textconv_repo: tuple[Path, Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    git_temp_in_private_home: list[str],
+    sub: str,
 ) -> None:
     repo, sentinel, head = textconv_repo
     count = ["--max-count=1"] if sub == "log" else []
@@ -2214,6 +2290,9 @@ def test_no_textconv_is_load_bearing(
     _drop_diff_flag(monkeypatch, "--no-textconv")
     GitReader(repo)._run(sub, args, max_stdout=65536)
     assert sentinel.exists()
+    # The temp dirs lived in the private HOMEs and went with them.
+    assert git_temp_in_private_home
+    assert [f for f in git_temp_in_private_home if os.path.exists(f)] == []
 
 
 def test_no_color_is_load_bearing(
@@ -2243,7 +2322,10 @@ def _signed_commit(repo: Path) -> str:
 
 
 def test_log_show_signature_false_is_load_bearing(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    git_temp_in_private_home: list[str],
 ) -> None:
     sentinel = tmp_path / "sentinel"
     program = _sentinel_program(tmp_path, sentinel)  # gpg.program runs without a shell
