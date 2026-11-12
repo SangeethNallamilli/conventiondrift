@@ -10,9 +10,11 @@ import os
 import re
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import time
+import typing
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -39,6 +41,7 @@ from conventiondrift.discover.safefs import (
     size_limit,
 )
 from conventiondrift.errors import FileSkipped
+from conventiondrift.model import SkipReason
 
 POSIX = os.name == "posix"
 
@@ -161,6 +164,47 @@ def test_lowered_limit_applies_to_reads(tmp_path: Path, strategy: str) -> None:
         len(read_worktree_file(tmp_path, "m.py", "python", max_file_bytes=1025, origin="tree"))
         == 1025
     )
+
+
+def test_limits_and_reasons_are_the_spec_values() -> None:
+    """R2.3 limits and I-9/I-13 reason strings, written out so a changed constant fails.
+
+    The other tests compare against the imported constants, so without this a
+    mutated limit or reason string would go unnoticed.
+    """
+    assert (FILE_MAX_BYTES, CONFIG_MAX_BYTES) == (1_048_576, 65_536)
+    reasons = {
+        REASON_SIZE: "size limit",
+        REASON_SYMLINK: "symlink",
+        REASON_OUTSIDE: "outside repository",
+        REASON_BINARY: "binary",
+        REASON_NOT_DECODABLE: "not decodable",
+        REASON_SPECIAL: "special file",
+        REASON_UNSUPPORTED: "unsupported path",
+        REASON_UNREADABLE: "unreadable",
+    }
+    assert all(constant == spec for constant, spec in reasons.items()), reasons
+    assert len(reasons) == 8
+    assert set(reasons) <= set(typing.get_args(SkipReason))
+
+
+def test_check_size_honours_a_lowered_limit() -> None:
+    """Git blobs use check_size with I-6 ``max_file_bytes`` (D-PM-28 #7, CR2 S2).
+
+    D-TL-25: every FileKind, taken from the Literal itself.
+    """
+    kinds: tuple[FileKind, ...] = typing.get_args(FileKind)
+    assert set(kinds) == {"instruction", "python", "manifest", "lockfile", "config"}
+    for kind in kinds:
+        if kind == "config":  # the config limit is fixed: max_file_bytes never moves it
+            for override in (1024, FILE_MAX_BYTES):
+                check_size(CONFIG_MAX_BYTES, kind, override)
+                assert _reason(check_size, CONFIG_MAX_BYTES + 1, kind, override) == REASON_SIZE
+            continue
+        check_size(1024, kind, 1024)
+        assert _reason(check_size, 1025, kind, 1024) == REASON_SIZE, kind
+        check_size(FILE_MAX_BYTES, kind, FILE_MAX_BYTES + 1)  # can only lower it
+        assert _reason(check_size, FILE_MAX_BYTES + 1, kind, FILE_MAX_BYTES * 2) == REASON_SIZE
 
 
 def test_empty_file_reads_empty(tmp_path: Path, strategy: str) -> None:
@@ -334,6 +378,48 @@ def test_realpath_containment_defence_in_depth(
         lambda p: "/elsewhere/AGENTS.md" if str(p).endswith("AGENTS.md") else real_realpath(p),
     )
     assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_OUTSIDE
+
+
+def test_realpath_outside_for_a_missing_file_is_outside_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    """The link probe stops at the first component that does not exist."""
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda p: "/elsewhere/x.py" if str(p).endswith("x.py") else real_realpath(p),
+    )
+    assert _reason(read_worktree_file, tmp_path, "gone/x.py", "python") == REASON_OUTSIDE
+
+
+def test_reparse_point_pointing_outside_is_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A junction to outside the root is "symlink", not "outside repository" (CR2 S3)."""
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False)
+    (tmp_path / "j").mkdir()
+    (tmp_path / "j/a.py").write_text("a")
+    real_lstat = os.lstat
+    real_realpath = os.path.realpath
+
+    class FakeStat:
+        def __init__(self, st: os.stat_result) -> None:
+            self._st = st
+            self.st_file_attributes = 0x400
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._st, name)
+
+    monkeypatch.setattr(
+        os, "lstat", lambda p: FakeStat(real_lstat(p)) if str(p).endswith("j") else real_lstat(p)
+    )
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda p: "/elsewhere/a.py" if str(p).endswith("a.py") else real_realpath(p),
+    )
+    assert _reason(read_worktree_file, tmp_path, "j/a.py", "python") == REASON_SYMLINK
 
 
 def test_sibling_prefix_is_not_contained(tmp_path: Path) -> None:
@@ -1013,3 +1099,146 @@ def test_decode_text_cookie_is_linear_on_a_long_hostile_line() -> None:
     except FileSkipped:
         pass
     assert time.perf_counter() - start < REDOS_BUDGET_S
+
+
+# ---- SR N3 on T-009: the ASCII-superset cookie check is pinned -----------------------
+
+
+@pytest.mark.parametrize(
+    ("codec", "data"),
+    [
+        ("utf-16-le", b"# coding: utf-16-le\nx = 1\n"),  # 26 bytes: a valid UTF-16-LE text
+        ("utf-16-le", b"# coding: UTF_16LE\nx = 1\n\n"),
+        ("utf-16", b"# coding: utf-16\nx = 1\n\n"),  # even length, unlike the utf-16 case above
+        ("cp037", b"# coding: cp037\nx = 1\n"),  # EBCDIC: every byte decodes
+        ("cp500", b"#!/usr/bin/env python\n# -*- coding: cp500 -*-\nx = 1\n"),  # line 2
+    ],
+)
+def test_non_ascii_superset_cookie_is_not_decodable(codec: str, data: bytes) -> None:
+    """Only the ASCII-superset check refuses these: the bytes decode in the named codec."""
+    data.decode(codec)  # so it is the check, not a decode error, that refuses them
+    with pytest.raises(SyntaxError):
+        compile(data, "x.py", "exec")  # CPython refuses them too
+    with pytest.raises(FileSkipped) as exc:
+        decode_text(data, "python")
+    assert exc.value.reason == REASON_NOT_DECODABLE
+
+
+# ---- CR2 S3: real Windows behaviour, unskipped on the windows-latest leg -------------
+# No mocks of the file system: a real NTFS junction, a real swap between the lstat walk
+# and the open, real fstat/lstat file ids. Each test starts with a ``sys.platform``
+# guard so mypy checks its body as Windows code (``mypy --platform win32``).
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="real Windows behaviour; runs on windows-latest (CR2 S3)"
+)
+
+
+def _junction(target: Path, link: Path) -> None:
+    """Create a real NTFS junction ``link`` -> ``target`` (no admin rights needed)."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        raise AssertionError("junctions exist only on Windows")
+
+
+def _remove_junction(link: Path) -> None:
+    """Remove the junction itself, never what it points to."""
+    if os.path.lexists(link):
+        os.rmdir(link)
+
+
+@windows_only
+@pytest.mark.parametrize("where", ["parent", "final"])
+@pytest.mark.parametrize("target", ["inside", "outside"])
+def test_windows_real_junction_is_symlink(
+    tmp_path: Path, outside: Path, where: str, target: str
+) -> None:
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        assert not d._USE_DIR_FD, "Windows reads through the by-path fallback"
+        real = tmp_path / "real" if target == "inside" else outside
+        real.mkdir(exist_ok=True)
+        (real / "a.py").write_bytes(b"x = 1\n")
+        link = tmp_path / "j"
+        _junction(real, link)
+        try:
+            st = os.lstat(link)  # the OS really made a junction, and it is live
+            assert st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            assert st.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+            assert not os.path.islink(link), "islink is False for a junction"
+            assert (link / "a.py").read_bytes() == b"x = 1\n"
+            rel = "j/a.py" if where == "parent" else "j"
+            assert _skip_without_leak(tmp_path, rel) == REASON_SYMLINK
+            assert _skip_without_leak(tmp_path, rel, origin="input") == REASON_SYMLINK
+        finally:
+            _remove_junction(link)
+        assert (real / "a.py").exists(), "removing the junction must leave its target alone"
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")
+
+
+@windows_only
+def test_windows_fallback_reads_an_unchanged_ntfs_file(tmp_path: Path) -> None:
+    """On NTFS the handle's (st_dev, st_ino) equal the lstat ones, so a normal read works."""
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        assert not d._USE_DIR_FD
+        (tmp_path / "a/b").mkdir(parents=True)
+        f = tmp_path / "a/b/m.py"
+        f.write_bytes(b"x = 1\n")
+        fd = os.open(f, os.O_RDONLY | os.O_BINARY)
+        try:
+            by_handle = os.fstat(fd)
+        finally:
+            os.close(fd)
+        by_name = os.lstat(f)
+        assert (by_handle.st_dev, by_handle.st_ino) == (by_name.st_dev, by_name.st_ino)
+        assert read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")
+
+
+@windows_only
+@pytest.mark.parametrize("swap", ["junction", "other dir", "file"])
+def test_windows_fallback_refuses_a_real_swap_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap: str
+) -> None:
+    """A real swap between the lstat walk and the open is caught by the re-check (SR-012 F4).
+
+    Only the timing is arranged: the swap runs just before the real ``os.open``.
+    The rename, junction, open, ``fstat`` and second ``lstat`` walk are all real.
+    """
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        assert not d._USE_DIR_FD
+        (tmp_path / "a/b").mkdir(parents=True)
+        (tmp_path / "a/b/m.py").write_bytes(b"x = 1\n")
+        (tmp_path / "other/b").mkdir(parents=True)
+        (tmp_path / "other/b/m.py").write_bytes(b"evil = 1\n")
+        (tmp_path / "x.py").write_bytes(b"evil = 2\n")
+        real_open = os.open
+        swapped: list[str] = []
+
+        def swap_then_open(path: str, flags: int, *args: int, **kw: int) -> int:
+            if not swapped and str(path).endswith("m.py"):
+                swapped.append(str(path))
+                if swap == "junction":
+                    os.rename(tmp_path / "a", tmp_path / "a_old")
+                    _junction(tmp_path / "other", tmp_path / "a")
+                elif swap == "other dir":
+                    os.rename(tmp_path / "a", tmp_path / "a_old")
+                    os.rename(tmp_path / "other", tmp_path / "a")
+                else:
+                    os.replace(tmp_path / "x.py", tmp_path / "a/b/m.py")
+            return real_open(path, flags, *args, **kw)
+
+        monkeypatch.setattr(os, "open", swap_then_open)
+        try:
+            assert _skip_without_leak(tmp_path, "a/b/m.py") == REASON_SYMLINK
+            assert swapped, "the swap must have happened between the walk and the open"
+        finally:
+            monkeypatch.undo()
+            if swap == "junction":
+                _remove_junction(tmp_path / "a")
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")

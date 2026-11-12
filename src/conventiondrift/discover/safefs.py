@@ -87,7 +87,9 @@ REASON_BINARY: Final = "binary"
 REASON_NOT_DECODABLE: Final = "not decodable"
 # FIFOs, sockets, devices, and a folder where a file was expected (I-13).
 REASON_SPECIAL: Final = "special file"
-# Backslash or drive-form names found in the repo tree, e.g. ``a\\b.py`` (D-PM-28).
+# Tree names Windows cannot hold or reads differently (D-PM-28 as narrowed, I-13): a
+# backslash, a trailing dot or space, a device name, a lone surrogate, a name too long
+# for the OS, and a ``:`` only when ``os.name == "nt"``.
 REASON_UNSUPPORTED: Final = "unsupported path"
 # Permission denied, I/O error, a file that vanished after listing, any other OS error (I-13).
 REASON_UNREADABLE: Final = "unreadable"
@@ -99,12 +101,14 @@ REASON_WALK_LIMIT: Final = "walk limit"
 WALK_MAX_ENTRIES = 500_000
 WALK_MAX_DEPTH = 64
 
-# Windows reserved device names (D-PM-28 #5, SR-012 F5): a segment whose part before
-# the first dot, without trailing spaces, is one of these, in any case: "nul.txt", "Com1.py".
+# Windows reserved device names (D-PM-28 #5, SR-012 F5, SR N2 / I-13): the Python 3.13
+# ``ntpath`` set, superscript digits and console names included. A segment whose part
+# before the first dot, without trailing spaces, is one of these, in any case, is a
+# device name on every OS: "nul.txt", "Com1.py", "conin$.log", "lpt\u00b2".
 _DEVICE_NAMES: Final = frozenset(
-    ["CON", "PRN", "AUX", "NUL"]
-    + [f"COM{i}" for i in range(1, 10)]
-    + [f"LPT{i}" for i in range(1, 10)]
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{c}" for c in "123456789\u00b9\u00b2\u00b3"]
+    + [f"LPT{c}" for c in "123456789\u00b9\u00b2\u00b3"]
 )
 # INTERFACES I-5 "Hard-exclusion name check" step 1: code points dropped before the
 # name is compared (a superset of git's HFS+-ignorable set). Design-controlled.
@@ -143,6 +147,16 @@ _FOREIGN_BOMS: Final = (
 _READ_CHUNK: Final = 65_536
 
 
+def _has_lone_surrogate(segment: str) -> bool:
+    """True if ``segment`` holds a code point in U+D800..U+DFFF (SR N1, I-13).
+
+    Python strings never pair surrogates, so this covers a stray ``\\ud800`` and the
+    ``\\udc80``-``\\udcff`` that ``surrogateescape`` (``os.fsdecode``) makes from
+    non-UTF-8 bytes. A plain scan, not ``encode``, so nothing is encoded first.
+    """
+    return any("\ud800" <= ch <= "\udfff" for ch in segment)
+
+
 def _windows_only_form(segment: str, *, colon: bool) -> bool:
     """True for a segment Windows cannot hold or reads differently (D-PM-28 #5).
 
@@ -178,6 +192,13 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
       A ``:`` (drive form included) is "unsupported path" only when
       ``os.name == "nt"``, where it would open an NTFS stream; on POSIX such
       names are analyzed normally (AC-N3.13 needs a ``::warning::`` file name).
+    * Any other ``origin`` (a bug: mypy rejects it) gets the strict typed-value
+      handling above, never the permissive tree one (CR2 S4).
+
+    A lone surrogate (U+D800..U+DFFF) in any segment, including the ``\\udc80``
+    style names ``surrogateescape`` decoding gives for non-UTF-8 bytes, gets the
+    same split (SR N1, I-13), so it never reaches ``os.fsencode`` and no
+    ``UnicodeEncodeError`` escapes.
 
     Traversal and absolute forms win over these. Glob characters are left
     alone, so the same check serves ``exclude`` entries. Plain string tests
@@ -188,8 +209,10 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     parts = [p for p in value.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
-    colon = origin == "input" or os.name == "nt"  # read per call, so tests can patch it
-    if any(_windows_only_form(p, colon=colon) for p in parts):
+    # Anything but "tree" takes the strict typed-value branch (CR2 S4); os.name is read
+    # per call, so tests can patch it.
+    colon = origin != "tree" or os.name == "nt"
+    if any(_has_lone_surrogate(p) or _windows_only_form(p, colon=colon) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
 
@@ -411,10 +434,22 @@ def _read(root: str | os.PathLike[str], parts: list[str], limit: int) -> bytes:
 
 
 def _has_link(root_real: str, parts: list[str]) -> bool:
+    """True if a component of ``parts`` is a symlink or a junction (any reparse point).
+
+    Reached only when ``realpath`` leaves the root: a link or junction pointing
+    outside, which is "symlink" like every other link (AC-N3.9). ``os.path.islink``
+    is False for a Windows junction, so this lstat-s each component instead (CR2 S3).
+    Tests reach it with a real symlink on POSIX, a real junction on Windows, and a
+    mocked ``realpath`` (CR2 N4).
+    """
     path = root_real
     for name in parts:
         path = os.path.join(path, name)
-        if os.path.islink(path):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False  # nothing here, so nothing below it can be a link
+        if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st):
             return True
     return False
 
