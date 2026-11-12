@@ -4,6 +4,7 @@ import ast
 from collections.abc import Callable, Iterable, Mapping
 from typing import Literal, Protocol
 
+from conventiondrift import model
 from conventiondrift.checkers import base
 from conventiondrift.checkers.base import Checker, CheckerId, FileContext, RuleMatch, Site
 
@@ -42,6 +43,14 @@ def test_checker_is_a_protocol() -> None:
     assert base.__all__ == ["Checker", "CheckerId", "FileContext", "RuleMatch", "Site"]
 
 
+def test_reexports_are_the_model_types() -> None:
+    # I-13 Q1: the types live in model.py; base.py only re-exports them.
+    assert base.RuleMatch is model.RuleMatch
+    assert base.Site is model.Site
+    assert base.FileContext is model.FileContext
+    assert base.CheckerId is model.CheckerId
+
+
 def test_structural_checker_is_usable_through_the_protocol() -> None:
     checker: Checker = _PrintChecker()
     assert checker.match_rule("use logging, not print") == RuleMatch(
@@ -52,8 +61,8 @@ def test_structural_checker_is_usable_through_the_protocol() -> None:
     tree = ast.parse("print('x')\n")
     call = tree.body[0].value  # type: ignore[attr-defined]
     handler = checker.ast_handlers()[ast.Call]
-    ctx = FileContext(path="src/a.py", is_test_file=False, is_script=False)
+    ctx = FileContext(path="src/a.py", is_test_file=False, is_script=False, main_guard_spans=())
     assert list(handler(call, ctx)) == [Site(file="src/a.py", line=1, col=0, option="print")]
-    script = FileContext(path="bin/run.py", is_test_file=False, is_script=True)
+    script = FileContext(path="bin/run.py", is_test_file=False, is_script=True, main_guard_spans=())
     assert list(handler(call, script)) == []
     assert list(checker.manifest_sites({"pyproject.toml": b""})) == []

@@ -1,7 +1,8 @@
 """The checker interface (INTERFACES I-10, ADR-0003; DESIGN §12 A-1).
 
 Internal in v1, shaped as a future plugin API. Checkers are pure: they see
-only the parsed AST and a ``FileContext``.
+only the parsed AST and a ``FileContext``. This module holds only the
+Protocol; the types it uses live in ``model.py`` and are re-exported (I-13 Q1).
 """
 
 import ast
