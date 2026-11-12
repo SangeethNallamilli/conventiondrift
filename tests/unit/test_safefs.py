@@ -163,6 +163,17 @@ def test_lowered_limit_applies_to_reads(tmp_path: Path, strategy: str) -> None:
     )
 
 
+def test_check_size_honours_a_lowered_limit() -> None:
+    """Git blobs use check_size with I-6 ``max_file_bytes`` (D-PM-28 #7, CR2 S2)."""
+    check_size(1024, "python", 1024)
+    assert _reason(check_size, 1025, "python", 1024) == REASON_SIZE
+    check_size(FILE_MAX_BYTES, "instruction", FILE_MAX_BYTES + 1)  # can only lower it
+    assert _reason(check_size, FILE_MAX_BYTES + 1, "manifest", FILE_MAX_BYTES * 2) == REASON_SIZE
+    # The config limit is fixed: a larger max_file_bytes does not raise it.
+    check_size(CONFIG_MAX_BYTES, "config", FILE_MAX_BYTES)
+    assert _reason(check_size, CONFIG_MAX_BYTES + 1, "config", FILE_MAX_BYTES) == REASON_SIZE
+
+
 def test_empty_file_reads_empty(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "AGENTS.md").write_bytes(b"")
     assert read_worktree_file(tmp_path, "AGENTS.md", "instruction", origin="tree") == b""
