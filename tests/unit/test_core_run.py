@@ -11,6 +11,7 @@ from conventiondrift import core
 from conventiondrift.components import Components
 from conventiondrift.core import (
     AnalysisOutcome,
+    FailOn,
     RefusedTriggerOutcome,
     RunContext,
     RunOutcome,
@@ -168,6 +169,9 @@ def test_error_fail_on_with_config_known_present(
 INVALID_EXPLICIT = [
     "bogus",
     "NEW-STALE",
+    "NONE",
+    "None",
+    "Any-Stale",
     " none",
     "none ",
     "none\n",
@@ -175,6 +179,14 @@ INVALID_EXPLICIT = [
     "n\u043ene",  # "none" with a Cyrillic small o (U+043E)
     "\uff4e\uff4f\uff4e\uff45",  # fullwidth "none" (U+FF4E U+FF4F U+FF4E U+FF45)
 ]
+
+
+def test_invalid_explicit_has_a_case_only_variant_of_every_value() -> None:
+    # D-TL-25: values are matched exactly, with no case folding (I-14 SR F1), so every
+    # valid value needs a case-only look-alike here; this kills a casefold() mutant.
+    valid = set(get_args(FailOn))
+    case_only = {v.casefold() for v in INVALID_EXPLICIT if v not in valid}
+    assert valid <= case_only
 
 
 @pytest.mark.parametrize("explicit", INVALID_EXPLICIT)
