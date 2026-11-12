@@ -31,6 +31,10 @@ A CI check fails any pull request that has a commit without a sign-off.
 
 You need Python 3.11 or newer and git. The commands below are for macOS and Linux.
 
+conventiondrift itself also supports Windows. Windows setup steps will be added here once they've been tested on a Windows machine; until then, the commands below won't work as written in Windows shells.
+
+<!-- TW-OPEN: add Windows (PowerShell) setup once tested, e.g. on the T-003 Windows runner. -->
+
 Clone the repository, then create a virtual environment and install the pinned development tools. Every dependency is pinned with a hash, so `pip` refuses anything that doesn't match.
 
 ```sh
@@ -49,9 +53,10 @@ Check that it worked:
 
 ## Run the checks
 
-Lint and type-check the code:
+Check formatting, lint and type-check the code:
 
 ```sh
+.venv/bin/ruff format --check .
 .venv/bin/ruff check src
 .venv/bin/mypy --strict src
 ```
