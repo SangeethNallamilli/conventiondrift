@@ -3,7 +3,7 @@
 # Build backend pinned exactly; the hashed build lock is requirements/build.txt
 # and CI builds with `pip install --require-hashes -r requirements/build.txt`
 # followed by `python -m build --no-isolation`.
-requires = ["setuptools==80.9.0"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -46,4 +46,6 @@ version = { attr = "conventiondrift.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Lets tests import conventiondrift_testkit (under tests/, never shipped).
+pythonpath = ["tests"]
 addopts = "-p no:cacheprovider"
