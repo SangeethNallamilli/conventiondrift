@@ -130,10 +130,12 @@ def side_result(
     # gets its normal verdict here (it only stops counting for fail-on).
     match = rule.match if rule.checker is not None else None
     results: list[SiteResult] = []
+    # Build the lookup set once, so membership is O(1) per site (SR F2).
+    recent_set = frozenset(recent_lines) if recent_lines is not None else None
     if match is not None:
         for s in sites:
             if s.option in options:
-                recent = recent_lines is not None and (s.file, s.line) in recent_lines
+                recent = recent_set is not None and (s.file, s.line) in recent_set
                 results.append(SiteResult(site=s, follows=follows(s.option, match), recent=recent))
     results.sort(key=lambda r: (r.site.file, r.site.line, r.site.col, r.site.option))
 

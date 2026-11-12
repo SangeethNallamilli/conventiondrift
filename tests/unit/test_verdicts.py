@@ -6,6 +6,7 @@ Test Engineer. The AC each case exercises is given in a comment instead.
 
 import ast
 import inspect
+from collections.abc import Collection
 from dataclasses import replace
 
 import pytest
@@ -321,7 +322,7 @@ def site(file: str, line: int, option: str, col: int = 0) -> Site:
 
 def build(
     sites: list[Site],
-    recent_lines: frozenset[tuple[str, int]] | None,
+    recent_lines: Collection[tuple[str, int]] | None,
     rule: Rule = RULE,
     t: Thresholds = DEFAULTS,
     options: frozenset[str] = HTTP,
@@ -434,6 +435,22 @@ def test_side_result_recent_matches_file_and_line_only() -> None:
     assert all(s.recent for s in r.sites)
     assert build(sites, frozenset({("src/a.py", 4)})).recent is None
     assert build(sites, frozenset({("src/b.py", 3)})).recent is None
+
+
+class _NoLinearScan(list[tuple[str, int]]):
+    """A list that refuses ``in``, so C9 must build its own set (SR F2)."""
+
+    def __contains__(self, item: object) -> bool:
+        raise AssertionError("recent_lines was scanned linearly")
+
+
+def test_side_result_recent_lines_list_is_converted_to_a_set_once() -> None:
+    old = [site("src/old.py", i, "requests") for i in range(6)]
+    new = [site("src/new.py", i, "httpx") for i in range(4)]
+    recent = _NoLinearScan([("src/new.py", i) for i in range(4)] + [("src/new.py", 0)])
+    r = build(old + new, recent)
+    assert r.recent == Counts(4, 0, 4)
+    assert r.verdict is M
 
 
 def test_side_result_min_sites_boundary() -> None:
