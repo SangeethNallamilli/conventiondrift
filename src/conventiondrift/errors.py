@@ -5,11 +5,13 @@ caught at the entrypoint, and ``GitUnavailable`` switches the run to
 head-only mode.
 """
 
+from conventiondrift.model import SkipReason
+
 
 class FileSkipped(Exception):
     """A file was not analyzed; ``reason`` is the reason listed in the report."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: SkipReason) -> None:
         super().__init__(reason)
         self.reason = reason
 
