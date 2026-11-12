@@ -30,12 +30,14 @@ each reader runs ``git --version`` and anything older or unparsable raises
 ``GitTooOld`` (I-14), failing closed.
 
 Part 1 (T-007): the runner, ``resolve``, ``is_shallow``, ``has_object``,
-``merge_base`` and ``commit_date``. ``tree``, ``blob``, ``changed_files``,
-``first_parent_chain`` and ``patches`` are T-008; they reuse :meth:`_command`
-and :func:`_environment` (``blob`` needs a streamed ``cat-file --batch``, so it
-can check the header size before reading the body).
+``merge_base`` and ``commit_date``. Part 2 (T-008): ``tree``, ``blob``,
+``changed_files``, ``first_parent_chain`` and ``patches``, through the same
+bounded runner, each with its own stdout cap. ``blob`` reads the
+``cat-file --batch-check`` header first, so an oversized body is never read.
+Signatures follow INTERFACES I-14 ``GitReaderProtocol``.
 """
 
+import contextlib
 import io
 import ntpath
 import os
@@ -45,13 +47,15 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from conventiondrift.components import ChangedFile, TreeEntry
 from conventiondrift.errors import (
     ComponentError,
+    FileSkipped,
     GitTooOld,
     GitUnavailable,
     UnresolvableRevision,
@@ -118,6 +122,11 @@ FIXED_ENV: dict[str, str] = {
 
 #: R2.6 (DESIGN §10 S4): at most 10,000 first-parent commits walked.
 MAX_COUNT_CAP: int = 10_000
+#: R2.6 (DESIGN §10 S4): at most 256 MiB of patch text read for history.
+PATCH_BYTES_CAP: int = 256 * 1024 * 1024
+#: Stdout cap for the ``ls-tree`` and ``diff-tree`` listings (I-14 bounds; T-008).
+#: About 500,000 entries at 128 bytes each, well past R2.6's 100,000 ``.py`` files.
+LISTING_MAX_BYTES: int = 64 * 1024 * 1024
 _MAX_COUNT_RE = re.compile(r"--max-count=([1-9][0-9]*)", re.ASCII)
 #: SR-014 low: these must carry exactly one ``--max-count=N`` with 1 <= N <= the cap.
 _MAX_COUNT_SUBCOMMANDS: frozenset[str] = frozenset({"rev-list", "log"})
@@ -127,12 +136,18 @@ _MAX_COUNT_SUBCOMMANDS: frozenset[str] = frozenset({"rev-list", "log"})
 #: T-008 extends this for its operations; anything not listed is refused.
 OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
     "rev-parse": frozenset({"--verify", "--is-shallow-repository"}),
-    "cat-file": frozenset({"-e"}),
+    # T-008 blob: object ids go on stdin, never on the command line (DESIGN §3).
+    "cat-file": frozenset({"-e", "--batch-check", "--batch"}),
     "merge-base": frozenset(),
-    "log": frozenset({"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}),
-    "rev-list": frozenset({"--first-parent"}),
+    "log": frozenset(
+        {"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}
+        # T-008 patches: merge diffs against the first parent (F-1), explicit renames
+        # and root diff (no repo config decides), and a commit marker with no message.
+        | {"-m", "-M", "--root", "--reverse", "--format=%x00%H"}
+    ),
+    "rev-list": frozenset({"--first-parent", "--timestamp"}),
     "ls-tree": frozenset({"-r", "-l", "-z", "--full-tree"}),
-    "diff-tree": frozenset({"-r", "-z", "-M", "-p", "--no-commit-id"}),
+    "diff-tree": frozenset({"-r", "-z", "-M", "-p", "--no-commit-id", "--name-status"}),
     "show": frozenset(),
 }
 
@@ -387,6 +402,54 @@ def _environment(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
     return env
 
 
+# T-008 output formats. Object ids are 40 or 64 lowercase hex (I-11 C3).
+_OID = rb"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+# ls-tree -r -l -z: "<mode> <type> <oid> <padded size or ->\t<path>"; -r lists no trees.
+_TREE_RECORD = re.compile(
+    rb"([0-7]{6}) (blob|commit) (" + _OID + rb") +(-|[0-9]{1,20})\t(.+)", re.S
+)
+# cat-file --batch-check / --batch header: "<oid> <type> <size>\n".
+_BATCH_HEADER = re.compile(rb"(" + _OID + rb") ([a-z]{1,8}) ([0-9]{1,20})\n")
+# rev-list --timestamp: "<committer epoch seconds> <sha>".
+_CHAIN_LINE = re.compile(rb"(-?[0-9]{1,20}) (" + _OID + rb")")
+_CHAIN_LINE_MAX = 1 + 20 + 1 + 64 + 1
+# diff-tree --name-status -z: a status letter (with a score for R and C), then paths.
+_STATUS = re.compile(rb"([ADMT])|([RC])[0-9]{1,3}")
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _bad_output() -> ComponentError:
+    return ComponentError(_COMPONENT, "unexpected git output")
+
+
+def _nul_records(data: bytes) -> list[bytes]:
+    """Split ``-z`` output; it must be empty or end in NUL, with no empty record."""
+    if not data:
+        return []
+    records = data.split(b"\0")
+    if records.pop() != b"" or b"" in records:
+        raise _bad_output()
+    return records
+
+
+def _path(raw: bytes) -> str:
+    """A repo path from git's raw bytes: UTF-8, with ``surrogateescape`` for the rest.
+
+    Lossless and never fails the run on one odd name; any lone surrogate left in
+    the text is shown as ``U+XXXX`` by ``render/escape.py`` (category Cs, I-14).
+    """
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def _lines(data: bytes) -> Iterator[bytes]:
+    """``data`` split after each ``\n``, newlines kept; a last unterminated line too."""
+    start = 0
+    while start < len(data):
+        end = data.find(b"\n", start) + 1 or len(data)
+        yield data[start:end]
+        start = end
+
+
 @dataclass(frozen=True)
 class _Output:
     returncode: int
@@ -434,21 +497,60 @@ def _run_bounded(
     max_stdout: int,
     timeout: float,
 ) -> _Output:
+    """Run ``argv`` with stdin ``DEVNULL``, a timeout and a stdout cap (SR-014).
+
+    See :func:`_bounded_process`.
+    """
+    return _bounded_process(
+        argv, cwd=cwd, env=env, label=label, max_stdout=max_stdout, timeout=timeout, stdin=None
+    )
+
+
+def _run_bounded_input(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+    max_stdout: int,
+    timeout: float,
+    stdin: bytes,
+) -> _Output:
+    """:func:`_run_bounded`, but with ``stdin`` written to a pipe and closed (T-008).
+
+    Used only for ``cat-file --batch-check``/``--batch`` requests, so object ids go
+    on stdin and never on the command line (DESIGN §3).
+    """
+    return _bounded_process(
+        argv, cwd=cwd, env=env, label=label, max_stdout=max_stdout, timeout=timeout, stdin=stdin
+    )
+
+
+def _bounded_process(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+    max_stdout: int,
+    timeout: float,
+    stdin: bytes | None,
+) -> _Output:
     """Run ``argv`` with a wall-clock timeout and a stdout cap (SR-014).
 
     stdout is read in chunks and capped at ``max_stdout + 1`` bytes; past the cap,
     or past ``timeout`` seconds, the process is killed and a fixed-text
     ``ComponentError("gitread")`` naming only ``label`` is raised. stderr is drained
     in chunks and discarded, never held whole and never put in a message. stdin is
-    ``DEVNULL``. A process that can't start raises ``GitUnavailable``. Reusable by
-    T-008 with its own cap (for example R2.6's patch-byte cap).
+    ``DEVNULL`` when ``stdin`` is None, or else a pipe that gets those few bytes
+    and is then closed. A process that can't start raises ``GitUnavailable``.
     """
     try:
         proc = subprocess.Popen(  # noqa: S603 (argv list, resolved git, no shell)
             list(argv),
             cwd=cwd,
             env=env,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
@@ -464,6 +566,13 @@ def _run_bounded(
     ]
     for reader in readers:
         reader.start()
+    if proc.stdin is not None:
+        # A few request bytes (one object id per line); git exiting early just
+        # closes the pipe, and the exit code or short output reports it.
+        with contextlib.suppress(OSError):
+            proc.stdin.write(stdin or b"")
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
     deadline = time.monotonic() + timeout
     failure: str | None = None
     try:
@@ -556,14 +665,20 @@ class GitReader:
         self._version_ok = True
 
     def _run(
-        self, subcommand: str, args: Sequence[str], *, max_stdout: int = SMALL_OUTPUT_MAX_BYTES
+        self,
+        subcommand: str,
+        args: Sequence[str],
+        *,
+        max_stdout: int = SMALL_OUTPUT_MAX_BYTES,
+        stdin: bytes | None = None,
     ) -> _Output:
         """Run one allowed git subcommand and return its exit code and stdout.
 
         The first call checks the git version (:meth:`_check_version`). Bounded by
         :data:`GIT_TIMEOUT_SECONDS` and ``max_stdout`` (SR-014, see
         :func:`_run_bounded`). Every T-007 call prints at most one short line, so
-        the default :data:`SMALL_OUTPUT_MAX_BYTES` applies; T-008 passes larger caps.
+        the default :data:`SMALL_OUTPUT_MAX_BYTES` applies; T-008 passes larger caps,
+        and ``stdin`` for ``cat-file --batch`` requests.
         """
         argv = self._command(subcommand, args)
         if not self._repo_dir.is_dir():
@@ -572,10 +687,21 @@ class GitReader:
         with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
             if not self._version_ok:
                 self._check_version(home)
+            env = _environment(home, git.search_path, self._repo_dir)
+            if stdin is not None:
+                return _run_bounded_input(
+                    argv,
+                    cwd=self._repo_dir,
+                    env=env,
+                    label=subcommand,
+                    max_stdout=max_stdout,
+                    timeout=GIT_TIMEOUT_SECONDS,
+                    stdin=stdin,
+                )
             return _run_bounded(
                 argv,
                 cwd=self._repo_dir,
-                env=_environment(home, git.search_path, self._repo_dir),
+                env=env,
                 label=subcommand,
                 max_stdout=max_stdout,
                 timeout=GIT_TIMEOUT_SECONDS,
@@ -647,3 +773,152 @@ class GitReader:
         if when.tzinfo is None:
             raise ComponentError(_COMPONENT, "unexpected git output")
         return when.astimezone(UTC)
+
+    # -- part 2 (T-008) -------------------------------------------------------
+
+    def tree(self, sha: str) -> Sequence[TreeEntry]:
+        """Every file of a commit's tree with its size, before any content is read.
+
+        ``ls-tree -r -l -z --full-tree``, capped at :data:`LISTING_MAX_BYTES`. The
+        size is ``None`` only for gitlinks (submodules, I-14 ``TreeEntry``).
+        """
+        out = self._run(
+            "ls-tree",
+            ["-r", "-l", "-z", "--full-tree", "--end-of-options", _require_sha(sha)],
+            max_stdout=LISTING_MAX_BYTES,
+        )
+        if out.returncode != 0:
+            raise self._fail("ls-tree", out)
+        entries: list[TreeEntry] = []
+        for record in _nul_records(out.stdout):
+            m = _TREE_RECORD.fullmatch(record)
+            if m is None or (m[2] == b"commit") != (m[4] == b"-"):
+                raise _bad_output()
+            size = None if m[4] == b"-" else int(m[4])
+            entries.append((m[1].decode("ascii"), m[3].decode("ascii"), size, _path(m[5])))
+        return entries
+
+    def blob(self, oid: str, max_bytes: int) -> bytes:
+        """A blob's bytes, by object id on ``cat-file`` stdin (DESIGN §3, I-11 C3).
+
+        The header size is checked against ``max_bytes`` before the body is read: a
+        ``--batch-check`` request reads only the header, and a blob over the limit
+        raises ``FileSkipped("size limit")`` without its body ever being requested
+        (R2.3). Otherwise ``--batch`` reads it, capped at exactly that header plus
+        the body. Objects are immutable by id, so both requests see the same object.
+        """
+        request = _require_sha(oid).encode("ascii") + b"\n"
+        if max_bytes < 0:
+            raise ComponentError(_COMPONENT, "invalid size limit")
+        check = self._run("cat-file", ["--batch-check"], stdin=request)
+        if check.returncode != 0:
+            raise self._fail("cat-file", check)
+        m = _BATCH_HEADER.fullmatch(check.stdout)
+        if m is None or m[1] + b"\n" != request:
+            raise _bad_output()  # includes "<oid> missing"
+        if m[2] != b"blob":
+            raise ComponentError(_COMPONENT, "object is not a blob")
+        size = int(m[3])
+        if size > max_bytes:
+            raise FileSkipped("size limit")
+        header = check.stdout
+        out = self._run("cat-file", ["--batch"], stdin=request, max_stdout=len(header) + size + 1)
+        if out.returncode != 0:
+            raise self._fail("cat-file", out)
+        body = out.stdout
+        if len(body) != len(header) + size + 1 or not body.startswith(header):
+            raise _bad_output()
+        if not body.endswith(b"\n"):
+            raise _bad_output()
+        return body[len(header) : -1]
+
+    def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]:
+        """Files changed from ``base`` to ``head``, renames detected (-M, ADR-0004).
+
+        ``diff-tree -r -M -z --name-status``, capped at :data:`LISTING_MAX_BYTES`.
+        Each entry is (status letter without the score, old path, new path): old is
+        ``None`` only for an added file, and for a deleted file new is the deleted
+        path. Paths are in git's order.
+        """
+        args = ["-r", "-M", "-z", "--name-status", "--end-of-options"]
+        out = self._run(
+            "diff-tree",
+            [*args, _require_sha(base), _require_sha(head)],
+            max_stdout=LISTING_MAX_BYTES,
+        )
+        if out.returncode != 0:
+            raise self._fail("diff-tree", out)
+        records = _nul_records(out.stdout)
+        changes: list[ChangedFile] = []
+        i = 0
+        while i < len(records):
+            m = _STATUS.fullmatch(records[i])
+            count = 2 if m is not None and m[2] is not None else 1
+            paths = records[i + 1 : i + 1 + count]
+            if m is None or len(paths) != count:
+                raise _bad_output()
+            status = (m[1] or m[2]).decode("ascii")
+            old = None if status == "A" else _path(paths[0])
+            changes.append((status, old, _path(paths[-1])))
+            i += 1 + count
+        return changes
+
+    def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]:
+        """``sha`` and its first-parent ancestors, newest first, at most ``limit``.
+
+        ``rev-list --first-parent --max-count=<limit> --timestamp``. Each entry is
+        (commit SHA, committer date as a timezone-aware UTC datetime, like
+        :meth:`commit_date`). ``limit`` must be 1 to the R2.6 cap
+        (:data:`MAX_COUNT_CAP`); anything else is a caller bug and is refused.
+        """
+        _require_sha(sha)
+        if not 1 <= limit <= MAX_COUNT_CAP:
+            raise ComponentError(_COMPONENT, "first-parent limit outside the R2.6 cap")
+        out = self._run(
+            "rev-list",
+            ["--first-parent", f"--max-count={limit}", "--timestamp", "--end-of-options", sha],
+            max_stdout=limit * _CHAIN_LINE_MAX,
+        )
+        if out.returncode != 0:
+            raise self._fail("rev-list", out)
+        lines = out.stdout.split(b"\n")
+        if lines.pop() != b"" or not lines or len(lines) > limit:
+            raise _bad_output()
+        chain: list[tuple[str, datetime]] = []
+        for line in lines:
+            m = _CHAIN_LINE.fullmatch(line)
+            if m is None:
+                raise _bad_output()
+            try:
+                when = _EPOCH + timedelta(seconds=int(m[1]))
+            except OverflowError as exc:
+                raise _bad_output() from exc
+            chain.append((m[2].decode("ascii"), when))
+        return chain
+
+    def patches(self, from_sha: str, to_sha: str) -> Iterator[bytes]:
+        """The first-parent patch text for ``from_sha..to_sha``, oldest commit first.
+
+        ``log --first-parent -m -p -U0 -M --root --reverse --format=%x00%H`` (F-1),
+        plus ``--no-ext-diff --no-textconv --no-color``: ``from_sha`` itself is
+        excluded, as in git's ``A..B``. Merges diff against their first parent, so
+        lines a merge brings in take the merge's date. Each commit starts with a
+        ``b"\\0<sha>\\n"`` line and a blank line, then its patch; commit messages are
+        never printed.
+        The lines (newlines kept) are yielded one by one.
+
+        Bounded by R2.6: ``--max-count`` at :data:`MAX_COUNT_CAP` commits, and
+        :data:`PATCH_BYTES_CAP` bytes of output; past the byte cap, or past
+        :data:`GIT_TIMEOUT_SECONDS`, git is killed and ``ComponentError("gitread")``
+        is raised before anything is yielded.
+        """
+        args = ["--first-parent", "-m", "-p", "-U0", "-M", "--root", "--reverse"]
+        rev = f"{_require_sha(from_sha)}..{_require_sha(to_sha)}"
+        out = self._run(
+            "log",
+            [*args, "--format=%x00%H", f"--max-count={MAX_COUNT_CAP}", "--end-of-options", rev],
+            max_stdout=PATCH_BYTES_CAP,
+        )
+        if out.returncode != 0:
+            raise self._fail("log", out)
+        return _lines(out.stdout)
