@@ -653,8 +653,12 @@ def test_read_then_decode_end_to_end(tmp_path: Path, strategy: str) -> None:
 
 
 def test_root_slash_contains_everything_below_it() -> None:
-    assert d._contained("/", "/")
-    assert d._contained("/", "/etc/x")
+    # The root as _read passes it: a realpath, so "/" on POSIX and a drive root such as
+    # "D:\\" on Windows, where a bare "/" is never a realpath.
+    root = os.path.realpath(os.sep)
+    assert root == "/" or os.name == "nt"
+    assert d._contained(root, root)
+    assert d._contained(root, os.path.join(root, "etc", "x"))
 
 
 def test_sibling_prefix_repo2_is_not_contained(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1035,7 +1039,7 @@ def test_fallback_recheck_passes_for_an_unchanged_path(
 ) -> None:
     monkeypatch.setattr(d, "_USE_DIR_FD", False)
     (tmp_path / "a/b").mkdir(parents=True)
-    (tmp_path / "a/b/m.py").write_text("x = 1\n")
+    (tmp_path / "a/b/m.py").write_bytes(b"x = 1\n")  # bytes: text mode writes CRLF on Windows
     seen: list[str] = []
     real_lstat = os.lstat
 

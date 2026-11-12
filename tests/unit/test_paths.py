@@ -294,7 +294,13 @@ def test_origin_is_a_required_keyword() -> None:
 
 
 def test_read_tree_name_with_backslash_is_unsupported(tmp_path: Path, opened: list[object]) -> None:
-    (tmp_path / "a\\b.py").write_bytes(b"x = 1\n")
+    # Plant the file the name would reach: one file named "a\\b.py" on POSIX, and on
+    # Windows (where "\\" is a separator and that name cannot exist) the file a/b.py.
+    if os.name == "nt":
+        (tmp_path / "a").mkdir()
+        (tmp_path / "a" / "b.py").write_bytes(b"x = 1\n")
+    else:
+        (tmp_path / "a\\b.py").write_bytes(b"x = 1\n")
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
         read_worktree_file(tmp_path, "a\\b.py", "python", origin="tree")
