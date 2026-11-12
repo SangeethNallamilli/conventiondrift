@@ -385,3 +385,20 @@ def test_invalid_explicit_fail_on_does_not_hide_the_config_fail_on_note() -> Non
     assert result.effective_fail_on == "any-stale"
     assert len(result.after_merge_notes) == 1
     assert "fail-on" in result.after_merge_notes[0]
+
+
+@pytest.mark.parametrize("fail_on", ["new-stale", "any-stale"])
+@pytest.mark.parametrize("base_files", [{}, {"AGENTS.md": RULES}, {"AGENTS.md": b""}])
+def test_sr32_c1_head_only_marker_has_no_effect_when_gated(
+    fail_on: str, base_files: dict[str, bytes]
+) -> None:
+    # SR #32 C-1: a gated run's markers come from the base side only, with no fallback
+    # to head, even when base has no instruction file or no marker in it.
+    base = PolicySide(config=None, instruction_files=base_files)
+    head = PolicySide(
+        config=None, instruction_files={"AGENTS.md": RULES_IGNORED, "CLAUDE.md": M.encode()}
+    )
+    result = compare(Inputs(fail_on=fail_on), base, head)
+    assert result.source == "base"
+    assert result.markers == {}
+    assert len(result.after_merge_notes) == 2

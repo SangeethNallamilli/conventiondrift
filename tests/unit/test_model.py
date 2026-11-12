@@ -839,3 +839,56 @@ def test_rule_match_type_error_does_not_echo_values() -> None:
     with pytest.raises(TypeError) as excinfo:
         RuleMatch(preferred=hostile, prohibited=frozenset(), specificity=0)  # type: ignore[arg-type]
     assert "SECRET" not in str(excinfo.value)
+
+
+# SR #32 C-1 / L2: each invalid class of Policy.markers pairs, tested on its own. The
+# expected messages restate I-13 ("sorted (line, alone_on_line) pairs") per class.
+_MARKER_INVALID: dict[str, tuple[Any, str]] = {
+    "values not a tuple": ([(1, True)], "values must be tuples of pairs"),
+    "entry not a pair": (((1, True, False),), "must be .line, alone_on_line. pairs"),
+    "entry not a tuple": (([1, True],), "must be .line, alone_on_line. pairs"),
+    "line is a bool": (((True, True),), "lines must be integers >= 1"),
+    "line is zero": (((0, True),), "lines must be integers >= 1"),
+    "line is negative": (((-3, False),), "lines must be integers >= 1"),
+    "line not an int": ((("4", False),), "lines must be integers >= 1"),
+    "line is a float": (((4.0, False),), "lines must be integers >= 1"),
+    "alone is an int": (((4, 1),), "alone_on_line must be a bool"),
+    "alone is None": (((4, None),), "alone_on_line must be a bool"),
+    "unsorted": (((9, False), (2, True)), "must be sorted with no duplicate lines"),
+    "duplicate line": (((2, False), (2, True)), "must be sorted with no duplicate lines"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_MARKER_INVALID))
+def test_policy_rejects_each_invalid_marker_class(name: str) -> None:
+    pairs, message = _MARKER_INVALID[name]
+    markers = {"CLAUDE.md": ((1, True),), "AGENTS.md": pairs}
+    with pytest.raises(ValueError, match=message):
+        dataclasses.replace(POLICY, markers=markers)
+
+
+def test_policy_marker_classes_are_covered() -> None:
+    # D-TL-25: every SR C-1 condition has at least one case above.
+    conditions = {"pair", "line >= 1", "line not bool", "alone bool", "sorted", "unique"}
+    covers = {
+        "pair": {"values not a tuple", "entry not a pair", "entry not a tuple"},
+        "line >= 1": {"line is zero", "line is negative"},
+        "line not bool": {"line is a bool"},
+        "alone bool": {"alone is an int", "alone is None"},
+        "sorted": {"unsorted"},
+        "unique": {"duplicate line"},
+    }
+    assert set(covers) == conditions
+    assert set().union(*covers.values()) <= set(_MARKER_INVALID)
+
+
+def test_policy_accepts_named_tuple_pairs() -> None:
+    # T-013's Marker is a NamedTuple(line, alone); it is a valid pair too.
+    from typing import NamedTuple
+
+    class Marker(NamedTuple):
+        line: int
+        alone: bool
+
+    policy = dataclasses.replace(POLICY, markers={"AGENTS.md": (Marker(3, True),)})
+    assert policy.markers["AGENTS.md"] == ((3, True),)
