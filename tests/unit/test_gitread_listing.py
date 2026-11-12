@@ -135,6 +135,13 @@ def _pinned(args: list[str]) -> list[str]:
     return ["-O<orderfile>" if a.startswith("-O") else a for a in args]
 
 
+def _set_and_tail(args: list[str], revs: int) -> tuple[set[str], list[str]]:
+    """I-14 item 9: options compare as a set (no repeats); ``--end-of-options`` and revs last."""
+    options, tail = args[: -(revs + 1)], args[-(revs + 1) :]
+    assert len(options) == len(set(options))
+    return set(_pinned(options)), tail
+
+
 def _no_host_path(exc: BaseException, repo: Path) -> None:
     assert str(repo) not in str(exc)
     assert str(repo.parent) not in str(exc)
@@ -530,11 +537,13 @@ def test_changed_files_add_modify_delete_and_rename(repo: Path, spy: list[Call])
         ],
         key=str,
     )
-    assert _sub_args(spy[-1], "diff-tree")[:3] == ["--no-ext-diff", "--no-textconv", "--no-color"]
-    assert _pinned(_sub_args(spy[-1], "diff-tree")[3:]) == [
-        "-r", "-z", "--name-status", "-M50%", "-l1000", "--no-relative", "-O<orderfile>",
-        "--end-of-options", base, head,
-    ]  # fmt: skip
+    assert _set_and_tail(_sub_args(spy[-1], "diff-tree"), 2) == (
+        {
+            "-r", "-z", "--name-status", "--no-color", "--no-ext-diff", "--no-textconv",
+            "-M50%", "-l1000", "--no-relative", "-O<orderfile>",
+        },
+        ["--end-of-options", base, head],
+    )  # fmt: skip
     assert spy[-1]["max_stdout"] == gitread.LISTING_MAX_BYTES
 
 
@@ -749,15 +758,16 @@ def test_patches_stream_newest_first_with_commit_markers(repo: Path, spy: list[C
     assert b"merge" not in text.replace(marker[1], b"")  # no commit messages
     (call,) = spy
     assert call["batch"] is True and call["label"] == "log"
-    assert _pinned(_sub_args(call, "log")) == [
-        "--no-ext-diff", "--no-textconv", "--no-color",
-        "--first-parent", "-m", "--root", "-p", "-U0", "--text",
-        "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000",
-        "--diff-algorithm=myers", "--no-indent-heuristic", "--inter-hunk-context=0",
-        "--no-relative", "--submodule=short", "--no-show-signature", "-O<orderfile>",
-        "--format=%x00%H",
-        f"--max-count={gitread.MAX_COUNT_CAP}", "--end-of-options", s["c3"], "^" + s["c1"],
-    ]  # fmt: skip
+    assert _set_and_tail(_sub_args(call, "log"), 2) == (
+        {
+            "--first-parent", "--max-count=10000", "-m", "--root", "-p", "-U0", "--text",
+            "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/",
+            "--dst-prefix=b/", "-M50%", "-l1000", "--diff-algorithm=myers",
+            "--no-indent-heuristic", "--inter-hunk-context=0", "--no-relative",
+            "--submodule=short", "--no-show-signature", "-O<orderfile>", "--format=%x00%H",
+        },
+        ["--end-of-options", s["c3"], "^" + s["c1"]],
+    )  # fmt: skip
 
 
 def test_patches_from_none_go_back_to_the_root(repo: Path, spy: list[Call]) -> None:
@@ -765,6 +775,7 @@ def test_patches_from_none_go_back_to_the_root(repo: Path, spy: list[Call]) -> N
     text = b"".join(GitReader(repo).patches(None, s["c2"]))
     assert _markers(text) == [s["c2"], s["c1"]]  # c1 is the root commit: included
     assert _sub_args(spy[-1], "log")[-2:] == ["--end-of-options", s["c2"]]
+    assert not any(a.startswith("^") for a in spy[-1]["argv"])
 
 
 def test_patches_from_none_show_the_root_diff(repo: Path) -> None:

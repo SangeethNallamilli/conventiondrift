@@ -2,7 +2,7 @@
 
 import dataclasses
 import inspect
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -69,7 +69,7 @@ class _MemoryGit:
     def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]:
         return [(sha, self.commit_date(sha))][:limit]
 
-    def patches(self, from_sha: str | None, to_sha: str) -> Iterator[bytes]:
+    def patches(self, from_sha: str | None, to_sha: str) -> Generator[bytes, None, None]:
         yield b""
 
     def tree(self, sha: str) -> Sequence[TreeEntry]:

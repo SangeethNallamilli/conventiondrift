@@ -374,7 +374,9 @@ PIN_DEFEATS: dict[str, str] = {
     "--no-color": "color.ui / color.diff",
     "core.quotePath=true": "core.quotePath=false",
 }
-#: Pins whose hostile key can't change gitread's output on its own, and why.
+#: Pins whose hostile key can't change gitread's output on its own, and why. I-14
+#: item 9 ("Argv and stream details") keeps them as defence in depth, pinned by an
+#: argv-presence test only.
 PIN_UNOBSERVABLE: dict[str, str] = {
     "--no-relative": "gitread always runs git at the repo root, where diff.relative is a no-op",
     "i18n.logOutputEncoding=UTF-8": "gitread never prints commit messages (--format=%x00%H)",
@@ -384,7 +386,7 @@ PIN_PAIRED: frozenset[str] = frozenset({"--no-show-signature", "log.showSignatur
 #: The rest of the constants: what to output (pinned by the argv tests) and T-007's
 #: security flags (pinned by test_gitread.py and the fsmonitor/hostile-config tests).
 NOT_DIFF_CONFIG_PINS: frozenset[str] = frozenset(
-    {"--first-parent", "-m", "--root", "-p", "-U0", "--format=%x00%H"}
+    {"--first-parent", "--max-count=10000", "-m", "--root", "-p", "-U0", "--format=%x00%H"}
     | {"-r", "-z", "--name-status", "--no-ext-diff", "--no-textconv"}
     | {"core.fsmonitor=false", "core.hooksPath=/dev/null", "core.untrackedCache=false"}
     | {"diff.external=", "core.pager=cat", "protocol.allow=never"}
@@ -458,18 +460,68 @@ def test_dropping_any_one_pin_breaks_the_comparison(
         assert hostile[1:] == clean[1:]
 
 
-@_POSIX_ONLY
-@pytest.mark.parametrize("pin", sorted(PIN_UNOBSERVABLE) + sorted(PIN_PAIRED))
-def test_dropping_a_backstop_pin_alone_changes_nothing(
+#: Where each defence-in-depth pin must appear, written out from I-14 item 9: the
+#: ``-c`` pins on every git call, the flags on the calls whose argv lists them.
+BACKSTOP_CALLS: dict[str, frozenset[str]] = {
+    "--no-relative": frozenset({"log", "diff-tree"}),
+    "--no-show-signature": frozenset({"log"}),
+    "i18n.logOutputEncoding=UTF-8": frozenset({"ls-tree", "cat-file", "diff-tree", "log"}),
+    "log.showSignature=false": frozenset({"ls-tree", "cat-file", "diff-tree", "log"}),
+}
+
+
+def test_backstop_table_covers_every_unobservable_and_paired_pin() -> None:
+    assert set(BACKSTOP_CALLS) == set(PIN_UNOBSERVABLE) | PIN_PAIRED
+
+
+def _recorded_calls(
+    repo: Path, root: str, head: str, monkeypatch: pytest.MonkeyPatch
+) -> list[list[str]]:
+    seen: list[list[str]] = []
+    for name in ("_run_bounded", "_start_batch"):
+        real: Callable[..., Any] = getattr(gitread, name)
+
+        def wrapper(argv: list[str], _real: Callable[..., Any] = real, **kwargs: Any) -> Any:
+            if argv[1:] != ["--version"]:
+                seen.append(list(argv))
+            return _real(argv, **kwargs)
+
+        monkeypatch.setattr(gitread, name, wrapper)
+    reader = GitReader(repo)
+    reader.blob(reader.tree(head)[0][1], 1 << 20)
+    reader.changed_files(root, head)
+    b"".join(reader.patches(None, head))
+    reader.close()
+    return seen
+
+
+def _subcommand(argv: list[str]) -> str:
+    i = 1
+    while argv[i] == "-c":
+        i += 2
+    return argv[i]
+
+
+@pytest.mark.parametrize("pin", sorted(BACKSTOP_CALLS))
+def test_each_backstop_pin_is_present_where_i14_lists_it(
     history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch, pin: str
 ) -> None:
-    repo, root, head, marker = history
-    _drop(monkeypatch, pin)
-    clean = _outputs(repo, root, head)
-    _make_hostile(repo, marker)
-    hostile = _outputs(repo, root, head)
-    _assert_same_patches(clean[0], hostile[0])
-    assert hostile[1:] == clean[1:] and not marker.exists()
+    repo, root, head, _ = history
+    calls = _recorded_calls(repo, root, head, monkeypatch)
+    assert {_subcommand(c) for c in calls} == {"ls-tree", "cat-file", "diff-tree", "log"}
+    for argv in calls:
+        sub = _subcommand(argv)
+        before = argv[: argv.index(sub)]
+        options = (
+            argv[argv.index(sub) + 1 : argv.index("--end-of-options")]
+            if "--end-of-options" in argv
+            else argv[argv.index(sub) + 1 :]
+        )
+        if "=" in pin and not pin.startswith("-"):
+            present = any(before[i : i + 2] == ["-c", pin] for i in range(len(before)))
+        else:
+            present = pin in options
+        assert present == (sub in BACKSTOP_CALLS[pin]), (pin, sub)
 
 
 @_POSIX_ONLY

@@ -174,11 +174,11 @@ OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
 }
 
 
-#: I-14 item 9 argv, after ``_command`` adds ``--no-ext-diff --no-textconv
-#: --no-color`` (DESIGN §3) and before ``--end-of-options``. ``patches`` also adds
-#: the required ``--max-count`` at the R2.6 cap (item 9 "the commit cap stays").
+#: I-14 item 9 option sets ("Argv and stream details": the order is free, and
+#: ``--end-of-options`` and the revisions come last). ``_command`` adds
+#: ``--no-ext-diff --no-textconv --no-color`` (DESIGN §3) in front.
 _PATCHES_ARGS: tuple[str, ...] = (
-    "--first-parent", "-m", "--root", "-p", "-U0", "--text",
+    "--first-parent", f"--max-count={MAX_COUNT_CAP}", "-m", "--root", "-p", "-U0", "--text",
     "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000",
     "--diff-algorithm=myers", "--no-indent-heuristic", "--inter-hunk-context=0",
     "--no-relative", "--submodule=short", "--no-show-signature", ORDERFILE_ARG,
@@ -1139,8 +1139,8 @@ class GitReader:
         """Raw first-parent patch text for ``from_sha..to_sha``, newest commit first.
 
         I-14 item 9: ``log`` with :data:`_PATCHES_ARGS` (the diff-config pins,
-        ``--no-show-signature`` and an empty ``-O`` order file), the DESIGN §3
-        ``--no-ext-diff --no-textconv --no-color``, ``--max-count=10000``, then
+        ``--no-show-signature``, ``--max-count=10000`` and an empty ``-O`` order file),
+        the DESIGN §3 ``--no-ext-diff --no-textconv --no-color``, then
         ``--end-of-options <to_sha> [^<from_sha>]``. ``from_sha`` is excluded, and
         ``None`` means back to the root. Merges diff against their first parent.
         Each commit starts with ``\\x00<sha>\\n``; commit messages are never printed.
@@ -1155,9 +1155,7 @@ class GitReader:
         revs = [_require_sha(to_sha)]
         if from_sha is not None:
             revs.append("^" + _require_sha(from_sha))
-        argv = self._command(
-            "log", [*_PATCHES_ARGS, f"--max-count={MAX_COUNT_CAP}", "--end-of-options", *revs]
-        )
+        argv = self._command("log", [*_PATCHES_ARGS, "--end-of-options", *revs])
         return self._stream_patches(argv)
 
     def _stream_patches(self, argv: list[str]) -> Generator[bytes, None, None]:
