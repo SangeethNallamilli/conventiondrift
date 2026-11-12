@@ -75,7 +75,7 @@ def exit_code(outcome: RunOutcome) -> int:
 _COMPONENT = re.compile(r"[a-z][a-z0-9_]*(:[a-z0-9_-]+)?")
 
 
-def internal_error(exc: Exception | SystemExit | GeneratorExit) -> InternalError:
+def internal_error(exc: BaseException) -> InternalError:
     """The reportable form of a caught exception (I-14 Q6, sanitizing).
 
     Only the component name and the exception class are used; the exception's
@@ -95,17 +95,29 @@ def internal_error(exc: Exception | SystemExit | GeneratorExit) -> InternalError
     )
 
 
-def error_fail_on(explicit: str | None, base_config: FailOn | None) -> FailOn:
-    """``fail-on`` for a run that failed before policy loaded (I-14 Q5).
+def error_fail_on(
+    explicit: str | None, base_config: FailOn | None, *, config_known_present: bool = False
+) -> FailOn:
+    """``fail-on`` for a run that failed before policy loaded (I-14 Q5, D-PM-32, SR-015, SR F1).
 
-    The explicit input or flag when present and valid, else the base config's
-    value if it was already read, else ``none``.
+    The explicit input or flag when present and valid wins. Otherwise the base
+    config's value if it was already read. Otherwise ``new-stale`` if a non-empty
+    explicit value was given but isn't valid (SR F1: a typo or look-alike such as
+    ``"none "`` must not open the gate), or if the policy-side tree is known to
+    contain a config file that wasn't read (D-PM-32). Either way the run fails
+    closed with exit 3, and that value is an internal gate only, never a
+    configured ``fail-on``. Otherwise ``none``; an empty explicit value counts as
+    unset.
     """
     for value in _FAIL_ON_VALUES:
         if explicit == value:
             return value
     if base_config is not None:
         return base_config
+    if explicit:
+        return "new-stale"
+    if config_known_present:
+        return "new-stale"
     return "none"
 
 
@@ -114,11 +126,13 @@ class RunContext:
     """What the pipeline has learned so far that error handling needs (I-14 Q5).
 
     The pipeline (T-028, T-029, T-031) records the raw explicit ``fail-on`` and
-    the base config's ``fail-on`` here as soon as it reads them.
+    the base config's ``fail-on`` here as soon as it reads them. T-028 sets
+    ``config_known_present`` from base-side data only (D-PM-32).
     """
 
     explicit_fail_on: str | None = None
     base_fail_on: FailOn | None = None
+    config_known_present: bool = False
     internal_errors: tuple[InternalError, ...] = ()
 
 
@@ -142,20 +156,27 @@ def run(
 ) -> int:
     """The single entrypoint for ``conventiondrift.action`` and ``conventiondrift.cli`` (I-2).
 
-    ``entry`` is passed by the caller and never inferred from ``env``. Any
-    ``Exception``, ``SystemExit`` or ``GeneratorExit`` from the pipeline becomes an
-    ``InternalError`` and the run exits per I-4 with the ``fail-on`` known so far
-    (I-14). Only ``KeyboardInterrupt`` propagates.
+    ``entry`` is passed by the caller and never inferred from ``env``. Every
+    ``BaseException`` from the pipeline (including ``SystemExit``,
+    ``GeneratorExit`` and ``asyncio.CancelledError``) becomes an ``InternalError``
+    and the run exits per I-4 with the ``fail-on`` known so far (I-14, SR F3).
+    Only ``KeyboardInterrupt`` propagates.
     """
     context = RunContext()
     try:
         outcome = _pipeline(argv, env, entry, components or Components(), context)
-    # I-14: argument parsing never raises SystemExit, so a SystemExit or GeneratorExit here
-    # came from a component and must not pass the gate. Only KeyboardInterrupt propagates.
-    except (Exception, SystemExit, GeneratorExit) as exc:  # noqa: BLE001 -- I-14: all but KeyboardInterrupt become an InternalError
+    except KeyboardInterrupt:
+        raise
+    # I-14, SR F3: argument parsing never raises SystemExit, so any BaseException here came
+    # from a component and must not pass the gate. Only KeyboardInterrupt propagates.
+    except BaseException as exc:  # noqa: BLE001 -- I-14, SR F3: all but KeyboardInterrupt become an InternalError
         context.internal_errors += (internal_error(exc),)
         outcome = AnalysisOutcome(
-            fail_on=error_fail_on(context.explicit_fail_on, context.base_fail_on),
+            fail_on=error_fail_on(
+                context.explicit_fail_on,
+                context.base_fail_on,
+                config_known_present=context.config_known_present,
+            ),
             # Head-only isn't known yet when the error is caught. It doesn't matter: exit_code()
             # returns 0 for "none" and 3 for an internal error under a gating mode before it
             # looks at head_only (SC-2.50), so either value gives the same exit code.
