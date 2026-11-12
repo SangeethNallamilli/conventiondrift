@@ -10,8 +10,6 @@ from pathlib import Path
 
 import pytest
 
-import conventiondrift.checkers as checkers_pkg
-
 # Written by hand from I-10 "Pure functions".
 BANNED_CALLS = frozenset({"exec", "eval", "compile", "__import__", "open"})
 BANNED_MODULES = frozenset({"importlib", "subprocess", "socket", "os", "urllib"})
@@ -28,7 +26,10 @@ I10_LIST = {
     "urllib",
 }
 
-CHECKERS_DIR = Path(checkers_pkg.__file__).parent
+# Locate the real source tree from this test file, not from
+# conventiondrift.checkers.__file__. Under mutmut 3.x that path is the
+# mutants/ copy (same approach as #25 S2 in test_verdicts.py).
+CHECKERS_DIR = Path(__file__).resolve().parents[2] / "src" / "conventiondrift" / "checkers"
 
 
 def violations(source: str) -> list[str]:
@@ -57,6 +58,13 @@ def violations(source: str) -> list[str]:
 
 def test_the_ban_list_is_the_i10_list() -> None:
     assert BANNED_CALLS | BANNED_MODULES == I10_LIST
+
+
+def test_the_scanned_checkers_directory_exists_and_is_not_empty() -> None:
+    assert CHECKERS_DIR.is_dir()
+    files = list(CHECKERS_DIR.rglob("*.py"))
+    assert files
+    assert "mutants" not in CHECKERS_DIR.parts
 
 
 def test_checkers_package_has_no_banned_use() -> None:
