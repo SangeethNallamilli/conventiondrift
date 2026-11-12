@@ -35,7 +35,7 @@ def test_errors_are_raisable_exceptions(exc: Exception) -> None:
 
 def test_error_types_are_distinct() -> None:
     # Each outcome is handled differently (I-11), so none may catch another.
-    types = (FileSkipped, ComponentError, GitUnavailable)
+    types = (FileSkipped, ComponentError, GitUnavailable, UnresolvableRevision)
     for a in types:
         for b in types:
             assert issubclass(a, b) == (a is b)

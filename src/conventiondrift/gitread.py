@@ -9,7 +9,10 @@ Every call goes through :meth:`GitReader._run`, which:
 * puts the full ``-c`` hardening set before every subcommand;
 * allows only the eight read-only subcommands in DESIGN §3;
 * adds ``--no-ext-diff --no-textconv --no-color`` to diff and log calls;
-* never puts stderr or caller input in an error message.
+* discards stderr (``DEVNULL``) and never puts stderr or caller input in an
+  error message;
+* stops git after :data:`GIT_TIMEOUT_SECONDS` and reports a fixed-text
+  ``ComponentError("gitread")``.
 
 Revisions from input are resolved once by :meth:`GitReader.resolve`; every other
 operation accepts only validated lowercase hex SHAs, placed after ``--end-of-options``.
@@ -39,6 +42,12 @@ from pathlib import Path
 from conventiondrift.errors import ComponentError, GitUnavailable, UnresolvableRevision
 
 _COMPONENT = "gitread"
+
+# QUESTION(A?): DESIGN.md, SECURITY-RULES.md and INTERFACES.md state no per-call git
+# timeout. 60 s is the whole-run limit of AC-N2.1 (B10k < 60 s), so no single
+# plumbing call may take longer; the calls in this module normally take milliseconds.
+#: Wall-clock limit for one non-streamed git call, in seconds.
+GIT_TIMEOUT_SECONDS: float = 60.0
 
 #: DESIGN §3 "Allowed subcommands only". ``show`` is for the object form only (T-008).
 ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset(
@@ -143,7 +152,17 @@ class GitReader:
         return argv
 
     def _run(self, subcommand: str, args: Sequence[str]) -> _Output:
-        """Run one allowed git subcommand and return its exit code and stdout."""
+        """Run one allowed git subcommand and return its exit code and stdout.
+
+        stdout is buffered in memory, so ``_run`` is only for commands whose output
+        is bounded by construction: every T-007 call prints at most one short line
+        (``rev-parse --verify`` / ``--is-shallow-repository``, ``merge-base``
+        without ``--all``, ``log --no-walk`` of one SHA) or nothing
+        (``cat-file -e``), and each caller rejects anything but that exact shape.
+        stderr is discarded, never buffered. Output that can be large (``ls-tree``,
+        ``cat-file --batch``, ``log -p``; T-008) must be streamed with a size cap
+        instead of going through ``_run``.
+        """
         argv = self._command(subcommand, args)
         if not self._repo_dir.is_dir():
             raise ComponentError(_COMPONENT, "repository directory not found")
@@ -154,10 +173,16 @@ class GitReader:
                     cwd=self._repo_dir,
                     env=_environment(home),
                     stdin=subprocess.DEVNULL,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     shell=False,
                     check=False,
+                    timeout=GIT_TIMEOUT_SECONDS,
                 )
+            except subprocess.TimeoutExpired:
+                # subprocess.run has killed git. Fixed text only; the exception (which
+                # holds the argv, so the caller's REV, and any output) is not chained.
+                raise ComponentError(_COMPONENT, f"git {subcommand} timed out") from None
             except OSError as exc:
                 raise GitUnavailable("git could not be started") from exc
         return _Output(proc.returncode, proc.stdout)

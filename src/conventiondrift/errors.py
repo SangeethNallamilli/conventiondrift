@@ -26,7 +26,12 @@ class ComponentError(Exception):
 
 
 class GitUnavailable(Exception):
-    """Git or a needed object is unavailable; the run falls back to head-only mode."""
+    """Git is missing or cannot start; the run falls back to head-only mode (I-11 C3).
+
+    It means only that: a missing object, "not a git repository", a
+    ``safe.directory`` refusal, a timeout or any other git failure is a
+    ``ComponentError("gitread")``, never ``GitUnavailable``.
+    """
 
 
 class UnresolvableRevision(Exception):

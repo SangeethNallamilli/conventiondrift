@@ -8,6 +8,7 @@ tests of the runner and the first five operations.
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -319,6 +320,64 @@ def test_git_that_cannot_start_raises_git_unavailable(
     monkeypatch.setattr(gitread.subprocess, "run", boom)
     with pytest.raises(GitUnavailable):
         GitReader(repo).is_shallow()
+
+
+def test_every_call_has_a_timeout_and_discards_stderr(repo: Path, spy: list[Call]) -> None:
+    reader = GitReader(repo)
+    head = reader.resolve("HEAD")
+    reader.is_shallow()
+    reader.has_object(head)
+    reader.merge_base(head, head)
+    reader.commit_date(head)
+    assert len(spy) == 5
+    for call in spy:
+        kwargs = call["kwargs"]
+        assert kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
+        assert kwargs["stdout"] is subprocess.PIPE
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        assert "capture_output" not in kwargs
+
+
+def test_timeout_is_a_positive_bound_within_the_run_limit() -> None:
+    # AC-N2.1: a whole B10k run finishes in under 60 s, so no single call may take longer.
+    assert 0 < gitread.GIT_TIMEOUT_SECONDS <= 60
+
+
+def test_timeout_is_a_component_error_with_fixed_text(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def hang(argv: list[str], **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(
+            argv, kwargs["timeout"], output=b"secret-out", stderr=b"fatal: secret-err"
+        )
+
+    monkeypatch.setattr(gitread.subprocess, "run", hang)
+    with pytest.raises(ComponentError) as info:
+        GitReader(repo).resolve("secret-ref-name")
+    err = info.value
+    assert err.component == "gitread"
+    assert err.message == "git rev-parse timed out"
+    assert err.__cause__ is None
+    assert err.__suppress_context__ is True  # the argv (with the REV) is not chained
+    for text in ("secret", "fatal", str(repo)):
+        assert text not in str(err)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
+def test_hanging_git_is_killed_after_the_timeout(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_git = tmp_path / "bin" / "git"
+    fake_git.parent.mkdir()
+    fake_git.write_text("#!/bin/sh\nexec sleep 30\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(gitread.shutil, "which", lambda *_a, **_k: str(fake_git))
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
+    start = time.monotonic()
+    with pytest.raises(ComponentError) as info:
+        GitReader(repo).is_shallow()
+    assert info.value.message == "git rev-parse timed out"
+    assert time.monotonic() - start < 10
 
 
 def test_missing_repo_dir_is_a_component_error(tmp_path: Path) -> None:
