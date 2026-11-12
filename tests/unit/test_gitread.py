@@ -621,6 +621,45 @@ def test_empty_dot_and_relative_path_entries_are_dropped(
     assert found.search_path == str(tmp_path / "trusted")  # the PATH git runs with
 
 
+def test_relative_bin_entry_outside_untrusted_folders_is_never_chosen(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-3: a relative PATH entry must be dropped even when it resolves
+    # outside the repo, workspace and cwd. A bare "bin" is still inside the
+    # cwd, so the containment check would hide a missing isabs() drop; use
+    # ../bin from a sibling cwd so only the relative-entry rule applies.
+    # If relative entries were kept, the planted git would beat the trusted one.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    planted = _fake_git_in(tmp_path / "bin")
+    trusted = _fake_git_in(tmp_path / "trusted")
+    _set_path(monkeypatch, "../bin", tmp_path / "trusted")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    assert found.path != os.path.realpath(planted)
+    assert found.search_path == str(tmp_path / "trusted")
+    assert "../bin" not in found.search_path.split(os.pathsep)
+
+
+def test_symlink_path_entry_into_the_repo_is_dropped_when_trusted_git_follows(
+    repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # N-3: per-entry realpath must drop a PATH folder that is a symlink into
+    # the repo. Without realpath the entry looks innocent, which() / the walk
+    # would hit the planted git first, and the binary re-check would fail
+    # closed instead of using the later trusted git.
+    _fake_git_in(repo / "tools")
+    innocent = tmp_path / "innocent"
+    innocent.symlink_to(repo / "tools")
+    trusted = _fake_git_in(tmp_path / "trusted")
+    _set_path(monkeypatch, innocent, tmp_path / "trusted")
+    found = gitread._find_git(repo)
+    assert found.path == os.path.realpath(trusted)
+    assert found.search_path == str(tmp_path / "trusted")
+
+
 @pytest.mark.parametrize("entry", ["", ".", "bin"])
 def test_git_only_behind_a_relative_entry_fails_closed(
     repo: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch, entry: str, spy: list[Call]
