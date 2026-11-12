@@ -247,19 +247,35 @@ def _open_dir_fd(root_real: str, parts: list[str]) -> int:
         os.close(dir_fd)
 
 
-def _open_by_path(root_real: str, parts: list[str]) -> int:
-    """Fallback where ``dir_fd`` is unsupported (Windows): lstat each prefix, then
-    check the opened handle is the same file the final lstat saw."""
+def _lstat_prefixes(root_real: str, parts: list[str]) -> list[tuple[int, int]]:
+    """lstat every prefix of ``parts``; refuse links and non-folders; return (dev, ino)s."""
+    ids: list[tuple[int, int]] = []
     path = root_real
     for i, name in enumerate(parts):
         path = os.path.join(path, name)
-        last = os.lstat(path)
-        _reject_link_or_other(last, final=i == len(parts) - 1)
-    fd = os.open(path, _FILE_FLAGS)
-    st = os.fstat(fd)
-    if (st.st_dev, st.st_ino) != (last.st_dev, last.st_ino):
+        st = os.lstat(path)
+        _reject_link_or_other(st, final=i == len(parts) - 1)
+        ids.append((st.st_dev, st.st_ino))
+    return ids
+
+
+def _open_by_path(root_real: str, parts: list[str]) -> int:
+    """Fallback where ``dir_fd`` is unsupported (Windows).
+
+    lstat each prefix, open, check the handle is the file the final lstat saw,
+    then lstat the whole relative path again (SR-012 F4): a folder swapped for
+    a link or junction, or for another folder, while the file was being opened
+    is refused as "symlink", the same as a swapped final component.
+    """
+    before = _lstat_prefixes(root_real, parts)
+    fd = os.open(os.path.join(root_real, *parts), _FILE_FLAGS)
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != before[-1] or _lstat_prefixes(root_real, parts) != before:
+            raise FileSkipped(REASON_SYMLINK)
+    except BaseException:
         os.close(fd)
-        raise FileSkipped(REASON_SYMLINK)
+        raise
     return fd
 
 

@@ -818,3 +818,64 @@ def test_every_stdlib_codec_cookie_decodes_or_is_skipped(name: str) -> None:
             assert exc.reason == REASON_NOT_DECODABLE
         else:
             assert isinstance(out, str)
+
+
+# ---- SR-012 F4: the Windows fallback re-checks the whole path after opening ----------
+
+
+@pytest.mark.parametrize(
+    ("swap", "expected"),
+    [
+        ("symlink", REASON_SYMLINK),  # folder became a link or junction
+        ("other dir", REASON_SYMLINK),  # folder replaced by a different folder
+        ("file", REASON_SPECIAL),  # folder replaced by a file
+        ("gone", REASON_UNREADABLE),  # folder vanished
+    ],
+)
+def test_fallback_rechecks_every_parent_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap: str, expected: str
+) -> None:
+    monkeypatch.setattr(d, "_USE_DIR_FD", False)
+    (tmp_path / "a/b").mkdir(parents=True)
+    (tmp_path / "a/b/m.py").write_text("x")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "f").write_text("x")
+    real_lstat = os.lstat
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy_open(path: str, flags: int, *a: object, **kw: object) -> int:
+        opened.append(str(path))
+        return real_open(path, flags, *a, **kw)  # type: ignore[arg-type]
+
+    def fake_lstat(p: str) -> os.stat_result:
+        if opened and str(p) == str(tmp_path / "a"):  # only after the file was opened
+            if swap == "gone":
+                raise OSError(errno.ENOENT, "gone", str(p))
+            if swap == "symlink":
+                return os.stat_result((stat.S_IFLNK | 0o777, *real_lstat(p)[1:]))
+            return real_lstat(tmp_path / ("other" if swap == "other dir" else "f"))
+        return real_lstat(p)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    assert _skip_without_leak(tmp_path, "a/b/m.py") == expected
+
+
+def test_fallback_recheck_passes_for_an_unchanged_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(d, "_USE_DIR_FD", False)
+    (tmp_path / "a/b").mkdir(parents=True)
+    (tmp_path / "a/b/m.py").write_text("x = 1\n")
+    seen: list[str] = []
+    real_lstat = os.lstat
+
+    def spy(p: str) -> os.stat_result:
+        seen.append(str(p))
+        return real_lstat(p)
+
+    monkeypatch.setattr(os, "lstat", spy)
+    assert read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
+    mine = [p for p in seen if p.startswith(str(tmp_path / "a"))]  # realpath lstats too
+    assert mine[-6:] == [str(tmp_path / p) for p in ("a", "a/b", "a/b/m.py")] * 2
