@@ -1,6 +1,10 @@
 """Unit tests for C7 analysis, conventiondrift.checkers.pool (T-014)."""
 
-from collections.abc import Callable, Mapping
+import concurrent.futures
+import functools
+import os
+from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -10,6 +14,8 @@ from checker_standins import (
     FaultyChecker,
     ManifestChecker,
     NodeCounter,
+    RecordingChecker,
+    read_records,
 )
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -197,10 +203,26 @@ def test_a_system_exit_from_a_checker_is_isolated_too() -> None:
 # --- the process pool (DESIGN §5, §3a) ----------------------------------------------------
 
 
+@pytest.fixture
+def outside_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Run from an empty folder that isn't on ``sys.path``, with ``PYTHONSAFEPATH`` restored.
+
+    The isolation pre-check (I-13 C7 ruling 8) runs the checkers inline when the
+    current folder is on ``sys.path``, as it is under ``python -m pytest``.
+    The pool sets ``PYTHONSAFEPATH``; the monkeypatch undoes that afterwards.
+    """
+    work = tmp_path / "cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    yield work
+
+
 def _many(n: int) -> list[PyFile]:
     return [py(f"pkg/m{i:03}.py", f"print({i})\nrequests({i})\n") for i in range(n)]
 
 
+@pytest.mark.usefixtures("outside_repo")
 def test_the_pool_gives_the_same_result_as_inline() -> None:
     files = [*_many(130), py("pkg/broken.py", "def (:\n")]
     checkers = reg(PRINT, HTTP, FaultyChecker("raises on one file"))
@@ -216,6 +238,7 @@ def test_the_pool_gives_the_same_result_as_inline() -> None:
     assert len(pooled.sites("logging")) == 130
 
 
+@pytest.mark.usefixtures("outside_repo")
 def test_the_pool_is_never_wider_than_the_batch_count() -> None:
     result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=8)
     assert result.workers == 2
@@ -227,6 +250,7 @@ class _Unpicklable(CallChecker):
         self.hook: Callable[[], None] = lambda: None
 
 
+@pytest.mark.usefixtures("outside_repo")
 def test_a_broken_pool_fails_closed_as_a_checkers_component_error() -> None:
     with pytest.raises(ComponentError) as info:
         analyze(_many(65), checkers=reg(_Unpicklable()), is_script=never, max_workers=2)
@@ -248,11 +272,95 @@ def test_a_memory_error_on_the_inline_path_is_a_checkers_component_error() -> No
     assert info.value.component == "checkers"
 
 
+@pytest.mark.usefixtures("outside_repo")
 def test_a_memory_error_on_the_pool_path_is_a_checkers_component_error() -> None:
     files = [*_many(64), py("src/huge.py", _MEMORY_ERROR_SRC)]
     with pytest.raises(ComponentError) as info:
         analyze(files, checkers=reg(PRINT), is_script=never, max_workers=2)
     assert info.value.component == "checkers"
+
+
+# --- worker isolation (I-13 C7 ruling 8, SR C-1 on #31) ---------------------------------
+
+
+def test_a_pool_run_sets_pythonsafepath_for_its_workers(outside_repo: Path) -> None:
+    records = outside_repo.parent / "records"
+    records.mkdir()
+    result = analyze(_many(65), checkers=reg(RecordingChecker(str(records))), is_script=never)
+    assert result.workers >= 1
+    seen = read_records(str(records))
+    assert seen
+    assert os.getpid() not in {r["pid"] for r in seen}
+    assert all(r["PYTHONSAFEPATH"] == "1" and r["safe_path"] is True for r in seen)
+    assert os.environ["PYTHONSAFEPATH"] == "1"
+
+
+def test_pythonsafepath_stays_set_when_the_pool_replaces_a_worker_mid_run(
+    outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # max_tasks_per_child=1 makes the pool replace each worker after one batch,
+    # so 3 batches on 2 workers need at least one replacement started mid-run.
+    real = concurrent.futures.ProcessPoolExecutor
+    monkeypatch.setattr(
+        concurrent.futures, "ProcessPoolExecutor", functools.partial(real, max_tasks_per_child=1)
+    )
+    records = outside_repo.parent / "records"
+    records.mkdir()
+    checker = RecordingChecker(str(records))
+    result = analyze(_many(130), checkers=reg(checker), is_script=never, max_workers=2)
+    assert result.workers == 2
+    seen = read_records(str(records))
+    assert len({r["pid"] for r in seen}) == 3
+    assert all(r["PYTHONSAFEPATH"] == "1" and r["safe_path"] is True for r in seen)
+    assert len(result.sites("logging")) == 130
+
+
+class _DropsSafePath(concurrent.futures.ProcessPoolExecutor):
+    """A pool whose PYTHONSAFEPATH is removed while it is alive, after its last task.
+
+    (Removed before a worker starts, that worker's backstop breaks the pool
+    instead; see the backstop test below.)
+    """
+
+    def map(self, *args: object, **kwargs: object) -> Iterator[object]:  # type: ignore[override]
+        done: list[object] = list(super().map(*args, **kwargs))  # type: ignore[arg-type]
+        del os.environ["PYTHONSAFEPATH"]
+        return iter(done)
+
+
+def test_pythonsafepath_removed_while_the_pool_runs_fails_closed(
+    outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", _DropsSafePath)
+    with pytest.raises(ComponentError) as info:
+        analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert info.value.component == "checkers"
+    assert info.value.message == "PYTHONSAFEPATH changed while the pool ran"
+
+
+@pytest.mark.parametrize("unsafe", ["cwd on sys.path", "empty entry on sys.path"])
+def test_an_unsafe_sys_path_runs_the_checkers_inline(
+    unsafe: str, outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.syspath_prepend(str(outside_repo) if unsafe == "cwd on sys.path" else "")
+    result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert result.workers == 0
+    assert len(result.sites("logging")) == 65
+    assert "PYTHONSAFEPATH" not in os.environ
+
+
+def test_the_worker_backstop_runs_in_every_worker_and_fails_closed(
+    outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force the pool past the pre-check with the current folder on sys.path;
+    # spawn copies that sys.path into each worker, whose initializer refuses it.
+    monkeypatch.syspath_prepend(str(outside_repo))
+    monkeypatch.setattr("conventiondrift.checkers.pool.pool_allowed", lambda root: True)
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    with pytest.raises(ComponentError) as info:
+        analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert info.value.component == "checkers"
+    assert info.value.message == "process pool failed: BrokenProcessPool"
 
 
 # --- manifests (I-10 manifest_sites) ------------------------------------------------------

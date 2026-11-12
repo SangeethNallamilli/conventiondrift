@@ -4,6 +4,9 @@ They live at module level so the spawn process pool can pickle them by name.
 """
 
 import ast
+import json
+import os
+import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Literal
 
@@ -187,3 +190,41 @@ class ManifestChecker:
         if self.fault == "wrong file":
             out.append(Site("not-a-manifest.toml", 1, 0, "uv"))
         return out
+
+
+class RecordingChecker(CallChecker):
+    """``CallChecker`` for ``print`` that also notes, per process, how it was isolated.
+
+    Each process that walks a file writes ``<record_dir>/<pid>.json`` with its
+    ``PYTHONSAFEPATH`` value and ``safe_path``/``isolated`` flags, so a test
+    can see which processes ran the checkers (I-13 C7 ruling 8 tests). Test
+    code only: real checkers never do I/O.
+    """
+
+    def __init__(self, record_dir: str) -> None:
+        super().__init__("logging", frozenset({"print"}))
+        self.record_dir = record_dir
+
+    def ast_handlers(self) -> Handlers:
+        return {ast.Module: self._on_module, ast.Call: self._on_call}
+
+    def _on_module(self, node: ast.AST, ctx: FileContext) -> list[Site]:
+        record = {
+            "pid": os.getpid(),
+            "PYTHONSAFEPATH": os.environ.get("PYTHONSAFEPATH"),
+            "safe_path": bool(sys.flags.safe_path),
+            "isolated": bool(sys.flags.isolated),
+        }
+        path = os.path.join(self.record_dir, f"{os.getpid()}.json")
+        with open(path, "w", encoding="utf-8") as out:
+            json.dump(record, out)
+        return []
+
+
+def read_records(record_dir: str) -> list[dict[str, object]]:
+    """Every record a ``RecordingChecker`` wrote into ``record_dir``, by pid."""
+    found: list[dict[str, object]] = []
+    for name in sorted(os.listdir(record_dir)):
+        with open(os.path.join(record_dir, name), encoding="utf-8") as src:
+            found.append(json.load(src))
+    return found

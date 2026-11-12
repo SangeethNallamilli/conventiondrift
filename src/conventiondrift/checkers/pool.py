@@ -12,11 +12,18 @@ output doesn't depend on scheduling.
 A checker that raises, or returns an invalid site, on any file is dropped as
 a whole and reported as ``ComponentError("checker:<id>")``; the others carry
 on (DESIGN §4). A file that doesn't parse is skipped and listed (AC-E.14).
+
+Worker isolation (I-13 C7 ruling 8, SR C-1 on #31): before any process is
+created, ``conventiondrift.isolation.pool_allowed`` decides whether the pool may
+run (setting ``PYTHONSAFEPATH=1`` for the children when needed); otherwise the
+batches run inline. Each worker runs ``worker_backstop`` before its first task,
+and a pool whose ``PYTHONSAFEPATH`` was removed while it was alive fails closed.
+``concurrent.futures.process`` is only imported after that decision.
 """
 
+import concurrent.futures
 import multiprocessing
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import get_args
@@ -31,6 +38,7 @@ from conventiondrift.checkers.walk import (
     site_key,
 )
 from conventiondrift.errors import ComponentError
+from conventiondrift.isolation import pool_allowed, safe_path_still_set, worker_backstop
 from conventiondrift.model import CheckerId, ManifestFile, PyFile, Site, SkippedFile
 
 BATCH_SIZE = 64
@@ -64,11 +72,18 @@ def batches(jobs: Sequence[FileJob], size: int = BATCH_SIZE) -> list[tuple[FileJ
 
 
 def _run_batches(
-    checkers: tuple[Checker, ...], work: list[tuple[FileJob, ...]], max_workers: int | None
+    checkers: tuple[Checker, ...],
+    work: list[tuple[FileJob, ...]],
+    max_workers: int | None,
+    root: str | None = None,
 ) -> tuple[list[BatchOutcome], int]:
-    """Run the batches inline (one batch or ``max_workers=1``) or in a spawn pool.
+    """Run the batches inline (one batch, ``max_workers=1``, or the isolation
+    pre-check refuses the pool) or in a spawn pool.
 
-    Returns the outcomes in batch order and the number of pool workers (0 inline).
+    ``root`` is the analyzed repo root for the isolation checks; ``analyze``
+    passes ``None`` until I-11 carries one (only ``""`` and the current folder
+    are compared then). Returns the outcomes in batch order and the number of
+    pool workers (0 inline).
     """
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be at least 1")
@@ -77,16 +92,26 @@ def _run_batches(
     # BaseException, including MemoryError and SystemExit, becomes
     # ComponentError("checkers") and fails closed (I-13 C7 ruling 2).
     try:
-        if len(work) <= 1 or max_workers == 1:
+        if len(work) <= 1 or max_workers == 1 or not pool_allowed(root):
             return [analyze_batch(checkers, batch) for batch in work], 0
         context = multiprocessing.get_context("spawn")
         workers = min(len(work), max_workers or context.cpu_count())
-        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
-            return list(pool.map(analyze_batch, [checkers] * len(work), work)), workers
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=context,
+            initializer=worker_backstop,
+            initargs=(root,),
+        ) as pool:
+            outcomes = list(pool.map(analyze_batch, [checkers] * len(work), work))
     except KeyboardInterrupt:
         raise
     except BaseException as exc:  # noqa: BLE001 -- a broken pool fails closed as C7's own error
         raise ComponentError("checkers", f"process pool failed: {type(exc).__name__}") from None
+    # PYTHONSAFEPATH must have stayed set for the pool's whole lifetime: the
+    # pool may start a replacement worker at any point while it is alive.
+    if not safe_path_still_set():
+        raise ComponentError("checkers", "PYTHONSAFEPATH changed while the pool ran")
+    return outcomes, workers
 
 
 @dataclass(frozen=True, slots=True)
