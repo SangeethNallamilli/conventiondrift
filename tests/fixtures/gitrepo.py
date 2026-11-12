@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -104,11 +105,14 @@ def symlinks_available() -> bool:
 
 
 def _isolated_gitconfig(home: Path) -> Path:
-    """Empty file used as GIT_CONFIG_GLOBAL (os.devnull is not reliable on Windows)."""
+    """Empty file used as GIT_CONFIG_GLOBAL (os.devnull is not reliable on Windows).
+
+    Always truncated, so a leftover or planted config in a reused home cannot
+    leak aliases or identity into fixture git calls.
+    """
     home.mkdir(parents=True, exist_ok=True)
     cfg = home / "isolated.gitconfig"
-    if not cfg.exists():
-        cfg.write_text("", encoding="utf-8")
+    cfg.write_text("", encoding="utf-8")
     return cfg
 
 
@@ -122,7 +126,12 @@ def _rmtree(path: Path) -> None:
             pass
         fn(p)
 
-    shutil.rmtree(path, onerror=_retry)
+    # onexc is 3.12+; onerror remains the 3.11 fallback (signatures differ in
+    # the third argument, which _retry ignores).
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:
+        shutil.rmtree(path, onerror=_retry)
 
 
 def base_git_env(home: Path) -> dict[str, str]:
@@ -479,9 +488,42 @@ class GitRepo:
             )
         return PullRequest(number, base_branch, head_branch, base_tip, head, mb)
 
+    def _merge_trees(self, merge_base: str, base_tip: str, head: str) -> str:
+        """Three-way merge tree using plumbing that exists in git 2.30 (D-TL-18).
+
+        `git merge-tree --write-tree` needs 2.38+. This uses a temporary
+        GIT_INDEX_FILE so the worktree is not checked out and the repository
+        index is left untouched. Raises RuntimeError if the merge conflicts.
+        """
+        # A missing path, not an empty file: git rejects a 0-byte index
+        # ("index file smaller than expected").
+        td = tempfile.mkdtemp(prefix="cd-merge-index-")
+        index_path = str(Path(td) / "index")
+        env = {"GIT_INDEX_FILE": index_path}
+        try:
+            self.git(
+                "read-tree",
+                "-i",
+                "-m",
+                "--aggressive",
+                merge_base,
+                base_tip,
+                head,
+                env=env,
+            )
+            unmerged = self.git("ls-files", "-u", env=env, check=False)
+            if unmerged:
+                raise RuntimeError(
+                    "github_merge_commit: merge conflicts between "
+                    f"{base_tip} and {head}:\n{unmerged}"
+                )
+            return self.git("write-tree", env=env)
+        finally:
+            _rmtree(Path(td))
+
     def github_merge_commit(self, pr: PullRequest, *, date: DateLike) -> PullRequest:
         """Create refs/pull/<n>/merge the way GitHub does: parents (base tip, PR head)."""
-        tree = self.git("merge-tree", "--write-tree", pr.base_tip, pr.head).splitlines()[0]
+        tree = self._merge_trees(pr.merge_base, pr.base_tip, pr.head)
         sha = self.commit_tree(
             tree, [pr.base_tip, pr.head], f"Merge {pr.head} into {pr.base_tip}", date=date
         )

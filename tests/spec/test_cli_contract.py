@@ -76,8 +76,7 @@ def _clean_env(home: Path, *, path: str | None = None) -> dict[str, str]:
     }
     home.mkdir(parents=True, exist_ok=True)
     cfg = home / "isolated.gitconfig"
-    if not cfg.exists():
-        cfg.write_text("", encoding="utf-8")
+    cfg.write_text("", encoding="utf-8")
     env.update(
         {
             "HOME": str(home),
@@ -143,10 +142,13 @@ def _install_git_sentinel(directory: Path) -> Path:
         script = f'@echo called>>"{marker}"\r\n@exit /b 1\r\n'
         (directory / "git.cmd").write_text(script, encoding="ascii")
         (directory / "git.bat").write_text(script, encoding="ascii")
+        # A git.exe next to the scripts, so a Windows lookup of "git" or
+        # "git.exe" cannot slip past the sentinel (PATHEXT prefers .exe).
+        (directory / "git.exe").write_bytes(b"")
     else:
-        script = directory / "git"
-        script.write_text(f'#!/bin/sh\necho called >> "{marker}"\nexit 1\n', encoding="utf-8")
-        script.chmod(0o755)
+        git_stub = directory / "git"
+        git_stub.write_text(f'#!/bin/sh\necho called >> "{marker}"\nexit 1\n', encoding="utf-8")
+        git_stub.chmod(0o755)
     return marker
 
 

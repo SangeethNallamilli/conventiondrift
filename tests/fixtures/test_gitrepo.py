@@ -17,6 +17,7 @@ from fixtures.gitrepo import (
     base_git_env,
     days_before,
     git_date,
+    git_version,
     recent_lines,
 )
 
@@ -93,6 +94,39 @@ def test_github_merge_commit_parents(tmp_path: Path) -> None:
     assert r.parents(pr.merge_commit) == [pr.base_tip, pr.head]
     assert r.rev_parse("refs/pull/5/merge") == pr.merge_commit
     assert set(r.ls_files(pr.merge_commit)) == {"a.py", "b.py"}
+
+
+def test_github_merge_commit_tree_matches_merge_tree_when_available(tmp_path: Path) -> None:
+    """The 2.30 plumbing yields the same tree as `merge-tree --write-tree` on git 2.38+.
+
+    Always runs: parents and a merge tree are asserted on every git we support.
+    The merge-tree comparison is gated on git 2.38, when that flag exists.
+    """
+    r = _build(tmp_path / "r")
+    pr = r.pull_request(number=5, base_branch="main", head_branch="feature")
+    merged = r.github_merge_commit(pr, date=T)
+    assert merged.merge_commit is not None
+    assert r.parents(merged.merge_commit) == [pr.base_tip, pr.head]
+    tree = r.tree_of(merged.merge_commit)
+    assert tree
+    if git_version() >= (2, 38):
+        expected = r.git("merge-tree", "--write-tree", pr.base_tip, pr.head).splitlines()[0]
+        assert tree == expected
+
+
+def test_github_merge_commit_raises_on_conflict(tmp_path: Path) -> None:
+    r = GitRepo.init(tmp_path / "r")
+    r.commit_files("c1", {"a.py": "base\n"}, date=T)
+    r.start_pr_branch("feature")
+    r.commit_files("p1", {"a.py": "head\n"}, date=T)
+    r.checkout("main")
+    r.commit_files("b1", {"a.py": "main\n"}, date=T)
+    pr = r.pull_request(number=1, base_branch="main", head_branch="feature")
+    with pytest.raises(RuntimeError, match="merge conflicts"):
+        r.github_merge_commit(pr, date=T)
+    # The repository index and worktree were not used as the merge target.
+    assert (r.path / "a.py").read_text(encoding="utf-8") == "main\n"
+    assert r.git("diff", "--name-only") == ""
 
 
 @pytest.mark.parametrize("which", ["head", "merge"])
@@ -175,8 +209,43 @@ def test_base_git_env_isolates_config_and_keeps_windows_runtime(
     assert env_no_path["PATH"] == os.defpath
 
 
+def test_base_git_env_truncates_poisoned_gitconfig(tmp_path: Path) -> None:
+    """A planted isolated.gitconfig in the fixture home is emptied on every call."""
+    home = tmp_path / "home"
+    home.mkdir()
+    cfg = home / "isolated.gitconfig"
+    cfg.write_text("[user]\n\tname = poison\n[alias]\n\tstatus = !echo pwned\n", encoding="utf-8")
+    env = base_git_env(home)
+    assert Path(env["GIT_CONFIG_GLOBAL"]) == cfg
+    assert cfg.read_text(encoding="utf-8") == ""
+    # --global + a non-repo cwd: only the emptied GIT_CONFIG_GLOBAL is read.
+    proc = subprocess.run(
+        ["git", "config", "--global", "--get", "user.name"],  # noqa: S607 - git from PATH by design
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "poison" not in proc.stdout
+    assert "poison" not in proc.stderr
+    assert proc.returncode != 0
+    alias = subprocess.run(
+        ["git", "status"],  # noqa: S607 - git from PATH by design
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "pwned" not in alias.stdout
+
+
 def test_executable_bit_is_recorded_in_the_index(tmp_path: Path) -> None:
     r = GitRepo.init(tmp_path / "r")
+    # core.fileMode=false so a POSIX worktree +x bit is ignored; the test
+    # fails if write() drops `update-index --chmod=+x`.
+    r.git("config", "core.fileMode", "false")
     r.write("script.sh", "#!/bin/sh\necho hi\n", executable=True)
     r.write("plain.txt", "nope\n")
     sha = r.commit("modes", date="2026-01-01T00:00:00+00:00")
