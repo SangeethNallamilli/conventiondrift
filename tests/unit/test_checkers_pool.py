@@ -280,6 +280,22 @@ def test_a_memory_error_on_the_pool_path_is_a_checkers_component_error() -> None
     assert info.value.component == "checkers"
 
 
+@pytest.mark.parametrize("max_workers", [1, 2])
+def test_a_keyboard_interrupt_is_re_raised_not_mapped(
+    max_workers: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*args: object, **kwargs: object) -> object:
+        raise KeyboardInterrupt
+
+    if max_workers == 2:
+        monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", interrupted)
+        monkeypatch.setattr("conventiondrift.checkers.pool.pool_allowed", lambda root: True)
+    else:
+        monkeypatch.setattr("conventiondrift.checkers.pool.analyze_batch", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=max_workers)
+
+
 # --- worker isolation (I-13 C7 ruling 8, SR C-1 on #31) ---------------------------------
 
 
