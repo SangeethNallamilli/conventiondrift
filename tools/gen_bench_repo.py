@@ -360,6 +360,23 @@ def git(repo: Path, *args: str) -> str:
     return out.stdout.decode().strip()
 
 
+def _fixtures_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "tests"
+
+
+def init_repo(repo: Path, branch: str = "main") -> None:
+    """`git init` on `branch`, with the same git < 2.28 fallback as GitRepo.init."""
+    tests = str(_fixtures_dir())
+    if tests not in sys.path:
+        sys.path.insert(0, tests)
+    from fixtures.gitrepo import init_with_branch
+
+    def _run(*args: str) -> str:
+        return git(repo, *args)
+
+    init_with_branch(_run, branch)
+
+
 # ----------------------------------------------------------------------------- generator
 def generate(prof: Profile, seed: int, out: Path) -> dict:
     t0 = time.monotonic()
@@ -410,7 +427,7 @@ def generate(prof: Profile, seed: int, out: Path) -> dict:
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    git(out, "init", "-q", "-b", "main", ".")
+    init_repo(out, "main")
     proc = subprocess.Popen(
         ["git", "fast-import", "--quiet", "--done"],  # noqa: S607 - git from PATH by design
         cwd=out,
