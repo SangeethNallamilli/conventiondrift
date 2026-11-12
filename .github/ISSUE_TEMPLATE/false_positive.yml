@@ -1,0 +1,41 @@
+name: False positive
+description: conventiondrift warned that a rule went stale, but your code still follows it.
+labels: ["false positive"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        False warnings are the bug we care about most, so thank you. The more exact the example, the faster we can fix it.
+        To silence the warning while you wait, see "How to silence it" on that checker's docs page.
+  - type: input
+    id: version
+    attributes:
+      label: conventiondrift version
+      description: The Action ref you use (for example `@v1`) or the output of `conventiondrift --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: rule
+    attributes:
+      label: The rule it warned about
+      description: Paste the exact line from your instruction file (AGENTS.md, CLAUDE.md, or similar), with its file name and line number.
+    validations:
+      required: true
+  - type: textarea
+    id: warning
+    attributes:
+      label: The warning
+      description: Paste the comment entry, annotation, or job summary text it produced.
+    validations:
+      required: true
+  - type: textarea
+    id: why-wrong
+    attributes:
+      label: Why is it wrong?
+      description: Show the code that follows the rule but was counted as contradicting it, or explain what was miscounted.
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Public pull request or repository link (optional)
