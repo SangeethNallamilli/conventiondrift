@@ -231,9 +231,16 @@ def _open_subdir(name: str, dir_fd: int) -> int:
     except OSError as exc:
         if exc.errno != errno.ENOTDIR:
             raise
-    # Linux returns ENOTDIR, not ELOOP, for O_NOFOLLOW | O_DIRECTORY on a symlink, so a
-    # folder swapped for a symlink after the lstat is told apart from one swapped for a file.
-    _reject_link_or_other(os.lstat(name, dir_fd=dir_fd), final=False)
+    # Linux returns ENOTDIR, not ELOOP, for O_NOFOLLOW | O_DIRECTORY on a symlink, so the
+    # name is lstat-ed again (INTERFACES I-14): a symlink is "symlink", anything else
+    # "special file", and an lstat that fails is "unreadable" whatever its errno.
+    try:
+        st = os.lstat(name, dir_fd=dir_fd)
+    except OSError:
+        st = None
+    if st is None:
+        raise FileSkipped(REASON_UNREADABLE)  # outside the handler: no __context__
+    _reject_link_or_other(st, final=False)
     raise FileSkipped(REASON_SPECIAL)
 
 

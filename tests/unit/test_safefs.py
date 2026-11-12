@@ -812,6 +812,34 @@ def test_folder_swapped_for_file_after_lstat_is_special_file(
     assert _skip_without_leak(tmp_path, "docs/AGENTS.md") == REASON_SPECIAL
 
 
+@pytest.mark.skipif(not d._USE_DIR_FD, reason="needs openat")
+@pytest.mark.parametrize("name", ["ENOENT", "EACCES", "ELOOP", "ENOTDIR", "ENAMETOOLONG"])
+def test_enotdir_relstat_failure_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """I-14: the folder open gives a real ENOTDIR (the folder became a file), then the
+    re-lstat of the same name fails. Whatever its errno, the reason is "unreadable"."""
+    monkeypatch.setattr(d, "_USE_DIR_FD", True)
+    (tmp_path / "docs").mkdir()
+    real_lstat = os.lstat
+    calls: list[str] = []
+
+    def racing_lstat(p: str, *, dir_fd: int | None = None) -> os.stat_result:
+        if p == "docs":
+            calls.append(p)
+            if len(calls) == 2:  # the re-lstat after ENOTDIR
+                raise _os_error(getattr(errno, name), tmp_path)
+            st = real_lstat(p, dir_fd=dir_fd)
+            os.rmdir(tmp_path / "docs")
+            (tmp_path / "docs").write_text("not a folder")
+            return st
+        return real_lstat(p, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "lstat", racing_lstat)
+    assert _skip_without_leak(tmp_path, "docs/AGENTS.md") == REASON_UNREADABLE
+    assert calls == ["docs", "docs"]
+
+
 def test_eftype_where_it_exists_is_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
 ) -> None:
