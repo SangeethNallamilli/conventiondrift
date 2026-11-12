@@ -12,6 +12,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+IMAGE_RE = re.compile(
+    r"^(?P<indent>\s*)image:\s*[\'\"]?(?P<value>[^\'\"\s#]+)[\'\"]?\s*(?P<comment>#.*)?\s*$"
+)
 USES_RE = re.compile(
     r"^(?P<indent>\s*)uses:\s*['\"]?(?P<value>[^'\"\s#]+)['\"]?\s*(?P<comment>#.*)?\s*$"
 )
@@ -61,6 +64,17 @@ def check_uses(path: Path, line_no: int, value: str, comment: str | None) -> lis
     return errors
 
 
+def check_image(path: Path, line_no: int, value: str) -> list[str]:
+    """Require container images to be pinned by sha256 digest."""
+    loc = f"{path.relative_to(REPO)}:{line_no}"
+    if "@sha256:" in value:
+        digest = value.rsplit("@sha256:", 1)[1]
+        if re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            return []
+        return [f"{loc}: container image digest is not a 64-char sha256: {value}"]
+    return [f"{loc}: container image is not pinned by sha256 digest: {value}"]
+
+
 def check_file(path: Path) -> list[str]:
     errors: list[str] = []
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -77,6 +91,9 @@ def check_file(path: Path) -> list[str]:
         match = USES_RE.match(raw)
         if match:
             errors.extend(check_uses(path, i, match.group("value"), match.group("comment")))
+        img = IMAGE_RE.match(raw)
+        if img:
+            errors.extend(check_image(path, i, img.group("value")))
     return errors
 
 

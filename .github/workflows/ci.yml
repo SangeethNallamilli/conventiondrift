@@ -135,6 +135,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
+      - name: Report the default runner git version
+        run: git --version
       - name: Install hash-pinned pip, then hashed locks
         run: |
           python3 scripts/ci/install_pinned_pip.py
@@ -174,8 +176,9 @@ jobs:
       - name: python -m build --no-isolation
         run: python -m build --no-isolation
 
-  vendor:
-    name: vendor
+  release:
+    name: release
+    needs: [lockfile]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -187,24 +190,23 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Re-extract PyYAML 6.0.3 and compare to _vendor/MANIFEST
-        run: python3 scripts/ci/check_vendor.py
-
-  import-resolution:
-    name: import-resolution
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"
-      - name: Imports resolve only to stdlib, conventiondrift, and _vendor
-        run: python3 -I scripts/ci/check_import_resolution.py
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      # test_vendor_manifest downloads the pinned sdist; this job has network (not offline).
+      - name: Release checks (TE tests if present, otherwise scripts/ci)
+        run: |
+          if [ -f tests/release/test_vendor_manifest.py ]; then
+            echo "Using tests/release from the tree (PR #12)"
+            python -m pytest tests/release --hypothesis-seed="${HYPOTHESIS_SEED}"
+          else
+            echo "tests/release not on this tree yet; using scripts/ci fallback"
+            python3 scripts/ci/check_vendor.py
+            python3 -I scripts/ci/check_import_resolution.py
+          fi
 
   secret-scan:
     name: secret-scan
@@ -253,6 +255,9 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
+      - name: Report the default runner git version
+        shell: pwsh
+        run: git --version
       - name: CONTRIBUTING setup steps in PowerShell (not yet documented; allowed to fail)
         shell: pwsh
         run: |
@@ -263,6 +268,47 @@ jobs:
           .\.venv\Scripts\pip install --require-hashes --no-deps -r requirements/build.txt -r requirements/dev.txt
           .\.venv\Scripts\pip install --no-deps --no-build-isolation -e .
           .\.venv\Scripts\conventiondrift --version
+
+  git-2-24:
+    name: git-2-24
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # Digest of python:3.11-bookworm (tag updated 2026-11-06). Running in a
+    # pinned container keeps the compiler toolchain stable so Git 2.24.4
+    # (2019) still builds; ubuntu-latest is already on much newer gcc.
+    container:
+      image: python:3.11-bookworm@sha256:726d304906fa5eb468e5531e366548d1903286352f5adb54ef508ac01fbd80c6 # 3.11-bookworm 2026-11-06
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Git build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates gettext libcurl4-openssl-dev \
+            libexpat1-dev libssl-dev make zlib1g-dev
+      - name: Build checksum-pinned Git 2.24.4
+        run: python3 scripts/ci/install_git_min.py
+      - name: Confirm PATH git is 2.24.4
+        run: |
+          command -v git
+          git --version
+          case "$(git --version)" in
+            "git version 2.24.4") ;;
+            *) echo "expected git version 2.24.4" >&2; exit 1 ;;
+          esac
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: pytest against Git 2.24.4 (unit/spec/snapshot/property)
+        run: python -m pytest tests/unit tests/spec tests/snapshot tests/property --hypothesis-seed="${HYPOTHESIS_SEED}"
 
   ci:
     name: ci
@@ -275,8 +321,8 @@ jobs:
       - types
       - test
       - build
-      - vendor
-      - import-resolution
+      - release
+      - git-2-24
       - secret-scan
       - dependency-scan
     runs-on: ubuntu-latest
