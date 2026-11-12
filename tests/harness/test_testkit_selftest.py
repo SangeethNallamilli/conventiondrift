@@ -115,18 +115,11 @@ def test_make_components_uses_dataclasses_replace() -> None:
         make_components(base, fault_hook=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=(ImportError, ModuleNotFoundError),
-    reason="T-006a: conventiondrift.components not on main yet",
-)
 def test_production_components_documented_shape() -> None:
     """I-11/I-14: frozen, keyword-only dataclass; None = default; dataclasses.replace for variants;
     the I-11 replaceable parts are fields.
 
-    Imports `conventiondrift.components` directly (I-14). A failed import fails this
-    test; the strict xfail is only for ImportError/ModuleNotFoundError until T-006a
-    lands, at which point the marker must be removed (an XPASS fails the suite).
+    Imports `conventiondrift.components` directly (I-14). A failed import fails this test.
     """
     from conventiondrift.components import Components
 
