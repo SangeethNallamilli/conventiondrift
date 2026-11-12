@@ -55,7 +55,7 @@ target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
 # Vendored files must stay byte-identical to the pinned sdist (ADR-0002).
-extend-exclude = ["src/conventiondrift/_vendor"]
+extend-exclude = ["src/conventiondrift/_vendor/yaml/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "A", "RUF"]
@@ -69,4 +69,4 @@ strict = true
 files = ["src"]
 warn_unreachable = true
 # Vendored PyYAML is third-party source; do not type-check it under strict.
-exclude = ["conventiondrift/_vendor/"]
+exclude = ["conventiondrift/_vendor/yaml/"]
