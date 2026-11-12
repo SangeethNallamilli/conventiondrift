@@ -622,6 +622,68 @@ def test_checkout_at_filesystem_root_never_uses_git_inside_the_checkout(
     _assert_not_executed(sentinel)
 
 
+@pytest.mark.parametrize(
+    ("scenario", "path_entry"),
+    [
+        ("empty_path_entry", ""),
+        ("dot_path_entry", "."),
+        ("relative_path_entry", "relbin"),
+    ],
+)
+def test_relative_or_empty_path_entry_is_dropped_when_cwd_is_filesystem_root(
+    scenario: str,
+    path_entry: str,
+    hijack_layout: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-14: drop empty, ``.`` and plain-relative PATH entries even at a root cwd.
+
+    The cwd containment rule is skipped when the cwd is a filesystem root
+    (WORKDIR /). A planted git in that cwd, or in a plain-relative folder
+    under it, is then protected only by the relative-entry rule (I-14 step 1:
+    drop empty entries, ``.``, and every relative entry). Each class is its
+    own case so a mutant that keeps only that class is killed on its own row
+    (D-TL-25). The expected result is written from I-14 step 2, not from the
+    code: a git existed but every candidate was dropped, so
+    ComponentError("gitread"), and the planted binary is never run.
+    """
+    # The checkout is a different folder from the simulated root. If they
+    # were the same, the repo rule would still drop the planted git and a
+    # relative-entry mutant would survive (CR2 B1).
+    repo = hijack_layout["repo"]
+    fake_root = hijack_layout["root"] / "fsroot"
+    fake_root.mkdir()
+    relbin = fake_root / "relbin"
+    relbin.mkdir()
+    sentinel = hijack_layout["sentinel"]
+    if scenario == "relative_path_entry":
+        _plant_all_names(relbin, sentinel)
+    elif scenario in ("empty_path_entry", "dot_path_entry"):
+        _plant_all_names(fake_root, sentinel)
+    else:
+        raise AssertionError(f"unknown scenario {scenario}")
+
+    real_is_root = gitread._is_filesystem_root
+
+    def is_root(path: str) -> bool:
+        try:
+            if Path(path).resolve() == fake_root.resolve():
+                return True
+        except OSError:
+            pass
+        return real_is_root(path)
+
+    monkeypatch.setattr(gitread, "_is_filesystem_root", is_root)
+    monkeypatch.chdir(fake_root)
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    _set_path(monkeypatch, path_entry)
+
+    with pytest.raises(ComponentError) as info:
+        gitread._find_git(repo)
+    _assert_dropped_git_error(info.value)
+    _assert_not_executed(sentinel)
+
+
 # ---------------------------------------------------------------------------
 # SR-013 Windows: only git.exe is considered
 # ---------------------------------------------------------------------------
