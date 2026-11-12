@@ -1,9 +1,10 @@
 """Unit tests for the boundary types in conventiondrift.model (T-005; I-10, I-11, I-13)."""
 
 import dataclasses
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Literal, get_args, get_type_hints
+from typing import Any, Literal, TypeVar, get_args, get_type_hints
 
 import pytest
 from hypothesis import example, given, settings
@@ -754,6 +755,16 @@ _PROPERTY_EXAMPLES: tuple[tuple[frozenset[str], frozenset[str], int], ...] = (
     (frozenset({"a"}), frozenset({"b"}), 2),
 )
 
+_F = TypeVar("_F", bound=Callable[..., None])
+
+
+def _with_property_examples(test: _F) -> _F:
+    """Attach every ``_PROPERTY_EXAMPLES`` entry as a Hypothesis ``@example`` (one source)."""
+    for preferred, prohibited, specificity in _PROPERTY_EXAMPLES:
+        test = example(preferred=preferred, prohibited=prohibited, specificity=specificity)(test)
+    return test
+
+
 _OPTION_SETS = st.frozensets(st.sampled_from(("a", "b", "c", "d")), max_size=4)
 
 
@@ -787,12 +798,7 @@ def test_rule_match_property_examples_cover_invalid_classes() -> None:
     prohibited=_OPTION_SETS,
     specificity=st.integers(min_value=-100, max_value=100),
 )
-@example(preferred=frozenset(), prohibited=frozenset(), specificity=0)
-@example(preferred=frozenset({"a"}), prohibited=frozenset({"a"}), specificity=1)
-@example(preferred=frozenset({"a", "b"}), prohibited=frozenset({"b", "c"}), specificity=2)
-@example(preferred=frozenset({"a"}), prohibited=frozenset(), specificity=1)
-@example(preferred=frozenset(), prohibited=frozenset({"b"}), specificity=1)
-@example(preferred=frozenset({"a"}), prohibited=frozenset({"b"}), specificity=2)
+@_with_property_examples
 @settings(max_examples=80, deadline=None, derandomize=True)
 def test_rule_match_constructs_iff_union_nonempty_and_disjoint(
     preferred: frozenset[str], prohibited: frozenset[str], specificity: int
@@ -807,3 +813,29 @@ def test_rule_match_constructs_iff_union_nonempty_and_disjoint(
         assert invalid_class in _RULEMATCH_INVALID_CLASSES
         with pytest.raises(ValueError, match=_RULEMATCH_INVALID_MATCH[invalid_class]):
             RuleMatch(preferred=preferred, prohibited=prohibited, specificity=specificity)
+
+
+# CR2 #27 F1: a wrong argument type is a TypeError, whichever field it is in and whatever
+# the other field holds; only the two I-10 value conditions are ValueError.
+_NOT_FROZENSETS: tuple[Any, ...] = (None, [], ["a"], set(), {"a"}, (), ("a",), "a", {"a": 1})
+
+
+@pytest.mark.parametrize("bad", _NOT_FROZENSETS)
+@pytest.mark.parametrize("other", [frozenset(), frozenset({"b"})])
+@pytest.mark.parametrize("field", ["preferred", "prohibited"])
+def test_rule_match_rejects_non_frozensets_with_type_error(
+    field: str, other: Any, bad: Any
+) -> None:
+    kwargs: dict[str, Any] = {"preferred": other, "prohibited": other, "specificity": 1}
+    kwargs[field] = bad
+    with pytest.raises(TypeError, match="must be frozensets"):
+        RuleMatch(**kwargs)
+    with pytest.raises(TypeError, match="must be frozensets"):
+        dataclasses.replace(MATCH, **{field: bad})
+
+
+def test_rule_match_type_error_does_not_echo_values() -> None:
+    hostile = ["untrusted-option<SECRET>"]
+    with pytest.raises(TypeError) as excinfo:
+        RuleMatch(preferred=hostile, prohibited=frozenset(), specificity=0)  # type: ignore[arg-type]
+    assert "SECRET" not in str(excinfo.value)

@@ -66,6 +66,10 @@ class RuleMatch:
     specificity: int
 
     def __post_init__(self) -> None:
+        # A wrong type is a TypeError, an invalid value a ValueError (I-10 validity). A plain
+        # set would also pass the checks below but leave the match unhashable (I-13).
+        if not (isinstance(self.preferred, frozenset) and isinstance(self.prohibited, frozenset)):
+            raise TypeError("RuleMatch preferred and prohibited must be frozensets")
         if not (self.preferred | self.prohibited):
             raise ValueError("RuleMatch preferred and prohibited must not both be empty")
         if self.preferred & self.prohibited:
