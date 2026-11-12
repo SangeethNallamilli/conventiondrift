@@ -1,13 +1,21 @@
-"""Entrypoint core (DESIGN §12 A-1). T-006a: the pure I-4 exit-code policy.
+"""Entrypoint core (DESIGN §12 A-1; INTERFACES I-2, I-4, I-14).
 
-``run()`` and the pipeline arrive with T-006a's remaining parts and T-028. The
-callers (C1, C2, T-028) reduce a run to one of the outcomes below; this module
-only maps it to an exit status, following INTERFACES I-4 "Exit codes", DESIGN
-§4 and SC-2.50 (D-PM-30).
+T-006a ships the ``run()`` skeleton, the pure I-4 exit-code policy, the
+exception-to-``InternalError`` helper and the ``fail-on`` fallback used when an
+error happens before policy loads. The pipeline itself is T-028; writing the
+Internal error section is T-006b.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
+
+from conventiondrift.components import Components
+from conventiondrift.errors import ComponentError
+from conventiondrift.model import InternalError
+
+FailOn = Literal["none", "new-stale", "any-stale"]
+_FAIL_ON_VALUES: tuple[FailOn, ...] = get_args(FailOn)
 
 EXIT_OK = 0
 EXIT_FAIL_ON_MET = 1
@@ -28,22 +36,21 @@ class RefusedTriggerOutcome:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AnalysisOutcome:
-    """A run that got past argument and trigger checks.
+    """A run that got past argument and trigger checks."""
 
-    ``new_stale_met`` and ``any_stale_met`` say whether the I-4 "What counts"
-    condition for each mode holds; callers compute them (scan mode never meets
-    ``new-stale``). ``internal_error`` is true when any ``InternalError`` was
-    recorded.
-    """
-
-    fail_on: Literal["none", "new-stale", "any-stale"]
+    fail_on: FailOn
+    """The effective ``fail-on`` (I-4 B7)."""
     head_only: bool
     new_stale_met: bool
+    """I-4 "What counts" for ``new-stale``; T-028 sets ``Result.counts.new_stale > 0``."""
     any_stale_met: bool
+    """I-4 "What counts" for ``any-stale``; T-028 sets ``Result.counts.stale > 0``."""
     internal_error: bool
+    """True when any ``InternalError`` was recorded."""
 
 
 RunOutcome = UsageErrorOutcome | RefusedTriggerOutcome | AnalysisOutcome
+"""``RefusedTriggerOutcome`` is only ever built when ``entry == "action"`` (I-2, I-4)."""
 
 
 def exit_code(outcome: RunOutcome) -> int:
@@ -62,3 +69,82 @@ def exit_code(outcome: RunOutcome) -> int:
         return EXIT_OK
     met = outcome.new_stale_met if outcome.fail_on == "new-stale" else outcome.any_stale_met
     return EXIT_FAIL_ON_MET if met else EXIT_OK
+
+
+def internal_error(exc: Exception) -> InternalError:
+    """The reportable form of a caught exception (I-14 Q6).
+
+    Only the component name and the exception class are used; the exception's
+    own message (including ``ComponentError.message``) is never written.
+    """
+    component = exc.component if isinstance(exc, ComponentError) else "core"
+    return InternalError(
+        component,
+        f"{type(exc).__name__}: this part of the analysis could not finish; details are withheld",
+    )
+
+
+def error_fail_on(explicit: str | None, base_config: FailOn | None) -> FailOn:
+    """``fail-on`` for a run that failed before policy loaded (I-14 Q5).
+
+    The explicit input or flag when present and valid, else the base config's
+    value if it was already read, else ``none``.
+    """
+    for value in _FAIL_ON_VALUES:
+        if explicit == value:
+            return value
+    if base_config is not None:
+        return base_config
+    return "none"
+
+
+@dataclass(slots=True)
+class RunContext:
+    """What the pipeline has learned so far that error handling needs (I-14 Q5).
+
+    The pipeline (T-028, T-029, T-031) records the raw explicit ``fail-on`` and
+    the base config's ``fail-on`` here as soon as it reads them.
+    """
+
+    explicit_fail_on: str | None = None
+    base_fail_on: FailOn | None = None
+    internal_errors: tuple[InternalError, ...] = ()
+
+
+def _pipeline(
+    argv: list[str],
+    env: Mapping[str, str],
+    entry: Literal["action", "cli"],
+    components: Components,
+    context: RunContext,
+) -> RunOutcome:
+    """The C3-to-C12 pipeline (DESIGN §2). Arrives with T-028."""
+    raise NotImplementedError
+
+
+def run(
+    argv: list[str],
+    env: Mapping[str, str],
+    *,
+    entry: Literal["action", "cli"],
+    components: Components | None = None,
+) -> int:
+    """The single entrypoint for ``conventiondrift.action`` and ``conventiondrift.cli`` (I-2).
+
+    ``entry`` is passed by the caller and never inferred from ``env``. Any
+    exception from the pipeline becomes an ``InternalError`` and the run exits
+    per I-4 with the ``fail-on`` known so far.
+    """
+    context = RunContext()
+    try:
+        outcome = _pipeline(argv, env, entry, components or Components(), context)
+    except Exception as exc:  # noqa: BLE001 -- I-14: every exception in run() is reported
+        context.internal_errors += (internal_error(exc),)
+        outcome = AnalysisOutcome(
+            fail_on=error_fail_on(context.explicit_fail_on, context.base_fail_on),
+            head_only=False,
+            new_stale_met=False,
+            any_stale_met=False,
+            internal_error=True,
+        )
+    return exit_code(outcome)
