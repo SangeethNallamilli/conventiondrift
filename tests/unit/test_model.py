@@ -76,7 +76,7 @@ POLICY = Policy(
         {cid: LOGGING if cid == "logging" else CheckerPolicy(True, ()) for cid in CHECKER_IDS}
     ),
     ignores=(IgnoreEntry(file="AGENTS.md", line=9, text=None),),
-    markers=MappingProxyType({"AGENTS.md": (4,)}),
+    markers=MappingProxyType({"AGENTS.md": ((4, True),)}),
     paths=None,
     comment=True,
     sarif=True,
@@ -466,14 +466,33 @@ def test_missing_field_is_rejected() -> None:
 
 def test_policy_wraps_mappings_in_read_only_copies() -> None:
     checkers = {cid: CheckerPolicy(enabled=True, script_paths=()) for cid in CHECKER_IDS}
-    markers = {"AGENTS.md": (4,)}
+    markers = {"AGENTS.md": ((4, False),)}
     policy = dataclasses.replace(POLICY, checkers=checkers, markers=markers)
     assert isinstance(policy.checkers, MappingProxyType)
     assert isinstance(policy.markers, MappingProxyType)
     checkers.clear()
-    markers["CLAUDE.md"] = (1,)
+    markers["CLAUDE.md"] = ((1, True),)
     assert set(policy.checkers) == set(CHECKER_IDS)
-    assert dict(policy.markers) == {"AGENTS.md": (4,)}
+    assert dict(policy.markers) == {"AGENTS.md": ((4, False),)}
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [(), ((4, True),), ((1, False), (2, True), (9, False))],
+)
+def test_policy_accepts_sorted_marker_pairs(pairs: tuple[tuple[int, bool], ...]) -> None:
+    policy = dataclasses.replace(POLICY, markers={"AGENTS.md": pairs})
+    assert policy.markers["AGENTS.md"] == pairs
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [((9, False), (2, True)), ((1, False), (3, True), (2, False))],
+)
+def test_policy_rejects_unsorted_marker_pairs(pairs: tuple[tuple[int, bool], ...]) -> None:
+    # I-13: each file's markers are sorted (line, alone_on_line) pairs.
+    with pytest.raises(ValueError, match=r"Policy\.markers must be sorted"):
+        dataclasses.replace(POLICY, markers={"CLAUDE.md": ((1, True),), "AGENTS.md": pairs})
 
 
 @pytest.mark.parametrize("missing", CHECKER_IDS)

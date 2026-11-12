@@ -170,7 +170,8 @@ class Policy:
     max_file_bytes: int
     checkers: Mapping[CheckerId, CheckerPolicy]
     ignores: tuple[IgnoreEntry, ...]
-    markers: Mapping[str, tuple[int, ...]]
+    markers: Mapping[str, tuple[tuple[int, bool], ...]]
+    """File -> sorted ``(line, alone_on_line)`` pairs, from the policy side (I-7, I-13)."""
     paths: tuple[str, ...] | None
     comment: bool
     sarif: bool
@@ -186,6 +187,8 @@ class Policy:
             raise ValueError('CheckerPolicy.script_paths must be () except for "logging"')
         if self.gated != (self.effective_fail_on != "none"):
             raise ValueError('Policy.gated must equal effective_fail_on != "none"')
+        for pairs in self.markers.values():
+            _check_sorted(pairs, "Policy.markers")
 
 
 @dataclass(frozen=True, slots=True)
