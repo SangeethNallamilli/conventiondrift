@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any
 import pytest
 
 from conventiondrift import gitread
-from conventiondrift.errors import ComponentError, FileSkipped
+from conventiondrift.errors import ComponentError, FileSkipped, GitUnavailable
 from conventiondrift.gitread import GitReader
 
 _REAL_RUN = subprocess.run
@@ -71,23 +72,22 @@ Call = dict[str, Any]
 
 @pytest.fixture
 def spy(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Call]]:
-    """Record every bounded git call except the version check, then run it."""
+    """Record every bounded or long-lived git start except the version check."""
     calls: list[Call] = []
     real = gitread._run_bounded
+    real_start = gitread._start_batch
 
     def recorder(argv: list[str], **kwargs: Any) -> Any:
         if argv[1:] != ["--version"]:
             calls.append({"argv": list(argv), **kwargs})
         return real(argv, **kwargs)
 
-    real_input = gitread._run_bounded_input
-
-    def input_recorder(argv: list[str], **kwargs: Any) -> Any:
-        calls.append({"argv": list(argv), **kwargs})
-        return real_input(argv, **kwargs)
+    def start_recorder(argv: list[str], **kwargs: Any) -> Any:
+        calls.append({"argv": list(argv), "batch": True, **kwargs})
+        return real_start(argv, **kwargs)
 
     monkeypatch.setattr(gitread, "_run_bounded", recorder)
-    monkeypatch.setattr(gitread, "_run_bounded_input", input_recorder)
+    monkeypatch.setattr(gitread, "_start_batch", start_recorder)
     yield calls
 
 
@@ -104,8 +104,20 @@ def _fake(monkeypatch: pytest.MonkeyPatch, *outputs: tuple[int, bytes]) -> list[
         return gitread._Output(*queue.pop(0))
 
     monkeypatch.setattr(gitread, "_run_bounded", fake)
-    monkeypatch.setattr(gitread, "_run_bounded_input", fake)
     return calls
+
+
+def _fake_batch(monkeypatch: pytest.MonkeyPatch, script: str) -> list[list[str]]:
+    """Make every long-lived git a Python process running ``script`` (stdin -> stdout)."""
+    real_start = gitread._start_batch
+    started: list[list[str]] = []
+
+    def start(argv: list[str], **kwargs: Any) -> Any:
+        started.append(list(argv))
+        return real_start([sys.executable, "-c", script], **kwargs)
+
+    monkeypatch.setattr(gitread, "_start_batch", start)
+    return started
 
 
 def _sub_args(call: Call, sub: str) -> list[str]:
@@ -118,11 +130,11 @@ def _no_host_path(exc: BaseException, repo: Path) -> None:
     assert str(repo.parent) not in str(exc)
 
 
-# --- bounded runner with stdin --------------------------------------------------
+# --- runner seam and allowlist --------------------------------------------------
 
 
 def test_t007_runner_signatures_are_unchanged() -> None:
-    # The TE's SR-013/SR-014 tests (PR #26) pin these; stdin needs its own helper.
+    # The TE's SR-013/SR-014 tests (PR #26) and I-14 item 8 pin these.
     import inspect
 
     assert list(inspect.signature(gitread._run_bounded).parameters) == [
@@ -132,40 +144,14 @@ def test_t007_runner_signatures_are_unchanged() -> None:
     assert [f.name for f in dataclasses.fields(gitread._Output)] == ["returncode", "stdout"]
 
 
-def test_bounded_runner_feeds_stdin_through_a_pipe(tmp_path: Path) -> None:
-    code = "import sys; sys.stdout.write(sys.stdin.read().upper())"
-    out = gitread._run_bounded_input(
-        [sys.executable, "-c", code],
-        cwd=tmp_path,
-        env=dict(os.environ),
-        label="cat-file",
-        max_stdout=64,
-        timeout=20.0,
-        stdin=b"abc\n",
-    )
-    assert out == gitread._Output(0, b"ABC\n")
-
-
-def test_bounded_runner_survives_a_process_that_ignores_stdin(tmp_path: Path) -> None:
-    out = gitread._run_bounded_input(
-        [sys.executable, "-c", "import os, sys; os.close(0); sys.exit(4)"],
-        cwd=tmp_path,
-        env=dict(os.environ),
-        label="cat-file",
-        max_stdout=64,
-        timeout=20.0,
-        stdin=b"x" * 64,
-    )
-    assert out.returncode == 4
-
-
 def test_new_options_are_allowlisted_and_nothing_wider() -> None:
     allow = gitread.OPTION_ALLOWLIST
     assert {"--batch-check", "--batch"} <= allow["cat-file"]
     assert "--batch-all-objects" not in allow["cat-file"]
     assert "--timestamp" in allow["rev-list"]
     assert "--name-status" in allow["diff-tree"]
-    assert {"-m", "-M", "--root", "--reverse", "--format=%x00%H"} <= allow["log"]
+    assert {"-m", "-M", "--root", "--format=%x00%H"} <= allow["log"]
+    assert "--reverse" not in allow["log"]
     for sub in ("log", "diff-tree"):
         assert not {"--ext-diff", "--textconv", "--output", "--follow"} & allow[sub]
 
@@ -267,49 +253,61 @@ def test_tree_rejects_malformed_listings(
 # --- blob -----------------------------------------------------------------------
 
 
-def _oid(repo: Path, data: bytes) -> str:
-    _write(repo, "f.bin", data)
+def _oid(repo: Path, data: bytes, name: str = "f.bin") -> str:
+    _write(repo, name, data)
     _commit(repo)
-    return _git(repo, "rev-parse", "HEAD:f.bin")
+    return _git(repo, "rev-parse", f"HEAD:{name}")
 
 
 @pytest.mark.parametrize("data", [b"x = 1\n", b"", b"\x00\xff no newline", b"\n\n"])
 def test_blob_returns_the_exact_bytes(repo: Path, data: bytes) -> None:
-    assert GitReader(repo).blob(_oid(repo, data), 1 << 20) == data
+    reader = GitReader(repo)
+    try:
+        assert reader.blob(_oid(repo, data), 1 << 20) == data
+    finally:
+        reader.close()
 
 
 def test_blob_at_exactly_the_limit_is_read(repo: Path) -> None:
-    assert GitReader(repo).blob(_oid(repo, b"12345"), 5) == b"12345"
+    reader = GitReader(repo)
+    assert reader.blob(_oid(repo, b"12345"), 5) == b"12345"
+    reader.close()
 
 
-def test_blob_passes_the_id_on_stdin_and_caps_the_body(repo: Path, spy: list[Call]) -> None:
-    oid = _oid(repo, b"hello\n")
-    GitReader(repo).blob(oid, 100)
-    check, batch = spy
-    assert _sub_args(check, "cat-file") == ["--batch-check"]
-    assert _sub_args(batch, "cat-file") == ["--batch"]
-    assert check["stdin"] == batch["stdin"] == oid.encode() + b"\n"
-    assert all(oid not in arg for call in spy for arg in call["argv"])
-    header = len(f"{oid} blob 6\n")
-    assert check["max_stdout"] == gitread.SMALL_OUTPUT_MAX_BYTES
-    assert batch["max_stdout"] == header + 6 + 1
-    assert batch["timeout"] == gitread.GIT_TIMEOUT_SECONDS
+def test_blob_reuses_one_process_per_mode_for_many_blobs(repo: Path, spy: list[Call]) -> None:
+    oids = [_oid(repo, f"v{i}\n".encode() * (i + 1), f"f{i}.py") for i in range(12)]
+    reader = GitReader(repo)
+    try:
+        for i, oid in enumerate(oids):
+            assert reader.blob(oid, 1 << 20) == f"v{i}\n".encode() * (i + 1)
+    finally:
+        reader.close()
+    assert [_sub_args(c, "cat-file") for c in spy] == [["--batch-check"], ["--batch"]]
+    for call in spy:
+        assert call["batch"] is True and call["label"] == "cat-file"
+        assert all(oid not in arg for oid in oids for arg in call["argv"])  # ids on stdin
+        assert "safe.bareRepository=explicit" in call["argv"]
+        assert call["env"]["GIT_NO_LAZY_FETCH"] == "1"
+        assert call["argv"][0] == gitread._find_git(repo).path
 
 
-def test_blob_over_the_limit_is_skipped_without_reading_the_body(
-    repo: Path, spy: list[Call]
-) -> None:
+def test_blob_over_the_limit_never_asks_batch_for_the_body(repo: Path, spy: list[Call]) -> None:
     oid = _oid(repo, b"123456")
+    reader = GitReader(repo)
     with pytest.raises(FileSkipped) as info:
-        GitReader(repo).blob(oid, 5)
+        reader.blob(oid, 5)
     assert info.value.reason == "size limit"
     assert [_sub_args(c, "cat-file") for c in spy] == [["--batch-check"]]
+    assert reader.blob(oid, 6) == b"123456"  # the check process is still in step
+    reader.close()
 
 
 def test_blob_with_a_zero_limit_reads_only_empty_blobs(repo: Path) -> None:
-    assert GitReader(repo).blob(_oid(repo, b""), 0) == b""
+    reader = GitReader(repo)
+    assert reader.blob(_oid(repo, b""), 0) == b""
     with pytest.raises(FileSkipped):
-        GitReader(repo).blob(_oid(repo, b"x"), 0)
+        reader.blob(_oid(repo, b"x", "g.bin"), 0)
+    reader.close()
 
 
 def test_blob_negative_limit_is_refused(repo: Path, spy: list[Call]) -> None:
@@ -325,42 +323,178 @@ def test_blob_refuses_a_bad_id_before_running_git(repo: Path, spy: list[Call], b
     assert spy == []
 
 
-def test_blob_of_a_missing_object_is_a_component_error(repo: Path) -> None:
-    _commit(repo)
-    with pytest.raises(ComponentError, match="unexpected git output") as info:
-        GitReader(repo).blob(SHA, 10)
+def test_blob_of_a_missing_object_keeps_the_processes(repo: Path, spy: list[Call]) -> None:
+    oid = _oid(repo, b"ok")
+    reader = GitReader(repo)
+    with pytest.raises(ComponentError, match="object not found") as info:
+        reader.blob(SHA, 10)
     _no_host_path(info.value, repo)
+    assert reader.blob(oid, 10) == b"ok"
+    assert len(spy) == 2  # one --batch-check, one --batch: nothing restarted
+    reader.close()
 
 
 def test_blob_of_a_tree_or_commit_is_refused(repo: Path) -> None:
     _write(repo, "d/f.py", "")
     head = _commit(repo)
     tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    reader = GitReader(repo)
     for oid in (head, tree):
         with pytest.raises(ComponentError, match="object is not a blob"):
-            GitReader(repo).blob(oid, 1 << 20)
+            reader.blob(oid, 1 << 20)
+    reader.close()
+
+
+def _batch_script(check: str, batch: str) -> str:
+    """A fake cat-file: --batch-check answers with ``check``, --batch with ``batch``."""
+    return (
+        "import sys\n"
+        "mode = 'check' if len(sys.argv) < 2 else sys.argv[1]\n"
+        f"CHECK, BATCH = {check!r}, {batch!r}\n"
+        "for line in sys.stdin:\n"
+        "    oid = line.strip()\n"
+        "    out = CHECK if mode == 'check' else BATCH\n"
+        "    sys.stdout.buffer.write(out.replace('OID', oid).encode('latin-1'))\n"
+        "    sys.stdout.flush()\n"
+        "    if 'EXIT' in out or not out.endswith('\\n'): sys.exit(0)\n"
+    )
+
+
+def _fake_cat_file(monkeypatch: pytest.MonkeyPatch, check: str, batch: str) -> list[list[str]]:
+    real_start = gitread._start_batch
+    started: list[list[str]] = []
+
+    def start(argv: list[str], **kwargs: Any) -> Any:
+        started.append(list(argv))
+        mode = "check" if argv[-1] == "--batch-check" else "batch"
+        script = _batch_script(check, batch)
+        return real_start([sys.executable, "-c", script, mode], **kwargs)
+
+    monkeypatch.setattr(gitread, "_start_batch", start)
+    return started
 
 
 @pytest.mark.parametrize(
-    "outputs",
+    ("check", "batch"),
     [
-        [(128, b"")],
-        [(0, SHA2.encode() + b" blob 3\n")],  # header for another object
-        [(0, SHA.encode() + b" blob 3")],  # no newline
-        [(0, SHA.encode() + b" blob 3\n"), (1, b"")],
-        [(0, SHA.encode() + b" blob 3\n"), (0, SHA.encode() + b" blob 3\nab\n")],  # short
-        [(0, SHA.encode() + b" blob 3\n"), (0, SHA.encode() + b" blob 4\nabc\n")],
-        [(0, SHA.encode() + b" blob 3\n"), (0, SHA.encode() + b" blob 3\nabcd")],  # no LF
+        ("XX blob 3\n", ""),  # header for another object
+        ("OID blob 3", ""),  # no newline, then end of output
+        ("OID blob 3" + "x" * 5000 + "\n", ""),  # header over the 4096-byte cap
+        ("OID tag-x 3\n", ""),
+        ("", ""),  # check process ends without answering
+        ("OID blob 3\n", ""),  # batch ends without answering
+        ("OID blob 3\n", "OID blob 4\nabcd\n"),  # different header
+        ("OID blob 3\n", "OID blob 3\nab"),  # short body, then end (process died)
+        ("OID blob 3\n", "OID blob 3\nabcd"),  # no trailing LF
+        ("OID blob 3\n", "OID blob 3\nabEXIT"),  # dies mid-body
     ],
 )
-def test_blob_rejects_malformed_or_failed_cat_file(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, outputs: list[tuple[int, bytes]]
+def test_blob_protocol_errors_kill_both_processes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, check: str, batch: str
 ) -> None:
-    _fake(monkeypatch, *outputs)
+    started = _fake_cat_file(monkeypatch, check, batch)
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 5.0)  # every case ends sooner
+    reader = GitReader(repo)
     with pytest.raises(ComponentError) as info:
-        GitReader(repo).blob(SHA, 100)
+        reader.blob(SHA, 100)
     assert info.value.component == "gitread"
     assert "abc" not in info.value.message
+    assert reader._batch_check is None and reader._batch is None
+    reader.close()
+    assert started  # and a later call starts fresh processes:
+    with pytest.raises(ComponentError):
+        reader.blob(SHA, 100)
+    assert len(started) >= 2
+
+
+def test_blob_request_timeout_kills_both_processes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = _fake_batch(monkeypatch, "import time; time.sleep(60)")
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
+    reader = GitReader(repo)
+    begin = time.monotonic()
+    with pytest.raises(ComponentError, match="git cat-file timed out"):
+        reader.blob(SHA, 100)
+    assert time.monotonic() - begin < 10
+    assert reader._batch_check is None and len(started) == 1
+
+
+def test_batch_send_to_an_exited_process_is_a_component_error(tmp_path: Path) -> None:
+    proc = gitread._start_batch(
+        [sys.executable, "-c", "pass"], cwd=tmp_path, env=dict(os.environ), label="cat-file"
+    )
+    assert proc.wait(time.monotonic() + 20) == 0
+    with pytest.raises(ComponentError) as info:
+        proc.send(b"x" * 200_000)  # past any pipe buffer, to a closed read end
+    assert info.value.message == "git cat-file stopped"
+    proc.kill()
+
+
+def test_close_is_idempotent_and_safe_before_use(repo: Path) -> None:
+    reader = GitReader(repo)
+    reader.close()  # nothing started
+    reader.close()
+    oid = _oid(repo, b"data")
+    assert reader.blob(oid, 10) == b"data"
+    check, batch = reader._batch_check, reader._batch
+    assert check is not None and batch is not None
+    procs = [check._proc, batch._proc]
+    reader.close()
+    assert all(proc.returncode is not None for proc in procs)  # killed and reaped
+    reader.close()
+    assert reader.blob(oid, 10) == b"data"  # restarts lazily after close
+    reader.close()
+
+
+def test_batch_process_reports_eof_and_reads_lines(tmp_path: Path) -> None:
+    proc = gitread._start_batch(
+        [sys.executable, "-c", "import sys; sys.stdout.write('ab\\ncdef')"],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        label="log",
+    )
+    deadline = time.monotonic() + 20
+    assert proc.read_line(10, deadline) == b"ab\n"
+    assert proc.read_some(2, deadline) == b"cd"
+    assert proc.read_some(10, deadline) == b"ef"
+    assert proc.read_some(10, deadline) == b""
+    assert proc.read_some(10, deadline) == b""  # stays at end of output
+    assert proc.wait(deadline) == 0
+    proc.kill()
+    proc.kill()
+
+
+def test_start_batch_that_cannot_start_is_git_unavailable(tmp_path: Path) -> None:
+    with pytest.raises(GitUnavailable):
+        gitread._start_batch([str(tmp_path / "no-git")], cwd=tmp_path, env={}, label="cat-file")
+
+
+def test_batch_pump_stops_when_killed_with_a_full_queue(tmp_path: Path) -> None:
+    proc = gitread._start_batch(
+        [sys.executable, "-c", "import sys\nwhile True: sys.stdout.write('x' * 65536)"],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        label="log",
+    )
+    deadline = time.monotonic() + 20
+    while proc._queue.qsize() < gitread._QUEUE_CHUNKS and time.monotonic() < deadline:
+        time.sleep(0.01)
+    proc.kill()
+    assert all(not t.is_alive() for t in proc._threads)
+
+
+def test_batch_wait_timeout_is_a_component_error(tmp_path: Path) -> None:
+    proc = gitread._start_batch(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        label="log",
+    )
+    with pytest.raises(ComponentError, match="git log timed out"):
+        proc.wait(time.monotonic() + 0.2)
+    proc.kill()
+    assert proc._proc.returncode is not None
 
 
 # --- changed_files --------------------------------------------------------------
@@ -380,8 +514,8 @@ def test_changed_files_add_modify_delete_and_rename(repo: Path, spy: list[Call])
     assert sorted(GitReader(repo).changed_files(base, head), key=str) == sorted(
         [
             ("A", None, "added.py"),
-            ("D", "gone.py", "gone.py"),
-            ("M", "keep.py", "keep.py"),
+            ("D", None, "gone.py"),
+            ("M", None, "keep.py"),
             ("R", "old/name.py", "new/name.py"),
         ],
         key=str,
@@ -408,7 +542,7 @@ def test_changed_files_type_change(repo: Path) -> None:
     (repo / "x").unlink()
     os.symlink("elsewhere", repo / "x")
     head = _commit(repo)
-    assert GitReader(repo).changed_files(base, head) == [("T", "x", "x")]
+    assert GitReader(repo).changed_files(base, head) == [("T", None, "x")]
 
 
 def test_changed_files_same_commit_is_empty(repo: Path) -> None:
@@ -422,7 +556,7 @@ def test_changed_files_copy_status_from_git_drops_the_score(
     _fake(monkeypatch, (0, b"C075\0a.py\0b.py\0M\0c\xff.py\0"))
     assert GitReader(repo).changed_files(SHA, SHA2) == [
         ("C", "a.py", "b.py"),
-        ("M", "c\udcff.py", "c\udcff.py"),
+        ("M", None, "c\udcff.py"),
     ]
 
 
@@ -584,29 +718,88 @@ def test_first_parent_chain_rejects_malformed_output(
 # --- patches --------------------------------------------------------------------
 
 
-def test_patches_stream_oldest_first_with_commit_markers(repo: Path, spy: list[Call]) -> None:
+def _markers(text: bytes) -> list[str]:
+    return [line[1:].decode() for line in text.split(b"\n") if line.startswith(b"\0")]
+
+
+def test_patches_stream_newest_first_with_commit_markers(repo: Path, spy: list[Call]) -> None:
     s = _history(repo)
     stream = GitReader(repo).patches(s["c1"], s["c3"])
-    assert isinstance(stream, Iterator)
-    lines = list(stream)
-    assert all(line.endswith(b"\n") for line in lines)
-    markers = [line for line in lines if line.startswith(b"\0")]
-    assert markers == [b"\0" + s[k].encode() + b"\n" for k in ("c2", "merge", "c3")]
-    text = b"".join(lines)
+    assert spy == []  # git starts on the first next()
+    chunks = list(stream)
+    assert all(0 < len(c) <= gitread.PATCH_CHUNK_BYTES for c in chunks)
+    text = b"".join(chunks)
+    assert _markers(text) == [s["c3"], s["merge"], s["c2"]]  # newest first, c1 excluded
+    marker = [b"\0" + s[k].encode() + b"\n" for k in ("c3", "merge", "c2")]
     # the merge diffs against its first parent: side.py arrives with the merge
-    merge_part = text.split(markers[1])[1].split(markers[2])[0]
+    merge_part = text.split(marker[1])[1].split(marker[2])[0]
     assert b"+++ b/side.py\n" in merge_part and b"@@ -0,0 +1 @@\n+s\n" in merge_part
-    assert b"@@ -1,0 +2 @@" in text.split(markers[2])[1]  # -U0: no context lines
-    assert b"merge" not in text.replace(markers[1], b"")  # no commit messages
-    args = _sub_args(spy[-1], "log")
-    assert args == [
+    assert b"@@ -1,0 +2 @@" in text.split(marker[0])[1].split(marker[1])[0]  # -U0
+    assert b"merge" not in text.replace(marker[1], b"")  # no commit messages
+    (call,) = spy
+    assert call["batch"] is True and call["label"] == "log"
+    assert _sub_args(call, "log") == [
         "--no-ext-diff", "--no-textconv", "--no-color",
-        "--first-parent", "-m", "-p", "-U0", "-M", "--root", "--reverse",
-        "--format=%x00%H", f"--max-count={gitread.MAX_COUNT_CAP}",
-        "--end-of-options", f"{s['c1']}..{s['c3']}",
+        "--first-parent", "-m", "-M", "--root", "-p", "-U0", "--format=%x00%H",
+        f"--max-count={gitread.MAX_COUNT_CAP}", "--end-of-options", s["c3"], "^" + s["c1"],
     ]  # fmt: skip
-    assert spy[-1]["max_stdout"] == gitread.PATCH_BYTES_CAP
-    assert spy[-1]["timeout"] == gitread.GIT_TIMEOUT_SECONDS
+
+
+def test_patches_from_none_go_back_to_the_root(repo: Path, spy: list[Call]) -> None:
+    s = _history(repo)
+    text = b"".join(GitReader(repo).patches(None, s["c2"]))
+    assert _markers(text) == [s["c2"], s["c1"]]  # c1 is the root commit: included
+    assert _sub_args(spy[-1], "log")[-2:] == ["--end-of-options", s["c2"]]
+
+
+def test_patches_from_none_show_the_root_diff(repo: Path) -> None:
+    _git(repo, "config", "log.showRoot", "false")  # --root wins over repo config
+    _write(repo, "a.py", "first\n")
+    root = _commit(repo)
+    text = b"".join(GitReader(repo).patches(None, root))
+    assert _markers(text) == [root]
+    assert b"+++ b/a.py\n@@ -0,0 +1 @@\n+first\n" in text
+
+
+def test_patches_chunks_are_at_most_one_mib(repo: Path) -> None:
+    base = _commit(repo)
+    _write(repo, "big.py", "".join(f"line_{i} = {i}\n" for i in range(150_000)))
+    head = _commit(repo)
+    chunks = list(GitReader(repo).patches(base, head))
+    assert sum(map(len, chunks)) > 2 * gitread.PATCH_CHUNK_BYTES
+    assert max(map(len, chunks)) <= gitread.PATCH_CHUNK_BYTES
+
+
+def test_patches_chunk_cap_is_applied_to_buffered_output(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _commit(repo)
+    _write(repo, "a.py", "x = 1\n" * 50)
+    head = _commit(repo)
+    monkeypatch.setattr(gitread, "PATCH_CHUNK_BYTES", 7)
+    chunks = list(GitReader(repo).patches(base, head))
+    assert max(map(len, chunks)) <= 7 and len(chunks) > 20
+
+
+def test_patches_close_mid_stream_kills_git(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    base = _commit(repo)
+    _write(repo, "big.py", "".join(f"v{i} = {i}\n" for i in range(300_000)))
+    head = _commit(repo)
+    started: list[Any] = []
+    real_start = gitread._start_batch
+
+    def start(argv: list[str], **kwargs: Any) -> Any:
+        started.append(real_start(argv, **kwargs))
+        return started[-1]
+
+    monkeypatch.setattr(gitread, "_start_batch", start)
+    stream = GitReader(repo).patches(base, head)
+    first = next(stream)
+    assert first.startswith(b"\0" + head.encode())
+    (process,) = started
+    stream.close()  # what C8 does at its 256 MiB cap
+    assert process._proc.returncode is not None  # killed and reaped
+    assert all(not t.is_alive() for t in process._threads)
 
 
 def test_patches_never_print_a_hostile_commit_message(repo: Path) -> None:
@@ -641,22 +834,35 @@ def test_patches_of_an_empty_range_are_empty(repo: Path) -> None:
     assert list(GitReader(repo).patches(head, head)) == []
 
 
-def test_patches_over_the_byte_cap_is_a_component_error(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    base = _commit(repo)
-    _write(repo, "big.py", "x = 1\n" * 200)
-    head = _commit(repo)
-    monkeypatch.setattr(gitread, "PATCH_BYTES_CAP", 256)
-    with pytest.raises(ComponentError, match="git log output too large"):
-        GitReader(repo).patches(base, head)
-
-
-def test_patches_failure_is_a_component_error_before_any_line(repo: Path) -> None:
+def test_patches_failure_is_a_component_error(repo: Path) -> None:
     head = _commit(repo)
     with pytest.raises(ComponentError, match=r"git log failed \(exit 128\)") as info:
-        GitReader(repo).patches(SHA, head)
+        list(GitReader(repo).patches(SHA, head))
     _no_host_path(info.value, repo)
+
+
+def test_patches_waiting_too_long_for_a_chunk_is_a_component_error(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_batch(monkeypatch, "import time; time.sleep(60)")
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
+    with pytest.raises(ComponentError, match="git log timed out"):
+        list(GitReader(repo).patches(SHA, SHA2))
+
+
+def test_patches_waiting_too_long_for_the_exit_is_a_component_error(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_batch(
+        monkeypatch,
+        "import os, sys, time\nsys.stdout.write('x'); sys.stdout.flush()\n"
+        "os.close(1); time.sleep(60)",
+    )
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
+    stream = GitReader(repo).patches(SHA, SHA2)
+    assert next(stream) == b"x"
+    with pytest.raises(ComponentError, match="git log timed out"):
+        next(stream)
 
 
 @pytest.mark.parametrize(("a", "b"), [("HEAD", SHA), (SHA, "a" * 40 + "..HEAD")])
@@ -666,17 +872,15 @@ def test_patches_refuse_bad_shas(repo: Path, spy: list[Call], a: str, b: str) ->
     assert spy == []
 
 
-def test_patches_yield_a_last_unterminated_line(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _fake(monkeypatch, (0, b"a\n\nb"))
-    assert list(GitReader(repo).patches(SHA, SHA2)) == [b"a\n", b"\n", b"b"]
+def test_patches_in_a_missing_repo_dir_is_a_component_error(tmp_path: Path) -> None:
+    with pytest.raises(ComponentError, match="repository directory not found"):
+        next(GitReader(tmp_path / "gone").patches(None, SHA))
 
 
 # --- every T-008 call is bounded ------------------------------------------------
 
 
-def test_every_t008_call_goes_through_the_bounded_runner(repo: Path, spy: list[Call]) -> None:
+def test_every_t008_call_goes_through_the_seam(repo: Path, spy: list[Call]) -> None:
     _write(repo, "a.py", "1\n")
     base = _commit(repo)
     _write(repo, "a.py", "2\n")
@@ -687,9 +891,13 @@ def test_every_t008_call_goes_through_the_bounded_runner(repo: Path, spy: list[C
     reader.changed_files(base, head)
     reader.first_parent_chain(head, 5)
     list(reader.patches(base, head))
+    reader.close()
     assert len(spy) == 6
+    git = gitread._find_git(repo).path
     for call in spy:
-        assert call["timeout"] == gitread.GIT_TIMEOUT_SECONDS
-        assert 0 < call["max_stdout"] <= gitread.PATCH_BYTES_CAP
+        assert call["argv"][0] == git
         assert "safe.bareRepository=explicit" in call["argv"]
         assert call["env"]["GIT_NO_LAZY_FETCH"] == "1"
+        if not call.get("batch"):
+            assert call["timeout"] == gitread.GIT_TIMEOUT_SECONDS
+            assert 0 < call["max_stdout"] <= gitread.LISTING_MAX_BYTES

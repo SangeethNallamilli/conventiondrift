@@ -41,6 +41,7 @@ import contextlib
 import io
 import ntpath
 import os
+import queue
 import re
 import signal
 import string
@@ -48,11 +49,11 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from conventiondrift.components import ChangedFile, TreeEntry
 from conventiondrift.errors import (
@@ -124,8 +125,10 @@ FIXED_ENV: dict[str, str] = {
 
 #: R2.6 (DESIGN §10 S4): at most 10,000 first-parent commits walked.
 MAX_COUNT_CAP: int = 10_000
-#: R2.6 (DESIGN §10 S4): at most 256 MiB of patch text read for history.
-PATCH_BYTES_CAP: int = 256 * 1024 * 1024
+#: Largest chunk ``patches`` yields (I-14 item 9). C8 counts patch bytes, not C3.
+PATCH_CHUNK_BYTES: int = 1024 * 1024
+#: Most stdout chunks held between a long-lived git and its reader (back-pressure).
+_QUEUE_CHUNKS = 16
 #: Stdout cap for the ``ls-tree`` and ``diff-tree`` listings (I-14 bounds; T-008).
 #: About 500,000 entries at 128 bytes each, well past R2.6's 100,000 ``.py`` files.
 LISTING_MAX_BYTES: int = 64 * 1024 * 1024
@@ -145,7 +148,7 @@ OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
         {"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}
         # T-008 patches: merge diffs against the first parent (F-1), explicit renames
         # and root diff (no repo config decides), and a commit marker with no message.
-        | {"-m", "-M", "--root", "--reverse", "--format=%x00%H"}
+        | {"-m", "-M", "--root", "--format=%x00%H"}
     ),
     "rev-list": frozenset({"--first-parent", "--timestamp"}),
     "ls-tree": frozenset({"-r", "-l", "-z", "--full-tree"}),
@@ -443,15 +446,6 @@ def _path(raw: bytes) -> str:
     return raw.decode("utf-8", "surrogateescape")
 
 
-def _lines(data: bytes) -> Iterator[bytes]:
-    """``data`` split after each ``\n``, newlines kept; a last unterminated line too."""
-    start = 0
-    while start < len(data):
-        end = data.find(b"\n", start) + 1 or len(data)
-        yield data[start:end]
-        start = end
-
-
 @dataclass(frozen=True)
 class _Output:
     returncode: int
@@ -555,60 +549,21 @@ def _run_bounded(
     max_stdout: int,
     timeout: float,
 ) -> _Output:
-    """Run ``argv`` with stdin ``DEVNULL``, a timeout and a stdout cap (SR-014).
-
-    See :func:`_bounded_process`.
-    """
-    return _bounded_process(
-        argv, cwd=cwd, env=env, label=label, max_stdout=max_stdout, timeout=timeout, stdin=None
-    )
-
-
-def _run_bounded_input(
-    argv: Sequence[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    label: str,
-    max_stdout: int,
-    timeout: float,
-    stdin: bytes,
-) -> _Output:
-    """:func:`_run_bounded`, but with ``stdin`` written to a pipe and closed (T-008).
-
-    Used only for ``cat-file --batch-check``/``--batch`` requests, so object ids go
-    on stdin and never on the command line (DESIGN §3).
-    """
-    return _bounded_process(
-        argv, cwd=cwd, env=env, label=label, max_stdout=max_stdout, timeout=timeout, stdin=stdin
-    )
-
-
-def _bounded_process(
-    argv: Sequence[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    label: str,
-    max_stdout: int,
-    timeout: float,
-    stdin: bytes | None,
-) -> _Output:
     """Run ``argv`` with a wall-clock timeout and a stdout cap (SR-014).
 
     stdout is read in chunks and capped at ``max_stdout + 1`` bytes; past the cap,
-    or past ``timeout`` seconds, the process is killed and a fixed-text
-    ``ComponentError("gitread")`` naming only ``label`` is raised. stderr is drained
-    in chunks and discarded, never held whole and never put in a message. stdin is
-    ``DEVNULL`` when ``stdin`` is None, or else a pipe that gets those few bytes
-    and is then closed. A process that can't start raises ``GitUnavailable``.
+    or past ``timeout`` seconds, git and every process it started are killed
+    (:func:`_kill_tree`) and a fixed-text ``ComponentError("gitread")`` naming only
+    ``label`` is raised. stderr is drained in chunks and discarded, never held
+    whole and never put in a message. stdin is ``DEVNULL``. A process that can't
+    start raises ``GitUnavailable``.
     """
     try:
         proc = subprocess.Popen(  # noqa: S603 (argv list, resolved git, no shell)
             list(argv),
             cwd=cwd,
             env=env,
-            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
@@ -625,13 +580,6 @@ def _bounded_process(
     ]
     for reader in readers:
         reader.start()
-    if proc.stdin is not None:
-        # A few request bytes (one object id per line); git exiting early just
-        # closes the pipe, and the exit code or short output reports it.
-        with contextlib.suppress(OSError):
-            proc.stdin.write(stdin or b"")
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
     deadline = time.monotonic() + timeout
     failure: str | None = None
     try:
@@ -661,6 +609,148 @@ def _bounded_process(
     return _Output(returncode, b"".join(chunks))
 
 
+class _BatchProcess:
+    """A long-lived git with piped stdin and stdout, read with per-request deadlines.
+
+    Started only by :func:`_start_batch` (I-14 item 9). A pump thread moves stdout
+    into a bounded queue, so a slow reader stops git instead of buffering its
+    output; stderr is drained and discarded. Every read waits at most until its
+    ``deadline`` (``time.monotonic()``); past it, or on a short read, a fixed-text
+    ``ComponentError("gitread")`` is raised and the caller kills the process.
+    """
+
+    def __init__(self, proc: "subprocess.Popen[bytes]", label: str) -> None:
+        self._proc = proc
+        self._label = label
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=_QUEUE_CHUNKS)
+        self._buffer = bytearray()
+        self._eof = False
+        self._stop = threading.Event()
+        self._threads = [
+            threading.Thread(target=self._pump, daemon=True),
+            threading.Thread(target=_drain, args=(proc.stderr, -1, [], threading.Event())),
+        ]
+        for thread in self._threads:
+            thread.daemon = True
+            thread.start()
+
+    def _pump(self) -> None:
+        stdout = cast(io.BufferedIOBase, self._proc.stdout)  # a pipe (_start_batch)
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := stdout.read1(_CHUNK_BYTES):
+                if not self._put(chunk):
+                    return
+        self._put(b"")  # end of output
+
+    def _put(self, chunk: bytes) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(chunk, timeout=0.05)
+            except queue.Full:
+                continue
+            return True
+        return False
+
+    def _error(self, what: str) -> ComponentError:
+        return ComponentError(_COMPONENT, f"git {self._label} {what}")
+
+    def send(self, data: bytes) -> None:
+        """Write one request; a git that already exited is a ``ComponentError``."""
+        stdin = cast(io.BufferedIOBase, self._proc.stdin)  # a pipe (_start_batch)
+        try:
+            stdin.write(data)
+            stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise self._error("stopped") from exc
+
+    def close_stdin(self) -> None:
+        with contextlib.suppress(OSError):
+            cast(io.BufferedIOBase, self._proc.stdin).close()
+
+    def _fill(self, deadline: float) -> bool:
+        """Wait for the next stdout chunk; False at end of output."""
+        if self._eof:
+            return False
+        try:
+            chunk = self._queue.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise self._error("timed out") from None
+        if not chunk:
+            self._eof = True
+            return False
+        self._buffer += chunk
+        return True
+
+    def read_line(self, limit: int, deadline: float) -> bytes:
+        """One ``\\n``-terminated line of at most ``limit`` bytes."""
+        while (end := self._buffer.find(b"\n", 0, limit)) < 0:
+            if len(self._buffer) >= limit or not self._fill(deadline):
+                raise _bad_output()
+        line = bytes(self._buffer[: end + 1])
+        del self._buffer[: end + 1]
+        return line
+
+    def read_exact(self, size: int, deadline: float) -> bytes:
+        """Exactly ``size`` bytes; output that ends sooner is a short read."""
+        while len(self._buffer) < size:
+            if not self._fill(deadline):
+                raise _bad_output()
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def read_some(self, limit: int, deadline: float) -> bytes:
+        """Up to ``limit`` bytes as soon as any are there; ``b""`` at end of output."""
+        if not self._buffer and not self._fill(deadline):
+            return b""
+        data = bytes(self._buffer[:limit])
+        del self._buffer[:limit]
+        return data
+
+    def wait(self, deadline: float) -> int:
+        """git's exit code, waiting at most until ``deadline``."""
+        try:
+            return self._proc.wait(max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            raise self._error("timed out") from None
+
+    def kill(self) -> None:
+        """Kill git's process tree if it still runs (N-4), reap it and stop the threads."""
+        self._stop.set()
+        if self._proc.poll() is None:
+            _kill_tree(self._proc)
+        self.close_stdin()
+        for thread in self._threads:
+            thread.join(1.0)
+        for stream in (self._proc.stdout, self._proc.stderr):
+            cast(io.BufferedIOBase, stream).close()
+
+
+def _start_batch(
+    argv: Sequence[str], *, cwd: Path, env: dict[str, str], label: str
+) -> _BatchProcess:
+    """Start a long-lived git (I-14 items 8 and 9) in its own process group.
+
+    The same argv rules, environment and git as :func:`_run_bounded` (the caller
+    builds ``argv`` with :meth:`GitReader._command`), with piped stdin and stdout.
+    A process that can't start raises ``GitUnavailable``.
+    """
+    try:
+        proc = subprocess.Popen(  # noqa: S603 (argv list, resolved git, no shell)
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            **_process_group_kwargs(),
+        )
+    except OSError as exc:
+        raise GitUnavailable("git could not be started") from exc
+    return _BatchProcess(proc, label)
+
+
 class GitReader:
     """Read-only, hardened access to the git repository at ``repo_dir`` (I-11 C3).
 
@@ -674,6 +764,10 @@ class GitReader:
         self._repo_dir = Path(repo_dir)
         self._git: _ResolvedGit | None = None
         self._version_ok = False
+        # T-008 blob: one long-lived cat-file per mode, started lazily (I-14 item 9).
+        self._batch_check: _BatchProcess | None = None
+        self._batch: _BatchProcess | None = None
+        self._batch_home: tempfile.TemporaryDirectory[str] | None = None
 
     def _resolved_git(self) -> _ResolvedGit:
         """Git, resolved once per reader and cached (I-14 step 1)."""
@@ -723,20 +817,14 @@ class GitReader:
         self._version_ok = True
 
     def _run(
-        self,
-        subcommand: str,
-        args: Sequence[str],
-        *,
-        max_stdout: int = SMALL_OUTPUT_MAX_BYTES,
-        stdin: bytes | None = None,
+        self, subcommand: str, args: Sequence[str], *, max_stdout: int = SMALL_OUTPUT_MAX_BYTES
     ) -> _Output:
         """Run one allowed git subcommand and return its exit code and stdout.
 
         The first call checks the git version (:meth:`_check_version`). Bounded by
         :data:`GIT_TIMEOUT_SECONDS` and ``max_stdout`` (SR-014, see
         :func:`_run_bounded`). Every T-007 call prints at most one short line, so
-        the default :data:`SMALL_OUTPUT_MAX_BYTES` applies; T-008 passes larger caps,
-        and ``stdin`` for ``cat-file --batch`` requests.
+        the default :data:`SMALL_OUTPUT_MAX_BYTES` applies; T-008 passes larger caps.
         """
         argv = self._command(subcommand, args)
         if not self._repo_dir.is_dir():
@@ -745,25 +833,52 @@ class GitReader:
         with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
             if not self._version_ok:
                 self._check_version(home)
-            env = _environment(home, git.search_path, self._repo_dir)
-            if stdin is not None:
-                return _run_bounded_input(
-                    argv,
-                    cwd=self._repo_dir,
-                    env=env,
-                    label=subcommand,
-                    max_stdout=max_stdout,
-                    timeout=GIT_TIMEOUT_SECONDS,
-                    stdin=stdin,
-                )
             return _run_bounded(
                 argv,
                 cwd=self._repo_dir,
-                env=env,
+                env=_environment(home, git.search_path, self._repo_dir),
                 label=subcommand,
                 max_stdout=max_stdout,
                 timeout=GIT_TIMEOUT_SECONDS,
             )
+
+    def _start(self, argv: list[str], home: str, label: str) -> _BatchProcess:
+        """Start a long-lived git through :func:`_start_batch`, after the version check."""
+        if not self._repo_dir.is_dir():
+            raise ComponentError(_COMPONENT, "repository directory not found")
+        if not self._version_ok:
+            self._check_version(home)
+        env = _environment(home, self._resolved_git().search_path, self._repo_dir)
+        return _start_batch(argv, cwd=self._repo_dir, env=env, label=label)
+
+    def _batch_process(self, mode: str) -> _BatchProcess:
+        """The reader's ``cat-file --batch-check`` or ``--batch`` process, started once."""
+        current = self._batch_check if mode == "--batch-check" else self._batch
+        if current is not None:
+            return current
+        argv = self._command("cat-file", [mode])
+        if self._batch_home is None:
+            self._batch_home = tempfile.TemporaryDirectory(prefix="conventiondrift-home-")
+        started = self._start(argv, self._batch_home.name, "cat-file")
+        if mode == "--batch-check":
+            self._batch_check = started
+        else:
+            self._batch = started
+        return started
+
+    def close(self) -> None:
+        """Kill and reap both long-lived ``cat-file`` processes (I-14 item 9).
+
+        Idempotent, and safe when they were never started. T-028 calls it in a
+        ``finally``. A later ``blob`` call starts new processes.
+        """
+        for process in (self._batch_check, self._batch):
+            if process is not None:
+                process.kill()
+        self._batch_check = self._batch = None
+        if self._batch_home is not None:
+            self._batch_home.cleanup()
+            self._batch_home = None
 
     def _fail(self, subcommand: str, out: _Output) -> ComponentError:
         # Fixed text: never stderr, never a revision or path from input (DESIGN §4).
@@ -857,46 +972,59 @@ class GitReader:
         return entries
 
     def blob(self, oid: str, max_bytes: int) -> bytes:
-        """A blob's bytes, by object id on ``cat-file`` stdin (DESIGN §3, I-11 C3).
+        """A blob's bytes, by object id on ``cat-file`` stdin (DESIGN §3, I-14 item 9).
 
-        The header size is checked against ``max_bytes`` before the body is read: a
-        ``--batch-check`` request reads only the header, and a blob over the limit
-        raises ``FileSkipped("size limit")`` without its body ever being requested
-        (R2.3). Otherwise ``--batch`` reads it, capped at exactly that header plus
-        the body. Objects are immutable by id, so both requests see the same object.
+        The reader's long-lived ``--batch-check`` gives the header first (capped at
+        :data:`SMALL_OUTPUT_MAX_BYTES`); a blob over ``max_bytes`` raises
+        ``FileSkipped("size limit")`` and ``--batch`` is never asked for it (R2.3).
+        Otherwise ``--batch`` gives the same header, then exactly the body and its
+        trailing LF. Each request waits at most :data:`GIT_TIMEOUT_SECONDS`. A
+        timeout, short read or protocol mismatch kills both processes and raises
+        ``ComponentError("gitread")``; so do a missing object and a non-blob, which
+        leave the processes in step and running.
         """
         request = _require_sha(oid).encode("ascii") + b"\n"
         if max_bytes < 0:
             raise ComponentError(_COMPONENT, "invalid size limit")
-        check = self._run("cat-file", ["--batch-check"], stdin=request)
-        if check.returncode != 0:
-            raise self._fail("cat-file", check)
-        m = _BATCH_HEADER.fullmatch(check.stdout)
-        if m is None or m[1] + b"\n" != request:
-            raise _bad_output()  # includes "<oid> missing"
+        try:
+            check = self._batch_process("--batch-check")
+            check.send(request)
+            header = check.read_line(SMALL_OUTPUT_MAX_BYTES, time.monotonic() + GIT_TIMEOUT_SECONDS)
+            m = _BATCH_HEADER.fullmatch(header)
+            missing = header == request[:-1] + b" missing\n"
+            if not missing and (m is None or m[1] + b"\n" != request):
+                raise _bad_output()
+        except ComponentError:
+            self.close()
+            raise
+        if m is None:  # "<oid> missing": the protocol is still in step
+            raise ComponentError(_COMPONENT, "object not found")
         if m[2] != b"blob":
             raise ComponentError(_COMPONENT, "object is not a blob")
         size = int(m[3])
         if size > max_bytes:
             raise FileSkipped("size limit")
-        header = check.stdout
-        out = self._run("cat-file", ["--batch"], stdin=request, max_stdout=len(header) + size + 1)
-        if out.returncode != 0:
-            raise self._fail("cat-file", out)
-        body = out.stdout
-        if len(body) != len(header) + size + 1 or not body.startswith(header):
-            raise _bad_output()
-        if not body.endswith(b"\n"):
-            raise _bad_output()
-        return body[len(header) : -1]
+        try:
+            batch = self._batch_process("--batch")
+            batch.send(request)
+            deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+            if batch.read_line(SMALL_OUTPUT_MAX_BYTES, deadline) != header:
+                raise _bad_output()
+            body = batch.read_exact(size + 1, deadline)
+            if not body.endswith(b"\n"):
+                raise _bad_output()
+        except ComponentError:
+            self.close()
+            raise
+        return body[:-1]
 
     def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]:
         """Files changed from ``base`` to ``head``, renames detected (-M, ADR-0004).
 
         ``diff-tree -r -M -z --name-status``, capped at :data:`LISTING_MAX_BYTES`.
-        Each entry is (status letter without the score, old path, new path): old is
-        ``None`` only for an added file, and for a deleted file new is the deleted
-        path. Paths are in git's order.
+        Each entry is (status letter without the score, old path, new path) with
+        the old path set only for R and C (I-14 item 9): a deleted file is
+        ``("D", None, deleted_path)``. Paths are in git's order.
         """
         args = ["-r", "-M", "-z", "--name-status", "--end-of-options"]
         out = self._run(
@@ -916,7 +1044,7 @@ class GitReader:
             if m is None or len(paths) != count:
                 raise _bad_output()
             status = (m[1] or m[2]).decode("ascii")
-            old = None if status == "A" else _path(paths[0])
+            old = _path(paths[0]) if count == 2 else None
             changes.append((status, old, _path(paths[-1])))
             i += 1 + count
         return changes
@@ -954,29 +1082,42 @@ class GitReader:
             chain.append((m[2].decode("ascii"), when))
         return chain
 
-    def patches(self, from_sha: str, to_sha: str) -> Iterator[bytes]:
-        """The first-parent patch text for ``from_sha..to_sha``, oldest commit first.
+    def patches(self, from_sha: str | None, to_sha: str) -> Generator[bytes, None, None]:
+        """Raw first-parent patch text for ``from_sha..to_sha``, newest commit first.
 
-        ``log --first-parent -m -p -U0 -M --root --reverse --format=%x00%H`` (F-1),
-        plus ``--no-ext-diff --no-textconv --no-color``: ``from_sha`` itself is
-        excluded, as in git's ``A..B``. Merges diff against their first parent, so
-        lines a merge brings in take the merge's date. Each commit starts with a
-        ``b"\\0<sha>\\n"`` line and a blank line, then its patch; commit messages are
-        never printed.
-        The lines (newlines kept) are yielded one by one.
+        I-14 item 9: ``log --first-parent -m -M --root -p -U0 --no-ext-diff
+        --no-textconv --no-color --format=%x00%H --max-count=10000``, then
+        ``--end-of-options <to_sha> [^<from_sha>]``. ``from_sha`` is excluded, and
+        ``None`` means back to the root. Merges diff against their first parent.
+        Each commit starts with ``\\x00<sha>\\n``; commit messages are never printed.
 
-        Bounded by R2.6: ``--max-count`` at :data:`MAX_COUNT_CAP` commits, and
-        :data:`PATCH_BYTES_CAP` bytes of output; past the byte cap, or past
-        :data:`GIT_TIMEOUT_SECONDS`, git is killed and ``ComponentError("gitread")``
-        is raised before anything is yielded.
+        The result is a generator of raw stdout chunks of at most
+        :data:`PATCH_CHUNK_BYTES`; git starts on the first ``next()``. C3 doesn't
+        count patch bytes: C8 stops at its R2.6 cap and calls ``close()``, and the
+        generator's ``finally`` kills git's process tree and reaps it. Waiting more
+        than :data:`GIT_TIMEOUT_SECONDS` for a chunk or for git to exit, or a
+        non-zero exit, raises ``ComponentError("gitread")``.
         """
-        args = ["--first-parent", "-m", "-p", "-U0", "-M", "--root", "--reverse"]
-        rev = f"{_require_sha(from_sha)}..{_require_sha(to_sha)}"
-        out = self._run(
-            "log",
-            [*args, "--format=%x00%H", f"--max-count={MAX_COUNT_CAP}", "--end-of-options", rev],
-            max_stdout=PATCH_BYTES_CAP,
+        revs = [_require_sha(to_sha)]
+        if from_sha is not None:
+            revs.append("^" + _require_sha(from_sha))
+        args = ["--first-parent", "-m", "-M", "--root", "-p", "-U0", "--format=%x00%H"]
+        argv = self._command(
+            "log", [*args, f"--max-count={MAX_COUNT_CAP}", "--end-of-options", *revs]
         )
-        if out.returncode != 0:
-            raise self._fail("log", out)
-        return _lines(out.stdout)
+        return self._stream_patches(argv)
+
+    def _stream_patches(self, argv: list[str]) -> Generator[bytes, None, None]:
+        with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
+            process = self._start(argv, home, "log")
+            try:
+                process.close_stdin()
+                while chunk := process.read_some(
+                    PATCH_CHUNK_BYTES, time.monotonic() + GIT_TIMEOUT_SECONDS
+                ):
+                    yield chunk
+                code = process.wait(time.monotonic() + GIT_TIMEOUT_SECONDS)
+                if code != 0:
+                    raise ComponentError(_COMPONENT, f"git log failed (exit {code})")
+            finally:
+                process.kill()
