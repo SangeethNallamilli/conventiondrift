@@ -41,6 +41,7 @@ from conventiondrift.discover.safefs import (
     size_limit,
 )
 from conventiondrift.errors import FileSkipped
+from conventiondrift.model import SkipReason
 
 POSIX = os.name == "posix"
 
@@ -163,6 +164,28 @@ def test_lowered_limit_applies_to_reads(tmp_path: Path, strategy: str) -> None:
         len(read_worktree_file(tmp_path, "m.py", "python", max_file_bytes=1025, origin="tree"))
         == 1025
     )
+
+
+def test_limits_and_reasons_are_the_spec_values() -> None:
+    """R2.3 limits and I-9/I-13 reason strings, written out so a changed constant fails.
+
+    The other tests compare against the imported constants, so without this a
+    mutated limit or reason string would go unnoticed.
+    """
+    assert (FILE_MAX_BYTES, CONFIG_MAX_BYTES) == (1_048_576, 65_536)
+    reasons = {
+        REASON_SIZE: "size limit",
+        REASON_SYMLINK: "symlink",
+        REASON_OUTSIDE: "outside repository",
+        REASON_BINARY: "binary",
+        REASON_NOT_DECODABLE: "not decodable",
+        REASON_SPECIAL: "special file",
+        REASON_UNSUPPORTED: "unsupported path",
+        REASON_UNREADABLE: "unreadable",
+    }
+    assert all(constant == spec for constant, spec in reasons.items()), reasons
+    assert len(reasons) == 8
+    assert set(reasons) <= set(typing.get_args(SkipReason))
 
 
 def test_check_size_honours_a_lowered_limit() -> None:
