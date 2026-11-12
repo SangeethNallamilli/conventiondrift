@@ -45,8 +45,13 @@ jobs:
         run: python3 scripts/ci/check_action_pins.py
 
   dco:
+    # Runs on pull_request, and on workflow_dispatch when the ref is not
+    # main, so a manual run on a PR branch cannot produce a green `ci`
+    # while skipping the DCO gate. Push, schedule, and workflow_dispatch
+    # on main still skip this job; the aggregate allows that skip only
+    # on refs/heads/main for those events.
     name: dco
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -59,10 +64,35 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
-      - name: Check Signed-off-by on each PR commit
+      - name: Resolve the DCO range
+        # For pull_request, use the PR base/head SHAs. For workflow_dispatch
+        # on a non-main branch, fetch origin/main and check merge-base(origin/main, HEAD)..HEAD
+        # via the existing DCO_BASE_SHA / DCO_HEAD_SHA interface.
+        # github.* values are passed in as env; they are never interpolated
+        # into the script body. persist-credentials stays false; the token
+        # is used only for this one fetch and is not written to .git/config.
         env:
-          DCO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            printf '%s\n' "DCO_BASE_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_HEAD_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
+          else
+            AUTH="http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            git -c credential.helper= -c "$AUTH" fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            base="$(git merge-base origin/main HEAD)"
+            head="$(git rev-parse HEAD)"
+            printf '%s\n' "DCO_BASE_SHA=${base}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_HEAD_SHA=${head}" >> "$GITHUB_ENV"
+          fi
+      - name: Check Signed-off-by on each commit in the range
+        env:
+          DCO_BASE_SHA: ${{ env.DCO_BASE_SHA }}
+          DCO_HEAD_SHA: ${{ env.DCO_HEAD_SHA }}
         run: python3 scripts/ci/check_dco.py
 
   lockfile:
@@ -469,19 +499,30 @@ jobs:
       - name: All required jobs passed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           needs = json.loads(os.environ["NEEDS_JSON"])
+          event = os.environ.get("EVENT_NAME", "")
+          ref = os.environ.get("GITHUB_REF", "")
           failed = []
           for name, data in needs.items():
               result = data.get("result")
-              # dco runs only on pull_request; it is skipped on push,
-              # schedule, and workflow_dispatch. That skip is allowed.
+              # dco may be skipped only on refs/heads/main for push,
+              # schedule, or workflow_dispatch. A skipped dco on any
+              # other event or ref (including workflow_dispatch on a
+              # PR branch) is a gate bypass and fails this aggregate.
               # Every other required job must succeed.
               if result == "success":
                   continue
-              if name == "dco" and result == "skipped":
+              if (
+                  name == "dco"
+                  and result == "skipped"
+                  and ref == "refs/heads/main"
+                  and event in ("push", "schedule", "workflow_dispatch")
+              ):
                   continue
               failed.append(f"{name}={result}")
           if failed:
