@@ -119,6 +119,7 @@ HARDENING = [
     "-c", "log.showSignature=false",
     "-c", "core.quotePath=true",
     "-c", "i18n.logOutputEncoding=UTF-8",
+    "-c", "log.diffMerges=first-parent",
     "-c", "safe.bareRepository=explicit",
 ]  # fmt: skip
 
@@ -197,9 +198,11 @@ def test_environment_is_fixed_and_nothing_else_leaks(
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(repo)),
         "HOME": env["HOME"],
+        "GIT_GRAFT_FILE": env["GIT_GRAFT_FILE"],
     }
     assert env["HOME"] != str(repo)
-    assert spy[0]["home_listing"] == []
+    assert env["GIT_GRAFT_FILE"] == str(Path(env["HOME"]) / "conventiondrift-grafts")
+    assert spy[0]["home_listing"] == ["conventiondrift-grafts"]
     assert not os.path.exists(env["HOME"])  # removed after the call
 
 
@@ -1495,7 +1498,10 @@ def test_version_check_runs_once_first_with_fixed_env_and_no_flags(
         "PATH",
         "HOME",
         "GIT_CEILING_DIRECTORIES",
+        "GIT_GRAFT_FILE",
     }
+    graft = version_kwargs["env"]["GIT_GRAFT_FILE"]
+    assert graft == str(Path(version_kwargs["env"]["HOME"]) / "conventiondrift-grafts")
     assert version_kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
     assert version_kwargs["max_stdout"] == gitread.SMALL_OUTPUT_MAX_BYTES
 

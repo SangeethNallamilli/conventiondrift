@@ -44,6 +44,7 @@ import os
 import queue
 import re
 import signal
+import stat
 import string
 import subprocess
 import tempfile
@@ -104,6 +105,10 @@ HARDENING_CONFIG: tuple[str, ...] = (
     # I-14 item 9 diff-config pins: C-quoted paths and UTF-8 output, whatever the repo says.
     "core.quotePath=true",
     "i18n.logOutputEncoding=UTF-8",
+    # I-14 item 9 / SR #29 M-1: keep first-parent merge diffs under -m.
+    # git >= 2.31 honours repo log.diffMerges; 2.30 ignores the unknown key
+    # and already defaults to this.
+    "log.diffMerges=first-parent",
     # SR-014 low: never discover a bare repository implicitly (git >= 2.38; older
     # git ignores the unknown key, and the run is then as before).
     "safe.bareRepository=explicit",
@@ -146,6 +151,9 @@ _MAX_COUNT_SUBCOMMANDS: frozenset[str] = frozenset({"rev-list", "log"})
 #: call's private ``HOME`` (:func:`_with_orderfile`). Never chosen by config or env.
 ORDERFILE_ARG = "-O<orderfile>"
 _ORDERFILE_NAME = "conventiondrift-orderfile"
+#: Empty file that ``GIT_GRAFT_FILE`` points at (I-14 item 9 / SR #29 L-6), so
+#: ``.git/info/grafts`` is never read. Created in the call's private ``HOME``.
+_GRAFTFILE_NAME = "conventiondrift-grafts"
 #: I-14 item 9 pins shared by ``patches`` and ``changed_files``: fixed rename
 #: threshold and limit, no ``diff.relative``, and an empty order file.
 _DIFF_PINS: frozenset[str] = frozenset({"-M50%", "-l1000", "--no-relative", ORDERFILE_ARG})
@@ -166,6 +174,7 @@ OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
         | _DIFF_PINS
         | {"--text", "--src-prefix=a/", "--dst-prefix=b/", "--diff-algorithm=myers"}
         | {"--no-indent-heuristic", "--inter-hunk-context=0", "--submodule=short"}
+        | {"--full-index"}
     ),
     "rev-list": frozenset({"--first-parent", "--timestamp"}),
     "ls-tree": frozenset({"-r", "-l", "-z", "--full-tree"}),
@@ -181,7 +190,7 @@ OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
 #: ``--no-ext-diff --no-textconv --no-color`` (DESIGN §3) in front.
 _PATCHES_ARGS: tuple[str, ...] = (
     "--first-parent", f"--max-count={MAX_COUNT_CAP}", "-m", "--root", "-p", "-U0", "--text",
-    "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000",
+    "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000", "--full-index",
     "--diff-algorithm=myers", "--no-indent-heuristic", "--inter-hunk-context=0",
     "--no-relative", "--submodule=short", "--no-show-signature", ORDERFILE_ARG,
     "--format=%x00%H",
@@ -471,6 +480,21 @@ def _nul_records(data: bytes) -> list[bytes]:
     return records
 
 
+def _empty_home_file(home: str, name: str, what: str) -> str:
+    """Create an empty 0600 file in ``home``. A path that already exists is refused.
+
+    Uses ``O_CREAT | O_EXCL`` (and ``O_NOFOLLOW`` where it exists), so a planted
+    symlink or other file is not followed or reused.
+    """
+    path = os.path.join(os.path.abspath(home), name)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        os.close(os.open(path, flags, 0o600))
+    except OSError as exc:
+        raise ComponentError(_COMPONENT, f"{what} could not be created") from exc
+    return path
+
+
 def _with_orderfile(argv: list[str], home: str) -> list[str]:
     """``argv`` with :data:`ORDERFILE_ARG` replaced by ``-O<home>/<fixed name>``.
 
@@ -481,13 +505,40 @@ def _with_orderfile(argv: list[str], home: str) -> list[str]:
     """
     if ORDERFILE_ARG not in argv:
         return argv
-    path = os.path.join(os.path.abspath(home), _ORDERFILE_NAME)
+    path = _empty_home_file(home, _ORDERFILE_NAME, "order file")
+    return ["-O" + path if arg == ORDERFILE_ARG else arg for arg in argv]
+
+
+def _graft_file(home: str) -> str:
+    """Absolute path of the empty ``GIT_GRAFT_FILE`` in ``home``.
+
+    Created the same way as the order file. A second call on the same ``home``
+    (the version check, then the real call, or the two ``cat-file`` processes)
+    reuses the existing file only when it is still a regular empty file.
+    """
+    path = os.path.join(os.path.abspath(home), _GRAFTFILE_NAME)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         os.close(os.open(path, flags, 0o600))
+        return path
+    except FileExistsError:
+        pass
     except OSError as exc:
-        raise ComponentError(_COMPONENT, "order file could not be created") from exc
-    return ["-O" + path if arg == ORDERFILE_ARG else arg for arg in argv]
+        raise ComponentError(_COMPONENT, "graft file could not be created") from exc
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise ComponentError(_COMPONENT, "graft file could not be created") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
+        raise ComponentError(_COMPONENT, "graft file could not be created")
+    return path
+
+
+def _call_env(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
+    """:func:`_environment` plus ``GIT_GRAFT_FILE`` pointing at an empty 0600 file."""
+    env = _environment(home, search_path, repo_dir)
+    env["GIT_GRAFT_FILE"] = _graft_file(home)
+    return env
 
 
 def _path(raw: bytes) -> str:
@@ -879,7 +930,7 @@ class GitReader:
         out = _run_bounded(
             [git.path, "--version"],
             cwd=self._repo_dir,
-            env=_environment(home, git.search_path, self._repo_dir),
+            env=_call_env(home, git.search_path, self._repo_dir),
             label="--version",
             max_stdout=SMALL_OUTPUT_MAX_BYTES,
             timeout=GIT_TIMEOUT_SECONDS,
@@ -910,7 +961,7 @@ class GitReader:
             return _run_bounded(
                 _with_orderfile(argv, home),
                 cwd=self._repo_dir,
-                env=_environment(home, git.search_path, self._repo_dir),
+                env=_call_env(home, git.search_path, self._repo_dir),
                 label=subcommand,
                 max_stdout=max_stdout,
                 timeout=GIT_TIMEOUT_SECONDS,
@@ -922,7 +973,7 @@ class GitReader:
             raise ComponentError(_COMPONENT, "repository directory not found")
         if not self._version_ok:
             self._check_version(home)
-        env = _environment(home, self._resolved_git().search_path, self._repo_dir)
+        env = _call_env(home, self._resolved_git().search_path, self._repo_dir)
         argv = _with_orderfile(argv, home)
         return _start_batch(argv, cwd=self._repo_dir, env=env, label=label)
 

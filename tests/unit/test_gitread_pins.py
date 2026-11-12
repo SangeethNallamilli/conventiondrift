@@ -135,8 +135,16 @@ def history(tmp_path: Path) -> tuple[Path, str, str, Path]:
         "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEE\n -----END PGP SIGNATURE-----\n"
         "\nsigned\n"
     ).encode()
-    head = _git(repo, "hash-object", "-t", "commit", "-w", "--stdin", stdin=raw).decode().strip()
-    _git(repo, "update-ref", "HEAD", head)
+    signed = _git(repo, "hash-object", "-t", "commit", "-w", "--stdin", stdin=raw).decode().strip()
+    _git(repo, "update-ref", "HEAD", signed)
+    # a merge commit so log.diffMerges can change the patches output (SR #29 M-1)
+    _git(repo, "checkout", "-q", "-b", "side", root)
+    _write(repo, "side.py", "from_the_side = 1\n")
+    _git(repo, "add", "-A")
+    _commit(repo, "side")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--no-ff", "side", "-m", "merge")
+    head = _git(repo, "rev-parse", "HEAD").decode().strip()
     return repo, root, head, tmp_path / "gpg-ran"
 
 
@@ -216,7 +224,7 @@ def test_hostile_repo_config_does_not_change_any_output(
     assert patch.count(b"\n@@ -7 +7 @@") == 1 and b"\n@@ -11 +11 @@" in patch  # two hunks
     assert b"\x1b[" not in patch and b"Binary files" not in patch
     assert ("R", "old/one.py", "new/uno.py") in clean[1]
-    everything = patch.split(b"\x00")[2]  # newest first: signed, everything, root
+    everything = next(part for part in patch.split(b"\x00") if b"rename from old/one.py" in part)
     assert everything.index(b"a/a.py") < everything.index(b"a/z.py")  # not orderFile's
 
 
@@ -233,7 +241,8 @@ def test_control_hostile_config_changes_plain_git(history: tuple[Path, str, str,
     hostile_log = _git(repo, *hardening, *base)
     assert _strip_hunk_tails(hostile_log) != _strip_hunk_tails(clean_log)
     assert _git(repo, *hardening, *names) != clean_names  # renames off, limit 1
-    _git(repo, "log", "-1", head)  # no -c log.showSignature=false: gpg runs
+    signed = _git(repo, "rev-parse", f"{head}^1").decode().strip()
+    _git(repo, "log", "-1", signed)  # no -c log.showSignature=false: gpg runs
     assert marker.exists()
 
 
@@ -380,6 +389,7 @@ PIN_DEFEATS: dict[str, str] = {
 PIN_UNOBSERVABLE: dict[str, str] = {
     "--no-relative": "gitread always runs git at the repo root, where diff.relative is a no-op",
     "i18n.logOutputEncoding=UTF-8": "gitread never prints commit messages (--format=%x00%H)",
+    "--full-index": "index lines would follow core.abbrev; pinned by an argv-presence test",
 }
 #: Two guards against log.showSignature; each alone keeps gpg from running.
 PIN_PAIRED: frozenset[str] = frozenset({"--no-show-signature", "log.showSignature=false"})
@@ -390,7 +400,7 @@ NOT_DIFF_CONFIG_PINS: frozenset[str] = frozenset(
     | {"-r", "-z", "--name-status", "--no-ext-diff", "--no-textconv"}
     | {"core.fsmonitor=false", "core.hooksPath=/dev/null", "core.untrackedCache=false"}
     | {"diff.external=", "core.pager=cat", "protocol.allow=never"}
-    | {"safe.bareRepository=explicit"}
+    | {"safe.bareRepository=explicit", "log.diffMerges=first-parent"}
 )
 _PIN_CONSTANTS = ("_PATCHES_ARGS", "_CHANGED_FILES_ARGS", "HARDENING_CONFIG", "_DIFF_FLAGS")
 
@@ -436,7 +446,9 @@ def test_every_hostile_setting_maps_to_a_real_pin() -> None:
     pins = _all_pinned_strings()
     assert all(pin in pins for pin in KEY_PINNED_BY.values() if pin is not None)
     covered = {pin for pin in KEY_PINNED_BY.values() if pin is not None}
-    assert covered == set(PIN_DEFEATS) | set(PIN_UNOBSERVABLE) | PIN_PAIRED
+    # --full-index is argv-presence only (SR #29 L-5); it has no hostile key.
+    assert covered == (set(PIN_DEFEATS) | set(PIN_UNOBSERVABLE) | PIN_PAIRED) - {"--full-index"}
+    assert "--full-index" in PIN_UNOBSERVABLE
 
 
 def _drop(monkeypatch: pytest.MonkeyPatch, *pins: str) -> None:
@@ -465,6 +477,7 @@ def test_dropping_any_one_pin_breaks_the_comparison(
 BACKSTOP_CALLS: dict[str, frozenset[str]] = {
     "--no-relative": frozenset({"log", "diff-tree"}),
     "--no-show-signature": frozenset({"log"}),
+    "--full-index": frozenset({"log"}),
     "i18n.logOutputEncoding=UTF-8": frozenset({"ls-tree", "cat-file", "diff-tree", "log"}),
     "log.showSignature=false": frozenset({"ls-tree", "cat-file", "diff-tree", "log"}),
 }
@@ -553,3 +566,119 @@ def test_each_hostile_setting_alone_changes_nothing(
     _assert_same_patches(clean[0], hostile[0])
     assert hostile[1:] == clean[1:]
     assert not marker.exists()
+
+
+def _git_version() -> tuple[int, int]:
+    out = _REAL_RUN([_GIT, "--version"], capture_output=True, text=True, check=True).stdout
+    major, minor = out.split()[2].split(".")[:2]
+    return int(major), int(minor)
+
+
+# --- SR #29 pins (M-1, L-5, L-6) ------------------------------------------------
+
+
+def test_log_diff_merges_pin_is_on_every_call(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, root, head, _ = history
+    pin = "log.diffMerges=first-parent"
+    assert pin in gitread.HARDENING_CONFIG
+    calls = _recorded_calls(repo, root, head, monkeypatch)
+    assert {_subcommand(c) for c in calls} == {"ls-tree", "cat-file", "diff-tree", "log"}
+    for argv in calls:
+        before = argv[: argv.index(_subcommand(argv))]
+        assert any(before[i : i + 2] == ["-c", pin] for i in range(len(before)))
+
+
+@pytest.mark.skipif(_git_version() < (2, 31), reason="log.diffMerges needs git 2.31")
+@pytest.mark.parametrize("value", ["off", "separate", "combined", "remerge"])
+def test_hostile_log_diff_merges_keeps_first_parent_diff(
+    history: tuple[Path, str, str, Path], value: str
+) -> None:
+    repo, _, head, _ = history
+    clean = b"".join(GitReader(repo).patches(None, head))
+    _git(repo, "config", "log.diffMerges", value)
+    hostile = b"".join(GitReader(repo).patches(None, head))
+    assert hostile == clean
+    first = clean.split(b"\x00")[1]  # newest first: the merge
+    assert first.startswith(head.encode() + b"\n")
+    assert b"+++ b/side.py\n" in first
+    assert b"+from_the_side = 1\n" in first
+    # the first-parent diff, not a combined/remerge view or a suppressed merge
+    assert b"index " in first
+    assert first.count(b"diff --git") == 1
+
+
+def test_hostile_grafts_do_not_reparent_history(history: tuple[Path, str, str, Path]) -> None:
+    repo, root, head, _ = history
+    clean_chain = GitReader(repo).first_parent_chain(head, 10)
+    clean_tree = list(GitReader(repo).tree(head))
+    clean_log = b"".join(GitReader(repo).patches(None, head))
+    assert len(clean_chain) > 1
+    info = repo / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "grafts").write_text(f"{head} {root}\n")  # would skip every commit in between
+    assert GitReader(repo).first_parent_chain(head, 10) == clean_chain
+    assert list(GitReader(repo).tree(head)) == clean_tree
+    assert b"".join(GitReader(repo).patches(None, head)) == clean_log
+
+
+def test_graft_file_is_a_fresh_empty_0600_file_in_home(tmp_path: Path) -> None:
+    path = Path(gitread._graft_file(str(tmp_path)))
+    assert path == tmp_path / "conventiondrift-grafts"
+    info = os.lstat(path)
+    assert stat.S_ISREG(info.st_mode) and info.st_size == 0
+    if os.name != "nt":
+        assert stat.S_IMODE(info.st_mode) == 0o600
+    assert gitread._graft_file(str(tmp_path)) == str(path)  # same home: reused, not recreated
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need a POSIX filesystem")
+def test_a_planted_graft_file_is_refused_not_reused(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_text("commit-sha parent-sha\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    os.symlink(target, home / "conventiondrift-grafts")
+    with pytest.raises(ComponentError, match="graft file could not be created"):
+        gitread._graft_file(str(home))
+    assert target.read_text() == "commit-sha parent-sha\n"
+
+
+def test_a_non_empty_graft_file_is_refused_not_reused(tmp_path: Path) -> None:
+    planted = tmp_path / "conventiondrift-grafts"
+    planted.write_text("not empty\n")
+    with pytest.raises(ComponentError, match="graft file could not be created"):
+        gitread._graft_file(str(tmp_path))
+    assert planted.read_text() == "not empty\n"
+
+
+def test_real_calls_get_an_empty_graft_file_in_their_home(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, root, head, _ = history
+    seen: list[os.stat_result] = []
+    for name in ("_run_bounded", "_start_batch"):
+        real = getattr(gitread, name)
+
+        def wrapper(argv: list[str], _real: Callable[..., Any] = real, **kwargs: Any) -> Any:
+            if argv[1:] != ["--version"]:
+                path = kwargs["env"]["GIT_GRAFT_FILE"]
+                seen.append(os.lstat(path))
+                assert Path(path).parent == Path(kwargs["env"]["HOME"])
+                assert Path(path).name == "conventiondrift-grafts"
+            return _real(argv, **kwargs)
+
+        monkeypatch.setattr(gitread, name, wrapper)
+    reader = GitReader(repo)
+    reader.tree(head)
+    reader.first_parent_chain(head, 4)
+    reader.changed_files(root, head)
+    list(reader.patches(None, head))
+    reader.blob(reader.tree(head)[0][1], 1 << 20)
+    reader.close()
+    assert seen
+    for info in seen:
+        assert stat.S_ISREG(info.st_mode) and info.st_size == 0
+        if os.name != "nt":
+            assert stat.S_IMODE(info.st_mode) == 0o600

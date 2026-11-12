@@ -167,7 +167,9 @@ def test_new_options_are_allowlisted_and_nothing_wider() -> None:
     assert "--batch-all-objects" not in allow["cat-file"]
     assert "--timestamp" in allow["rev-list"]
     assert "--name-status" in allow["diff-tree"]
-    assert {"-m", "--root", "--format=%x00%H", "--no-show-signature"} <= allow["log"]
+    assert {"-m", "--root", "--format=%x00%H", "--no-show-signature", "--full-index"} <= allow[
+        "log"
+    ]
     assert "--reverse" not in allow["log"]
     for sub in ("log", "diff-tree"):
         assert not {"--ext-diff", "--textconv", "--output", "--follow"} & allow[sub]
@@ -762,7 +764,7 @@ def test_patches_stream_newest_first_with_commit_markers(repo: Path, spy: list[C
         {
             "--first-parent", "--max-count=10000", "-m", "--root", "-p", "-U0", "--text",
             "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/",
-            "--dst-prefix=b/", "-M50%", "-l1000", "--diff-algorithm=myers",
+            "--dst-prefix=b/", "-M50%", "-l1000", "--full-index", "--diff-algorithm=myers",
             "--no-indent-heuristic", "--inter-hunk-context=0", "--no-relative",
             "--submodule=short", "--no-show-signature", "-O<orderfile>", "--format=%x00%H",
         },
