@@ -94,11 +94,10 @@ def md_cell(text: str) -> str:
 def workflow_cmd(text: str) -> str:
     """Escape the data part of ``::command props::data`` (R3.1, AC-N3.13, I-14).
 
-    The I-14 mapping runs first, so CR and LF are already ``␍`` / ``␊``. Then
-    ``%`` (first), CR and LF are percent-encoded the way the runner unescapes
-    them; after the mapping the CR/LF replacements are a no-op.
+    The I-14 mapping runs first, so CR and LF are already ``␍`` / ``␊``. The
+    remaining protocol encoding is ``%`` -> ``%25``.
     """
-    return _visible_text(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return _visible_text(text).replace("%", "%25")
 
 
 def workflow_prop(text: str) -> str:
