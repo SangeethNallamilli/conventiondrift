@@ -112,7 +112,7 @@ def _windows_only_form(segment: str) -> bool:
     )
 
 
-def validate_relpath(value: str, origin: PathOrigin = "input") -> str:
+def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     """Return ``value`` as a normalized repo-relative POSIX path, or reject it.
 
     Rejected with ``FileSkipped("outside repository")`` (R2.1, AC-N3.8):

@@ -53,7 +53,7 @@ def opened() -> Iterator[list[object]]:
 @pytest.mark.parametrize("value", list(AC_N3_8_VALUES.values()), ids=list(AC_N3_8_VALUES))
 def test_validate_relpath_rejects(value: str, tmp_path: Path, opened: list[object]) -> None:
     with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value)
+        validate_relpath(value, origin="input")
     assert exc.value.reason == REASON_OUTSIDE
     with pytest.raises(FileSkipped) as exc2:
         read_worktree_file(tmp_path, value, "config", origin="input")
@@ -76,9 +76,10 @@ def test_validate_relpath_rejects(value: str, tmp_path: Path, opened: list[objec
         "a\x00b",
     ],
 )
-def test_reject_edge_forms(value: str) -> None:
+@pytest.mark.parametrize("origin", ["input", "tree"])
+def test_reject_edge_forms(value: str, origin: PathOrigin) -> None:
     with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value)
+        validate_relpath(value, origin=origin)
     assert exc.value.reason == REASON_OUTSIDE
 
 
@@ -101,8 +102,9 @@ def test_reject_edge_forms(value: str) -> None:
         ("ünïcode/ファイル.py", "ünïcode/ファイル.py"),
     ],
 )
-def test_accept_and_normalize(value: str, expected: str) -> None:
-    assert validate_relpath(value) == expected
+@pytest.mark.parametrize("origin", ["input", "tree"])
+def test_accept_and_normalize(value: str, expected: str, origin: PathOrigin) -> None:
+    assert validate_relpath(value, origin=origin) == expected
 
 
 BACKSLASH_OR_DRIVE = [
@@ -150,11 +152,8 @@ BACKSLASH_OR_DRIVE = [
 @pytest.mark.parametrize("value", BACKSLASH_OR_DRIVE)
 def test_backslash_or_drive_typed_value_is_outside_repository(value: str) -> None:
     """A value the user typed keeps AC-N3.8's reason (D-PM-28)."""
-    with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value)
-    assert exc.value.reason == REASON_OUTSIDE
     with pytest.raises(FileSkipped) as exc2:
-        validate_relpath(value, "input")
+        validate_relpath(value, origin="input")
     assert exc2.value.reason == REASON_OUTSIDE
     with pytest.raises(FileSkipped) as exc3:
         read_worktree_file(Path("/nonexistent"), value, "python", origin="input")
@@ -165,7 +164,7 @@ def test_backslash_or_drive_typed_value_is_outside_repository(value: str) -> Non
 def test_backslash_or_drive_tree_name_is_unsupported_path(value: str) -> None:
     """A name found in the repo tree gets "unsupported path" (D-PM-28, I-13)."""
     with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, "tree")
+        validate_relpath(value, origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
     with pytest.raises(FileSkipped) as exc2:
         read_worktree_file(Path("/nonexistent"), value, "python", origin="tree")
@@ -179,14 +178,22 @@ def test_backslash_or_drive_tree_name_is_unsupported_path(value: str) -> None:
 def test_traversal_wins_over_unsupported_for_tree_names(value: str) -> None:
     """Traversal, absolute and NUL forms stay "outside repository" from any origin."""
     with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, "tree")
+        validate_relpath(value, origin="tree")
     assert exc.value.reason == REASON_OUTSIDE
 
 
 def test_tree_origin_accepts_ordinary_names() -> None:
-    assert validate_relpath("src/ab.py", "tree") == "src/ab.py"
-    assert validate_relpath("./con_sole/x.py", "tree") == "con_sole/x.py"
-    assert validate_relpath("src/./a.py", "tree") == "src/a.py"  # "." keeps its handling
+    assert validate_relpath("src/ab.py", origin="tree") == "src/ab.py"
+    assert validate_relpath("./con_sole/x.py", origin="tree") == "con_sole/x.py"
+    assert validate_relpath("src/./a.py", origin="tree") == "src/a.py"  # "." keeps its handling
+
+
+def test_origin_is_a_required_keyword() -> None:
+    """Every caller must say where the path came from (D-PM-28, CR suggestion)."""
+    with pytest.raises(TypeError):
+        validate_relpath("a.py")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        validate_relpath("a.py", "tree")  # type: ignore[call-arg]
 
 
 def test_read_tree_name_with_backslash_is_unsupported(tmp_path: Path, opened: list[object]) -> None:

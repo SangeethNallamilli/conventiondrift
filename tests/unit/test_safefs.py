@@ -553,7 +553,7 @@ def test_nul_anywhere_is_binary(kind: FileKind, where: int) -> None:
 
 
 def test_bomless_utf16_is_binary() -> None:
-    # Documents current behaviour; see open question Q-decode (order/BOM-less UTF-16).
+    """UTF-16 without a BOM is full of NULs, so it may be listed as binary (SC-2.48)."""
     assert _reason(decode_text, "version: 1\n".encode("utf-16-le"), "config") == REASON_BINARY
 
 
