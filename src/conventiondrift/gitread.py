@@ -652,16 +652,24 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
 
 
 def _close_when_done(stream: object, reader: threading.Thread) -> None:
-    """Close a pipe only once its reader thread is done (CR2 S1).
+    """Close a pipe once its reader is done, or close the raw fd if it is not.
 
     Closing a buffered pipe waits on the lock a blocked reader holds, so while a
-    process outside git's group still holds the pipe, the pipe is left to the
-    daemon thread, which ends at that process's EOF; nothing here blocks.
+    process outside git's group still holds the pipe we must not call
+    ``stream.close()``. Closing the underlying raw file (CR1 #4) marks the
+    wrapper closed without taking that lock, so nothing here blocks and the
+    pipe is not leaked.
     """
     reader.join(_READER_JOIN_SECONDS)
+    pipe = cast(io.BufferedIOBase, stream)
     if not reader.is_alive():
         with contextlib.suppress(OSError):
-            cast(io.BufferedIOBase, stream).close()
+            pipe.close()
+        return
+    raw = getattr(pipe, "raw", None)
+    if raw is not None:
+        with contextlib.suppress(OSError, ValueError):
+            raw.close()
 
 
 def _run_bounded(

@@ -99,10 +99,13 @@ def test_the_same_diff_tree_with_the_flag_does_not(hostile: tuple[Path, Path, st
 def test_no_t008_operation_runs_the_hook(hostile: tuple[Path, Path, str, str]) -> None:
     repo, sentinel, base, head = hostile
     reader = GitReader(repo)
-    entries = reader.tree(head)
-    reader.blob(entries[0][1], 100)
-    assert reader.changed_files(base, head) == [("M", None, "a.py")]
-    reader.first_parent_chain(head, 5)
-    assert b"+2\n" in b"".join(reader.patches(base, head))
-    reader.is_shallow()
-    assert not sentinel.exists()
+    try:
+        entries = reader.tree(head)
+        reader.blob(entries[0][1], 100)
+        assert reader.changed_files(base, head) == [("M", None, "a.py")]
+        reader.first_parent_chain(head, 5)
+        assert b"+2\n" in b"".join(reader.patches(base, head))
+        reader.is_shallow()
+        assert not sentinel.exists()
+    finally:
+        reader.close()
