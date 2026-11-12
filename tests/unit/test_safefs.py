@@ -508,3 +508,25 @@ def test_read_then_decode_end_to_end(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "x.py").write_bytes(b"\x00\x01")
     raw = read_worktree_file(tmp_path, "x.py", "python", origin="tree")
     assert _reason(decode_text, raw, "python") == REASON_BINARY
+
+
+# ---- CR S1: containment is by whole segments, also for a root of "/" -------------------
+
+
+def test_root_slash_contains_everything_below_it() -> None:
+    assert d._contained("/", "/")
+    assert d._contained("/", "/etc/x")
+
+
+def test_sibling_prefix_repo2_is_not_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os.path, "realpath", lambda p: str(p))
+    assert d._contained("/x/repo", "/x/repo/a.py")
+    assert not d._contained("/x/repo", "/x/repo2")
+    assert not d._contained("/x/repo", "/x/repo2/a.py")
+    assert not d._contained("/x/repo", "/x")
+
+
+def test_uncomparable_paths_are_not_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    """commonpath raises ValueError for mixed absolute/relative (or, on Windows, drives)."""
+    monkeypatch.setattr(os.path, "realpath", lambda p: "relative/x")
+    assert not d._contained("/x/repo", "/x/repo/a.py")

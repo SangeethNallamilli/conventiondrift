@@ -148,8 +148,17 @@ def _reject_link_or_other(st: os.stat_result, *, final: bool) -> None:
 
 
 def _contained(root_real: str, full: str) -> bool:
-    real = os.path.realpath(full)
-    return real == root_real or real.startswith(root_real.rstrip(os.sep) + os.sep)
+    """True if ``realpath(full)`` is ``root_real`` or below it, by whole path segments.
+
+    ``os.path.commonpath`` compares segments, so ``/x/repo2`` is not under
+    ``/x/repo``, and a root of ``/`` (or ``C:\\``) needs no special case.
+    """
+    root = os.path.normcase(root_real)
+    real = os.path.normcase(os.path.realpath(full))
+    try:
+        return os.path.commonpath([root, real]) == root
+    except ValueError:  # different drives on Windows, or a relative realpath
+        return False
 
 
 _O_NOFOLLOW: Final = getattr(os, "O_NOFOLLOW", 0)
