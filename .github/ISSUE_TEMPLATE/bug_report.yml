@@ -1,0 +1,50 @@
+name: Bug report
+description: conventiondrift crashed, failed, or did something its docs say it shouldn't.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If conventiondrift warned about a rule that your code actually follows, please use the **False positive** template instead.
+        Never paste secrets or tokens. For a security problem, see SECURITY.md and report it privately.
+  - type: input
+    id: version
+    attributes:
+      label: conventiondrift version
+      description: The Action ref you use (for example `@v1`) or the output of `conventiondrift --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where did it happen?
+      options:
+        - GitHub Action
+        - Command-line tool
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include the full error message, exit code, or job summary text.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it?
+      description: A public repository or pull request link is best. Otherwise, the instruction file lines, a small code sample, and your workflow file or CLI command.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Runner or OS, and Python version
+      description: For example `ubuntu-24.04` runner, or macOS 15 with Python 3.12.
