@@ -10,7 +10,8 @@ Every call goes through :meth:`GitReader._run`, which:
   temporary directory; only ``PATH`` is inherited, plus ``SYSTEMROOT`` on
   Windows (``os.name == "nt"``, I-11 C3);
 * puts the full ``-c`` hardening set before every subcommand;
-* allows only the eight read-only subcommands in DESIGN §3;
+* allows only the eight read-only subcommands in DESIGN §3, each with its own
+  option allowlist, and ``rev-list``/``log`` only with one bounded ``--max-count``;
 * adds ``--no-ext-diff --no-textconv --no-color`` to diff and log calls;
 * drains and discards stderr, and never puts stderr or caller input in an
   error message;
@@ -91,6 +92,9 @@ HARDENING_CONFIG: tuple[str, ...] = (
     "core.pager=cat",
     "protocol.allow=never",
     "log.showSignature=false",
+    # SR-014 low: never discover a bare repository implicitly (git >= 2.38; older
+    # git ignores the unknown key, and the run is then as before).
+    "safe.bareRepository=explicit",
 )
 
 #: DESIGN §3 "Diff and log calls".
@@ -105,7 +109,47 @@ FIXED_ENV: dict[str, str] = {
     "GIT_OPTIONAL_LOCKS": "0",
     "GIT_NO_REPLACE_OBJECTS": "1",
     "GIT_ATTR_NOSYSTEM": "1",
+    # SR-014 low: never lazily fetch a missing object from a promisor remote
+    # (git >= 2.44; ``protocol.allow=never`` blocks it on older git).
+    "GIT_NO_LAZY_FETCH": "1",
 }
+
+#: R2.6 (DESIGN §10 S4): at most 10,000 first-parent commits walked.
+MAX_COUNT_CAP: int = 10_000
+_MAX_COUNT_RE = re.compile(r"--max-count=([1-9][0-9]*)", re.ASCII)
+#: SR-014 low: these must carry exactly one ``--max-count=N`` with 1 <= N <= the cap.
+_MAX_COUNT_SUBCOMMANDS: frozenset[str] = frozenset({"rev-list", "log"})
+
+#: SR-014 low: the options each subcommand may take, before ``--end-of-options``.
+#: Everything after ``--end-of-options`` is an operand (validated by the caller).
+#: T-008 extends this for its operations; anything not listed is refused.
+OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
+    "rev-parse": frozenset({"--verify", "--is-shallow-repository"}),
+    "cat-file": frozenset({"-e"}),
+    "merge-base": frozenset(),
+    "log": frozenset({"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}),
+    "rev-list": frozenset({"--first-parent"}),
+    "ls-tree": frozenset({"-r", "-l", "-z", "--full-tree"}),
+    "diff-tree": frozenset({"-r", "-z", "-M", "-p", "--no-commit-id"}),
+    "show": frozenset(),
+}
+
+
+def _check_options(subcommand: str, args: Sequence[str]) -> None:
+    """Refuse options outside :data:`OPTION_ALLOWLIST` and enforce ``--max-count``."""
+    end = args.index("--end-of-options") if "--end-of-options" in args else len(args)
+    max_counts = 0
+    for option in args[:end]:
+        count = _MAX_COUNT_RE.fullmatch(option)
+        if count is not None and subcommand in _MAX_COUNT_SUBCOMMANDS:
+            if int(count[1]) > MAX_COUNT_CAP:
+                raise ComponentError(_COMPONENT, "git --max-count over the cap")
+            max_counts += 1
+        elif option not in OPTION_ALLOWLIST[subcommand]:
+            raise ComponentError(_COMPONENT, "git option not allowed")
+    if subcommand in _MAX_COUNT_SUBCOMMANDS and max_counts != 1:
+        raise ComponentError(_COMPONENT, "git call needs exactly one --max-count")
+
 
 # I-11 C3: SHAs are lowercase 40 or 64 hex only.
 _SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}", re.ASCII)
@@ -197,15 +241,18 @@ def _find_git(repo_dir: Path) -> _ResolvedGit:
     raise GitUnavailable("git executable not found")
 
 
-def _environment(home: str, search_path: str) -> dict[str, str]:
+def _environment(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
     """The fixed git environment (DESIGN §3, I-11 C3, I-14).
 
-    The DESIGN §3 values and ``HOME``, plus ``search_path`` as ``PATH`` (the
-    filtered ``PATH`` that git was resolved from), plus
+    The DESIGN §3 values and ``HOME``, ``GIT_NO_LAZY_FETCH``, plus
+    ``GIT_CEILING_DIRECTORIES`` set to the parent of the repo's real path (so git
+    never discovers a repository above ``repo_dir``), plus ``search_path`` as
+    ``PATH`` (the filtered ``PATH`` that git was resolved from), plus
     ``SYSTEMROOT`` if set and only when ``os.name == "nt"`` (Git for Windows needs
     it to start).
     """
     env = dict(FIXED_ENV)
+    env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(os.path.realpath(repo_dir))
     env["PATH"] = search_path
     if os.name == "nt":
         systemroot = os.environ.get("SYSTEMROOT")
@@ -344,6 +391,7 @@ class GitReader:
             raise ComponentError(_COMPONENT, "git subcommand not allowed")
         if any("\x00" in arg for arg in args):
             raise ComponentError(_COMPONENT, "NUL in git argument")
+        _check_options(subcommand, args)
         # I-11 C3: GitUnavailable means only "git is missing or cannot start".
         argv = [self._resolved_git().path]
         for setting in HARDENING_CONFIG:
@@ -365,7 +413,7 @@ class GitReader:
         out = _run_bounded(
             [git.path, "--version"],
             cwd=self._repo_dir,
-            env=_environment(home, git.search_path),
+            env=_environment(home, git.search_path, self._repo_dir),
             label="--version",
             max_stdout=SMALL_OUTPUT_MAX_BYTES,
             timeout=GIT_TIMEOUT_SECONDS,
@@ -396,7 +444,7 @@ class GitReader:
             return _run_bounded(
                 argv,
                 cwd=self._repo_dir,
-                env=_environment(home, git.search_path),
+                env=_environment(home, git.search_path, self._repo_dir),
                 label=subcommand,
                 max_stdout=max_stdout,
                 timeout=GIT_TIMEOUT_SECONDS,
@@ -455,7 +503,10 @@ class GitReader:
 
     def commit_date(self, sha: str) -> datetime:
         """The committer date of a commit as a timezone-aware UTC datetime (I-11 C3)."""
-        out = self._run("log", ["--no-walk", "--format=%cI", "--end-of-options", _require_sha(sha)])
+        out = self._run(
+            "log",
+            ["--no-walk", "--max-count=1", "--format=%cI", "--end-of-options", _require_sha(sha)],
+        )
         if out.returncode != 0:
             raise self._fail("log", out)
         try:

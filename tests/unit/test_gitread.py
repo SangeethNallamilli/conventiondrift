@@ -5,6 +5,7 @@ tests/spec/ and tests/security/ own the TRACEABILITY test ids; these are unit
 tests of the runner and the first five operations.
 """
 
+import contextlib
 import io
 import os
 import shutil
@@ -114,6 +115,7 @@ HARDENING = [
     "-c", "core.pager=cat",
     "-c", "protocol.allow=never",
     "-c", "log.showSignature=false",
+    "-c", "safe.bareRepository=explicit",
 ]  # fmt: skip
 
 BAD_SHAS = [
@@ -188,6 +190,8 @@ def test_environment_is_fixed_and_nothing_else_leaks(
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(repo)),
         "HOME": env["HOME"],
     }
     assert env["HOME"] != str(repo)
@@ -197,18 +201,21 @@ def test_environment_is_fixed_and_nothing_else_leaks(
 
 def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    repo_dir = Path("/r/repo")  # built before os.name changes, so it stays a PosixPath
     monkeypatch.setattr(gitread.os, "name", "nt")
-    nt_env = gitread._environment("/h", "/bin")
+    nt_env = gitread._environment("/h", "/bin", repo_dir)
     monkeypatch.setattr(gitread.os, "name", "posix")
-    posix_env = gitread._environment("/h", "/bin")
-    assert nt_env == dict(gitread.FIXED_ENV, PATH="/bin", SYSTEMROOT=r"C:\Windows", HOME="/h")
-    assert posix_env == dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h")
+    posix_env = gitread._environment("/h", "/bin", repo_dir)
+    base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES="/r")
+    assert nt_env == dict(base, SYSTEMROOT=r"C:\Windows")
+    assert posix_env == base
 
 
 def test_systemroot_absent_on_windows_is_not_invented(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SYSTEMROOT", raising=False)
+    repo_dir = Path("/r/repo")
     monkeypatch.setattr(gitread.os, "name", "nt")
-    env = gitread._environment("/h", "/bin")
+    env = gitread._environment("/h", "/bin", repo_dir)
     monkeypatch.setattr(gitread.os, "name", "posix")
     assert "SYSTEMROOT" not in env
 
@@ -288,7 +295,8 @@ def test_diff_and_log_calls_get_no_ext_diff_no_textconv_no_color(
     repo: Path, spy: list[Call], sub: str
 ) -> None:
     head = GitReader(repo).resolve("HEAD")
-    GitReader(repo)._run(sub, ["--end-of-options", head])
+    count = ["--max-count=1"] if sub == "log" else []
+    GitReader(repo)._run(sub, [*count, "--end-of-options", head])
     argv = spy[-1]["argv"]
     i = argv.index(sub)
     assert argv[i + 1 : i + 4] == ["--no-ext-diff", "--no-textconv", "--no-color"]
@@ -820,7 +828,11 @@ def test_version_check_runs_once_first_with_fixed_env_and_no_flags(
     assert [a for a in argvs if a[1:] == ["--version"]] == [argvs[0]]  # once
     assert all(a[0] == argvs[0][0] for a in argvs)  # the same resolved git every time
     version_kwargs = seen[0][1]
-    assert set(version_kwargs["env"]) == set(gitread.FIXED_ENV) | {"PATH", "HOME"}
+    assert set(version_kwargs["env"]) == set(gitread.FIXED_ENV) | {
+        "PATH",
+        "HOME",
+        "GIT_CEILING_DIRECTORIES",
+    }
     assert version_kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
     assert version_kwargs["max_stdout"] == gitread.SMALL_OUTPUT_MAX_BYTES
 
@@ -1036,7 +1048,8 @@ def test_commit_date_argv(repo: Path, spy: list[Call]) -> None:
     argv = spy[0]["argv"]
     i = argv.index("log")
     assert argv[i:] == ["log", "--no-ext-diff", "--no-textconv", "--no-color",
-                        "--no-walk", "--format=%cI", "--end-of-options", sha]  # fmt: skip
+                        "--no-walk", "--max-count=1", "--format=%cI", "--end-of-options",
+                        sha]  # fmt: skip
 
 
 @pytest.mark.parametrize("sha", BAD_SHAS)
@@ -1061,3 +1074,329 @@ def test_commit_date_rejects_malformed_or_naive_output(
     _fake_run(monkeypatch, 0, stdout)
     with pytest.raises(ComponentError):
         GitReader(repo).commit_date("ab" * 20)
+
+
+# --- option allowlist and --max-count (SR-014 lows) -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("sub", "args"),
+    [
+        ("log", ["--max-count=1", "--ext-diff"]),
+        ("log", ["--max-count=1", "--textconv"]),
+        ("log", ["--max-count=1", "--output=x"]),
+        ("log", ["--max-count=1", "--all"]),
+        ("show", ["--ext-diff"]),
+        ("show", ["--textconv"]),
+        ("diff-tree", ["--ext-diff"]),
+        ("diff-tree", ["--textconv"]),
+        ("rev-parse", ["--git-dir=x"]),
+        ("rev-parse", ["--exec-path"]),
+        ("rev-parse", ["-c"]),
+        ("cat-file", ["--batch-all-objects"]),
+        ("merge-base", ["--all"]),
+        ("ls-tree", ["--name-only", "x"]),
+        ("rev-parse", ["HEAD"]),  # an operand before --end-of-options
+    ],
+)
+def test_options_outside_the_allowlist_are_refused(
+    repo: Path, spy: list[Call], sub: str, args: list[str]
+) -> None:
+    with pytest.raises(ComponentError) as info:
+        GitReader(repo)._run(sub, [*args, "--end-of-options"])
+    assert info.value.message == "git option not allowed"
+    assert "x" not in info.value.message.split()
+    assert spy == []
+
+
+@pytest.mark.parametrize("sub", sorted(gitread.OPTION_ALLOWLIST))
+def test_every_allowlisted_option_is_accepted(sub: str) -> None:
+    count = ["--max-count=1"] if sub in ("log", "rev-list") else []
+    gitread._check_options(sub, [*sorted(gitread.OPTION_ALLOWLIST[sub]), *count])
+
+
+def test_option_allowlist_covers_exactly_the_allowed_subcommands() -> None:
+    assert frozenset(gitread.OPTION_ALLOWLIST) == gitread.ALLOWED_SUBCOMMANDS
+
+
+def test_operands_after_end_of_options_are_not_options() -> None:
+    gitread._check_options("rev-parse", ["--verify", "--end-of-options", "--output=x", "-c"])
+
+
+@pytest.mark.parametrize("sub", ["log", "rev-list"])
+@pytest.mark.parametrize(
+    ("counts", "message"),
+    [
+        ([], "git call needs exactly one --max-count"),
+        (["--max-count=1", "--max-count=2"], "git call needs exactly one --max-count"),
+        (["--max-count=10001"], "git --max-count over the cap"),
+        (["--max-count=99999999999999999999"], "git --max-count over the cap"),
+        (["--max-count=0"], "git option not allowed"),
+        (["--max-count=-1"], "git option not allowed"),
+        (["--max-count=01"], "git option not allowed"),
+        (["--max-count=1x"], "git option not allowed"),
+        (["--max-count=\u0661"], "git option not allowed"),  # non-ASCII digit
+        (["-n1"], "git option not allowed"),
+        (["--max-count", "1"], "git option not allowed"),
+    ],
+)
+def test_log_and_rev_list_need_one_bounded_max_count(
+    sub: str, counts: list[str], message: str
+) -> None:
+    with pytest.raises(ComponentError) as info:
+        gitread._check_options(sub, [*counts, "--end-of-options", "a" * 40])
+    assert info.value.message == message
+
+
+def test_max_count_after_end_of_options_does_not_count() -> None:
+    with pytest.raises(ComponentError, match="exactly one --max-count"):
+        gitread._check_options("log", ["--end-of-options", "--max-count=1"])
+
+
+@pytest.mark.parametrize("value", [1, 10_000])
+def test_max_count_within_the_cap_is_accepted(value: int) -> None:
+    gitread._check_options("rev-list", [f"--max-count={value}", "--end-of-options", "a" * 40])
+    assert gitread.MAX_COUNT_CAP == 10_000  # R2.6: first-parent commits walked
+
+
+def test_max_count_is_not_allowed_where_it_is_not_needed() -> None:
+    with pytest.raises(ComponentError, match="option not allowed"):
+        gitread._check_options("rev-parse", ["--max-count=1"])
+
+
+# --- hardening, flag by flag (SR-014 (c)) ---------------------------------------
+#
+# Each test below removes ONE hardening setting and shows the attack then works,
+# and shows that with the full hardening it does not. Mapping, setting -> test:
+#   --no-textconv (diff/log flag)   -> test_no_textconv_is_load_bearing[log|show]
+#   --no-color (diff/log flag)      -> test_no_color_is_load_bearing
+#   log.showSignature=false         -> test_log_show_signature_false_is_load_bearing
+#   safe.bareRepository=explicit    -> test_safe_bare_repository_is_load_bearing
+#   protocol.allow=never            -> test_lazy_fetch_is_blocked_by_each_setting_alone
+#   GIT_NO_LAZY_FETCH=1             -> test_lazy_fetch_is_blocked_by_each_setting_alone
+#   GIT_NO_REPLACE_OBJECTS=1        -> test_no_replace_objects_is_load_bearing
+#   GIT_CEILING_DIRECTORIES         -> test_ceiling_directories_is_load_bearing
+#   HOME (fresh temp dir)           -> test_global_config_in_inherited_home_is_ignored
+# Not observable through the allowed subcommands, so kept as defence in depth
+# (a test can't fail when they are removed): core.fsmonitor, core.hooksPath,
+# core.untrackedCache, GIT_OPTIONAL_LOCKS (no allowed subcommand reads the index or
+# runs hooks); diff.external= and --no-ext-diff (log/show/diff-tree run an external
+# diff only with --ext-diff, which the option allowlist refuses); core.pager=cat
+# (stdout is never a tty); GIT_TERMINAL_PROMPT (no transport is allowed);
+# GIT_CONFIG_GLOBAL (HOME is empty and XDG_CONFIG_HOME is not passed);
+# GIT_CONFIG_NOSYSTEM and GIT_ATTR_NOSYSTEM (need root to plant system files).
+
+
+def _git_version() -> tuple[int, int]:
+    out = _REAL_RUN([_GIT, "--version"], capture_output=True, text=True, check=True).stdout
+    major, minor = out.split()[2].split(".")[:2]
+    return int(major), int(minor)
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+def _drop_config(monkeypatch: pytest.MonkeyPatch, setting: str) -> None:
+    assert setting in gitread.HARDENING_CONFIG
+    kept = tuple(s for s in gitread.HARDENING_CONFIG if s != setting)
+    monkeypatch.setattr(gitread, "HARDENING_CONFIG", kept)
+
+
+def _drop_env(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    assert name in gitread.FIXED_ENV
+    kept = {k: v for k, v in gitread.FIXED_ENV.items() if k != name}
+    monkeypatch.setattr(gitread, "FIXED_ENV", kept)
+
+
+def _drop_diff_flag(monkeypatch: pytest.MonkeyPatch, flag: str) -> None:
+    assert flag in gitread._DIFF_FLAGS
+    monkeypatch.setattr(gitread, "_DIFF_FLAGS", tuple(f for f in gitread._DIFF_FLAGS if f != flag))
+
+
+def _sentinel_script(tmp_path: Path) -> tuple[Path, Path]:
+    sentinel = tmp_path / "sentinel"
+    script = tmp_path / "evil.sh"
+    script.write_text(f'#!/bin/sh\ntouch {sentinel}\ncat "$1" 2>/dev/null\nexit 0\n')
+    script.chmod(0o755)
+    return script, sentinel
+
+
+@pytest.fixture
+def textconv_repo(repo: Path, tmp_path: Path) -> tuple[Path, Path, str]:
+    """A repo whose config and attributes run a sentinel script as a textconv driver."""
+    script, sentinel = _sentinel_script(tmp_path)
+    (repo / "f.txt").write_text("a\n")
+    _git(repo, "add", "f.txt")
+    _commit(repo, "add f")
+    (repo / "f.txt").write_text("b\n")
+    _git(repo, "add", "f.txt")
+    head = _commit(repo, "change f")
+    with (repo / ".git" / "config").open("a") as cfg:
+        cfg.write(f'[diff "x"]\n\ttextconv = {script}\n[diff]\n\texternal = {script}\n')
+    (repo / ".gitattributes").write_text("* diff=x\n")
+    return repo, sentinel, head
+
+
+@needs_git
+def test_plain_git_control_runs_the_hostile_textconv(textconv_repo: tuple[Path, Path, str]) -> None:
+    # Control: without the hardening the planted config DOES run, so the
+    # hardened tests below can fail.
+    repo, sentinel, _head = textconv_repo
+    _git(repo, "log", "-p", "-1")
+    assert sentinel.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script")
+def test_hardened_patch_calls_run_nothing(textconv_repo: tuple[Path, Path, str]) -> None:
+    repo, sentinel, head = textconv_repo
+    parent = _git(repo, "rev-parse", "HEAD~1")
+    reader = GitReader(repo)
+    big = 65536
+    reader._run("log", ["-p", "--max-count=2", "--end-of-options", head], max_stdout=big)
+    reader._run("show", ["--end-of-options", head], max_stdout=big)
+    reader._run("diff-tree", ["-p", "--end-of-options", parent, head], max_stdout=big)
+    assert not sentinel.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script")
+@pytest.mark.parametrize("sub", ["log", "show"])
+def test_no_textconv_is_load_bearing(
+    textconv_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch, sub: str
+) -> None:
+    repo, sentinel, head = textconv_repo
+    count = ["--max-count=1"] if sub == "log" else []
+    args = [*(["-p"] if sub == "log" else []), *count, "--end-of-options", head]
+    GitReader(repo)._run(sub, args, max_stdout=65536)
+    assert not sentinel.exists()
+    _drop_diff_flag(monkeypatch, "--no-textconv")
+    GitReader(repo)._run(sub, args, max_stdout=65536)
+    assert sentinel.exists()
+
+
+def test_no_color_is_load_bearing(
+    textconv_repo: tuple[Path, Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _sentinel, head = textconv_repo
+    (repo / ".gitattributes").unlink()
+    _git(repo, "config", "color.ui", "always")
+    args = ["-p", "--max-count=1", "--end-of-options", head]
+    assert b"\x1b[" not in GitReader(repo)._run("log", args, max_stdout=65536).stdout
+    _drop_diff_flag(monkeypatch, "--no-color")
+    assert b"\x1b[" in GitReader(repo)._run("log", args, max_stdout=65536).stdout
+
+
+def _signed_commit(repo: Path) -> str:
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    parent = _git(repo, "rev-parse", "HEAD")
+    body = (
+        f"tree {tree}\nparent {parent}\n"
+        "author t <t@example.invalid> 1700000000 +0000\n"
+        "committer t <t@example.invalid> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\nsigned\n"
+    )
+    env = dict(_TEST_GIT_ENV, HOME=str(repo))
+    out = _REAL_RUN(
+        [_GIT, "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=repo,
+        env=env,
+        input=body,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script")
+def test_log_show_signature_false_is_load_bearing(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script, sentinel = _sentinel_script(tmp_path)
+    signed = _signed_commit(repo)
+    _git(repo, "config", "log.showSignature", "true")
+    _git(repo, "config", "gpg.program", str(script))
+    assert GitReader(repo).commit_date(signed) == datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)
+    assert not sentinel.exists()
+    _drop_config(monkeypatch, "log.showSignature=false")
+    with contextlib.suppress(ComponentError):
+        GitReader(repo).commit_date(signed)
+    assert sentinel.exists()
+
+
+def test_no_replace_objects_is_load_bearing(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = _git(repo, "rev-parse", "HEAD")
+    second = _commit(repo, "second", date="2026-03-04T05:06:07+00:00")
+    _git(repo, "replace", second, first)
+    expected = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+    assert GitReader(repo).commit_date(second) == expected
+    _drop_env(monkeypatch, "GIT_NO_REPLACE_OBJECTS")
+    assert GitReader(repo).commit_date(second) != expected  # the replacement's date
+
+
+def test_ceiling_directories_is_load_bearing(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    plain = repo / "plain"  # not a repository, but inside one
+    plain.mkdir()
+    with pytest.raises(ComponentError):
+        GitReader(plain).is_shallow()
+    real = gitread._environment
+
+    def without_ceiling(*args: Any) -> dict[str, str]:
+        env = real(*args)
+        del env["GIT_CEILING_DIRECTORIES"]
+        return env
+
+    monkeypatch.setattr(gitread, "_environment", without_ceiling)
+    assert GitReader(plain).is_shallow() is False  # found the outer repository
+
+
+@pytest.mark.skipif(_git_version() < (2, 38), reason="safe.bareRepository needs git 2.38")
+def test_safe_bare_repository_is_load_bearing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bare = tmp_path / "embedded.git"
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    with pytest.raises(ComponentError):
+        GitReader(bare).is_shallow()
+    _drop_config(monkeypatch, "safe.bareRepository=explicit")
+    assert GitReader(bare).is_shallow() is False
+
+
+@pytest.fixture
+def partial_clone(repo: Path, tmp_path: Path) -> tuple[Path, str]:
+    """A blob:none partial clone of ``repo`` and the id of a blob it lacks."""
+    (repo / "f.txt").write_text("payload\n")
+    _git(repo, "add", "f.txt")
+    _commit(repo, "blob")
+    _git(repo, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "partial"
+    _git(tmp_path, "-c", "protocol.file.allow=always", "clone", "-q", "--no-checkout",
+         "--filter=blob:none", f"file://{repo}", str(clone))  # fmt: skip
+    return clone, _git(repo, "rev-parse", "HEAD:f.txt")
+
+
+def _still_missing(clone: Path, blob: str) -> bool:
+    env = dict(_TEST_GIT_ENV, HOME=str(clone), GIT_NO_LAZY_FETCH="1")
+    probe = [_GIT, "-c", "protocol.allow=never", "cat-file", "-e", blob]
+    return _REAL_RUN(probe, cwd=clone, env=env, capture_output=True, check=False).returncode != 0
+
+
+@pytest.mark.skipif(_git_version() < (2, 44), reason="GIT_NO_LAZY_FETCH needs git 2.44")
+def test_lazy_fetch_is_blocked_by_each_setting_alone(
+    partial_clone: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clone, blob = partial_clone
+    assert GitReader(clone).has_object(blob) is False  # full hardening
+    assert _still_missing(clone, blob)
+    with monkeypatch.context() as m:  # only protocol.allow=never left
+        _drop_env(m, "GIT_NO_LAZY_FETCH")
+        with pytest.raises(ComponentError):
+            GitReader(clone).has_object(blob)
+    assert _still_missing(clone, blob)
+    with monkeypatch.context() as m:  # only GIT_NO_LAZY_FETCH left
+        _drop_config(m, "protocol.allow=never")
+        assert GitReader(clone).has_object(blob) is False
+    assert _still_missing(clone, blob)
+    _drop_env(monkeypatch, "GIT_NO_LAZY_FETCH")  # neither: the control fetches
+    _drop_config(monkeypatch, "protocol.allow=never")
+    assert GitReader(clone).has_object(blob) is True
+    assert not _still_missing(clone, blob)
