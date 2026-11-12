@@ -389,10 +389,22 @@ def _read(root: str | os.PathLike[str], parts: list[str], limit: int) -> bytes:
 
 
 def _has_link(root_real: str, parts: list[str]) -> bool:
+    """True if a component of ``parts`` is a symlink or a junction (any reparse point).
+
+    Reached only when ``realpath`` leaves the root: a link or junction pointing
+    outside, which is "symlink" like every other link (AC-N3.9). ``os.path.islink``
+    is False for a Windows junction, so this lstat-s each component instead (CR2 S3).
+    Tests reach it with a real symlink on POSIX, a real junction on Windows, and a
+    mocked ``realpath`` (CR2 N4).
+    """
     path = root_real
     for name in parts:
         path = os.path.join(path, name)
-        if os.path.islink(path):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False  # nothing here, so nothing below it can be a link
+        if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st):
             return True
     return False
 

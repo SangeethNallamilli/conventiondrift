@@ -347,6 +347,48 @@ def test_realpath_containment_defence_in_depth(
     assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_OUTSIDE
 
 
+def test_realpath_outside_for_a_missing_file_is_outside_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, strategy: str
+) -> None:
+    """The link probe stops at the first component that does not exist."""
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda p: "/elsewhere/x.py" if str(p).endswith("x.py") else real_realpath(p),
+    )
+    assert _reason(read_worktree_file, tmp_path, "gone/x.py", "python") == REASON_OUTSIDE
+
+
+def test_reparse_point_pointing_outside_is_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A junction to outside the root is "symlink", not "outside repository" (CR2 S3)."""
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False)
+    (tmp_path / "j").mkdir()
+    (tmp_path / "j/a.py").write_text("a")
+    real_lstat = os.lstat
+    real_realpath = os.path.realpath
+
+    class FakeStat:
+        def __init__(self, st: os.stat_result) -> None:
+            self._st = st
+            self.st_file_attributes = 0x400
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._st, name)
+
+    monkeypatch.setattr(
+        os, "lstat", lambda p: FakeStat(real_lstat(p)) if str(p).endswith("j") else real_lstat(p)
+    )
+    monkeypatch.setattr(
+        os.path,
+        "realpath",
+        lambda p: "/elsewhere/a.py" if str(p).endswith("a.py") else real_realpath(p),
+    )
+    assert _reason(read_worktree_file, tmp_path, "j/a.py", "python") == REASON_SYMLINK
+
+
 def test_sibling_prefix_is_not_contained(tmp_path: Path) -> None:
     root = str(tmp_path / "repo")
     assert not d._contained(root, str(tmp_path / "repo-evil" / "x"))
