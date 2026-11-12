@@ -1013,3 +1013,26 @@ def test_decode_text_cookie_is_linear_on_a_long_hostile_line() -> None:
     except FileSkipped:
         pass
     assert time.perf_counter() - start < REDOS_BUDGET_S
+
+
+# ---- SR N3 on T-009: the ASCII-superset cookie check is pinned -----------------------
+
+
+@pytest.mark.parametrize(
+    ("codec", "data"),
+    [
+        ("utf-16-le", b"# coding: utf-16-le\nx = 1\n"),  # 26 bytes: a valid UTF-16-LE text
+        ("utf-16-le", b"# coding: UTF_16LE\nx = 1\n\n"),
+        ("utf-16", b"# coding: utf-16\nx = 1\n\n"),  # even length, unlike the utf-16 case above
+        ("cp037", b"# coding: cp037\nx = 1\n"),  # EBCDIC: every byte decodes
+        ("cp500", b"#!/usr/bin/env python\n# -*- coding: cp500 -*-\nx = 1\n"),  # line 2
+    ],
+)
+def test_non_ascii_superset_cookie_is_not_decodable(codec: str, data: bytes) -> None:
+    """Only the ASCII-superset check refuses these: the bytes decode in the named codec."""
+    data.decode(codec)  # so it is the check, not a decode error, that refuses them
+    with pytest.raises(SyntaxError):
+        compile(data, "x.py", "exec")  # CPython refuses them too
+    with pytest.raises(FileSkipped) as exc:
+        decode_text(data, "python")
+    assert exc.value.reason == REASON_NOT_DECODABLE
