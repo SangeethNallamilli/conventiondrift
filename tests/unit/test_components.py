@@ -105,6 +105,8 @@ class _Client:
         run_head_sha: str,
         comment: str | None,
         sarif: str | None,
+        sarif_commit_sha: str,
+        sarif_ref: str,
     ) -> tuple[PublishOutcome, str | None]:
         return ("skipped", "read-only token")
 
@@ -191,6 +193,8 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
         ("run_head_sha", KW, NO),
         ("comment", KW, NO),
         ("sarif", KW, NO),
+        ("sarif_commit_sha", KW, NO),
+        ("sarif_ref", KW, NO),
     ),
     (GitHubClient, "lookup"): (("repo", KW, NO), ("pr_number", KW, NO)),
 }
@@ -248,7 +252,13 @@ def test_components_take_factories_and_stand_ins() -> None:
     assert components.github_client is not None
     client = components.github_client("http://127.0.0.1:8080", "fake-token")
     assert client.publish(
-        repo="o/r", pr_number=1, run_head_sha="a" * 40, comment=None, sarif=None
+        repo="o/r",
+        pr_number=1,
+        run_head_sha="a" * 40,
+        comment=None,
+        sarif=None,
+        sarif_commit_sha="c" * 40,
+        sarif_ref="refs/pull/1/merge",
     ) == ("skipped", "read-only token")
     assert client.lookup(repo="o/r", pr_number=1) == (False, None)
     variant = dataclasses.replace(components, github_base_url=None)

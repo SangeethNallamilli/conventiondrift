@@ -466,12 +466,17 @@ class GitHubApiClient:
         run_head_sha: str,
         comment: str | None,
         sarif: str | None,
+        sarif_commit_sha: str,
+        sarif_ref: str,
     ) -> tuple[PublishOutcome, str | None]:
         """Write the sticky comment and upload SARIF; never raises for HTTP errors.
 
         It acts only on its arguments (ruling 2): ``comment=None`` makes no
         comment request of any kind (no list, create, update or delete), and
-        ``sarif=None`` makes no SARIF request. The outcome describes the
+        ``sarif=None`` makes no SARIF request. ``sarif_commit_sha`` and
+        ``sarif_ref`` are ``GITHUB_SHA`` / ``GITHUB_REF`` from T-028 and go to
+        the upload verbatim; C12 never derives them (ruling 7). The outcome
+        describes the
         comment, so ``comment=None`` is ``skipped`` (ruling 6); T-028 writes the
         summary note saying why the comment was off.
         """
@@ -488,7 +493,7 @@ class GitHubApiClient:
             if cnote:
                 notes.append(cnote)
         if sarif is not None:
-            snote = self._upload_sarif(repo, sarif, commit_sha=None, ref=None)
+            snote = self._upload_sarif(repo, sarif, commit_sha=sarif_commit_sha, ref=sarif_ref)
             if snote:
                 notes.append(snote)
         if self._expired:
@@ -571,16 +576,13 @@ class GitHubApiClient:
         # A 404 means another run already removed it: success, never an error (I-3).
         return resp is not None and resp.status in (200, 204, 404)
 
-    def _upload_sarif(
-        self, repo: str, sarif: str, *, commit_sha: str | None, ref: str | None
-    ) -> str | None:
-        # I-5 pins commit_sha = GITHUB_SHA and ref = GITHUB_REF, and no publish()
-        # parameter carries GITHUB_SHA yet (open Architect question), so publish
-        # passes None and the upload is skipped with a note rather than guessed.
+    def _upload_sarif(self, repo: str, sarif: str, *, commit_sha: str, ref: str) -> str | None:
+        # I-5: commit_sha = GITHUB_SHA and ref = GITHUB_REF, sent exactly as given
+        # (ruling 7). A missing or malformed value skips the upload with a note.
         if not commit_sha or not _SHA.fullmatch(commit_sha) or not ref or not _REF.fullmatch(ref):
             return NOTE_SARIF_NO_REF
         packed = base64.b64encode(gzip.compress(sarif.encode("utf-8"), mtime=0)).decode("ascii")
-        payload = {"commit_sha": commit_sha.lower(), "ref": ref, "sarif": packed}
+        payload = {"commit_sha": commit_sha, "ref": ref, "sarif": packed}
         resp = self._call("POST", f"/repos/{repo}/code-scanning/sarifs", payload)
         if resp is None or resp.status not in _OK:
             return NOTE_SARIF_ERROR
@@ -606,6 +608,8 @@ class _SkippingClient:
         run_head_sha: str,
         comment: str | None,
         sarif: str | None,
+        sarif_commit_sha: str,
+        sarif_ref: str,
     ) -> tuple[PublishOutcome, str | None]:
         return "skipped", self._note
 

@@ -187,8 +187,18 @@ def publish(
     sarif: str | None = None,
     pr: int = PR,
     head: str = HEAD,
+    sarif_sha: str = GITHUB_SHA,
+    sarif_ref: str = GITHUB_REF,
 ) -> tuple[str, str | None]:
-    return client.publish(repo=REPO, pr_number=pr, run_head_sha=head, comment=comment, sarif=sarif)
+    return client.publish(
+        repo=REPO,
+        pr_number=pr,
+        run_head_sha=head,
+        comment=comment,
+        sarif=sarif,
+        sarif_commit_sha=sarif_sha,
+        sarif_ref=sarif_ref,
+    )
 
 
 # -- identity (I-3, ADR-0005) ------------------------------------------------------
@@ -311,7 +321,15 @@ def test_env_http_base_url_is_refused_and_never_connects() -> None:
 
 def test_missing_env_base_url_is_refused() -> None:
     client = client_from_env({"GITHUB_TOKEN": TOKEN})
-    outcome = client.publish(repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=BODY, sarif=None)
+    outcome = client.publish(
+        repo=REPO,
+        pr_number=PR,
+        run_head_sha=HEAD,
+        comment=BODY,
+        sarif=None,
+        sarif_commit_sha=GITHUB_SHA,
+        sarif_ref=GITHUB_REF,
+    )
     assert outcome == ("skipped", github.NOTE_NO_BASE_URL)
     assert github._SkippingClient(github.NOTE_NO_BASE_URL).lookup(repo=REPO, pr_number=PR) == (
         False,
@@ -323,7 +341,15 @@ def test_seam_base_url_allows_http() -> None:
     api = FakeGitHub()
     env = {"GITHUB_API_URL": "https://ignored.test", "GITHUB_TOKEN": TOKEN}
     client = client_from_env(env, base_url_override="http://127.0.0.1:9", transport=api)
-    client.publish(repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=BODY, sarif=None)
+    client.publish(
+        repo=REPO,
+        pr_number=PR,
+        run_head_sha=HEAD,
+        comment=BODY,
+        sarif=None,
+        sarif_commit_sha=GITHUB_SHA,
+        sarif_ref=GITHUB_REF,
+    )
     assert api.requests
     assert all(r.url.startswith("http://127.0.0.1:9/") for r in api.requests)
 
@@ -661,7 +687,15 @@ def test_bad_pr_head_sha_is_a_note() -> None:
 )
 def test_invalid_publish_arguments_make_no_request(repo: str, pr: int, head: str) -> None:
     api = FakeGitHub()
-    out = make(api).publish(repo=repo, pr_number=pr, run_head_sha=head, comment=BODY, sarif="{}")
+    out = make(api).publish(
+        repo=repo,
+        pr_number=pr,
+        run_head_sha=head,
+        comment=BODY,
+        sarif="{}",
+        sarif_commit_sha=GITHUB_SHA,
+        sarif_ref=GITHUB_REF,
+    )
     assert out == ("skipped", github.NOTE_BAD_REQUEST)
     assert api.requests == []
 
@@ -1052,7 +1086,13 @@ def test_converge_fork_and_dependabot_make_no_writes_deletes_included(who: str) 
     api = FakeGitHub(comments=comments, next_id=50, on_create=race(60))
     client = make(api)
     outcome, note = client.publish(
-        repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=None, sarif=None
+        repo=REPO,
+        pr_number=PR,
+        run_head_sha=HEAD,
+        comment=None,
+        sarif=None,
+        sarif_commit_sha=GITHUB_SHA,
+        sarif_ref=GITHUB_REF,
     )
     assert (outcome, note) == ("skipped", None)
     assert [r for r in api.requests if r.method in WRITE_METHODS] == []
@@ -1074,12 +1114,13 @@ def test_comment_false_makes_no_comment_writes() -> None:
 
 
 def test_comment_none_is_skipped_even_with_sarif() -> None:
-    # Ruling 6: the outcome is about the comment, and comment=None is skipped.
+    # Ruling 6/7: the outcome is about the comment, and comment=None is skipped, note None.
     api = FakeGitHub(comments=[bot_comment(5)])
-    out = publish(make(api), comment=None, sarif='{"version": "2.1.0"}')
-    assert out == ("skipped", github.NOTE_SARIF_NO_REF)
+    assert publish(make(api), comment=None, sarif='{"version": "2.1.0"}') == ("skipped", None)
     assert api.comment_requests() == []
-    assert api.writes() == []
+    assert [(r.method, r.path) for r in api.writes()] == [
+        ("POST", f"/repos/{REPO}/code-scanning/sarifs")
+    ]
 
 
 def test_api_failure_is_skipped_with_a_note() -> None:
@@ -1090,53 +1131,63 @@ def test_api_failure_is_skipped_with_a_note() -> None:
 
 
 def test_comment_false_still_uploads_sarif() -> None:
-    # Ruling 4: SARIF follows its own input, so comment=None does not stop the SARIF
-    # step. Until publish has a GITHUB_SHA source (open Architect question) that step
-    # is a fixed note and no request.
+    # Ruling 4: SARIF follows its own input, so comment=None does not stop the upload.
     api = FakeGitHub()
-    assert publish(make(api), comment=None, sarif="{}") == ("skipped", github.NOTE_SARIF_NO_REF)
-    assert api.requests == []
-
-
-def _sarif_client(api: FakeGitHub) -> GitHubApiClient:
-    client = make(api)
-    client._start_deadline()
-    return client
+    assert publish(make(api), comment=None, sarif="{}") == ("skipped", None)
+    assert [(r.method, r.path) for r in api.requests] == [
+        ("POST", f"/repos/{REPO}/code-scanning/sarifs")
+    ]
+    assert len(api.sarifs) == 1
 
 
 def test_sarif_upload_payload() -> None:
     api = FakeGitHub()
     sarif = '{"version": "2.1.0", "runs": []}'
-    client = _sarif_client(api)
-    assert client._upload_sarif(REPO, sarif, commit_sha=GITHUB_SHA, ref=GITHUB_REF) is None
+    assert publish(make(api), sarif=sarif) == ("posted", None)
     assert len(api.sarifs) == 1
     up = api.sarifs[0]
+    assert set(up) == {"commit_sha", "ref", "sarif"}
     assert up["commit_sha"] == GITHUB_SHA
     assert up["ref"] == GITHUB_REF
     assert gzip.decompress(base64.b64decode(up["sarif"])).decode() == sarif
 
 
+def test_sarif_target_is_passed_through_verbatim() -> None:
+    # Ruling 7: C12 never derives commit_sha or ref. These hand-written values share
+    # nothing with run_head_sha (HEAD) or pr_number (PR), and the SHA's mixed case
+    # must survive untouched.
+    merge_sha = "0123456789AbCdEf0123456789aBcDeF01234567"
+    merge_ref = "refs/pull/4242/merge"
+    assert merge_sha.lower() != HEAD and str(PR) not in merge_ref
+    api = FakeGitHub()
+    out = publish(make(api), sarif="{}", sarif_sha=merge_sha, sarif_ref=merge_ref)
+    assert out == ("posted", None)
+    assert [(u["commit_sha"], u["ref"]) for u in api.sarifs] == [(merge_sha, merge_ref)]
+
+
 def test_sarif_disabled_is_not_uploaded() -> None:
-    # sarif: false reaches publish as sarif=None (ruling 2).
+    # sarif: false or read-only reaches publish as sarif=None (ruling 2).
     api = FakeGitHub()
     assert publish(make(api), sarif=None) == ("posted", None)
+    assert api.requests
     assert all("code-scanning" not in r.path for r in api.requests)
+    assert api.sarifs == []
 
 
 @pytest.mark.parametrize(
     ("sha", "ref"),
     [
-        (None, GITHUB_REF),
-        (GITHUB_SHA, None),
+        ("", GITHUB_REF),
+        (GITHUB_SHA, ""),
         ("main", GITHUB_REF),
         (GITHUB_SHA, "pull/7/merge"),
         (GITHUB_SHA, "refs/x y"),
     ],
 )
-def test_sarif_without_valid_sha_or_ref_is_skipped(sha: str | None, ref: str | None) -> None:
+def test_sarif_without_valid_sha_or_ref_is_skipped(sha: str, ref: str) -> None:
     api = FakeGitHub()
-    client = _sarif_client(api)
-    assert client._upload_sarif(REPO, "{}", commit_sha=sha, ref=ref) == github.NOTE_SARIF_NO_REF
+    out = publish(make(api), comment=None, sarif="{}", sarif_sha=sha, sarif_ref=ref)
+    assert out == ("skipped", github.NOTE_SARIF_NO_REF)
     assert api.requests == []
 
 
@@ -1144,24 +1195,26 @@ def test_sarif_failure_adds_note_and_keeps_comment_outcome() -> None:
     api = FakeGitHub(
         hooks=[lambda r: HttpResponse(403, {}, b"") if "code-scanning" in r.path else None]
     )
-    client = _sarif_client(api)
-    note = client._upload_sarif(REPO, "{}", commit_sha=GITHUB_SHA, ref=GITHUB_REF)
-    assert note == github.NOTE_SARIF_ERROR
-    assert publish(make(FakeGitHub()), sarif="{}") == ("posted", github.NOTE_SARIF_NO_REF)
+    assert publish(make(api), sarif="{}") == ("posted", github.NOTE_SARIF_ERROR)
 
 
 def test_comment_and_sarif_notes_are_joined() -> None:
     api = FakeGitHub(head_sha=OTHER_HEAD)
-    out = publish(make(api), sarif="{}")
+    out = publish(make(api), sarif="{}", sarif_ref="")
     assert out == ("skipped", f"{github.NOTE_HEAD_MOVED} {github.NOTE_SARIF_NO_REF}")
 
 
 def test_client_satisfies_protocol() -> None:
     client: GitHubClient = make(FakeGitHub())
-    assert client.publish(repo=REPO, pr_number=PR, run_head_sha=HEAD, comment=None, sarif=None) == (
-        "skipped",
-        None,
-    )
+    assert client.publish(
+        repo=REPO,
+        pr_number=PR,
+        run_head_sha=HEAD,
+        comment=None,
+        sarif=None,
+        sarif_commit_sha=GITHUB_SHA,
+        sarif_ref=GITHUB_REF,
+    ) == ("skipped", None)
     assert client.lookup(repo=REPO, pr_number=PR) == (False, None)
     # The production class itself fits the Components factory type, (base_url, token).
     factory: Callable[[str, str], GitHubClient] = GitHubApiClient
