@@ -117,6 +117,8 @@ HARDENING = [
     "-c", "core.pager=cat",
     "-c", "protocol.allow=never",
     "-c", "log.showSignature=false",
+    "-c", "core.quotePath=true",
+    "-c", "i18n.logOutputEncoding=UTF-8",
     "-c", "safe.bareRepository=explicit",
 ]  # fmt: skip
 

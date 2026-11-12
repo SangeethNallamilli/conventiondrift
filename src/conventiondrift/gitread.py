@@ -101,6 +101,9 @@ HARDENING_CONFIG: tuple[str, ...] = (
     "core.pager=cat",
     "protocol.allow=never",
     "log.showSignature=false",
+    # I-14 item 9 diff-config pins: C-quoted paths and UTF-8 output, whatever the repo says.
+    "core.quotePath=true",
+    "i18n.logOutputEncoding=UTF-8",
     # SR-014 low: never discover a bare repository implicitly (git >= 2.38; older
     # git ignores the unknown key, and the run is then as before).
     "safe.bareRepository=explicit",
@@ -136,6 +139,15 @@ _MAX_COUNT_RE = re.compile(r"--max-count=([1-9][0-9]*)", re.ASCII)
 #: SR-014 low: these must carry exactly one ``--max-count=N`` with 1 <= N <= the cap.
 _MAX_COUNT_SUBCOMMANDS: frozenset[str] = frozenset({"rev-list", "log"})
 
+#: Placeholder for ``-O<orderfile>`` (I-14 item 9): replaced, after the allowlist
+#: check, by ``-O`` plus the absolute path of an empty file gitread creates in the
+#: call's private ``HOME`` (:func:`_with_orderfile`). Never chosen by config or env.
+ORDERFILE_ARG = "-O<orderfile>"
+_ORDERFILE_NAME = "conventiondrift-orderfile"
+#: I-14 item 9 pins shared by ``patches`` and ``changed_files``: fixed rename
+#: threshold and limit, no ``diff.relative``, and an empty order file.
+_DIFF_PINS: frozenset[str] = frozenset({"-M50%", "-l1000", "--no-relative", ORDERFILE_ARG})
+
 #: SR-014 low: the options each subcommand may take, before ``--end-of-options``.
 #: Everything after ``--end-of-options`` is an operand (validated by the caller).
 #: T-008 extends this for its operations; anything not listed is refused.
@@ -146,15 +158,35 @@ OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
     "merge-base": frozenset(),
     "log": frozenset(
         {"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}
-        # T-008 patches: merge diffs against the first parent (F-1), explicit renames
-        # and root diff (no repo config decides), and a commit marker with no message.
-        | {"-m", "-M", "--root", "--format=%x00%H"}
+        # T-008 patches: merge diffs against the first parent (F-1), root diff, a
+        # commit marker with no message, and the I-14 item 9 diff-config pins.
+        | {"-m", "--root", "--format=%x00%H", "--no-show-signature"}
+        | _DIFF_PINS
+        | {"--text", "--src-prefix=a/", "--dst-prefix=b/", "--diff-algorithm=myers"}
+        | {"--no-indent-heuristic", "--inter-hunk-context=0", "--submodule=short"}
     ),
     "rev-list": frozenset({"--first-parent", "--timestamp"}),
     "ls-tree": frozenset({"-r", "-l", "-z", "--full-tree"}),
-    "diff-tree": frozenset({"-r", "-z", "-M", "-p", "--no-commit-id", "--name-status"}),
+    "diff-tree": frozenset(
+        {"-r", "-z", "-M", "-p", "--no-commit-id", "--name-status"} | _DIFF_PINS
+    ),
     "show": frozenset(),
 }
+
+
+#: I-14 item 9 argv, after ``_command`` adds ``--no-ext-diff --no-textconv
+#: --no-color`` (DESIGN §3) and before ``--end-of-options``. ``patches`` also adds
+#: the required ``--max-count`` at the R2.6 cap (item 9 "the commit cap stays").
+_PATCHES_ARGS: tuple[str, ...] = (
+    "--first-parent", "-m", "--root", "-p", "-U0", "--text",
+    "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000",
+    "--diff-algorithm=myers", "--no-indent-heuristic", "--inter-hunk-context=0",
+    "--no-relative", "--submodule=short", "--no-show-signature", ORDERFILE_ARG,
+    "--format=%x00%H",
+)  # fmt: skip
+_CHANGED_FILES_ARGS: tuple[str, ...] = (
+    "-r", "-z", "--name-status", "-M50%", "-l1000", "--no-relative", ORDERFILE_ARG,
+)  # fmt: skip
 
 
 def _check_options(subcommand: str, args: Sequence[str]) -> None:
@@ -435,6 +467,25 @@ def _nul_records(data: bytes) -> list[bytes]:
     if records.pop() != b"" or b"" in records:
         raise _bad_output()
     return records
+
+
+def _with_orderfile(argv: list[str], home: str) -> list[str]:
+    """``argv`` with :data:`ORDERFILE_ARG` replaced by ``-O<home>/<fixed name>``.
+
+    The file is created empty with ``O_CREAT | O_EXCL`` (and ``O_NOFOLLOW`` where it
+    exists), mode 0600, inside the call's fresh private ``HOME``; a file already
+    there is refused rather than reused. Without the placeholder, ``argv`` is
+    returned unchanged and nothing is created.
+    """
+    if ORDERFILE_ARG not in argv:
+        return argv
+    path = os.path.join(os.path.abspath(home), _ORDERFILE_NAME)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        os.close(os.open(path, flags, 0o600))
+    except OSError as exc:
+        raise ComponentError(_COMPONENT, "order file could not be created") from exc
+    return ["-O" + path if arg == ORDERFILE_ARG else arg for arg in argv]
 
 
 def _path(raw: bytes) -> str:
@@ -834,7 +885,7 @@ class GitReader:
             if not self._version_ok:
                 self._check_version(home)
             return _run_bounded(
-                argv,
+                _with_orderfile(argv, home),
                 cwd=self._repo_dir,
                 env=_environment(home, git.search_path, self._repo_dir),
                 label=subcommand,
@@ -849,6 +900,7 @@ class GitReader:
         if not self._version_ok:
             self._check_version(home)
         env = _environment(home, self._resolved_git().search_path, self._repo_dir)
+        argv = _with_orderfile(argv, home)
         return _start_batch(argv, cwd=self._repo_dir, env=env, label=label)
 
     def _batch_process(self, mode: str) -> _BatchProcess:
@@ -1021,12 +1073,13 @@ class GitReader:
     def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]:
         """Files changed from ``base`` to ``head``, renames detected (-M, ADR-0004).
 
-        ``diff-tree -r -M -z --name-status``, capped at :data:`LISTING_MAX_BYTES`.
+        ``diff-tree`` with :data:`_CHANGED_FILES_ARGS` (I-14 item 9: the same rename
+        pins as ``patches``), capped at :data:`LISTING_MAX_BYTES`.
         Each entry is (status letter without the score, old path, new path) with
         the old path set only for R and C (I-14 item 9): a deleted file is
         ``("D", None, deleted_path)``. Paths are in git's order.
         """
-        args = ["-r", "-M", "-z", "--name-status", "--end-of-options"]
+        args = [*_CHANGED_FILES_ARGS, "--end-of-options"]
         out = self._run(
             "diff-tree",
             [*args, _require_sha(base), _require_sha(head)],
@@ -1085,8 +1138,9 @@ class GitReader:
     def patches(self, from_sha: str | None, to_sha: str) -> Generator[bytes, None, None]:
         """Raw first-parent patch text for ``from_sha..to_sha``, newest commit first.
 
-        I-14 item 9: ``log --first-parent -m -M --root -p -U0 --no-ext-diff
-        --no-textconv --no-color --format=%x00%H --max-count=10000``, then
+        I-14 item 9: ``log`` with :data:`_PATCHES_ARGS` (the diff-config pins,
+        ``--no-show-signature`` and an empty ``-O`` order file), the DESIGN §3
+        ``--no-ext-diff --no-textconv --no-color``, ``--max-count=10000``, then
         ``--end-of-options <to_sha> [^<from_sha>]``. ``from_sha`` is excluded, and
         ``None`` means back to the root. Merges diff against their first parent.
         Each commit starts with ``\\x00<sha>\\n``; commit messages are never printed.
@@ -1101,9 +1155,8 @@ class GitReader:
         revs = [_require_sha(to_sha)]
         if from_sha is not None:
             revs.append("^" + _require_sha(from_sha))
-        args = ["--first-parent", "-m", "-M", "--root", "-p", "-U0", "--format=%x00%H"]
         argv = self._command(
-            "log", [*args, f"--max-count={MAX_COUNT_CAP}", "--end-of-options", *revs]
+            "log", [*_PATCHES_ARGS, f"--max-count={MAX_COUNT_CAP}", "--end-of-options", *revs]
         )
         return self._stream_patches(argv)
 

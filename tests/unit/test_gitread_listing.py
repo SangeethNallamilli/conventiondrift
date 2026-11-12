@@ -125,6 +125,16 @@ def _sub_args(call: Call, sub: str) -> list[str]:
     return argv[argv.index(sub) + 1 :]
 
 
+def _pinned(args: list[str]) -> list[str]:
+    """``args`` with the one ``-O<abs path>`` folded back to ``-O<orderfile>``."""
+    orders = [a for a in args if a.startswith("-O")]
+    assert len(orders) == 1
+    path = orders[0][2:]
+    assert os.path.isabs(path) and os.path.basename(path) == "conventiondrift-orderfile"
+    assert os.path.basename(os.path.dirname(path)).startswith("conventiondrift-home-")
+    return ["-O<orderfile>" if a.startswith("-O") else a for a in args]
+
+
 def _no_host_path(exc: BaseException, repo: Path) -> None:
     assert str(repo) not in str(exc)
     assert str(repo.parent) not in str(exc)
@@ -150,7 +160,7 @@ def test_new_options_are_allowlisted_and_nothing_wider() -> None:
     assert "--batch-all-objects" not in allow["cat-file"]
     assert "--timestamp" in allow["rev-list"]
     assert "--name-status" in allow["diff-tree"]
-    assert {"-m", "-M", "--root", "--format=%x00%H"} <= allow["log"]
+    assert {"-m", "--root", "--format=%x00%H", "--no-show-signature"} <= allow["log"]
     assert "--reverse" not in allow["log"]
     for sub in ("log", "diff-tree"):
         assert not {"--ext-diff", "--textconv", "--output", "--follow"} & allow[sub]
@@ -521,8 +531,9 @@ def test_changed_files_add_modify_delete_and_rename(repo: Path, spy: list[Call])
         key=str,
     )
     assert _sub_args(spy[-1], "diff-tree")[:3] == ["--no-ext-diff", "--no-textconv", "--no-color"]
-    assert _sub_args(spy[-1], "diff-tree")[3:] == [
-        "-r", "-M", "-z", "--name-status", "--end-of-options", base, head,
+    assert _pinned(_sub_args(spy[-1], "diff-tree")[3:]) == [
+        "-r", "-z", "--name-status", "-M50%", "-l1000", "--no-relative", "-O<orderfile>",
+        "--end-of-options", base, head,
     ]  # fmt: skip
     assert spy[-1]["max_stdout"] == gitread.LISTING_MAX_BYTES
 
@@ -738,9 +749,13 @@ def test_patches_stream_newest_first_with_commit_markers(repo: Path, spy: list[C
     assert b"merge" not in text.replace(marker[1], b"")  # no commit messages
     (call,) = spy
     assert call["batch"] is True and call["label"] == "log"
-    assert _sub_args(call, "log") == [
+    assert _pinned(_sub_args(call, "log")) == [
         "--no-ext-diff", "--no-textconv", "--no-color",
-        "--first-parent", "-m", "-M", "--root", "-p", "-U0", "--format=%x00%H",
+        "--first-parent", "-m", "--root", "-p", "-U0", "--text",
+        "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000",
+        "--diff-algorithm=myers", "--no-indent-heuristic", "--inter-hunk-context=0",
+        "--no-relative", "--submodule=short", "--no-show-signature", "-O<orderfile>",
+        "--format=%x00%H",
         f"--max-count={gitread.MAX_COUNT_CAP}", "--end-of-options", s["c3"], "^" + s["c1"],
     ]  # fmt: skip
 
