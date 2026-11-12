@@ -201,6 +201,24 @@ jobs:
           # a sentinel that fails verification rather than skipping the check.
           checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
           enable-cache: false
+      # Test/test-macos only (contents: read, no secrets or id-token).
+      # Restore on pull_request; restore and save on push, schedule, and
+      # workflow_dispatch. Key is runner.os, the Python version, and
+      # hashFiles of the committed lockfiles. Hash-checked uv installs
+      # still use --require-hashes and --only-binary/--no-build. UV_CACHE_DIR
+      # is set on the install steps (runner.* is not available in job env).
+      - name: Restore the uv package cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+      - name: Restore and save the uv package cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
       - name: CONTRIBUTING setup (Windows)
@@ -208,7 +226,7 @@ jobs:
         # Job default is bash -e -o pipefail, so a failed native command
         # stops the step (L-5). Do not use pwsh here.
         env:
-          UV_NO_CACHE: "1"
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           # Translation of the CONTRIBUTING.md Unix setup (TW-OPEN). This is
           # the Windows install path for this matrix leg. The job fails if
@@ -223,13 +241,13 @@ jobs:
       - name: Install hashed locks with uv
         if: runner.os != 'Windows'
         env:
-          UV_NO_CACHE: "1"
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: --no-build -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         if: runner.os != 'Windows'
         env:
-          UV_NO_CACHE: "1"
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
       - name: Confirm no PyPI PyYAML in this environment
@@ -295,16 +313,34 @@ jobs:
           # a sentinel that fails verification rather than skipping the check.
           checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
           enable-cache: false
+      # Test/test-macos only (contents: read, no secrets or id-token).
+      # Restore on pull_request; restore and save on push, schedule, and
+      # workflow_dispatch. Key is runner.os, the Python version, and
+      # hashFiles of the committed lockfiles. Hash-checked uv installs
+      # still use --require-hashes and --only-binary/--no-build. UV_CACHE_DIR
+      # is set on the install steps (runner.* is not available in job env).
+      - name: Restore the uv package cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+      - name: Restore and save the uv package cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/uv-pkg-cache
+          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
       - name: Install hashed locks with uv
         env:
-          UV_NO_CACHE: "1"
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: --no-build -r requirements/build.txt -r requirements/dev.txt
       - name: Install the package (no deps, no build isolation)
         env:
-          UV_NO_CACHE: "1"
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
         run: |
           uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
       - name: Confirm no PyPI PyYAML in this environment
