@@ -128,6 +128,8 @@ FIXED_ENV: dict[str, str] = {
 
 #: R2.6 (DESIGN §10 S4): at most 10,000 first-parent commits walked.
 MAX_COUNT_CAP: int = 10_000
+#: The monotonic clock every gitread deadline uses (a test seam, like ``_start_batch``).
+_clock = time.monotonic
 #: Largest chunk ``patches`` yields (I-14 item 9). C8 counts patch bytes, not C3.
 PATCH_CHUNK_BYTES: int = 1024 * 1024
 #: Most stdout chunks held between a long-lived git and its reader (back-pressure).
@@ -631,11 +633,11 @@ def _run_bounded(
     ]
     for reader in readers:
         reader.start()
-    deadline = time.monotonic() + timeout
+    deadline = _clock() + timeout
     failure: str | None = None
     try:
         for reader in readers:
-            reader.join(max(0.0, deadline - time.monotonic()))
+            reader.join(max(0.0, deadline - _clock()))
             if over.is_set():
                 failure = "output too large"
                 break
@@ -644,7 +646,7 @@ def _run_bounded(
                 break
         if failure is None:
             try:
-                returncode = proc.wait(max(0.0, deadline - time.monotonic()))
+                returncode = proc.wait(max(0.0, deadline - _clock()))
             except subprocess.TimeoutExpired:
                 failure = "timed out"
     finally:
@@ -666,7 +668,7 @@ class _BatchProcess:
     Started only by :func:`_start_batch` (I-14 item 9). A pump thread moves stdout
     into a bounded queue, so a slow reader stops git instead of buffering its
     output; stderr is drained and discarded. Every read waits at most until its
-    ``deadline`` (``time.monotonic()``); past it, or on a short read, a fixed-text
+    ``deadline`` (``_clock()``); past it, or on a short read, a fixed-text
     ``ComponentError("gitread")`` is raised and the caller kills the process.
     """
 
@@ -723,7 +725,7 @@ class _BatchProcess:
         if self._eof:
             return False
         try:
-            chunk = self._queue.get(timeout=max(0.0, deadline - time.monotonic()))
+            chunk = self._queue.get(timeout=max(0.0, deadline - _clock()))
         except queue.Empty:
             raise self._error("timed out") from None
         if not chunk:
@@ -761,7 +763,7 @@ class _BatchProcess:
     def wait(self, deadline: float) -> int:
         """git's exit code, waiting at most until ``deadline``."""
         try:
-            return self._proc.wait(max(0.0, deadline - time.monotonic()))
+            return self._proc.wait(max(0.0, deadline - _clock()))
         except subprocess.TimeoutExpired:
             raise self._error("timed out") from None
 
@@ -1041,7 +1043,7 @@ class GitReader:
         try:
             check = self._batch_process("--batch-check")
             check.send(request)
-            header = check.read_line(SMALL_OUTPUT_MAX_BYTES, time.monotonic() + GIT_TIMEOUT_SECONDS)
+            header = check.read_line(SMALL_OUTPUT_MAX_BYTES, _clock() + GIT_TIMEOUT_SECONDS)
             m = _BATCH_HEADER.fullmatch(header)
             missing = header == request[:-1] + b" missing\n"
             if not missing and (m is None or m[1] + b"\n" != request):
@@ -1059,7 +1061,7 @@ class GitReader:
         try:
             batch = self._batch_process("--batch")
             batch.send(request)
-            deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+            deadline = _clock() + GIT_TIMEOUT_SECONDS
             if batch.read_line(SMALL_OUTPUT_MAX_BYTES, deadline) != header:
                 raise _bad_output()
             body = batch.read_exact(size + 1, deadline)
@@ -1148,9 +1150,10 @@ class GitReader:
         The result is a generator of raw stdout chunks of at most
         :data:`PATCH_CHUNK_BYTES`; git starts on the first ``next()``. C3 doesn't
         count patch bytes: C8 stops at its R2.6 cap and calls ``close()``, and the
-        generator's ``finally`` kills git's process tree and reaps it. Waiting more
-        than :data:`GIT_TIMEOUT_SECONDS` for a chunk or for git to exit, or a
-        non-zero exit, raises ``ComponentError("gitread")``.
+        generator's ``finally`` kills git's process tree and reaps it. The whole
+        stream, from spawn to git's exit, has one :data:`GIT_TIMEOUT_SECONDS`
+        deadline (I-14 item 9); running out, or a non-zero exit, kills git's tree
+        and raises ``ComponentError("gitread")``.
         """
         revs = [_require_sha(to_sha)]
         if from_sha is not None:
@@ -1161,13 +1164,14 @@ class GitReader:
     def _stream_patches(self, argv: list[str]) -> Generator[bytes, None, None]:
         with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
             process = self._start(argv, home, "log")
+            # I-14 item 9: ONE deadline from spawn to exit; every chunk wait and the
+            # exit wait use what is left of it (time spent in C8 counts too).
+            deadline = _clock() + GIT_TIMEOUT_SECONDS
             try:
                 process.close_stdin()
-                while chunk := process.read_some(
-                    PATCH_CHUNK_BYTES, time.monotonic() + GIT_TIMEOUT_SECONDS
-                ):
+                while chunk := process.read_some(PATCH_CHUNK_BYTES, deadline):
                     yield chunk
-                code = process.wait(time.monotonic() + GIT_TIMEOUT_SECONDS)
+                code = process.wait(deadline)
                 if code != 0:
                     raise ComponentError(_COMPONENT, f"git log failed (exit {code})")
             finally:
