@@ -189,7 +189,7 @@ jobs:
           # deselected by default once PR #12's marker is on the tree.
           # Windows legs include tests/security (D-TL-19 / SR-013 PATH-hijack)
           # when those tests exist; pytest discovers them from tests/.
-          python -m coverage run --parallel-mode -m pytest tests --hypothesis-seed="${HYPOTHESIS_SEED}"
+          python -m coverage run --parallel-mode -m pytest tests -rs --hypothesis-seed="${HYPOTHESIS_SEED}"
           python -m coverage combine
           python -m coverage json -o coverage.json
           python -m coverage report --show-missing
