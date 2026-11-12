@@ -6,6 +6,7 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -50,7 +51,8 @@ ROWR = (
 
 
 def run(trace: str, repo: Path, enforce: bool = False) -> list[str]:
-    return ctt.check(SPEC, trace, repo, enforce)[0]
+    fails, _meta = ctt.check(SPEC, trace, repo, enforce)
+    return cast(list[str], fails)
 
 
 def test_pass(tmp_path: Path) -> None:
