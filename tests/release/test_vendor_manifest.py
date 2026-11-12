@@ -19,15 +19,19 @@ MANIFEST syntax this test reads (test-chosen where the MANIFEST does not define 
     sdist (it must still exist upstream, actually differ, and match its MANIFEST hash).
 
 Needs network access to the pinned ``sdist-url`` (PLAN T-004: "re-extracts the pinned
-sdist"). Without it the test fails with a clear message; it never skips.
+sdist") when no hash-verified cached sdist is present. Without a valid cache or
+network the test fails with a clear message; it never skips. The module is marked
+``network`` and deselected by default.
 """
 
 from __future__ import annotations
 
 import hashlib
 import io
+import os
 import re
 import tarfile
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +57,10 @@ PATCHED_LINE = re.compile(r"^#\s*patched:\s*(\S+)\s+(\S.*)$")
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+")
 
 VENDORED_TREE_ABSENT = not (VENDOR_DIR / "yaml").is_dir()
+
+# Deselected by default (addopts -m "not network"). Fails, never skips, if run
+# offline under ``pytest -m network`` with no valid cached sdist.
+pytestmark = pytest.mark.network
 
 
 @dataclass
@@ -124,7 +132,14 @@ def load_manifest() -> Manifest:
     return parse_manifest(MANIFEST.read_text(encoding="utf-8"))
 
 
-def load_sdist(manifest: Manifest, cache_dir: Path) -> dict[str, bytes]:
+def _sdist_cache_path(filename: str) -> Path:
+    """Persistent cache path for the pinned sdist; override with CONVENTIONDRIFT_SDIST_CACHE."""
+    root = os.environ.get("CONVENTIONDRIFT_SDIST_CACHE")
+    cache_dir = Path(root) if root else Path(tempfile.gettempdir()) / "conventiondrift-sdist-cache"
+    return cache_dir / filename
+
+
+def load_sdist(manifest: Manifest) -> dict[str, bytes]:
     """Regular files of the pinned sdist, keyed by path below its single top directory."""
     url = manifest.header.get("sdist-url", "")
     want = manifest.header.get("sdist-sha256", "")
@@ -132,18 +147,28 @@ def load_sdist(manifest: Manifest, cache_dir: Path) -> dict[str, bytes]:
     assert want == PINNED_SDIST_SHA256, (
         f"MANIFEST sdist-sha256 {want!r} is not the ADR-0002 pin {PINNED_SDIST_SHA256}"
     )
-    cache = cache_dir / url.rsplit("/", 1)[-1]
-    try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as resp:  # noqa: S310
-            data = resp.read()
-    except OSError as exc:
-        pytest.fail(
-            f"test_vendor_manifest needs network access to download the pinned sdist {url} "
-            f"(PLAN T-004 re-extracts it); download failed: {exc!r}"
-        )
-    cache.write_bytes(data)
-    got = _sha256(data)
-    assert got == want, f"downloaded sdist {url} has sha256 {got}, MANIFEST pins {want}"
+    cache = _sdist_cache_path(url.rsplit("/", 1)[-1])
+    data: bytes | None = None
+    if cache.is_file():
+        cached = cache.read_bytes()
+        if _sha256(cached) == want:
+            data = cached
+    if data is None:
+        try:
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as resp:  # noqa: S310
+                data = resp.read()
+        except OSError as exc:
+            pytest.fail(
+                f"test_vendor_manifest needs network access to download the pinned sdist {url} "
+                f"(PLAN T-004 re-extracts it); download failed: {exc!r}"
+            )
+        got = _sha256(data)
+        assert got == want, f"downloaded sdist {url} has sha256 {got}, MANIFEST pins {want}"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(data)
+    else:
+        got = _sha256(data)
+        assert got == want, f"cached sdist {cache} has sha256 {got}, MANIFEST pins {want}"
 
     files: dict[str, bytes] = {}
     tops: set[str] = set()
@@ -162,9 +187,9 @@ def load_sdist(manifest: Manifest, cache_dir: Path) -> dict[str, bytes]:
 @pytest.mark.xfail(
     condition=VENDORED_TREE_ABSENT, strict=True, reason="T-004 (PR #9 / PR #11) not merged"
 )
-def test_vendor_manifest(tmp_path: Path) -> None:
+def test_vendor_manifest() -> None:
     manifest = load_manifest()
-    sdist_files = load_sdist(manifest, tmp_path)
+    sdist_files = load_sdist(manifest)
     problems: list[str] = []
     problems += [f"unparseable MANIFEST line: {line!r}" for line in manifest.bad_lines]
 
