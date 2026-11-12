@@ -1,0 +1,94 @@
+"""The only escaping code in conventiondrift (DESIGN §3a, SECURITY-RULES R3).
+
+One function per sink (R3.2). Everything shown to a user that comes from the
+repo, the event payload or another user goes through exactly one of these:
+
+* :func:`md` - comment and job summary (GitHub Flavored Markdown).
+* :func:`workflow_cmd` - the message part of a workflow command (annotations).
+* :func:`workflow_prop` - a property value of a workflow command (``file=``, ``title=``).
+* :func:`output_heredoc` - one ``GITHUB_OUTPUT`` entry with a random delimiter.
+* :func:`sarif_text` - a SARIF ``message.text`` (plain text, never Markdown).
+
+Nothing in this package ever writes ``GITHUB_ENV`` or ``GITHUB_PATH``.
+"""
+
+from __future__ import annotations
+
+import re
+import secrets
+from collections.abc import Callable
+from typing import Final
+
+__all__ = ["md", "output_heredoc", "sarif_text", "workflow_cmd", "workflow_prop"]
+
+# C0 controls and DEL become their visible Unicode Control Pictures, so a
+# newline can never end a Markdown paragraph, table row or list item.
+_CONTROL_PICTURES: Final = {c: 0x2400 + c for c in range(0x20)} | {0x7F: 0x2421}
+_BACKTICK_RUN: Final = re.compile(r"`+")  # single quantifier, linear time
+
+
+def md(text: str) -> str:
+    """Return ``text`` as one inline GFM code span that renders it literally.
+
+    Inside a code span GitHub creates no mention, ``#123`` reference, autolink,
+    link, image, emphasis or HTML element, and the visible text is the input
+    verbatim (AC-N3.10, AC-E.17). The fence is one backtick longer than the
+    longest backtick run in ``text``, and a space pads each side when ``text``
+    starts or ends with a backtick or space (CommonMark strips exactly one).
+    Control characters are shown as Control Pictures (``\\n`` -> U+240A).
+    The empty string stays empty.
+    """
+    if not text:
+        return ""
+    body = text.translate(_CONTROL_PICTURES)
+    fence = "`" * (max((len(m) for m in _BACKTICK_RUN.findall(body)), default=0) + 1)
+    if body.strip(" ") and (body[0] in "` " or body[-1] in "` "):
+        body = f" {body} "
+    return f"{fence}{body}{fence}"
+
+
+def workflow_cmd(text: str) -> str:
+    """Escape the data part of ``::command props::data`` (R3.1, AC-N3.13).
+
+    ``%`` first, then CR and LF, exactly as GitHub's runner unescapes them.
+    """
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def workflow_prop(text: str) -> str:
+    """Escape a workflow-command property value: as :func:`workflow_cmd`, plus ``:`` and ``,``."""
+    return workflow_cmd(text).replace(":", "%3A").replace(",", "%2C")
+
+
+_OUTPUT_NAME: Final = re.compile(r"[a-z][a-z0-9-]{0,63}")  # fullmatch; linear
+_DELIMITER_TRIES: Final = 8
+# Replaceable in tests only (monkeypatch); production always uses ``secrets``.
+_token: Callable[[int], str] = secrets.token_hex
+
+
+def output_heredoc(name: str, value: str) -> str:
+    """Return one ``GITHUB_OUTPUT`` entry, ``name<<D\\nvalue\\nD\\n`` (R3.1, AC-N3.13).
+
+    ``D`` is a fresh random delimiter per call, verified absent from ``value``
+    (it is regenerated if present). ``name`` is our own fixed output name and
+    must be lowercase ``[a-z][a-z0-9-]*``; anything else is a programming error
+    and raises ``ValueError``, as does failing to find an absent delimiter.
+    """
+    if not _OUTPUT_NAME.fullmatch(name):
+        raise ValueError("invalid output name")
+    for _ in range(_DELIMITER_TRIES):
+        delimiter = f"ghadelimiter_{_token(16)}"
+        if delimiter not in value:
+            return f"{name}<<{delimiter}\n{value}\n{delimiter}\n"
+    raise ValueError("no heredoc delimiter absent from the value")
+
+
+def sarif_text(text: str) -> str:
+    """Return ``text`` for a SARIF plain-text ``message.text`` (R3.1, AC-N3.10).
+
+    Backslash, ``[`` and ``]`` are backslash-escaped so no ``[text](id)``
+    embedded link (SARIF 2.1.0 §3.11.6) can form from repo text; viewers show
+    the original characters. JSON encoding is left to the serializer, and no
+    Markdown field is ever built from repo text.
+    """
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
