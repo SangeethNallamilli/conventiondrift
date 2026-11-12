@@ -700,13 +700,16 @@ def test_rule_match_error_does_not_echo_option_values() -> None:
     assert hostile not in str(excinfo.value)
 
 
-# D-TL-25: the two I-10 invalid classes, using the same union and intersection
-# checks as RuleMatch.__post_init__.
+# D-TL-25: the two I-10 invalid classes. This oracle restates the I-10 rule
+# element by element ("at least one option named"; "no option both preferred
+# and prohibited") instead of reusing __post_init__'s set operations, so a bug
+# in those operations cannot also hide in the expected answer.
 def _rule_match_invalid_class(preferred: frozenset[str], prohibited: frozenset[str]) -> str | None:
-    if not (preferred | prohibited):
+    if len(preferred) == 0 and len(prohibited) == 0:
         return "empty_union"
-    if preferred & prohibited:
-        return "overlap"
+    for option in sorted(preferred):
+        if option in prohibited:
+            return "overlap"
     return None
 
 
