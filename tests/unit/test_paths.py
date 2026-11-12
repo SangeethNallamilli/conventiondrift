@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import ntpath
 import os
 import sys
 import typing
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -191,13 +192,39 @@ COLON_VALUES = [v for v, _ in COLON_FORMS]
 
 
 @pytest.fixture(params=["posix", "nt"])
-def os_name(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+def os_name(request: pytest.FixtureRequest) -> str:
     """Run a validate_relpath test as if on POSIX and as if on Windows.
 
-    Only pure string checks run under the patched name (no Path objects or file system).
+    The fixture only names the OS; :func:`_as_os` patches ``os.name`` around the
+    call under test.
     """
-    monkeypatch.setattr(os, "name", request.param)
     return str(request.param)
+
+
+@contextlib.contextmanager
+def _as_os(name: str) -> Iterator[None]:
+    """Patch ``os.name`` only around the call under test, restoring it before any assert.
+
+    On Python 3.11, a concrete ``Path`` built while ``os.name`` is patched (pytest
+    builds them while reporting a failure) crashes the run with INTERNALERROR. So
+    nothing here builds a Path, and a failing assert always runs with the real name.
+    """
+    real = os.name
+    os.name = name
+    try:
+        yield
+    finally:
+        os.name = real
+
+
+def _reason_as(name: str, fn: Callable[..., object], *args: object, **kw: object) -> str | None:
+    """Call ``fn`` with ``os.name`` patched; return the skip reason, or None if it passed."""
+    with _as_os(name):
+        try:
+            fn(*args, **kw)
+        except FileSkipped as exc:
+            return exc.reason
+    return None
 
 
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY + COLON_VALUES)
@@ -205,36 +232,26 @@ def test_windows_only_typed_value_is_outside_repository_on_every_os(
     value: str, os_name: str
 ) -> None:
     """A value the user typed keeps AC-N3.8's reason on every OS (D-PM-28)."""
-    with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, origin="input")
-    assert exc.value.reason == REASON_OUTSIDE
+    assert _reason_as(os_name, validate_relpath, value, origin="input") == REASON_OUTSIDE
 
 
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY)
 def test_windows_only_tree_name_is_unsupported_on_every_os(value: str, os_name: str) -> None:
     """Backslash, trailing dot or space, and device names in the tree (D-PM-28, I-13)."""
-    with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, origin="tree")
-    assert exc.value.reason == REASON_UNSUPPORTED
+    assert _reason_as(os_name, validate_relpath, value, origin="tree") == REASON_UNSUPPORTED
 
 
 @pytest.mark.parametrize("value", COLON_VALUES)
-def test_colon_tree_name_is_unsupported_on_windows(
-    value: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(os, "name", "nt")
-    with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, origin="tree")
-    assert exc.value.reason == REASON_UNSUPPORTED
+def test_colon_tree_name_is_unsupported_on_windows(value: str) -> None:
+    assert _reason_as("nt", validate_relpath, value, origin="tree") == REASON_UNSUPPORTED
 
 
 @pytest.mark.parametrize(("value", "expected"), COLON_FORMS)
-def test_colon_tree_name_is_analyzed_on_posix(
-    value: str, expected: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_colon_tree_name_is_analyzed_on_posix(value: str, expected: str) -> None:
     """On Linux and macOS a ':' is an ordinary name character (D-PM-28 narrowed, AC-N3.13)."""
-    monkeypatch.setattr(os, "name", "posix")
-    assert validate_relpath(value, origin="tree") == expected
+    with _as_os("posix"):
+        got = validate_relpath(value, origin="tree")
+    assert got == expected
 
 
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY + COLON_VALUES)
@@ -337,12 +354,10 @@ LONE_SURROGATES = [
 def test_lone_surrogate_split_by_origin(
     value: str, origin: PathOrigin, expected: str, os_name: str, opened: list[object]
 ) -> None:
-    with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, origin=origin)
-    assert exc.value.reason == expected
-    with pytest.raises(FileSkipped) as exc2:  # never a UnicodeEncodeError
-        read_worktree_file("/nonexistent", value, "python", origin=origin)
-    assert exc2.value.reason == expected
+    assert _reason_as(os_name, validate_relpath, value, origin=origin) == expected
+    # Never a UnicodeEncodeError: it would propagate out of _reason_as and fail the test.
+    got = _reason_as(os_name, read_worktree_file, "/nonexistent", value, "python", origin=origin)
+    assert got == expected
     assert opened == [], "nothing may be opened for a rejected path"
 
 
@@ -429,13 +444,8 @@ def test_tree_name_agrees_with_ntpath_isreserved(os_name: str) -> None:
     """Our device-name and trailing-dot checks say what Python 3.13's ``isreserved`` says."""
     for name in DEVICE_PROBES:
         reserved: bool = ntpath.isreserved(name)  # type: ignore[attr-defined,unused-ignore]
-        try:
-            validate_relpath(name, origin="tree")
-        except FileSkipped as exc:
-            assert exc.reason == REASON_UNSUPPORTED
-            assert reserved, name
-        else:
-            assert not reserved, name
+        got = _reason_as(os_name, validate_relpath, name, origin="tree")
+        assert got == (REASON_UNSUPPORTED if reserved else None), name
 
 
 # ---- CR2 S4: an origin outside Literal["input", "tree"] gets the strict branch ---------
@@ -456,15 +466,12 @@ def test_unknown_origins_are_outside_the_literal() -> None:
     "value", ["c:x.py", "src/a.py:stream", "a\\b.py", "nul.txt", "a\udc80.py", "src/a.py."]
 )
 def test_unknown_origin_is_treated_as_typed(
-    origin: object, value: str, monkeypatch: pytest.MonkeyPatch, opened: list[object]
+    origin: object, value: str, opened: list[object]
 ) -> None:
-    monkeypatch.setattr(os, "name", "posix")  # where a tree name with ':' would be accepted
-    with pytest.raises(FileSkipped) as exc:
-        validate_relpath(value, origin=origin)  # type: ignore[arg-type]
-    assert exc.value.reason == REASON_OUTSIDE
-    with pytest.raises(FileSkipped) as exc2:
-        read_worktree_file("/nonexistent", value, "python", origin=origin)  # type: ignore[arg-type]
-    assert exc2.value.reason == REASON_OUTSIDE
+    # Simulated POSIX, where a tree name with ':' would be accepted.
+    assert _reason_as("posix", validate_relpath, value, origin=origin) == REASON_OUTSIDE
+    got = _reason_as("posix", read_worktree_file, "/nonexistent", value, "python", origin=origin)
+    assert got == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
 
 
