@@ -201,7 +201,11 @@ def _write_reader_git(folder: Path, name: str, marker: Path) -> Path:
         verbatim = str(marker).replace('"', '""')
         source = (
             "#include <stdio.h>\n#include <string.h>\n"
+            "#include <fcntl.h>\n#include <io.h>\n"
             "int main(int argc, char **argv) {\n"
+            # Binary stdout: text mode would turn "false\n" into "false\r\n",
+            # which _one_line rightly rejects; real git.exe writes LF only.
+            "    _setmode(_fileno(stdout), _O_BINARY);\n"
             f'    FILE *f = fopen("{sentinel_lit}", "w");\n'
             '    if (f) { fputs("trusted\\n", f); fclose(f); }\n'
             "    for (int i = 1; i < argc; i++) {\n"
