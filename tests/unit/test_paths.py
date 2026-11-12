@@ -5,6 +5,7 @@ from __future__ import annotations
 import ntpath
 import os
 import sys
+import typing
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -117,6 +118,32 @@ def test_accept_and_normalize(value: str, expected: str, origin: PathOrigin) -> 
     assert validate_relpath(value, origin=origin) == expected
 
 
+# The Python 3.13 ``ntpath._reserved_names`` set, written out (SR N2, I-13).
+PY313_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{c}" for c in "123456789\u00b9\u00b2\u00b3"]
+    + [f"LPT{c}" for c in "123456789\u00b9\u00b2\u00b3"]
+)
+
+
+def _case_variants(name: str) -> tuple[str, ...]:
+    """Upper, lower, title and mixed case (D-TL-25): matching must ignore case."""
+    return tuple(dict.fromkeys((name, name.lower(), name.title(), name.title().swapcase())))
+
+
+# D-TL-25: every reserved name in every case variant, bare and with extensions or a
+# trailing-space stem, as a later segment, and as a folder. Built from the spec set
+# above; test_device_names_match_python_313 ties that set to the code's.
+DEVICE_NEGATIVES = [
+    *(v for n in sorted(PY313_DEVICE_NAMES) for v in _case_variants(n)),
+    *(
+        form
+        for n in sorted(PY313_DEVICE_NAMES)
+        for form in (f"{n.lower()}.py", f"{n}.tar.gz", f"src/{n.title()} .log", f"{n}/x.py")
+    ),
+]
+
+
 # Skipped or rejected on every OS, for both origins (D-PM-28 #5 as narrowed, I-13).
 ALWAYS_WINDOWS_ONLY = [
     "\\\\server\\share",
@@ -132,12 +159,7 @@ ALWAYS_WINDOWS_ONLY = [
     "a ",
     "src /a.py",
     "src/a.py ",
-    # reserved device names, any case, with or without an extension, any segment
-    *[
-        n
-        for d in ("CON", "PRN", "AUX", "NUL", "COM1", "COM9", "LPT1", "LPT9")
-        for n in (d, d.lower())
-    ],
+    # reserved device names: hand-picked shapes, then the full set (D-TL-25)
     "nul.txt",
     "Com1.py",
     "lPt9.tar.gz",
@@ -147,16 +169,7 @@ ALWAYS_WINDOWS_ONLY = [
     "a/nul.d/b.py",
     "NUL .txt",  # Windows ignores the trailing space before the extension
     "src/c:x/nul.py",  # a device name still wins on POSIX next to a ':'
-    # SR N2 (I-13): the rest of the Python 3.13 set, any case, with an extension
-    *[
-        n
-        for d in (
-            "CONIN$",
-            "CONOUT$",
-            *(f"{p}{c}" for p in ("COM", "LPT") for c in "\u00b9\u00b2\u00b3"),
-        )
-        for n in (d, d.lower(), d.title(), f"{d.lower()}.py", f"src/{d} .log", f"{d}.tar.gz")
-    ],
+    *DEVICE_NEGATIVES,
 ]
 
 # A ':' in any segment: always rejected when typed; for a tree name, only on Windows.
@@ -333,6 +346,18 @@ def test_lone_surrogate_split_by_origin(
     assert opened == [], "nothing may be opened for a rejected path"
 
 
+def test_every_surrogate_code_point_is_rejected() -> None:
+    """D-TL-25: the whole U+D800..U+DFFF range, alone and inside a name, both origins."""
+    for cp in range(0xD800, 0xE000):
+        for value in (chr(cp), f"src/a{chr(cp)}b.py"):
+            with pytest.raises(FileSkipped) as exc:
+                validate_relpath(value, origin="tree")
+            assert exc.value.reason == REASON_UNSUPPORTED
+            with pytest.raises(FileSkipped) as exc2:
+                validate_relpath(value, origin="input")
+            assert exc2.value.reason == REASON_OUTSIDE
+
+
 @pytest.mark.parametrize("value", ["../\ud800.py", "/\udc80", "a\udc80\x00"])
 def test_traversal_wins_over_lone_surrogate(value: str) -> None:
     with pytest.raises(FileSkipped) as exc:
@@ -363,19 +388,20 @@ def test_real_non_utf8_tree_name_is_unsupported(tmp_path: Path, opened: list[obj
     assert opened == [], "nothing may be opened for a rejected path"
 
 
-# The Python 3.13 ``ntpath._reserved_names`` set, written out (SR N2, I-13).
-PY313_DEVICE_NAMES = frozenset(
-    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
-    + [f"COM{c}" for c in "123456789\u00b9\u00b2\u00b3"]
-    + [f"LPT{c}" for c in "123456789\u00b9\u00b2\u00b3"]
-)
-
-
 def test_device_names_match_python_313() -> None:
     assert len(PY313_DEVICE_NAMES) == 30
     assert safefs._DEVICE_NAMES == PY313_DEVICE_NAMES
     if sys.version_info >= (3, 13):  # the stdlib's own set, where it exists
         assert ntpath._reserved_names == PY313_DEVICE_NAMES  # type: ignore[attr-defined]
+
+
+def test_device_negatives_cover_every_reserved_name_and_case() -> None:
+    """D-TL-25: the negative parameters cover the whole set, in every case variant."""
+    for name in PY313_DEVICE_NAMES:
+        for variant in _case_variants(name):
+            assert variant in ALWAYS_WINDOWS_ONLY, variant
+        assert any(v.startswith(f"{name.lower()}.") for v in ALWAYS_WINDOWS_ONLY), name
+    assert {v.upper() for v in _case_variants("conin$")} == {"CONIN$"}
 
 
 DEVICE_PROBES = [
@@ -415,6 +441,14 @@ def test_tree_name_agrees_with_ntpath_isreserved(os_name: str) -> None:
 # ---- CR2 S4: an origin outside Literal["input", "tree"] gets the strict branch ---------
 
 UNKNOWN_ORIGINS: list[object] = ["TREE", "Tree", "inputs", "", None, "tree ", 0]
+
+
+def test_unknown_origins_are_outside_the_literal() -> None:
+    """D-TL-25: the bad origins are built against PathOrigin itself, case variants included."""
+    valid = set(typing.get_args(PathOrigin))
+    assert valid == {"input", "tree"}
+    assert not valid & set(UNKNOWN_ORIGINS)
+    assert {"TREE", "Tree"} <= set(UNKNOWN_ORIGINS)  # case variants of "tree"
 
 
 @pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)
@@ -483,19 +517,9 @@ def test_windows_real_alternate_data_stream_is_never_opened(
         pytest.fail("Windows-only")
 
 
+# D-TL-25: every reserved name in every case, plus hand-picked shapes.
 WINDOWS_DEVICE_PATHS = [
-    "CON",
-    "nul",
-    "NUL.txt",
-    "aux.py",
-    "PRN",
-    "COM1",
-    "lpt9.log",
-    "COM\u00b9",
-    "com\u00b2.py",
-    "LPT\u00b3",
-    "CONIN$",
-    "conout$.log",
+    *DEVICE_NEGATIVES,
     "NUL .txt",
     "src/NUL",
     "src/CONIN$",

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import typing
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -165,14 +166,22 @@ def test_lowered_limit_applies_to_reads(tmp_path: Path, strategy: str) -> None:
 
 
 def test_check_size_honours_a_lowered_limit() -> None:
-    """Git blobs use check_size with I-6 ``max_file_bytes`` (D-PM-28 #7, CR2 S2)."""
-    check_size(1024, "python", 1024)
-    assert _reason(check_size, 1025, "python", 1024) == REASON_SIZE
-    check_size(FILE_MAX_BYTES, "instruction", FILE_MAX_BYTES + 1)  # can only lower it
-    assert _reason(check_size, FILE_MAX_BYTES + 1, "manifest", FILE_MAX_BYTES * 2) == REASON_SIZE
-    # The config limit is fixed: a larger max_file_bytes does not raise it.
-    check_size(CONFIG_MAX_BYTES, "config", FILE_MAX_BYTES)
-    assert _reason(check_size, CONFIG_MAX_BYTES + 1, "config", FILE_MAX_BYTES) == REASON_SIZE
+    """Git blobs use check_size with I-6 ``max_file_bytes`` (D-PM-28 #7, CR2 S2).
+
+    D-TL-25: every FileKind, taken from the Literal itself.
+    """
+    kinds: tuple[FileKind, ...] = typing.get_args(FileKind)
+    assert set(kinds) == {"instruction", "python", "manifest", "lockfile", "config"}
+    for kind in kinds:
+        if kind == "config":  # the config limit is fixed: max_file_bytes never moves it
+            for override in (1024, FILE_MAX_BYTES):
+                check_size(CONFIG_MAX_BYTES, kind, override)
+                assert _reason(check_size, CONFIG_MAX_BYTES + 1, kind, override) == REASON_SIZE
+            continue
+        check_size(1024, kind, 1024)
+        assert _reason(check_size, 1025, kind, 1024) == REASON_SIZE, kind
+        check_size(FILE_MAX_BYTES, kind, FILE_MAX_BYTES + 1)  # can only lower it
+        assert _reason(check_size, FILE_MAX_BYTES + 1, kind, FILE_MAX_BYTES * 2) == REASON_SIZE
 
 
 def test_empty_file_reads_empty(tmp_path: Path, strategy: str) -> None:
