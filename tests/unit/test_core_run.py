@@ -170,9 +170,12 @@ def test_run_reports_non_component_exceptions_as_core(monkeypatch: pytest.Monkey
     assert pipeline.context.internal_errors == (InternalError("core", "ValueError" + SUFFIX),)
 
 
-def test_run_does_not_swallow_base_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(core, "_pipeline", _Recorder(KeyboardInterrupt()))
-    with pytest.raises(KeyboardInterrupt):
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_run_does_not_swallow_base_exceptions(
+    monkeypatch: pytest.MonkeyPatch, exc_type: type[BaseException]
+) -> None:
+    monkeypatch.setattr(core, "_pipeline", _Recorder(exc_type()))
+    with pytest.raises(exc_type):
         run([], {}, entry="cli")
 
 

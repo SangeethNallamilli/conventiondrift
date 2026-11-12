@@ -4,6 +4,8 @@ import dataclasses
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
+from typing import get_args
 
 import pytest
 
@@ -18,7 +20,15 @@ from conventiondrift.components import (
     Side,
     TreeEntry,
 )
-from conventiondrift.model import Result, Window
+from conventiondrift.model import (
+    CheckerId,
+    CheckerPolicy,
+    Policy,
+    ReportCounts,
+    Result,
+    Thresholds,
+    Window,
+)
 
 FIELDS = (
     "git_reader",
@@ -174,3 +184,45 @@ def test_renderer_protocol_shape() -> None:
 
     components = Components(renderer=_Renderer())
     assert components.renderer is not None
+    rendered = components.renderer.render(_minimal_result(), previous_comment=False)
+    assert isinstance(rendered, Rendered)
+    assert rendered.comment == "c"
+    again = components.renderer.render(_minimal_result(), previous_comment=True)
+    assert again.comment is None
+
+
+def _minimal_result() -> Result:
+    policy = Policy(
+        effective_fail_on="none",
+        gated=False,
+        source="base",
+        history_days=90,
+        thresholds=Thresholds(80, 20, 20, 50, 70, 5),
+        excludes=(),
+        max_file_bytes=1048576,
+        checkers=MappingProxyType({cid: CheckerPolicy(True, ()) for cid in get_args(CheckerId)}),
+        ignores=(),
+        markers=MappingProxyType({}),
+        paths=None,
+        comment=True,
+        sarif=False,
+        after_merge_notes=(),
+        notes=(),
+    )
+    return Result(
+        mode="scan",
+        base_sha=None,
+        head_sha="b" * 40,
+        head_only_reason=None,
+        window=Window(end=None, days=90, available=False, unavailable_reason="no history"),
+        policy=policy,
+        instruction_files=(),
+        skipped_files=(),
+        rule_results=(),
+        conflicts=(),
+        unattached_markers=(),
+        internal_errors=(),
+        counts=ReportCounts(stale=0, new_stale=0, rules_changed=0, rules_unchanged=0),
+        notes=(),
+        analyzer_python="3.13.5",
+    )

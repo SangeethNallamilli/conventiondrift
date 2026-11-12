@@ -142,6 +142,9 @@ def run(
         context.internal_errors += (internal_error(exc),)
         outcome = AnalysisOutcome(
             fail_on=error_fail_on(context.explicit_fail_on, context.base_fail_on),
+            # Head-only isn't known yet when the error is caught. It doesn't matter: exit_code()
+            # returns 0 for "none" and 3 for an internal error under a gating mode before it
+            # looks at head_only (SC-2.50), so either value gives the same exit code.
             head_only=False,
             new_stale_met=False,
             any_stale_met=False,
