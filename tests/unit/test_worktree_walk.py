@@ -59,20 +59,34 @@ def test_lists_regular_files_sorted(tmp_path: Path, strategy: str) -> None:
     )
 
 
+def _excluded_dir_names() -> list[str]:
+    """D-TL-25: one folder per hard-excluded name and per I-5 normalisation class."""
+    ignorable = sorted(d.HARD_EXCLUDE_IGNORABLE)
+    out: list[str] = []
+    for name in sorted(d._HARD_EXCLUDED_NAMES):
+        out += [name, name.upper(), name.title()]  # case
+        out += [name[:2] + ch + name[2:] for ch in ignorable]  # every ignorable code point
+        if POSIX:  # Windows strips these itself, so the folder would be `name`
+            out += [name + ".", name + " ", name + ". ."]
+    out += ["GIT~1", "GI1A2B~1", "NODE_M~1", "NO1A2B~12"]  # 8.3 short names
+    return out
+
+
 def test_hard_excluded_folders_are_never_entered(
     tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    make(tmp_path, "src/a.py", ".git/config", "node_modules/m/x.py", "src/.GIT/config")
-    make(tmp_path, "NODE_M~1/x.py", "git~1/config", "GI1A2B~1/HEAD", "src/node\ufeff_modules/a.py")
-    make(tmp_path, ".g\u200cit/config", "gitx~1/a.py")
-    if POSIX:  # Windows can't create these names; there they'd be the same folder anyway
-        make(tmp_path, ".git./config", ".GIT /config")
+    names = _excluded_dir_names()
+    assert set(d._HARD_EXCLUDED_NAMES) <= set(names)
+    assert all(any(ch in n for n in names) for ch in d.HARD_EXCLUDE_IGNORABLE)
+    for i, name in enumerate(names):
+        (tmp_path / name).mkdir(exist_ok=True)  # case-insensitive FS: same folder, fine
+        (tmp_path / name / f"x{i}.py").write_text("x = 1\n")
+    make(tmp_path, "src/a.py", "src/.GIT/config", "src/node_modules/m.py", "gitx~1/a.py")
     seen = lstat_spy(monkeypatch)
     res = walk_worktree(tmp_path)
     assert res.files == ("gitx~1/a.py", "src/a.py")
     assert res.skipped == ()
-    names = [os.path.basename(p) for p in seen]
-    assert not any(d.is_hard_excluded(n) for n in names)  # not even lstat-ed
+    assert not any(d.is_hard_excluded(os.path.basename(p)) for p in seen)  # not even lstat-ed
 
 
 def test_git_symlink_and_gitlink_file_are_skipped_silently(tmp_path: Path, strategy: str) -> None:
@@ -174,9 +188,18 @@ def test_root_over_the_entry_cap(
     assert walk_worktree(tmp_path) == WalkResult((), (SkippedFile(".", "walk limit"),), 0)
 
 
-@pytest.mark.parametrize("code", [errno.EACCES, errno.ENOENT, errno.EIO])
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        (errno.EACCES, "unreadable"),
+        (errno.ENOENT, "unreadable"),
+        (errno.EIO, "unreadable"),
+        (errno.ELOOP, "symlink"),
+        (errno.ENAMETOOLONG, "unsupported path"),  # a tree name (I-14), never "outside"
+    ],
+)
 def test_lstat_error_is_a_fixed_reason(
-    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch, code: int
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch, code: int, reason: str
 ) -> None:
     make(tmp_path, "a.py", "b.py")
     real = os.lstat
@@ -189,7 +212,7 @@ def test_lstat_error_is_a_fixed_reason(
     monkeypatch.setattr(os, "lstat", fail)
     res = walk_worktree(tmp_path)
     assert res.files == ("a.py",)
-    assert res.skipped == (SkippedFile("b.py", "unreadable"),)
+    assert res.skipped == (SkippedFile("b.py", reason),)  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(not POSIX or os.geteuid() == 0, reason="needs POSIX permissions, not root")
@@ -251,3 +274,79 @@ def test_fallback_rechecks_the_folder_after_listing(
     res = walk_worktree(repo)
     assert res.files == ("a.py",)
     assert res.skipped == (SkippedFile("sub", "symlink"),)
+
+
+def test_walk_result_is_immutable() -> None:
+    res = WalkResult((), (), 0)
+    with pytest.raises(AttributeError):
+        res.entries = 1  # type: ignore[misc]
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/fd"), reason="needs /dev/fd")
+def test_every_folder_handle_is_closed(tmp_path: Path, strategy: str) -> None:
+    make(tmp_path, "a/b/c.py", "d/e.py", "f.py")
+    if POSIX:
+        (tmp_path / "locked").mkdir(mode=0)
+    before = len(os.listdir("/dev/fd"))
+    walk_worktree(tmp_path)
+    assert len(os.listdir("/dev/fd")) == before
+
+
+def test_dir_fd_strategy_lists_through_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not d._USE_DIR_FD:
+        pytest.skip("platform has no dir_fd/O_NOFOLLOW")
+    make(tmp_path, "a/b.py")
+    seen: list[object] = []
+    real = os.scandir
+
+    def spy(path: int) -> object:
+        seen.append(path)
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", spy)
+    assert walk_worktree(tmp_path).files == ("a/b.py",)
+    assert len(seen) == 2
+    assert all(isinstance(p, int) for p in seen)
+
+
+def test_links_and_special_files_are_never_opened(
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside"
+    make(outside, "x.py")
+    repo = tmp_path / "repo"
+    make(repo, "a.py")
+    symlink(outside, repo / "linkdir", is_dir=True)
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(repo / "fifo")
+    opened: list[str] = []
+    real_open, real_scandir = os.open, os.scandir
+
+    def spy_open(path: str, *a: object, **k: object) -> int:
+        opened.append(os.fsdecode(path))
+        return real_open(path, *a, **k)  # type: ignore[arg-type]
+
+    def spy_scandir(path: str | int) -> object:
+        opened.append(path if isinstance(path, int) else os.fsdecode(path))  # type: ignore[arg-type]
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "scandir", spy_scandir)
+    res = walk_worktree(repo)
+    assert res.files == ("a.py",)
+    names = {os.path.basename(p) for p in opened if isinstance(p, str)}
+    assert not names & {"linkdir", "fifo"}
+
+
+def test_junction_is_symlink(
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make(tmp_path, "a.py", "junction/x.py")
+    real = d._is_reparse_point
+    junction = os.lstat(tmp_path / "junction")
+    monkeypatch.setattr(d, "_is_reparse_point", lambda st: st.st_ino == junction.st_ino or real(st))
+    res = walk_worktree(tmp_path)
+    assert res.files == ("a.py",)
+    assert res.skipped == (SkippedFile("junction", "symlink"),)

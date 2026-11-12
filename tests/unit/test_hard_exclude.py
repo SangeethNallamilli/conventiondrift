@@ -1,4 +1,10 @@
-"""T-010b unit tests: the I-5 hard-exclusion name check (SR N4 on T-009, SC-2.43)."""
+"""T-010b unit tests: the I-5 hard-exclusion name check (SR N4 on T-009, SC-2.43).
+
+D-TL-25: the positive and negative cases are generated from the code's own
+constants (``_HARD_EXCLUDED_NAMES``, ``HARD_EXCLUDE_IGNORABLE``, the trailing
+characters stripped and the short-name patterns in ``REGEXES``), and
+``test_cases_cover_every_class`` fails if a class gains a member with no case.
+"""
 
 from __future__ import annotations
 
@@ -18,76 +24,76 @@ from conventiondrift.discover.safefs import (
 )
 from conventiondrift.errors import FileSkipped
 
-EXCLUDED = [
-    ".git",
-    "node_modules",
-    ".GIT",
-    ".Git",
-    "NODE_MODULES",
-    "Node_Modules",
-    # NTFS trailing dots and spaces, repeated and mixed (step 2).
-    ".git.",
-    ".GIT ",
-    ".git. .",
-    "node_modules...",
-    # Ignorable code points (step 1), anywhere in the name.
-    ".g\u200cit",
-    "\ufeff.git",
-    ".git\u200b",
-    "node\ufeff_modules",
-    "\u00adnode_modules",
-    ".g\u034fi\u180bt",
-    ".g\u202eit",
-    ".gi\u2060t",
-    ".gi\u206ft",
-    ".git\ufe0f",
-    # Ignorables are dropped before trailing dots/spaces are stripped.
-    ".git.\u200b",
-    # casefold, not lower: U+017F LATIN SMALL LETTER LONG S folds to "s".
-    "node_module\u017f",
-    # 8.3 short names (step 4).
-    "git~1",
-    "GIT~1",
-    "git~12",
-    "GI1A2B~1",
-    "gi00ff~9",
-    "NODE_M~1",
-    "node_m~12",
-    "NO1A2B~3",
-    "GIT~1.",
-]
-NOT_EXCLUDED = [
-    "git",
-    ".gitignore",
-    ".github",
-    ".git-blame-ignore-revs",
-    "x.git",
-    "..git",
-    "_git",
-    "node_module",
-    "node_modules2",
-    "gitx~1",
-    "git~0",
-    "git~01",
-    "git~",
-    "git~1a",
-    "gi1a2~1",
-    "gi1a2b3~1",
-    "gi1a2g~1",
-    "node_m~0",
-    "nodem~1",
-    "no1a2~1",
-    "xgit~1",
-    "git~1\n",
-    " .git",
-    ".g it",
-    # Not in HARD_EXCLUDE_IGNORABLE, so the name stays different.
-    ".g\u200ait",
-    ".g\u2028it",
-    "",
-    ".",
-    "..",
-]
+NAMES = sorted(d._HARD_EXCLUDED_NAMES)
+IGNORABLE = sorted(HARD_EXCLUDE_IGNORABLE)
+TRAILING = ". "  # I-5 step 2: NTFS drops trailing dots and spaces
+# Short names per name, keyed like NAMES; each must fullmatch exactly one REGEXES entry.
+SHORT = {
+    ".git": ["git~1", "GIT~1", "git~12", "GI1A2B~1", "gi00ff~9", "GIT~1."],
+    "node_modules": ["NODE_M~1", "node_m~12", "NO1A2B~3", "no00ff~9", "NODE_M~1 "],
+}
+SHORT_NEAR_MISS = {
+    ".git": ["gitx~1", "git~0", "git~01", "git~", "git~1a", "gi1a2~1", "gi1a2b3~1", "gi1a2g~1"],
+    "node_modules": ["node_m~0", "nodem~1", "no1a2~1", "node_mo~1", "no1a2b3~1", "xnode_m~1"],
+}
+
+
+def _case_variants(name: str) -> list[str]:
+    return sorted({name.upper(), name.title(), name.swapcase(), name.capitalize()} - {name})
+
+
+def _excluded_cases() -> list[str]:
+    out: list[str] = []
+    for name in NAMES:
+        out.append(name)
+        out += _case_variants(name)  # step 3
+        out += [name + t for t in TRAILING] + [name + TRAILING * 3]  # step 2, repeated
+        out += [name[:2] + ch + name[2:] for ch in IGNORABLE]  # step 1, every code point
+        out += [ch + name.upper() + "." for ch in IGNORABLE[:1]]  # all three steps at once
+        out.append(name + "." + IGNORABLE[0])  # ignorables go before the strip
+        out += SHORT[name]
+    out.append("node_module\u017f")  # casefold, not lower: U+017F folds to "s"
+    return out
+
+
+def _boundary_neighbours() -> list[str]:
+    """Code points next to the ignorable set that are not in it."""
+    cps = {ord(c) for c in HARD_EXCLUDE_IGNORABLE}
+    return sorted(chr(n) for c in cps for n in (c - 1, c + 1) if n not in cps)
+
+
+def _not_excluded_cases() -> list[str]:
+    out: list[str] = ["", ".", "..", "git", ".gitignore", ".github", "..git", "x.git"]
+    for name in NAMES:
+        out += [
+            name[:-1],
+            name + "x",
+            "x" + name,
+            " " + name,
+            name + "\n",
+            name[:2] + " " + name[2:],
+        ]
+        out += [name[:2] + ch + name[2:] for ch in _boundary_neighbours()]
+        out += SHORT_NEAR_MISS[name]
+    return out
+
+
+EXCLUDED = _excluded_cases()
+NOT_EXCLUDED = _not_excluded_cases()
+
+
+def test_cases_cover_every_class() -> None:
+    assert set(NAMES) == {".git", "node_modules"} == set(SHORT) == set(SHORT_NEAR_MISS)
+    for ch in HARD_EXCLUDE_IGNORABLE:
+        assert any(ch in c for c in EXCLUDED), hex(ord(ch))
+    for t in TRAILING:
+        assert any(c.endswith(t) for c in EXCLUDED)
+    shorts = [s.casefold().rstrip(TRAILING) for v in SHORT.values() for s in v]
+    for pattern in d.REGEXES:  # each short-name pattern has plain and hashed positives
+        assert sum(pattern.fullmatch(s) is not None for s in shorts) >= 4, pattern.pattern
+        assert any(pattern.fullmatch(s) and s[2] in "0123456789abcdef" for s in shorts)
+    assert len(_boundary_neighbours()) >= 2 * 8  # both edges of every range in the set
+    assert not set(EXCLUDED) & set(NOT_EXCLUDED)
 
 
 @pytest.mark.parametrize("name", EXCLUDED, ids=ascii)
@@ -104,9 +110,6 @@ def test_ignorable_set_is_exactly_the_interfaces_list() -> None:
     cps = [0x00AD, 0x034F, *range(0x180B, 0x180F), *range(0x200B, 0x2010)]
     cps += [*range(0x202A, 0x202F), *range(0x2060, 0x2070), *range(0xFE00, 0xFE10), 0xFEFF]
     assert frozenset(map(chr, cps)) == HARD_EXCLUDE_IGNORABLE
-    for ch in HARD_EXCLUDE_IGNORABLE:
-        assert is_hard_excluded(f".g{ch}it"), hex(ord(ch))
-        assert is_hard_excluded(f"node_modules{ch}"), hex(ord(ch))
 
 
 # The I-5 required cases, as repo-relative paths.
@@ -179,9 +182,15 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-@pytest.mark.parametrize(
-    "relpath", [".Git/config", ".git/config", "./.GIT/config", "x/../.git/config", "git~1/config"]
-)
+NAMED = [f"{v}/config" for n in NAMES for v in [n, *_case_variants(n), *SHORT[n][:1]]]
+
+
+def test_named_cases_include_the_tech_lead_case() -> None:
+    assert ".Git/config" in NAMED
+    assert set(NAMES) <= {r.split("/")[0] for r in NAMED}
+
+
+@pytest.mark.parametrize("relpath", [*NAMED, "./.GIT/config", "x/../.git/config"], ids=ascii)
 def test_paths_entry_naming_git_config_is_never_opened(
     repo: Path, relpath: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
