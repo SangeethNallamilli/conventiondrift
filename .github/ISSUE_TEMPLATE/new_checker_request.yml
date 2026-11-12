@@ -1,0 +1,34 @@
+name: New checker request
+description: Suggest a kind of convention that conventiondrift should learn to check.
+labels: ["new checker"]
+body:
+  - type: textarea
+    id: rule-examples
+    attributes:
+      label: Example rules from real instruction files
+      description: Paste one or more rules as people write them, for example "Use pathlib, not os.path."
+    validations:
+      required: true
+  - type: textarea
+    id: following
+    attributes:
+      label: What does code that follows the rule look like?
+      description: A short Python example.
+    validations:
+      required: true
+  - type: textarea
+    id: contradicting
+    attributes:
+      label: What does code that breaks the rule look like?
+      description: A short Python example.
+    validations:
+      required: true
+  - type: textarea
+    id: ambiguity
+    attributes:
+      label: Cases that are hard to call
+      description: Code where it's unclear whether the rule is followed. conventiondrift stays silent when unsure, so these matter.
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would this checker help you?
