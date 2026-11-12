@@ -454,14 +454,10 @@ def test_drain_discards_everything_with_keep_minus_one() -> None:
     assert chunks == [] and not over.is_set()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
 def test_hanging_git_is_killed_after_the_timeout(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake_git = tmp_path / "bin" / "git"
-    fake_git.parent.mkdir()
-    fake_git.write_text("#!/bin/sh\nexec sleep 30\n")
-    fake_git.chmod(0o755)
+    fake_git = _sleeping_git(tmp_path)
     resolved = gitread._ResolvedGit(str(fake_git), os.environ["PATH"])
     monkeypatch.setattr(gitread, "_find_git", lambda _repo: resolved)
     monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
@@ -475,11 +471,85 @@ def test_hanging_git_is_killed_after_the_timeout(
 # --- SR-013 / I-14: locating git ------------------------------------------------
 
 
-def _fake_git_in(folder: Path, name: str = "git") -> Path:
+def _platform_git_name() -> str:
+    return "git.exe" if os.name == "nt" else "git"
+
+
+def _run_tool(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run ``argv`` if the executable is on PATH; ``None`` if it is missing."""
+    resolved = shutil.which(argv[0])
+    if resolved is None:
+        return None
+    return _REAL_RUN([resolved, *argv[1:]], check=False, capture_output=True, text=True)
+
+
+def _compile_windows_exe(dest: Path, c_source: str, csharp_source: str) -> None:
+    """Compile a tiny console exe so a planted git.exe is actually runnable.
+
+    Tries gcc, clang, cl, then PowerShell Add-Type. Raises if none succeed,
+    rather than skipping.
+    """
+    src = dest.with_suffix(".c")
+    src.write_text(c_source, encoding="utf-8")
+    compilers = (
+        ["gcc", "-O0", "-s", "-o", str(dest), str(src)],
+        ["clang", "-O0", "-s", "-o", str(dest), str(src)],
+        ["cl", "/nologo", "/Fe" + str(dest), str(src)],
+    )
+    errors: list[str] = []
+    for argv in compilers:
+        completed = _run_tool(argv)
+        if completed is None:
+            continue
+        if completed.returncode == 0 and dest.exists():
+            return
+        errors.append(f"{argv[0]}: {completed.stderr or completed.stdout}")
+    csharp = dest.with_suffix(".cs")
+    csharp.write_text(csharp_source, encoding="utf-8")
+    ps = (
+        "Add-Type -OutputType ConsoleApplication "
+        f"-OutputAssembly '{dest}' "
+        f"-TypeDefinition (Get-Content -Raw '{csharp}')"
+    )
+    completed = _run_tool(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+    if completed is not None and completed.returncode == 0 and dest.exists():
+        return
+    if completed is not None:
+        errors.append(f"powershell: {completed.stderr or completed.stdout}")
+    raise RuntimeError(
+        "could not compile a runnable git.exe test stub; tried gcc, clang, cl, "
+        "and PowerShell Add-Type. " + " | ".join(errors)
+    )
+
+
+def _sleeping_git(tmp_path: Path) -> Path:
+    """A fake git that hangs, used by the timeout-kill test. Runnable on Windows."""
+    dest = tmp_path / "bin" / _platform_git_name()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        _compile_windows_exe(
+            dest,
+            "#include <windows.h>\nint main(void) { Sleep(30000); return 0; }\n",
+            "using System.Threading;\n"
+            "class FakeGit { static void Main() { Thread.Sleep(30000); } }\n",
+        )
+    else:
+        dest.write_text("#!/bin/sh\nexec sleep 30\n")
+        dest.chmod(0o755)
+    return dest
+
+
+def _fake_git_in(folder: Path, name: str | None = None) -> Path:
+    """Plant a git named for this platform. Resolution tests never execute it."""
     folder.mkdir(parents=True, exist_ok=True)
-    exe = folder / name
-    exe.write_text("#!/bin/sh\nexit 0\n")
-    exe.chmod(0o755)
+    exe = folder / (name if name is not None else _platform_git_name())
+    # Resolution tests only need the right filename for the PATH walk. A
+    # Windows .exe cannot be a shell script, and these files are never run.
+    if exe.suffix.lower() == ".exe":
+        exe.write_bytes(b"")
+    else:
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(0o755)
     return exe
 
 
@@ -497,6 +567,16 @@ def _set_path(monkeypatch: pytest.MonkeyPatch, *entries: str | Path) -> None:
     monkeypatch.setenv("PATH", os.pathsep.join(str(e) for e in entries))
 
 
+def test_fake_git_helper_plants_git_exe_when_os_name_is_nt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(os, "name", "nt")
+    exe = _fake_git_in(tmp_path / "trusted")
+    assert exe.name == "git.exe"
+    assert exe.is_file()
+    assert _platform_git_name() == "git.exe"
+
+
 def test_valid_absolute_path_entry_is_used(
     repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,7 +592,7 @@ def test_symlinked_git_is_resolved_to_its_real_path(
     exe = _fake_git_in(tmp_path / "real")
     link_dir = tmp_path / "links"
     link_dir.mkdir()
-    (link_dir / "git").symlink_to(exe)
+    (link_dir / _platform_git_name()).symlink_to(exe)
     _set_path(monkeypatch, link_dir)
     assert gitread._find_git(repo).path == os.path.realpath(exe)
 
@@ -665,7 +745,7 @@ def test_trusted_entry_with_git_symlinked_into_the_repo_fails_closed(
     exe = _fake_git_in(repo / "tools")
     link_dir = tmp_path / "links"
     link_dir.mkdir()
-    (link_dir / "git").symlink_to(exe)
+    (link_dir / _platform_git_name()).symlink_to(exe)
     _set_path(monkeypatch, link_dir)
     with pytest.raises(ComponentError) as info:
         gitread._find_git(repo)
@@ -977,13 +1057,44 @@ def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
 
 def _git_printing(tmp_path: Path) -> Path:
     """A fake git whose ``--version`` prints $GIT_FAKE_VERSION and exits $GIT_FAKE_CODE."""
-    exe = tmp_path / "fakebin" / "git"
+    exe = tmp_path / "fakebin" / _platform_git_name()
     exe.parent.mkdir(parents=True, exist_ok=True)
-    exe.write_bytes(
-        b'#!/bin/sh\nif [ "$1" = --version ]; then printf \'%s\' "$GIT_FAKE_VERSION"; '
-        b'exit "$GIT_FAKE_CODE"; fi\nexit 0\n'
-    )
-    exe.chmod(0o755)
+    if os.name == "nt":
+        _compile_windows_exe(
+            exe,
+            (
+                "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+                "int main(int argc, char **argv) {\n"
+                '    if (argc >= 2 && strcmp(argv[1], "--version") == 0) {\n'
+                '        const char *v = getenv("GIT_FAKE_VERSION");\n'
+                '        const char *c = getenv("GIT_FAKE_CODE");\n'
+                "        if (v) fputs(v, stdout);\n"
+                "        return c ? atoi(c) : 0;\n"
+                "    }\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            (
+                "using System;\n"
+                "class FakeGit {\n"
+                "  static int Main(string[] args) {\n"
+                '    if (args.Length >= 1 && args[0] == "--version") {\n'
+                "      string v = Environment.GetEnvironmentVariable(\n"
+                '          "GIT_FAKE_VERSION"); Console.Write(v ?? "");\n'
+                '      string c = Environment.GetEnvironmentVariable("GIT_FAKE_CODE") ?? "0";\n'
+                "      int code; return int.TryParse(c, out code) ? code : 0;\n"
+                "    }\n"
+                "    return 0;\n"
+                "  }\n"
+                "}\n"
+            ),
+        )
+    else:
+        exe.write_bytes(
+            b'#!/bin/sh\nif [ "$1" = --version ]; then printf \'%s\' "$GIT_FAKE_VERSION"; '
+            b'exit "$GIT_FAKE_CODE"; fi\nexit 0\n'
+        )
+        exe.chmod(0o755)
     return exe
 
 
@@ -1008,7 +1119,6 @@ def fake_version(repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     yield set_version
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
 @pytest.mark.parametrize(
     "text",
     [
@@ -1028,7 +1138,6 @@ def test_supported_git_versions_pass(repo: Path, fake_version: Any, text: str) -
     assert reader._version_ok is True
 
 
-@pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
 @pytest.mark.parametrize(
     ("text", "code"),
     [
