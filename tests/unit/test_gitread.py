@@ -5,9 +5,12 @@ tests/spec/ and tests/security/ own the TRACEABILITY test ids; these are unit
 tests of the runner and the first five operations.
 """
 
+import io
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
@@ -62,14 +65,19 @@ def repo(tmp_path: Path) -> Path:
 Call = dict[str, Any]
 
 
+_REAL_POPEN = subprocess.Popen
+
+
 @pytest.fixture
 def spy(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Call]]:
-    """Record every subprocess.run call gitread makes, then delegate to the real one."""
+    """Record every process gitread starts, then delegate to the real Popen."""
     calls: list[Call] = []
-    real = _REAL_RUN
+    real = _REAL_POPEN
 
     def recorder(*args: Any, **kwargs: Any) -> Any:
         env = kwargs.get("env") or {}
+        if "GIT_OPTIONAL_LOCKS" not in env:  # a fixture helper's git, not gitread's
+            return real(*args, **kwargs)
         home = env.get("HOME", "")
         calls.append(
             {
@@ -80,15 +88,20 @@ def spy(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[Call]]:
         )
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(gitread.subprocess, "run", recorder)
+    monkeypatch.setattr(gitread.subprocess, "Popen", recorder)
     yield calls
 
 
 def _fake_run(monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: bytes) -> None:
-    def fake(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.CompletedProcess([], returncode, stdout, b"")
+    """Stub the bounded runner for every git call except the version check."""
+    real = gitread._run_bounded
 
-    monkeypatch.setattr(gitread.subprocess, "run", fake)
+    def fake(argv: list[str], **kwargs: Any) -> Any:
+        if argv[1:] == ["--version"]:
+            return real(argv, **kwargs)
+        return gitread._Output(returncode, stdout)
+
+    monkeypatch.setattr(gitread, "_run_bounded", fake)
 
 
 HARDENING = [
@@ -309,50 +322,138 @@ def test_git_that_cannot_start_raises_git_unavailable(
     def boom(*_a: Any, **_k: Any) -> Any:
         raise PermissionError("exec")
 
-    monkeypatch.setattr(gitread.subprocess, "run", boom)
+    monkeypatch.setattr(gitread.subprocess, "Popen", boom)
     with pytest.raises(GitUnavailable):
         GitReader(repo).is_shallow()
 
 
-def test_every_call_has_a_timeout_and_discards_stderr(repo: Path, spy: list[Call]) -> None:
+def test_every_call_is_bounded(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[dict[str, Any]] = []
+    real = gitread._run_bounded
+
+    def recorder(argv: list[str], **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(gitread, "_run_bounded", recorder)
     reader = GitReader(repo)
     head = reader.resolve("HEAD")
     reader.is_shallow()
     reader.has_object(head)
     reader.merge_base(head, head)
     reader.commit_date(head)
-    assert len(spy) == 5
+    assert seen
+    for kwargs in seen:
+        assert kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
+        assert kwargs["max_stdout"] == gitread.SMALL_OUTPUT_MAX_BYTES
+
+
+def test_popen_uses_pipes_devnull_stdin_and_no_shell(repo: Path, spy: list[Call]) -> None:
+    GitReader(repo).is_shallow()
     for call in spy:
         kwargs = call["kwargs"]
-        assert kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
+        assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["stdout"] is subprocess.PIPE
-        assert kwargs["stderr"] is subprocess.DEVNULL
-        assert "capture_output" not in kwargs
+        assert kwargs["stderr"] is subprocess.PIPE
+        assert kwargs["shell"] is False
+        assert "timeout" not in kwargs  # enforced by _run_bounded itself
 
 
-def test_timeout_is_a_positive_bound_within_the_run_limit() -> None:
+def test_limits_are_conservative_constants() -> None:
     # AC-N2.1: a whole B10k run finishes in under 60 s, so no single call may take longer.
     assert 0 < gitread.GIT_TIMEOUT_SECONDS <= 60
+    # One 64-hex SHA or ISO date line fits many times over.
+    assert 128 <= gitread.SMALL_OUTPUT_MAX_BYTES <= 65536
 
 
-def test_timeout_is_a_component_error_with_fixed_text(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def hang(argv: list[str], **kwargs: Any) -> Any:
-        raise subprocess.TimeoutExpired(
-            argv, kwargs["timeout"], output=b"secret-out", stderr=b"fatal: secret-err"
-        )
+def _py(code: str) -> list[str]:
+    return [sys.executable, "-c", code]
 
-    monkeypatch.setattr(gitread.subprocess, "run", hang)
+
+def _bounded(argv: list[str], tmp_path: Path, max_stdout: int = 16, timeout: float = 20.0) -> Any:
+    return gitread._run_bounded(
+        argv,
+        cwd=tmp_path,
+        env=dict(os.environ),
+        label="rev-parse",
+        max_stdout=max_stdout,
+        timeout=timeout,
+    )
+
+
+def test_bounded_returns_exit_code_and_stdout(tmp_path: Path) -> None:
+    out = _bounded(_py("import sys; sys.stdout.write('x' * 16); sys.exit(3)"), tmp_path)
+    assert out == gitread._Output(3, b"x" * 16)
+
+
+def test_bounded_stdout_over_cap_kills_with_fixed_text(tmp_path: Path) -> None:
+    code = "import sys, time\nsys.stdout.write('secret' * 10); sys.stdout.flush(); time.sleep(30)"
+    start = time.monotonic()
     with pytest.raises(ComponentError) as info:
-        GitReader(repo).resolve("secret-ref-name")
-    err = info.value
-    assert err.component == "gitread"
-    assert err.message == "git rev-parse timed out"
-    assert err.__cause__ is None
-    assert err.__suppress_context__ is True  # the argv (with the REV) is not chained
-    for text in ("secret", "fatal", str(repo)):
-        assert text not in str(err)
+        _bounded(_py(code), tmp_path)
+    assert time.monotonic() - start < 10  # killed at the cap, not after the sleep
+    assert info.value.component == "gitread"
+    assert info.value.message == "git rev-parse output too large"
+    assert "secret" not in str(info.value)
+
+
+def test_bounded_large_stdout_is_never_held_whole(tmp_path: Path) -> None:
+    code = "import sys\nfor _ in range(64): sys.stdout.write('y' * 1048576)"
+    with pytest.raises(ComponentError, match="output too large"):
+        _bounded(_py(code), tmp_path, max_stdout=1000)
+
+
+def test_bounded_large_stderr_is_drained_and_discarded(tmp_path: Path) -> None:
+    # 8 MiB of stderr: far past any pipe buffer, so an undrained pipe would hang.
+    code = "import sys\nsys.stderr.write('fatal: secret ' * 600000); print('ok')"
+    out = _bounded(_py(code), tmp_path, timeout=20.0)
+    assert out == gitread._Output(0, b"ok\n")
+
+
+def test_bounded_timeout_kills_with_fixed_text(tmp_path: Path) -> None:
+    start = time.monotonic()
+    with pytest.raises(ComponentError) as info:
+        _bounded(_py("import time; time.sleep(30)"), tmp_path, timeout=0.5)
+    assert time.monotonic() - start < 10
+    assert info.value.message == "git rev-parse timed out"
+    assert info.value.__cause__ is None
+
+
+def test_bounded_timeout_after_output_closes(tmp_path: Path) -> None:
+    # stdout and stderr closed, but the process keeps running: proc.wait() times out.
+    code = "import os, time\nos.close(1); os.close(2); time.sleep(30)"
+    with pytest.raises(ComponentError, match="timed out"):
+        _bounded(_py(code), tmp_path, timeout=1.0)
+
+
+def test_bounded_process_that_cannot_start_is_git_unavailable(tmp_path: Path) -> None:
+    with pytest.raises(GitUnavailable):
+        _bounded([str(tmp_path / "no-such-git")], tmp_path)
+
+
+def test_drain_ends_quietly_on_a_closed_stream() -> None:
+    stream = io.BytesIO(b"abc")
+    stream.close()
+    chunks: list[bytes] = []
+    over = threading.Event()
+    gitread._drain(stream, 10, chunks, over)
+    assert chunks == [] and not over.is_set()
+
+
+def test_drain_keeps_exactly_cap_plus_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gitread, "_CHUNK_BYTES", 3)
+    chunks: list[bytes] = []
+    over = threading.Event()
+    gitread._drain(io.BytesIO(b"abcdefghij"), 4, chunks, over)
+    assert b"".join(chunks) == b"abcde"
+    assert over.is_set()
+
+
+def test_drain_discards_everything_with_keep_minus_one() -> None:
+    chunks: list[bytes] = []
+    over = threading.Event()
+    gitread._drain(io.BytesIO(b"x" * 200000), -1, chunks, over)
+    assert chunks == [] and not over.is_set()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="uses a POSIX shell script as a fake git")
@@ -368,7 +469,7 @@ def test_hanging_git_is_killed_after_the_timeout(
     start = time.monotonic()
     with pytest.raises(ComponentError) as info:
         GitReader(repo).is_shallow()
-    assert info.value.message == "git rev-parse timed out"
+    assert "timed out" in info.value.message
     assert time.monotonic() - start < 10
 
 

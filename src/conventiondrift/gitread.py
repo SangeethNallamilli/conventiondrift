@@ -11,10 +11,10 @@ Every call goes through :meth:`GitReader._run`, which:
 * puts the full ``-c`` hardening set before every subcommand;
 * allows only the eight read-only subcommands in DESIGN §3;
 * adds ``--no-ext-diff --no-textconv --no-color`` to diff and log calls;
-* discards stderr (``DEVNULL``) and never puts stderr or caller input in an
+* drains and discards stderr, and never puts stderr or caller input in an
   error message;
-* stops git after :data:`GIT_TIMEOUT_SECONDS` and reports a fixed-text
-  ``ComponentError("gitread")``.
+* kills git after :data:`GIT_TIMEOUT_SECONDS` or once stdout passes its cap
+  (SR-014) and reports a fixed-text ``ComponentError("gitread")``.
 
 Revisions from input are resolved once by :meth:`GitReader.resolve`; every other
 operation accepts only validated lowercase hex SHAs, placed after ``--end-of-options``.
@@ -31,10 +31,13 @@ and :func:`_environment` (``blob`` needs a streamed ``cat-file --batch``, so it
 can check the header size before reading the body).
 """
 
+import io
 import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,10 +48,20 @@ from conventiondrift.errors import ComponentError, GitUnavailable, UnresolvableR
 _COMPONENT = "gitread"
 
 # QUESTION(A?): DESIGN.md, SECURITY-RULES.md and INTERFACES.md state no per-call git
-# timeout. 60 s is the whole-run limit of AC-N2.1 (B10k < 60 s), so no single
-# plumbing call may take longer; the calls in this module normally take milliseconds.
-#: Wall-clock limit for one non-streamed git call, in seconds.
+# timeout. 60 s is the whole-run limit of AC-N2.1 (B10k < 60 s), so no single git
+# call may take longer; the calls in this module normally take milliseconds.
+#: Wall-clock limit for one git call, in seconds (SR-014).
 GIT_TIMEOUT_SECONDS: float = 60.0
+
+# QUESTION(A?): R2.6 (DESIGN §10 S4) caps only patch bytes (256 MiB, T-008's
+# ``patches``). No cap is stated for the one-line plumbing calls; every T-007 call
+# prints at most one 64-hex SHA or ISO date line, so 4 KiB is far above any valid
+# output and far below anything that could hurt memory.
+#: Default stdout cap for one git call, in bytes; more is a fixed-text error (SR-014).
+SMALL_OUTPUT_MAX_BYTES: int = 4096
+
+#: Read size for the stdout and stderr pipes; also the most stderr held at once.
+_CHUNK_BYTES = 65536
 
 #: DESIGN §3 "Allowed subcommands only". ``show`` is for the object form only (T-008).
 ALLOWED_SUBCOMMANDS: frozenset[str] = frozenset(
@@ -179,6 +192,99 @@ def _one_line(out: _Output) -> str:
     return data[:-1].decode("ascii")
 
 
+def _drain(
+    stream: io.BufferedIOBase, keep: int, chunks: list[bytes], over: threading.Event
+) -> None:
+    """Read ``stream`` in chunks until EOF, keeping at most ``keep + 1`` bytes.
+
+    Sets ``over`` and stops reading once more than ``keep`` bytes have arrived, so
+    the caller can kill the process. With ``keep == -1`` nothing is kept and the
+    stream is read and discarded until EOF (stderr). A stream closed under the
+    reader (after a kill) just ends the read.
+    """
+    total = 0
+    try:
+        while chunk := stream.read1(_CHUNK_BYTES):  # whatever has arrived, up to a chunk
+            if keep < 0:
+                continue
+            chunks.append(chunk[: keep + 1 - total])
+            total += len(chunks[-1])
+            if total > keep:
+                over.set()
+                return
+    except (OSError, ValueError):
+        return
+
+
+def _run_bounded(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    label: str,
+    max_stdout: int,
+    timeout: float,
+) -> _Output:
+    """Run ``argv`` with a wall-clock timeout and a stdout cap (SR-014).
+
+    stdout is read in chunks and capped at ``max_stdout + 1`` bytes; past the cap,
+    or past ``timeout`` seconds, the process is killed and a fixed-text
+    ``ComponentError("gitread")`` naming only ``label`` is raised. stderr is drained
+    in chunks and discarded, never held whole and never put in a message. stdin is
+    ``DEVNULL``. A process that can't start raises ``GitUnavailable``. Reusable by
+    T-008 with its own cap (for example R2.6's patch-byte cap).
+    """
+    try:
+        proc = subprocess.Popen(  # noqa: S603 (argv list, resolved git, no shell)
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
+    except OSError as exc:
+        raise GitUnavailable("git could not be started") from exc
+    assert proc.stdout is not None and proc.stderr is not None  # noqa: S101 (PIPE above)
+    chunks: list[bytes] = []
+    over = threading.Event()
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, max_stdout, chunks, over), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, -1, [], threading.Event()), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout
+    failure: str | None = None
+    try:
+        for reader in readers:
+            reader.join(max(0.0, deadline - time.monotonic()))
+            if over.is_set():
+                failure = "output too large"
+                break
+            if reader.is_alive():
+                failure = "timed out"
+                break
+        if failure is None:
+            try:
+                returncode = proc.wait(max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                failure = "timed out"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for reader in readers:
+            reader.join(1.0)
+        proc.stdout.close()
+        proc.stderr.close()
+    if failure is not None:
+        # Fixed text: never the argv (which may hold a REV), stdout or stderr.
+        raise ComponentError(_COMPONENT, f"git {label} {failure}")
+    return _Output(returncode, b"".join(chunks))
+
+
 class GitReader:
     """Read-only, hardened access to the git repository at ``repo_dir`` (I-11 C3)."""
 
@@ -203,41 +309,27 @@ class GitReader:
         argv += args
         return argv
 
-    def _run(self, subcommand: str, args: Sequence[str]) -> _Output:
+    def _run(
+        self, subcommand: str, args: Sequence[str], *, max_stdout: int = SMALL_OUTPUT_MAX_BYTES
+    ) -> _Output:
         """Run one allowed git subcommand and return its exit code and stdout.
 
-        stdout is buffered in memory, so ``_run`` is only for commands whose output
-        is bounded by construction: every T-007 call prints at most one short line
-        (``rev-parse --verify`` / ``--is-shallow-repository``, ``merge-base``
-        without ``--all``, ``log --no-walk`` of one SHA) or nothing
-        (``cat-file -e``), and each caller rejects anything but that exact shape.
-        stderr is discarded, never buffered. Output that can be large (``ls-tree``,
-        ``cat-file --batch``, ``log -p``; T-008) must be streamed with a size cap
-        instead of going through ``_run``.
+        Bounded by :data:`GIT_TIMEOUT_SECONDS` and ``max_stdout`` (SR-014, see
+        :func:`_run_bounded`). Every T-007 call prints at most one short line, so
+        the default :data:`SMALL_OUTPUT_MAX_BYTES` applies; T-008 passes larger caps.
         """
         argv = self._command(subcommand, args)
         if not self._repo_dir.is_dir():
             raise ComponentError(_COMPONENT, "repository directory not found")
         with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
-            try:
-                proc = subprocess.run(  # noqa: S603 (argv list, fixed git, no shell)
-                    argv,
-                    cwd=self._repo_dir,
-                    env=_environment(home),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    shell=False,
-                    check=False,
-                    timeout=GIT_TIMEOUT_SECONDS,
-                )
-            except subprocess.TimeoutExpired:
-                # subprocess.run has killed git. Fixed text only; the exception (which
-                # holds the argv, so the caller's REV, and any output) is not chained.
-                raise ComponentError(_COMPONENT, f"git {subcommand} timed out") from None
-            except OSError as exc:
-                raise GitUnavailable("git could not be started") from exc
-        return _Output(proc.returncode, proc.stdout)
+            return _run_bounded(
+                argv,
+                cwd=self._repo_dir,
+                env=_environment(home),
+                label=subcommand,
+                max_stdout=max_stdout,
+                timeout=GIT_TIMEOUT_SECONDS,
+            )
 
     def _fail(self, subcommand: str, out: _Output) -> ComponentError:
         # Fixed text: never stderr, never a revision or path from input (DESIGN §4).
