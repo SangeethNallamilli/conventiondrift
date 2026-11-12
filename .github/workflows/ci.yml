@@ -66,24 +66,22 @@ jobs:
           python-version: "3.11"
       - name: Resolve the DCO range
         # For pull_request, use the PR base/head SHAs. For workflow_dispatch
-        # on a non-main branch, fetch origin/main and check merge-base(origin/main, HEAD)..HEAD
-        # via the existing DCO_BASE_SHA / DCO_HEAD_SHA interface.
-        # github.* values are passed in as env; they are never interpolated
-        # into the script body. persist-credentials stays false; the token
-        # is used only for this one fetch and is not written to .git/config.
+        # on a non-main branch, fetch origin/main anonymously (the repo is
+        # public) and check merge-base(origin/main, HEAD)..HEAD via the
+        # existing DCO_BASE_SHA / DCO_HEAD_SHA interface. github.* values
+        # are passed in as env; they are never interpolated into the
+        # script body. persist-credentials stays false and this fetch is
+        # unauthenticated, so no token is written to .git/config.
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set +x
           if [ "$EVENT_NAME" = "pull_request" ]; then
             printf '%s\n' "DCO_BASE_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
             printf '%s\n' "DCO_HEAD_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
           else
-            AUTH="http.extraHeader=Authorization: Basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-            git -c credential.helper= -c "$AUTH" fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
             base="$(git merge-base origin/main HEAD)"
             head="$(git rev-parse HEAD)"
             printf '%s\n' "DCO_BASE_SHA=${base}" >> "$GITHUB_ENV"
