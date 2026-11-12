@@ -98,15 +98,16 @@ _FOREIGN_BOMS: Final = (
 _READ_CHUNK: Final = 65_536
 
 
-def _windows_only_form(segment: str) -> bool:
+def _windows_only_form(segment: str, *, colon: bool) -> bool:
     """True for a segment Windows cannot hold or reads differently (D-PM-28 #5).
 
-    A backslash, a ``:`` anywhere (drive forms like ``c:x.py`` and ``:`` streams),
-    a trailing dot or space, or a reserved device name with or without an extension.
+    A backslash, a trailing dot or space, or a reserved device name with or
+    without an extension; and, when ``colon`` is set, a ``:`` anywhere (drive
+    forms like ``c:x.py`` and NTFS ``:`` streams).
     """
     return (
         "\\" in segment
-        or ":" in segment
+        or (colon and ":" in segment)
         or segment.endswith((".", " "))
         or segment.split(".", 1)[0].rstrip(" ").upper() in _DEVICE_NAMES
     )
@@ -120,21 +121,30 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     normalize to nothing. ``.`` and empty segments are dropped, so ``./a//b/``
     becomes ``a/b``.
 
-    Windows-only forms in **any** segment (D-PM-28 #5): a backslash, a ``:``
-    (``c:x.py``, ``src/c:x.py``, ``a.py:stream``), a trailing dot or space, or a
-    device name such as ``CON``, ``nul.txt`` or ``Com1.py``. They are "outside
-    repository" for a value the user typed (``origin="input"``: ``paths``,
-    ``config``, ``exclude``, ignore entries) and "unsupported path" for a name
-    found in the repo tree (``origin="tree"``). Traversal and absolute forms
-    win over these. Glob characters are left alone, so the same check serves
-    ``exclude`` entries. Plain string tests only: no regex, linear in ``value``.
+    Windows-only forms in **any** segment (D-PM-28 #5 as narrowed, I-13):
+
+    * A value the user typed (``origin="input"``: ``paths``, ``config``,
+      ``exclude``, ignore entries) is "outside repository" on every OS if a
+      segment has a backslash, a ``:`` (``c:x.py``, ``src/c:x.py``,
+      ``a.py:stream``), a trailing dot or space, or a device name such as
+      ``CON``, ``nul.txt`` or ``Com1.py``.
+    * A name found in the repo tree (``origin="tree"``) is "unsupported path"
+      on every OS for a backslash, a trailing dot or space, or a device name.
+      A ``:`` (drive form included) is "unsupported path" only when
+      ``os.name == "nt"``, where it would open an NTFS stream; on POSIX such
+      names are analyzed normally (AC-N3.13 needs a ``::warning::`` file name).
+
+    Traversal and absolute forms win over these. Glob characters are left
+    alone, so the same check serves ``exclude`` entries. Plain string tests
+    only: no regex, linear in ``value``.
     """
     if not value or "\x00" in value or value.startswith("/"):
         raise FileSkipped(REASON_OUTSIDE)
     parts = [p for p in value.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
-    if any(_windows_only_form(p) for p in parts):
+    colon = origin == "input" or os.name == "nt"  # read per call, so tests can patch it
+    if any(_windows_only_form(p, colon=colon) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
 
