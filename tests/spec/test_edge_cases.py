@@ -22,7 +22,10 @@ def test_ac_e_12_large_pr_expected_findings(tmp_path_factory: pytest.TempPathFac
     work = tmp_path_factory.mktemp("e12")
     reason = benchlib.probe_cli(work)
     if reason:
-        pytest.skip(reason)
+        # Strict xfail only while the T-001 skeleton marker is present (T-031/T-033).
+        # probe_cli returns a reason only for that skeleton; any other exit 2 falls
+        # through and the assertions below fail the test.
+        pytest.xfail(reason)
     repo, manifest = benchlib.provision("b10k", work)
     run = benchlib.run_check(repo, "bench-pr-5000", work / "out", 0)
     assert run.exit_code == 0, run.stderr

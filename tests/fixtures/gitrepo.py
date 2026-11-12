@@ -21,7 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -73,6 +73,24 @@ def git_version() -> tuple[int, ...]:
     if m is None:
         raise RuntimeError(f"cannot parse git version from {out!r}")
     return tuple(int(x) for x in m.groups() if x is not None)
+
+
+def init_with_branch(
+    run: Callable[..., object],
+    default_branch: str = "main",
+    *,
+    version: tuple[int, ...] | None = None,
+) -> None:
+    """Run `git init` so HEAD is `default_branch`.
+
+    `git init -b` is new in git 2.28; older git gets `git init` plus
+    `symbolic-ref`. `run` is called like `git(*args)` (no leading `git`).
+    """
+    if (git_version() if version is None else version) >= (2, 28):
+        run("init", "-q", "-b", default_branch, ".")
+    else:
+        run("init", "-q", ".")
+        run("symbolic-ref", "HEAD", f"refs/heads/{default_branch}")
 
 
 def base_git_env(home: Path) -> dict[str, str]:
@@ -236,11 +254,7 @@ class GitRepo:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         repo = cls(path, home=home, author=author, committer=committer)
-        if git_version() >= (2, 28):
-            repo.git("init", "-q", "-b", default_branch, ".")
-        else:  # `git init -b` is new in git 2.28
-            repo.git("init", "-q", ".")
-            repo.git("symbolic-ref", "HEAD", f"refs/heads/{default_branch}")
+        init_with_branch(repo.git, default_branch)
         for key, value in (
             ("core.autocrlf", "false"),
             ("commit.gpgsign", "false"),

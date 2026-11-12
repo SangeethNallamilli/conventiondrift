@@ -15,9 +15,14 @@ I-4 says:
   * On a usage error stdout stays empty, stderr gets the usage line then one line
     `conventiondrift: error: <message>`, and no file is written (`--stats-out` included).
 
-What the T-001 skeleton does not do yet is `xfail(strict=True)` naming the task that
-implements it (T-031 for `check` parsing, T-032 for `--version`), so the xfail turns into a
-failure the moment the behaviour lands and the marker must be removed.
+Strict xfails are already in place. When the named task lands, remove the marker
+so the case becomes a real assertion (leaving it would XPASS and fail the suite):
+
+  * T-032: remove `XFAIL_T032` from `test_cli_contract_version_takes_precedence`
+    (IC-I4.2; `--version` precedence).
+  * T-031: remove `XFAIL_T031` from `test_cli_contract_usage_error_stderr_format`
+    (IC-I4.6; usage-error stderr shape) and from
+    `test_cli_contract_check_committed_repo_exits_0_or_1` (IC-I4.7; positive control).
 """
 
 from __future__ import annotations
