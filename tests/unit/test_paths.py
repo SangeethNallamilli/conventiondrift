@@ -444,3 +444,81 @@ def test_unknown_origin_name_too_long_is_outside_repository(origin: object, tmp_
 @pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)
 def test_unknown_origin_still_accepts_ordinary_names(origin: object) -> None:
     assert validate_relpath("./src/a.py", origin=origin) == "src/a.py"  # type: ignore[arg-type]
+
+
+# ---- CR2 S3: real Windows behaviour, unskipped on the windows-latest leg -------------
+# Real NTFS streams and real device names under the real ``os.name == "nt"``: nothing
+# is patched. Each body sits under a ``sys.platform`` check so mypy checks it as
+# Windows code (``mypy --platform win32``).
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="real Windows behaviour; runs on windows-latest (CR2 S3)"
+)
+
+
+@windows_only
+def test_windows_real_alternate_data_stream_is_never_opened(
+    tmp_path: Path, opened: list[object]
+) -> None:
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        assert os.name == "nt"
+        main = tmp_path / "a.py"
+        main.write_bytes(b"x = 1\n")
+        with open(f"{main}:s", "wb") as h:  # a real NTFS alternate data stream
+            h.write(b"secret = 1\n")
+        with open(f"{main}:s", "rb") as h:
+            assert h.read() == b"secret = 1\n", "the stream exists and is readable"
+        assert main.read_bytes() == b"x = 1\n", "the main stream is untouched"
+        opened.clear()
+        for name in ("a.py:s", "a.py:s:$DATA", "a.py::$DATA", "c:a.py", "./a.py:s"):
+            with pytest.raises(FileSkipped) as exc:
+                read_worktree_file(tmp_path, name, "python", origin="tree")
+            assert exc.value.reason == REASON_UNSUPPORTED, name
+            with pytest.raises(FileSkipped) as exc2:
+                read_worktree_file(tmp_path, name, "python", origin="input")
+            assert exc2.value.reason == REASON_OUTSIDE, name
+        assert opened == [], "no stream (or drive-relative path) may be opened"
+        assert read_worktree_file(tmp_path, "a.py", "python", origin="tree") == b"x = 1\n"
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")
+
+
+WINDOWS_DEVICE_PATHS = [
+    "CON",
+    "nul",
+    "NUL.txt",
+    "aux.py",
+    "PRN",
+    "COM1",
+    "lpt9.log",
+    "COM\u00b9",
+    "com\u00b2.py",
+    "LPT\u00b3",
+    "CONIN$",
+    "conout$.log",
+    "NUL .txt",
+    "src/NUL",
+    "src/CONIN$",
+    "src/con/x.py",
+]
+
+
+@windows_only
+def test_windows_real_device_names_are_never_opened(tmp_path: Path, opened: list[object]) -> None:
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        assert os.name == "nt"
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "ok.py").write_bytes(b"x = 1\n")
+        opened.clear()
+        for name in WINDOWS_DEVICE_PATHS:
+            with pytest.raises(FileSkipped) as exc:
+                read_worktree_file(tmp_path, name, "python", origin="tree")
+            assert exc.value.reason == REASON_UNSUPPORTED, name
+            with pytest.raises(FileSkipped) as exc2:
+                read_worktree_file(tmp_path, name, "config", origin="input")
+            assert exc2.value.reason == REASON_OUTSIDE, name
+        assert opened == [], "no device may be opened"
+        # The folder itself is readable, so the refusals above come from the name check.
+        assert read_worktree_file(tmp_path, "src/ok.py", "python", origin="tree") == b"x = 1\n"
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")
