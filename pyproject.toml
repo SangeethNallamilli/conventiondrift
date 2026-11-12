@@ -1,0 +1,49 @@
+# T-001 package skeleton (ADR-0001, ADR-0002). Owner of this file: Release / DevOps.
+[build-system]
+# Build backend pinned exactly; the hashed build lock is requirements/build.txt
+# and CI builds with `pip install --require-hashes -r requirements/build.txt`
+# followed by `python -m build --no-isolation`.
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conventiondrift"
+dynamic = ["version"]
+description = "Checks whether a Python codebase still follows the rules written in its AGENTS.md / CLAUDE.md, and reports what a pull request changed."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# No runtime dependencies (ADR-0002): stdlib plus vendored code under _vendor/ only.
+dependencies = []
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+conventiondrift = "conventiondrift.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["conventiondrift", "conventiondrift.*"]
+
+[tool.setuptools.package-data]
+"conventiondrift._vendor" = ["MANIFEST"]
+
+[tool.setuptools.dynamic]
+version = { attr = "conventiondrift.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

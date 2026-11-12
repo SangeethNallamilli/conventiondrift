@@ -1,0 +1,3 @@
+# Build tools (T-001). Locked with hashes into build.txt the same way as dev.txt.
+setuptools==80.9.0
+build
