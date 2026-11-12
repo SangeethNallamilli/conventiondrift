@@ -1,8 +1,12 @@
 """C9 verdict engine: counts plus thresholds give one verdict per rule per side.
 
-Pure (DESIGN §1, I-11 C9): no I/O, no subprocess, no clock, and it never raises
-for any input the model types allow. Everything is integer math on site counts;
-percentages exist only for display and are computed by C11 (I-9, I-13 ``Counts``).
+Pure (DESIGN §1, I-11 C9): no I/O, no subprocess, no clock. Everything is
+integer math on site counts; percentages exist only for display and are
+computed by C11 (I-9, I-13 ``Counts``). It never raises for I-6-valid
+thresholds and consistent ``Counts``. ``decide()`` raises ``ValueError`` when
+``min_sites < 1``, ``holds < 1``, or a count has ``following`` outside
+``0..relevant`` or ``following + contradicting != relevant`` (I-13
+``decide()`` guards). T-028 turns that into ``ComponentError("verdicts")``.
 
 The algorithm is DESIGN §10 S1, applied in its fixed order:
 
@@ -17,8 +21,10 @@ The algorithm is DESIGN §10 S1, applied in its fixed order:
    Migrating is unreachable here, because it needs recent adherence (AC-F4.12).
 
 Threshold validation (``stale.overall <= migrating.overall <= holds`` and
-``stale.recent <= migrating.recent``, falling back to defaults) is C5's job; C9
-applies whatever ``Thresholds`` it is given.
+``stale.recent <= migrating.recent``, falling back to defaults, and the I-6
+ranges) is C5's job. ``decide()`` still guards ``min_sites >= 1``,
+``holds >= 1`` and count consistency, and raises ``ValueError`` otherwise
+(I-13).
 """
 
 from collections.abc import Iterable, Sequence
@@ -51,6 +57,23 @@ def pct_ge(following: int, relevant: int, threshold: int) -> bool:
     return following * 100 >= threshold * relevant
 
 
+def _counts_are_consistent(counts: Counts) -> bool:
+    return (
+        0 <= counts.following <= counts.relevant
+        and counts.following + counts.contradicting == counts.relevant
+    )
+
+
+def _require_decidable(overall: Counts, recent: Counts | None, thresholds: Thresholds) -> None:
+    """Raise ValueError for inputs I-13 forbids ``decide()`` to verdict on."""
+    if thresholds.min_sites < 1 or thresholds.holds < 1:
+        raise ValueError("thresholds.min_sites and thresholds.holds must be >= 1")
+    if not _counts_are_consistent(overall):
+        raise ValueError("overall counts are inconsistent")
+    if recent is not None and not _counts_are_consistent(recent):
+        raise ValueError("recent counts are inconsistent")
+
+
 def follows(option: str, match: RuleMatch) -> bool:
     """I-10: a site follows when its option is preferred, or, when nothing is
     preferred, when its option is not prohibited. Otherwise it contradicts."""
@@ -71,7 +94,12 @@ def decide(
     ``recent`` is None when recent adherence is unavailable (no history, or no
     relevant site in the window). A ``Counts`` with zero relevant sites is treated
     the same way, since S1 defines "available" as at least one recent relevant site.
+
+    Raises ``ValueError`` (I-13 ``decide()`` guards) for ``min_sites < 1``,
+    ``holds < 1``, or inconsistent counts. That error never becomes a verdict,
+    including Not verifiable. T-028 maps it to ``ComponentError("verdicts")``.
     """
+    _require_decidable(overall, recent, thresholds)
     t = thresholds
     if not verifiable:
         return Verdict.NOT_VERIFIABLE

@@ -246,11 +246,79 @@ def test_decide_holds_does_not_look_at_recent() -> None:
     assert v(c(8, 10), None) is H
 
 
-def test_decide_zero_min_sites_and_zero_sites_follows_algorithm() -> None:
-    # min-sites is validated to 1..1000 by C5; with 0, an empty count passes step 2
-    # and 0*100 >= 80*0, so step 3 gives Holds. C9 never raises.
-    t = replace(DEFAULTS, min_sites=0)
-    assert v(c(0, 0), None, t) is H
+def test_decide_rejects_min_sites_below_one() -> None:
+    # I-13 decide() guards (CR2 S1, SR F1): never return a verdict, including NV.
+    t0 = replace(DEFAULTS, min_sites=0)
+    with pytest.raises(ValueError):
+        v(c(0, 0), None, t0)
+    with pytest.raises(ValueError):
+        decide(verifiable=False, overall=c(0, 0), recent=None, thresholds=t0)
+    t1 = replace(DEFAULTS, min_sites=1)
+    assert v(c(0, 0), None, t1) is I
+    assert v(c(0, 1), None, t1) is S
+
+
+def test_decide_rejects_holds_below_one() -> None:
+    t0 = replace(DEFAULTS, holds=0)
+    with pytest.raises(ValueError):
+        v(c(10, 10), None, t0)
+    with pytest.raises(ValueError):
+        decide(verifiable=False, overall=c(10, 10), recent=None, thresholds=t0)
+    t1 = replace(DEFAULTS, holds=1, min_sites=1)
+    assert v(c(1, 100), None, t1) is H
+    assert v(c(0, 100), None, t1) is not H
+
+
+@pytest.mark.parametrize(
+    "overall",
+    [
+        Counts(following=-1, contradicting=6, relevant=5),
+        Counts(following=6, contradicting=-1, relevant=5),  # following == relevant + 1
+        Counts(following=3, contradicting=0, relevant=5),  # contradicting inconsistent
+        Counts(following=0, contradicting=0, relevant=5),
+        Counts(following=5, contradicting=1, relevant=5),
+    ],
+    ids=[
+        "following-negative",
+        "following-above-relevant",
+        "contradicting-too-low",
+        "contradicting-zero-when-relevant",
+        "contradicting-too-high",
+    ],
+)
+def test_decide_rejects_inconsistent_overall_counts(overall: Counts) -> None:
+    with pytest.raises(ValueError):
+        v(overall, None)
+    with pytest.raises(ValueError):
+        decide(verifiable=False, overall=overall, recent=None, thresholds=DEFAULTS)
+
+
+def test_decide_accepts_following_boundaries() -> None:
+    assert v(c(0, 5), None) is S
+    assert v(c(5, 5), None) is H
+
+
+@pytest.mark.parametrize(
+    "recent",
+    [
+        Counts(following=-1, contradicting=3, relevant=2),
+        Counts(following=3, contradicting=-1, relevant=2),  # following == relevant + 1
+        Counts(following=1, contradicting=0, relevant=2),  # contradicting inconsistent
+    ],
+    ids=["recent-following-negative", "recent-following-above", "recent-contradicting"],
+)
+def test_decide_rejects_inconsistent_recent_counts(recent: Counts) -> None:
+    overall = c(4, 10)
+    with pytest.raises(ValueError):
+        v(overall, recent)
+    with pytest.raises(ValueError):
+        decide(verifiable=False, overall=overall, recent=recent, thresholds=DEFAULTS)
+
+
+def test_decide_accepts_consistent_recent_following_boundaries() -> None:
+    overall = c(4, 10)
+    assert v(overall, c(0, 2)) is C
+    assert v(overall, c(2, 2)) is M
 
 
 VERDICT_ORDER_CASES = st.tuples(
@@ -630,6 +698,14 @@ def test_side_result_accepts_any_iterable() -> None:
         thresholds=DEFAULTS,
     )
     assert r.overall.relevant == 5
+
+
+def test_side_result_does_not_trigger_decide_guard_on_valid_input() -> None:
+    # side_result always builds consistent Counts; I-6-valid thresholds must not raise.
+    tight = replace(DEFAULTS, min_sites=1, holds=1)
+    built = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), t=tight)
+    assert built.overall == Counts(0, 5, 5)
+    assert build([], None, t=tight).verdict is I
 
 
 @given(
