@@ -88,7 +88,11 @@ class Renderer(Protocol):
 
 
 class GitHubClient(Protocol):
-    """C12. Never raises for HTTP errors; returns (outcome, note)."""
+    """C12. Never raises for HTTP errors; returns (outcome, note).
+
+    ``lookup`` returns (our comment exists, note). It is read-only and never
+    raises; T-028 calls it before rendering (I-13 C12 ruling 1).
+    """
 
     def publish(
         self,
@@ -99,6 +103,8 @@ class GitHubClient(Protocol):
         comment: str | None,
         sarif: str | None,
     ) -> tuple[PublishOutcome, str | None]: ...
+
+    def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]: ...
 
 
 @dataclass(frozen=True, kw_only=True)

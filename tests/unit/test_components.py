@@ -108,6 +108,9 @@ class _Client:
     ) -> tuple[PublishOutcome, str | None]:
         return ("skipped", "read-only token")
 
+    def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]:
+        return (False, None)
+
 
 def test_components_default_to_none() -> None:
     components = Components()
@@ -189,6 +192,7 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
         ("comment", KW, NO),
         ("sarif", KW, NO),
     ),
+    (GitHubClient, "lookup"): (("repo", KW, NO), ("pr_number", KW, NO)),
 }
 
 
@@ -246,6 +250,7 @@ def test_components_take_factories_and_stand_ins() -> None:
     assert client.publish(
         repo="o/r", pr_number=1, run_head_sha="a" * 40, comment=None, sarif=None
     ) == ("skipped", "read-only token")
+    assert client.lookup(repo="o/r", pr_number=1) == (False, None)
     variant = dataclasses.replace(components, github_base_url=None)
     assert variant.git_reader is git_factory
     assert variant.github_base_url is None
