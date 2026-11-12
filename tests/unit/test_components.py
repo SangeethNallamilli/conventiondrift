@@ -69,7 +69,7 @@ class _MemoryGit:
     def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]:
         return [(sha, self.commit_date(sha))][:limit]
 
-    def patches(self, from_sha: str, to_sha: str) -> Iterator[bytes]:
+    def patches(self, from_sha: str | None, to_sha: str) -> Iterator[bytes]:
         yield b""
 
     def tree(self, sha: str) -> Sequence[TreeEntry]:
@@ -80,6 +80,9 @@ class _MemoryGit:
 
     def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]:
         return [("M", None, "a.py")]
+
+    def close(self) -> None:
+        """Stand-in readers own no processes (I-14 item 9)."""
 
 
 class _History:
@@ -161,6 +164,7 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
     (GitReaderProtocol, "tree"): (("sha", POS, NO),),
     (GitReaderProtocol, "blob"): (("oid", POS, NO), ("max_bytes", POS, NO)),
     (GitReaderProtocol, "changed_files"): (("base", POS, NO), ("head", POS, NO)),
+    (GitReaderProtocol, "close"): (),
     (Extractor, "extract"): (("files", POS, NO), ("policy", POS, NO), ("checkers", POS, NO)),
     (History, "recent"): (
         ("git", POS, NO),
