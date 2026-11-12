@@ -147,6 +147,8 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
       A ``:`` (drive form included) is "unsupported path" only when
       ``os.name == "nt"``, where it would open an NTFS stream; on POSIX such
       names are analyzed normally (AC-N3.13 needs a ``::warning::`` file name).
+    * Any other ``origin`` (a bug: mypy rejects it) gets the strict typed-value
+      handling above, never the permissive tree one (CR2 S4).
 
     A lone surrogate (U+D800..U+DFFF) in any segment, including the ``\\udc80``
     style names ``surrogateescape`` decoding gives for non-UTF-8 bytes, gets the
@@ -162,7 +164,9 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     parts = [p for p in value.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
-    colon = origin == "input" or os.name == "nt"  # read per call, so tests can patch it
+    # Anything but "tree" takes the strict typed-value branch (CR2 S4); os.name is read
+    # per call, so tests can patch it.
+    colon = origin != "tree" or os.name == "nt"
     if any(_has_lone_surrogate(p) or _windows_only_form(p, colon=colon) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)

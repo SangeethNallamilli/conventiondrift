@@ -410,3 +410,37 @@ def test_tree_name_agrees_with_ntpath_isreserved(name: str, os_name: str) -> Non
         assert reserved, name
     else:
         assert not reserved, name
+
+
+# ---- CR2 S4: an origin outside Literal["input", "tree"] gets the strict branch ---------
+
+UNKNOWN_ORIGINS: list[object] = ["TREE", "Tree", "inputs", "", None, "tree ", 0]
+
+
+@pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)
+@pytest.mark.parametrize(
+    "value", ["c:x.py", "src/a.py:stream", "a\\b.py", "nul.txt", "a\udc80.py", "src/a.py."]
+)
+def test_unknown_origin_is_treated_as_typed(
+    origin: object, value: str, monkeypatch: pytest.MonkeyPatch, opened: list[object]
+) -> None:
+    monkeypatch.setattr(os, "name", "posix")  # where a tree name with ':' would be accepted
+    with pytest.raises(FileSkipped) as exc:
+        validate_relpath(value, origin=origin)  # type: ignore[arg-type]
+    assert exc.value.reason == REASON_OUTSIDE
+    with pytest.raises(FileSkipped) as exc2:
+        read_worktree_file("/nonexistent", value, "python", origin=origin)  # type: ignore[arg-type]
+    assert exc2.value.reason == REASON_OUTSIDE
+    assert opened == [], "nothing may be opened for a rejected path"
+
+
+@pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)
+def test_unknown_origin_name_too_long_is_outside_repository(origin: object, tmp_path: Path) -> None:
+    with pytest.raises(FileSkipped) as exc:
+        read_worktree_file(tmp_path, "n" * 5000 + ".py", "python", origin=origin)  # type: ignore[arg-type]
+    assert exc.value.reason == REASON_OUTSIDE
+
+
+@pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)
+def test_unknown_origin_still_accepts_ordinary_names(origin: object) -> None:
+    assert validate_relpath("./src/a.py", origin=origin) == "src/a.py"  # type: ignore[arg-type]
