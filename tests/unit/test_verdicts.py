@@ -246,46 +246,157 @@ def test_decide_holds_does_not_look_at_recent() -> None:
     assert v(c(8, 10), None) is H
 
 
-def test_decide_rejects_min_sites_below_one() -> None:
-    # I-13 decide() guards (CR2 S1, SR F1): never return a verdict, including NV.
-    t0 = replace(DEFAULTS, min_sites=0)
-    with pytest.raises(ValueError) as min_sites_err:
-        v(c(0, 0), None, t0)
-    assert min_sites_err.value.args == ("thresholds.min_sites and thresholds.holds must be >= 1",)
+# I-13 decide() guards: min_sites >= 1 and holds >= 1. The negative domain is
+# every integer below that floor. FLOOR-1 (0), -1 and a large negative are
+# pinned so a mutant that rewrites ``< 1`` as ``== 0`` cannot survive (SR F4,
+# D-TL-25). Expected results are taken from I-13, not from the implementation:
+# each of these inputs must raise ValueError and must never yield a verdict,
+# Holds included. side_result() calls decide(), so the same inputs raise there.
+DECIDE_FLOOR = 1
+LARGE_NEGATIVE = -(2**31)
+BELOW_DECIDE_FLOOR = (DECIDE_FLOOR - 1, -1, LARGE_NEGATIVE)
+THRESHOLD_GUARD_MESSAGE = "thresholds.min_sites and thresholds.holds must be >= 1"
+
+
+def test_below_decide_floor_values_cover_the_i13_domain() -> None:
+    assert DECIDE_FLOOR == 1
+    assert BELOW_DECIDE_FLOOR == (0, -1, -(2**31))
+    assert all(value < DECIDE_FLOOR for value in BELOW_DECIDE_FLOOR)
+    assert DECIDE_FLOOR - 1 in BELOW_DECIDE_FLOOR
+    assert any(value < 0 for value in BELOW_DECIDE_FLOOR)
+
+
+@pytest.mark.parametrize("min_sites", BELOW_DECIDE_FLOOR, ids=lambda v: f"min_sites={v}")
+def test_decide_rejects_min_sites_below_floor(min_sites: int) -> None:
+    # I-13: min_sites < 1 raises ValueError and never returns a verdict.
+    t = replace(DEFAULTS, min_sites=min_sites)
+    with pytest.raises(ValueError) as err:
+        v(c(0, 0), None, t)
+    assert err.value.args == (THRESHOLD_GUARD_MESSAGE,)
     with pytest.raises(ValueError):
-        decide(verifiable=False, overall=c(0, 0), recent=None, thresholds=t0)
-    t1 = replace(DEFAULTS, min_sites=1)
+        decide(verifiable=False, overall=c(0, 0), recent=None, thresholds=t)
+    with pytest.raises(ValueError):
+        v(c(5, 5), None, t)
+
+
+@pytest.mark.parametrize("holds", BELOW_DECIDE_FLOOR, ids=lambda v: f"holds={v}")
+def test_decide_rejects_holds_below_floor(holds: int) -> None:
+    # I-13: holds < 1 raises ValueError. A slipped-through negative holds
+    # would make pct_ge true for any counts, including a 0% overall.
+    t = replace(DEFAULTS, holds=holds)
+    with pytest.raises(ValueError) as err:
+        v(c(10, 10), None, t)
+    assert err.value.args == (THRESHOLD_GUARD_MESSAGE,)
+    with pytest.raises(ValueError):
+        decide(verifiable=False, overall=c(10, 10), recent=None, thresholds=t)
+    with pytest.raises(ValueError):
+        v(c(0, 10), None, t)
+
+
+def test_decide_accepts_min_sites_at_the_i13_floor() -> None:
+    t1 = replace(DEFAULTS, min_sites=DECIDE_FLOOR)
     assert v(c(0, 0), None, t1) is I
     assert v(c(0, 1), None, t1) is S
 
 
-def test_decide_rejects_holds_below_one() -> None:
-    t0 = replace(DEFAULTS, holds=0)
-    with pytest.raises(ValueError):
-        v(c(10, 10), None, t0)
-    with pytest.raises(ValueError):
-        decide(verifiable=False, overall=c(10, 10), recent=None, thresholds=t0)
-    t1 = replace(DEFAULTS, holds=1, min_sites=1)
+def test_decide_accepts_holds_at_the_i13_floor() -> None:
+    t1 = replace(DEFAULTS, holds=DECIDE_FLOOR, min_sites=DECIDE_FLOOR)
     assert v(c(1, 100), None, t1) is H
     assert v(c(0, 100), None, t1) is not H
 
 
+# I-13 also requires 0 <= following <= relevant and following + contradicting
+# == relevant, on overall and on recent when it is given. Each row is an
+# input that fails that rule; the expected result, written from I-13, is
+# ValueError and never a verdict. The tables pin -1 and a large negative for
+# following and for contradicting, and both directions of the sum identity.
+def _i13_count_guard_failures(counts: Counts) -> frozenset[str]:
+    failed: set[str] = set()
+    if counts.following < 0:
+        failed.add("following-below-zero")
+    if counts.following > counts.relevant:
+        failed.add("following-above-relevant")
+    total = counts.following + counts.contradicting
+    if total < counts.relevant:
+        failed.add("sum-below-relevant")
+    if total > counts.relevant:
+        failed.add("sum-above-relevant")
+    return frozenset(failed)
+
+
+INCONSISTENT_OVERALL = (
+    ("following-negative", Counts(following=-1, contradicting=6, relevant=5)),
+    (
+        "following-large-negative",
+        Counts(following=LARGE_NEGATIVE, contradicting=5 - LARGE_NEGATIVE, relevant=5),
+    ),
+    ("following-above-relevant", Counts(following=6, contradicting=-1, relevant=5)),
+    ("contradicting-negative", Counts(following=3, contradicting=-1, relevant=5)),
+    (
+        "contradicting-large-negative",
+        Counts(following=3, contradicting=LARGE_NEGATIVE, relevant=5),
+    ),
+    ("sum-below-relevant", Counts(following=3, contradicting=0, relevant=5)),
+    ("contradicting-zero-when-relevant", Counts(following=0, contradicting=0, relevant=5)),
+    ("sum-above-relevant", Counts(following=5, contradicting=1, relevant=5)),
+)
+INCONSISTENT_RECENT = (
+    ("recent-following-negative", Counts(following=-1, contradicting=3, relevant=2)),
+    (
+        "recent-following-large-negative",
+        Counts(following=LARGE_NEGATIVE, contradicting=2 - LARGE_NEGATIVE, relevant=2),
+    ),
+    ("recent-following-above", Counts(following=3, contradicting=-1, relevant=2)),
+    ("recent-contradicting-negative", Counts(following=1, contradicting=-1, relevant=2)),
+    (
+        "recent-contradicting-large-negative",
+        Counts(following=1, contradicting=LARGE_NEGATIVE, relevant=2),
+    ),
+    ("recent-sum-below-relevant", Counts(following=1, contradicting=0, relevant=2)),
+    ("recent-sum-above-relevant", Counts(following=2, contradicting=1, relevant=2)),
+)
+
+
+def test_inconsistent_count_tables_cover_the_i13_predicate() -> None:
+    required = {
+        "following-below-zero",
+        "following-above-relevant",
+        "sum-below-relevant",
+        "sum-above-relevant",
+    }
+    overall_classes = set().union(
+        *(_i13_count_guard_failures(counts) for _, counts in INCONSISTENT_OVERALL)
+    )
+    recent_classes = set().union(
+        *(_i13_count_guard_failures(counts) for _, counts in INCONSISTENT_RECENT)
+    )
+    assert required <= overall_classes
+    assert required <= recent_classes
+
+    def _pins_negatives(rows: tuple[tuple[str, Counts], ...]) -> None:
+        followings = [counts.following for _, counts in rows]
+        contradictings = [counts.contradicting for _, counts in rows]
+        assert -1 in followings
+        assert LARGE_NEGATIVE in followings
+        assert any(
+            counts.contradicting == -1 and 0 <= counts.following <= counts.relevant
+            for _, counts in rows
+        )
+        assert any(
+            counts.contradicting == LARGE_NEGATIVE and 0 <= counts.following <= counts.relevant
+            for _, counts in rows
+        )
+        assert -1 in contradictings
+        assert LARGE_NEGATIVE in contradictings
+
+    _pins_negatives(INCONSISTENT_OVERALL)
+    _pins_negatives(INCONSISTENT_RECENT)
+
+
 @pytest.mark.parametrize(
     "overall",
-    [
-        Counts(following=-1, contradicting=6, relevant=5),
-        Counts(following=6, contradicting=-1, relevant=5),  # following == relevant + 1
-        Counts(following=3, contradicting=0, relevant=5),  # contradicting inconsistent
-        Counts(following=0, contradicting=0, relevant=5),
-        Counts(following=5, contradicting=1, relevant=5),
-    ],
-    ids=[
-        "following-negative",
-        "following-above-relevant",
-        "contradicting-too-low",
-        "contradicting-zero-when-relevant",
-        "contradicting-too-high",
-    ],
+    [counts for _, counts in INCONSISTENT_OVERALL],
+    ids=[label for label, _ in INCONSISTENT_OVERALL],
 )
 def test_decide_rejects_inconsistent_overall_counts(overall: Counts) -> None:
     with pytest.raises(ValueError) as err:
@@ -302,12 +413,8 @@ def test_decide_accepts_following_boundaries() -> None:
 
 @pytest.mark.parametrize(
     "recent",
-    [
-        Counts(following=-1, contradicting=3, relevant=2),
-        Counts(following=3, contradicting=-1, relevant=2),  # following == relevant + 1
-        Counts(following=1, contradicting=0, relevant=2),  # contradicting inconsistent
-    ],
-    ids=["recent-following-negative", "recent-following-above", "recent-contradicting"],
+    [counts for _, counts in INCONSISTENT_RECENT],
+    ids=[label for label, _ in INCONSISTENT_RECENT],
 )
 def test_decide_rejects_inconsistent_recent_counts(recent: Counts) -> None:
     overall = c(4, 10)
@@ -723,6 +830,32 @@ def test_side_result_does_not_trigger_decide_guard_on_valid_input() -> None:
     built = build(FIVE_REQUESTS, frozenset({("src/a.py", 1)}), t=tight)
     assert built.overall == Counts(0, 5, 5)
     assert build([], None, t=tight).verdict is I
+
+
+@pytest.mark.parametrize("min_sites", BELOW_DECIDE_FLOOR, ids=lambda v: f"min_sites={v}")
+def test_side_result_rejects_min_sites_below_floor(min_sites: int) -> None:
+    # I-13: side_result calls decide(), so a min_sites below the floor raises
+    # ValueError and never yields a verdict. Zero sites would become Holds if
+    # the guard were weakened to ``== 0`` (relevant == 0 passes min_sites, and
+    # pct_ge(0, 0, holds) is true).
+    t = replace(DEFAULTS, min_sites=min_sites)
+    with pytest.raises(ValueError) as err:
+        build([], None, t=t)
+    assert err.value.args == (THRESHOLD_GUARD_MESSAGE,)
+    with pytest.raises(ValueError):
+        build([site("src/a.py", 1, "httpx") for _ in range(5)], None, t=t)
+
+
+@pytest.mark.parametrize("holds", BELOW_DECIDE_FLOOR, ids=lambda v: f"holds={v}")
+def test_side_result_rejects_holds_below_floor(holds: int) -> None:
+    # I-13: a holds below the floor raises. If the guard let a negative
+    # through, pct_ge would treat any overall as Holds, including 0%.
+    t = replace(DEFAULTS, holds=holds)
+    with pytest.raises(ValueError) as err:
+        build(FIVE_REQUESTS, None, t=t)
+    assert err.value.args == (THRESHOLD_GUARD_MESSAGE,)
+    with pytest.raises(ValueError):
+        build([site("src/a.py", 1, "httpx") for _ in range(5)], None, t=t)
 
 
 @given(
