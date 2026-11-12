@@ -251,8 +251,8 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
         ),
     ),
 }
-# Policy holds read-only mappings (MappingProxyType), which are not hashable,
-# so Policy and Result (which holds a Policy) are not hashable either.
+# Policy and Result are frozen but unhashable by design (I-13, code review A1);
+# every other type is hashable.
 UNHASHABLE = {"Policy", "Result"}
 
 
@@ -298,18 +298,29 @@ def test_equal_copies_hash_equal(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(UNHASHABLE))
-def test_types_holding_read_only_mappings_are_unhashable(name: str) -> None:
+def test_policy_and_result_are_unhashable(name: str) -> None:
     sample, _ = SAMPLES[name]
     with pytest.raises(TypeError):
         hash(sample)
+
+
+# Changes that would break an I-13 invariant get a valid alternative instead.
+OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
+    ("Policy", "gated"): {"gated": False, "effective_fail_on": "none"},
+    ("Policy", "checkers"): {
+        "checkers": {cid: CheckerPolicy(enabled=False, script_paths=()) for cid in CHECKER_IDS}
+    },
+    ("Policy", "markers"): {"markers": {}},
+    ("Conflict", "rules"): {"rules": ("AGENTS.md:1", "AGENTS.md:2")},
+}
 
 
 @pytest.mark.parametrize("name", sorted(SAMPLES))
 def test_changing_a_field_breaks_equality(name: str) -> None:
     sample, fields = SAMPLES[name]
     for field in fields:
-        value = getattr(sample, field)
-        assert dataclasses.replace(sample, **{field: _different(value)}) != sample, field
+        changes = OVERRIDES.get((name, field), {field: _different(getattr(sample, field))})
+        assert dataclasses.replace(sample, **changes) != sample, field
 
 
 def _different(value: Any) -> Any:
@@ -328,6 +339,11 @@ def _different(value: Any) -> Any:
     if value is None:
         return "x"
     return None
+
+
+def test_unhashable_types_declare_hash_none() -> None:
+    assert Policy.__hash__ is None
+    assert Result.__hash__ is None
 
 
 def test_policy_mappings_are_read_only() -> None:
@@ -377,6 +393,7 @@ def test_skip_reasons_are_the_report_list() -> None:
         "cap exceeded",
         "walk limit",
         "manifest parse error",
+        "unsupported path",
     )
 
 
@@ -402,6 +419,7 @@ def test_cases() -> None:
             "head_only_reason",
             ("shallow clone", "missing object", "no merge base", type(None)),
         ),
+        (Window, "unavailable_reason", ("no history", "internal error", type(None))),
         (
             SideResult,
             "recent_unavailable_reason",
@@ -438,3 +456,139 @@ def test_unknown_verdict_is_rejected() -> None:
 def test_missing_field_is_rejected() -> None:
     with pytest.raises(TypeError):
         Site(file="a.py", line=1, col=0)  # type: ignore[call-arg]
+
+
+# --- I-13 invariants checked in __post_init__ -------------------------------------------
+
+
+def test_policy_wraps_mappings_in_read_only_copies() -> None:
+    checkers = {cid: CheckerPolicy(enabled=True, script_paths=()) for cid in CHECKER_IDS}
+    markers = {"AGENTS.md": (4,)}
+    policy = dataclasses.replace(POLICY, checkers=checkers, markers=markers)
+    assert isinstance(policy.checkers, MappingProxyType)
+    assert isinstance(policy.markers, MappingProxyType)
+    checkers.clear()
+    markers["CLAUDE.md"] = (1,)
+    assert set(policy.checkers) == set(CHECKER_IDS)
+    assert dict(policy.markers) == {"AGENTS.md": (4,)}
+
+
+@pytest.mark.parametrize("missing", CHECKER_IDS)
+def test_policy_rejects_a_missing_checker_id(missing: CheckerId) -> None:
+    checkers = {cid: p for cid, p in POLICY.checkers.items() if cid != missing}
+    with pytest.raises(ValueError, match="all 8 checker ids"):
+        dataclasses.replace(POLICY, checkers=checkers)
+
+
+@pytest.mark.parametrize(
+    ("fail_on", "gated", "ok"),
+    [
+        ("none", False, True),
+        ("new-stale", True, True),
+        ("any-stale", True, True),
+        ("none", True, False),
+        ("new-stale", False, False),
+        ("any-stale", False, False),
+    ],
+)
+def test_policy_gated_matches_fail_on(fail_on: str, gated: bool, ok: bool) -> None:
+    if ok:
+        policy = dataclasses.replace(POLICY, effective_fail_on=fail_on, gated=gated)
+        assert policy.gated is gated
+    else:
+        with pytest.raises(ValueError, match="gated"):
+            dataclasses.replace(POLICY, effective_fail_on=fail_on, gated=gated)
+
+
+def test_window_end_may_be_none_or_aware() -> None:
+    assert dataclasses.replace(WINDOW, end=None).end is None
+    assert WINDOW.end is not None
+
+
+def test_window_rejects_naive_end() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        dataclasses.replace(WINDOW, end=datetime(2026, 11, 12, 9, 0))
+
+
+def test_conflict_rules_must_be_sorted() -> None:
+    assert Conflict(rules=("A.md:1", "A.md:1"), checker="money").rules == ("A.md:1", "A.md:1")
+    with pytest.raises(ValueError, match=r"Conflict\.rules must be sorted"):
+        Conflict(rules=("CLAUDE.md:3", "AGENTS.md:3"), checker="http-client")
+
+
+def _site_result(file: str, line: int, col: int, option: str) -> SiteResult:
+    return SiteResult(site=Site(file, line, col, option), follows=True, recent=False)
+
+
+SORTED_SITES = (
+    _site_result("a.py", 1, 0, "print"),
+    _site_result("a.py", 1, 0, "print"),
+    _site_result("a.py", 1, 2, "logging"),
+    _site_result("a.py", 1, 2, "print"),
+    _site_result("a.py", 3, 0, "logging"),
+    _site_result("b.py", 1, 0, "logging"),
+)
+
+
+@pytest.mark.parametrize("sites", [(), SORTED_SITES[:1], SORTED_SITES])
+def test_side_result_accepts_sorted_sites(sites: tuple[SiteResult, ...]) -> None:
+    assert dataclasses.replace(SIDE, sites=sites).sites == sites
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        ("b.py", 1, 0, "x", "a.py", 9, 9, "z"),  # file out of order
+        ("a.py", 2, 0, "x", "a.py", 1, 9, "z"),  # line out of order
+        ("a.py", 1, 5, "x", "a.py", 1, 4, "z"),  # col out of order
+        ("a.py", 1, 0, "print", "a.py", 1, 0, "logging"),  # option out of order
+    ],
+)
+def test_side_result_rejects_unsorted_sites(pair: tuple[Any, ...]) -> None:
+    first, second = _site_result(*pair[:4]), _site_result(*pair[4:])
+    with pytest.raises(ValueError, match=r"SideResult\.sites must be sorted"):
+        dataclasses.replace(SIDE, sites=(first, second))
+
+
+def _rule_result(file: str, line: int, *, side: str = "head") -> RuleResult:
+    rule = dataclasses.replace(RULE, id=f"{file}:{line}", file=file, line=line)
+    if side == "head":
+        return dataclasses.replace(RULE_RESULT, rule_id=rule.id, head_rule=rule, base_rule=None)
+    return dataclasses.replace(RULE_RESULT, rule_id=rule.id, head_rule=None, base_rule=rule)
+
+
+def test_result_accepts_rule_results_sorted_by_head_else_base_rule() -> None:
+    ordered = (
+        _rule_result("AGENTS.md", 3),
+        _rule_result("AGENTS.md", 7, side="base"),
+        _rule_result("AGENTS.md", 10),
+        _rule_result("CLAUDE.md", 1, side="base"),
+    )
+    assert dataclasses.replace(RESULT, rule_results=ordered).rule_results == ordered
+    assert dataclasses.replace(RESULT, rule_results=()).rule_results == ()
+
+
+def test_result_head_rule_wins_over_base_rule_for_order() -> None:
+    late_base = dataclasses.replace(RULE, file="Z.md", line=99)
+    both = dataclasses.replace(_rule_result("AGENTS.md", 5), base_rule=late_base)
+    ordered = (both, _rule_result("AGENTS.md", 6))
+    assert dataclasses.replace(RESULT, rule_results=ordered).rule_results == ordered
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        (("CLAUDE.md", 1, "head"), ("AGENTS.md", 9, "head")),  # file out of order
+        (("AGENTS.md", 9, "head"), ("AGENTS.md", 2, "base")),  # line out of order
+    ],
+)
+def test_result_rejects_unsorted_rule_results(results: tuple[tuple[str, int, str], ...]) -> None:
+    rule_results = tuple(_rule_result(f, n, side=side) for f, n, side in results)
+    with pytest.raises(ValueError, match=r"Result\.rule_results must be sorted"):
+        dataclasses.replace(RESULT, rule_results=rule_results)
+
+
+def test_result_rejects_rule_result_without_any_rule() -> None:
+    orphan = dataclasses.replace(RULE_RESULT, head_rule=None, base_rule=None)
+    with pytest.raises(ValueError, match="needs a head_rule or a base_rule"):
+        dataclasses.replace(RESULT, rule_results=(orphan,))

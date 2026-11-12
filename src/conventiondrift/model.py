@@ -4,13 +4,17 @@ Every component boundary carries these frozen, slotted dataclasses. Collections
 are tuples or frozensets and ``Mapping`` fields hold read-only mappings
 (``types.MappingProxyType``). Paths are repo-relative POSIX strings. Field
 names and value sets follow I-13, which C11 maps one-to-one to the I-9 report.
+``__post_init__`` checks only the structural invariants I-13 lists and raises
+``ValueError`` when one is broken.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from itertools import pairwise
+from types import MappingProxyType
+from typing import Any, Literal, get_args
 
 CheckerId = Literal[
     "logging",
@@ -34,8 +38,22 @@ SkipReason = Literal[
     "cap exceeded",
     "walk limit",
     "manifest parse error",
+    "unsupported path",
 ]
 Case = Literal["made-stale-by-code", "stale-rule-added", "fixed", "pre-existing-stale", "removed"]
+
+_CHECKER_IDS = frozenset(get_args(CheckerId))
+
+
+def _check_sorted(keys: Iterable[Any], what: str) -> None:
+    """Raise ValueError unless ``keys`` is in non-decreasing order (one linear pass)."""
+    for prev, cur in pairwise(keys):
+        if cur < prev:
+            raise ValueError(f"{what} must be sorted")
+
+
+def _read_only(value: Mapping[Any, Any]) -> Mapping[Any, Any]:
+    return MappingProxyType(dict(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,9 +148,11 @@ class IgnoreEntry:
     text: str | None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=True)
 class Policy:
-    """C5 output: the effective settings for the run (I-11, I-13 Q6)."""
+    """C5 output: the effective settings for the run (I-11, I-13 Q6). Not hashable (A1)."""
+
+    __hash__ = None  # type: ignore[assignment]  # unhashable by design (I-13, A1)
 
     effective_fail_on: Literal["none", "new-stale", "any-stale"]
     gated: bool
@@ -149,6 +169,14 @@ class Policy:
     sarif: bool
     after_merge_notes: tuple[str, ...]
     notes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checkers", _read_only(self.checkers))
+        object.__setattr__(self, "markers", _read_only(self.markers))
+        if not _CHECKER_IDS <= self.checkers.keys():
+            raise ValueError("Policy.checkers must have all 8 checker ids")
+        if self.gated != (self.effective_fail_on != "none"):
+            raise ValueError('Policy.gated must equal effective_fail_on != "none"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +202,9 @@ class Conflict:
 
     rules: tuple[str, str]
     checker: CheckerId
+
+    def __post_init__(self) -> None:
+        _check_sorted(self.rules, "Conflict.rules")
 
 
 class Verdict(StrEnum):
@@ -214,6 +245,12 @@ class SideResult:
     overall: Counts
     recent: Counts | None
     recent_unavailable_reason: Literal["no history", "no relevant sites in the window"] | None
+
+    def __post_init__(self) -> None:
+        _check_sorted(
+            ((s.site.file, s.site.line, s.site.col, s.site.option) for s in self.sites),
+            "SideResult.sites",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +302,11 @@ class Window:
     end: datetime | None
     days: int
     available: bool
-    unavailable_reason: str | None
+    unavailable_reason: Literal["no history", "internal error"] | None
+
+    def __post_init__(self) -> None:
+        if self.end is not None and self.end.utcoffset() is None:
+            raise ValueError("Window.end must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,9 +327,11 @@ class ReportCounts:
     rules_unchanged: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=True)
 class Result:
-    """Everything C11 renders from (I-11 C11, I-13 Q9)."""
+    """Everything C11 renders from (I-11 C11, I-13 Q9). Not hashable (A1)."""
+
+    __hash__ = None  # type: ignore[assignment]  # unhashable by design (I-13, A1)
 
     mode: Literal["compare", "head-only", "scan"]
     base_sha: str | None
@@ -305,3 +348,13 @@ class Result:
     counts: ReportCounts
     notes: tuple[str, ...]
     analyzer_python: str
+
+    def __post_init__(self) -> None:
+        _check_sorted(map(_rule_result_key, self.rule_results), "Result.rule_results")
+
+
+def _rule_result_key(result: RuleResult) -> tuple[str, int]:
+    rule = result.head_rule or result.base_rule
+    if rule is None:
+        raise ValueError("a RuleResult in Result needs a head_rule or a base_rule to be sorted")
+    return (rule.file, rule.line)
