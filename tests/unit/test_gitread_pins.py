@@ -140,33 +140,45 @@ def history(tmp_path: Path) -> tuple[Path, str, str, Path]:
     return repo, root, head, tmp_path / "gpg-ran"
 
 
-def _make_hostile(repo: Path, marker: Path) -> None:
+#: Every hostile key the I-14 item 9 test names, with its value. ``{gpg}`` and
+#: ``{order}`` become paths to a marker-writing gpg program and an order file.
+HOSTILE_CONFIG: tuple[tuple[str, str], ...] = (
+    ("diff.noprefix", "true"),
+    ("diff.mnemonicPrefix", "true"),
+    ("diff.renames", "false"),
+    ("diff.renameLimit", "1"),
+    ("diff.algorithm", "patience"),
+    ("diff.indentHeuristic", "false"),  # git's default is true
+    ("diff.interHunkContext", "5"),
+    ("diff.relative", "true"),
+    ("diff.submodule", "log"),
+    ("diff.orderFile", "{order}"),
+    ("diff.evil.xfuncname", "^(# .*)$"),
+    ("core.quotePath", "false"),
+    ("i18n.logOutputEncoding", "latin1"),
+    ("log.showSignature", "true"),
+    ("gpg.program", "{gpg}"),
+    ("color.ui", "always"),
+    ("color.diff", "always"),
+)
+HOSTILE_ATTRIBUTES: tuple[str, ...] = ("*.py -diff", "*.txt diff=evil")
+
+
+def _make_hostile(
+    repo: Path,
+    marker: Path,
+    config: tuple[tuple[str, str], ...] = HOSTILE_CONFIG,
+    attributes: tuple[str, ...] = HOSTILE_ATTRIBUTES,
+) -> None:
     gpg = repo.parent / "fake-gpg"
     gpg.write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexit 1\n")
     gpg.chmod(0o755)
     order = repo.parent / "order.txt"
     order.write_text("z.py\nnotes.txt\nsub\n")
-    for key, value in [
-        ("diff.noprefix", "true"),
-        ("diff.mnemonicPrefix", "true"),
-        ("diff.renames", "false"),
-        ("diff.renameLimit", "1"),
-        ("diff.algorithm", "patience"),
-        ("diff.indentHeuristic", "false"),  # git's default is true
-        ("diff.interHunkContext", "5"),
-        ("diff.relative", "true"),
-        ("diff.submodule", "log"),
-        ("diff.orderFile", str(order)),
-        ("diff.evil.xfuncname", "^(# .*)$"),
-        ("core.quotePath", "false"),
-        ("i18n.logOutputEncoding", "latin1"),
-        ("log.showSignature", "true"),
-        ("gpg.program", str(gpg)),
-        ("color.ui", "always"),
-        ("color.diff", "always"),
-    ]:
-        _git(repo, "config", key, value)
-    _write(repo, ".gitattributes", "*.py -diff\n*.txt diff=evil\n")
+    for key, value in config:
+        _git(repo, "config", key, value.format(gpg=gpg, order=order))
+    if attributes:
+        _write(repo, ".gitattributes", "".join(line + "\n" for line in attributes))
 
 
 def _outputs(repo: Path, root: str, head: str) -> tuple[bytes, Any, Any]:
@@ -342,3 +354,150 @@ def test_the_placeholder_is_the_only_allowed_order_option() -> None:
                 continue  # T-007's diff-tree entry
             with pytest.raises(ComponentError, match="not allowed"):
                 gitread._check_options(sub, [*count, bad])
+
+
+# --- D-TL-25: every hostile key and every pin, one at a time --------------------
+
+#: Each I-14 item 9 pin, keyed by the exact string in gitread's constants, with the
+#: hostile setting that the pin defeats (and that the drop test shows it defeats).
+PIN_DEFEATS: dict[str, str] = {
+    "--src-prefix=a/": "diff.noprefix / diff.mnemonicPrefix",
+    "--dst-prefix=b/": "diff.noprefix / diff.mnemonicPrefix",
+    "-M50%": "diff.renames=false",
+    "-l1000": "diff.renameLimit=1",
+    "--diff-algorithm=myers": "diff.algorithm=patience",
+    "--no-indent-heuristic": "diff.indentHeuristic=false",
+    "--inter-hunk-context=0": "diff.interHunkContext=5",
+    "--submodule=short": "diff.submodule=log",
+    "--text": "*.py -diff",
+    "-O<orderfile>": "diff.orderFile",
+    "--no-color": "color.ui / color.diff",
+    "core.quotePath=true": "core.quotePath=false",
+}
+#: Pins whose hostile key can't change gitread's output on its own, and why.
+PIN_UNOBSERVABLE: dict[str, str] = {
+    "--no-relative": "gitread always runs git at the repo root, where diff.relative is a no-op",
+    "i18n.logOutputEncoding=UTF-8": "gitread never prints commit messages (--format=%x00%H)",
+}
+#: Two guards against log.showSignature; each alone keeps gpg from running.
+PIN_PAIRED: frozenset[str] = frozenset({"--no-show-signature", "log.showSignature=false"})
+#: The rest of the constants: what to output (pinned by the argv tests) and T-007's
+#: security flags (pinned by test_gitread.py and the fsmonitor/hostile-config tests).
+NOT_DIFF_CONFIG_PINS: frozenset[str] = frozenset(
+    {"--first-parent", "-m", "--root", "-p", "-U0", "--format=%x00%H"}
+    | {"-r", "-z", "--name-status", "--no-ext-diff", "--no-textconv"}
+    | {"core.fsmonitor=false", "core.hooksPath=/dev/null", "core.untrackedCache=false"}
+    | {"diff.external=", "core.pager=cat", "protocol.allow=never"}
+    | {"safe.bareRepository=explicit"}
+)
+_PIN_CONSTANTS = ("_PATCHES_ARGS", "_CHANGED_FILES_ARGS", "HARDENING_CONFIG", "_DIFF_FLAGS")
+
+
+def _all_pinned_strings() -> set[str]:
+    return {arg for name in _PIN_CONSTANTS for arg in getattr(gitread, name)}
+
+
+def test_every_constant_entry_is_classified() -> None:
+    classified = set(PIN_DEFEATS) | set(PIN_UNOBSERVABLE) | PIN_PAIRED | NOT_DIFF_CONFIG_PINS
+    assert _all_pinned_strings() == classified
+    assert not set(PIN_DEFEATS) & (set(PIN_UNOBSERVABLE) | PIN_PAIRED | NOT_DIFF_CONFIG_PINS)
+
+
+#: Which gitread pin answers each hostile setting (xfuncname has none: its text is
+#: the hunk-header tail the comparison strips, per I-14 item 9).
+KEY_PINNED_BY: dict[str, str | None] = {
+    "diff.noprefix": "--src-prefix=a/",
+    "diff.mnemonicPrefix": "--dst-prefix=b/",
+    "diff.renames": "-M50%",
+    "diff.renameLimit": "-l1000",
+    "diff.algorithm": "--diff-algorithm=myers",
+    "diff.indentHeuristic": "--no-indent-heuristic",
+    "diff.interHunkContext": "--inter-hunk-context=0",
+    "diff.relative": "--no-relative",
+    "diff.submodule": "--submodule=short",
+    "diff.orderFile": "-O<orderfile>",
+    "diff.evil.xfuncname": None,
+    "core.quotePath": "core.quotePath=true",
+    "i18n.logOutputEncoding": "i18n.logOutputEncoding=UTF-8",
+    "log.showSignature": "--no-show-signature",
+    "gpg.program": "log.showSignature=false",
+    "color.ui": "--no-color",
+    "color.diff": "--no-color",
+    "*.py -diff": "--text",
+    "*.txt diff=evil": None,
+}
+
+
+def test_every_hostile_setting_maps_to_a_real_pin() -> None:
+    settings = [key for key, _ in HOSTILE_CONFIG] + list(HOSTILE_ATTRIBUTES)
+    assert sorted(KEY_PINNED_BY) == sorted(settings)
+    pins = _all_pinned_strings()
+    assert all(pin in pins for pin in KEY_PINNED_BY.values() if pin is not None)
+    covered = {pin for pin in KEY_PINNED_BY.values() if pin is not None}
+    assert covered == set(PIN_DEFEATS) | set(PIN_UNOBSERVABLE) | PIN_PAIRED
+
+
+def _drop(monkeypatch: pytest.MonkeyPatch, *pins: str) -> None:
+    for name in _PIN_CONSTANTS:
+        kept = tuple(arg for arg in getattr(gitread, name) if arg not in pins)
+        monkeypatch.setattr(gitread, name, kept)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("pin", sorted(PIN_DEFEATS))
+def test_dropping_any_one_pin_breaks_the_comparison(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch, pin: str
+) -> None:
+    repo, root, head, marker = history
+    _drop(monkeypatch, pin)
+    clean = _outputs(repo, root, head)
+    _make_hostile(repo, marker)
+    hostile = _outputs(repo, root, head)
+    with pytest.raises(AssertionError):
+        _assert_same_patches(clean[0], hostile[0])
+        assert hostile[1:] == clean[1:]
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("pin", sorted(PIN_UNOBSERVABLE) + sorted(PIN_PAIRED))
+def test_dropping_a_backstop_pin_alone_changes_nothing(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch, pin: str
+) -> None:
+    repo, root, head, marker = history
+    _drop(monkeypatch, pin)
+    clean = _outputs(repo, root, head)
+    _make_hostile(repo, marker)
+    hostile = _outputs(repo, root, head)
+    _assert_same_patches(clean[0], hostile[0])
+    assert hostile[1:] == clean[1:] and not marker.exists()
+
+
+@_POSIX_ONLY
+def test_dropping_both_signature_guards_runs_gpg(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _, head, marker = history
+    _drop(monkeypatch, *PIN_PAIRED)
+    _make_hostile(repo, marker)
+    b"".join(GitReader(repo).patches(None, head))
+    assert marker.exists()
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize(
+    ("config", "attributes"),
+    [((item,), ()) for item in HOSTILE_CONFIG] + [((), (line,)) for line in HOSTILE_ATTRIBUTES],
+    ids=[key for key, _ in HOSTILE_CONFIG] + list(HOSTILE_ATTRIBUTES),
+)
+def test_each_hostile_setting_alone_changes_nothing(
+    history: tuple[Path, str, str, Path],
+    config: tuple[tuple[str, str], ...],
+    attributes: tuple[str, ...],
+) -> None:
+    repo, root, head, marker = history
+    clean = _outputs(repo, root, head)
+    _make_hostile(repo, marker, config, attributes)
+    hostile = _outputs(repo, root, head)
+    _assert_same_patches(clean[0], hostile[0])
+    assert hostile[1:] == clean[1:]
+    assert not marker.exists()
