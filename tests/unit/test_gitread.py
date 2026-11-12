@@ -5,6 +5,7 @@ tests/spec/ and tests/security/ own the TRACEABILITY test ids; these are unit
 tests of the runner and the first five operations.
 """
 
+import ast
 import contextlib
 import io
 import ntpath
@@ -203,9 +204,8 @@ def test_environment_is_fixed_and_nothing_else_leaks(
 def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
     repo_dir = Path("/r/repo")  # built before os.name changes, so it stays a PosixPath
-    monkeypatch.setattr(os, "name", "nt")
-    nt_env = gitread._environment("/h", "/bin", repo_dir)
-    monkeypatch.setattr(os, "name", "posix")
+    with _simulated_windows(monkeypatch):
+        nt_env = gitread._environment("/h", "/bin", repo_dir)
     posix_env = gitread._environment("/h", "/bin", repo_dir)
     base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES="/r")
     assert nt_env == dict(base, SYSTEMROOT=r"C:\Windows")
@@ -215,9 +215,8 @@ def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch) -> N
 def test_systemroot_absent_on_windows_is_not_invented(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SYSTEMROOT", raising=False)
     repo_dir = Path("/r/repo")
-    monkeypatch.setattr(os, "name", "nt")
-    env = gitread._environment("/h", "/bin", repo_dir)
-    monkeypatch.setattr(os, "name", "posix")
+    with _simulated_windows(monkeypatch):
+        env = gitread._environment("/h", "/bin", repo_dir)
     assert "SYSTEMROOT" not in env
 
 
@@ -567,14 +566,100 @@ def _set_path(monkeypatch: pytest.MonkeyPatch, *entries: str | Path) -> None:
     monkeypatch.setenv("PATH", os.pathsep.join(str(e) for e in entries))
 
 
+_REAL_OS_NAME = os.name
+_REAL_OS_PATH = os.path
+_REAL_PATHSEP = os.pathsep
+_REAL_GETCWD = os.getcwd
+
+
+@contextlib.contextmanager
+def _simulated_windows(
+    monkeypatch: pytest.MonkeyPatch, *, cwd: str | None = None
+) -> Iterator[None]:
+    """Run the body with ``os.name == "nt"``; with ``cwd``, also with ``ntpath`` rules.
+
+    Everything is restored on exit, before any assertion runs (SR N-9). On
+    Python 3.11 ``Path(...)`` builds a ``WindowsPath`` while ``os.name`` is
+    "nt" and raises, and pytest itself builds one when it reports a failure,
+    which stops the whole run with INTERNALERROR. So build every ``Path``
+    before entering, keep asserts outside, and put ``pytest.raises`` first in
+    the ``with`` so it sees the exception after os is restored.
+    ``test_windows_simulations_follow_the_rules`` checks this file for it.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    if cwd is not None:
+        monkeypatch.setattr(os, "path", ntpath)
+        monkeypatch.setattr(os, "pathsep", ";")
+        monkeypatch.setattr(os, "getcwd", lambda: cwd)
+        monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(os, "name", _REAL_OS_NAME)
+        monkeypatch.setattr(os, "path", _REAL_OS_PATH)
+        monkeypatch.setattr(os, "pathsep", _REAL_PATHSEP)
+        monkeypatch.setattr(os, "getcwd", _REAL_GETCWD)
+
+
+def test_simulated_windows_restores_os_even_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(RuntimeError), _simulated_windows(monkeypatch, cwd="C:\\"):
+        inside = (os.name, os.path, os.pathsep, os.getcwd())
+        raise RuntimeError
+    assert inside == ("nt", ntpath, ";", "C:\\")
+    assert (os.name, os.path, os.pathsep) == (_REAL_OS_NAME, _REAL_OS_PATH, _REAL_PATHSEP)
+    assert os.getcwd is _REAL_GETCWD
+
+
+def _is_simulation(item: ast.withitem) -> bool:
+    call = item.context_expr
+    return (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_simulated_windows"
+    )
+
+
+def test_windows_simulations_follow_the_rules() -> None:
+    # SR N-9: os.name is only ever set to "nt" by _simulated_windows, and no
+    # simulation builds a Path, asserts, or opens pytest.raises inside it.
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    simulations = 0
+    sets_nt = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "monkeypatch.setattr":
+            if [ast.unparse(a) for a in node.args[1:]] == ["'name'", "'nt'"]:
+                sets_nt.append(node.lineno)
+        if not isinstance(node, ast.With):
+            continue
+        sims = [i for i, item in enumerate(node.items) if _is_simulation(item)]
+        if not sims:
+            continue
+        simulations += 1
+        for item in node.items[sims[0] + 1 :]:
+            assert "raises" not in ast.unparse(item.context_expr), f"line {node.lineno}"
+        for inner in (n for stmt in node.body for n in ast.walk(stmt)):
+            assert not isinstance(inner, ast.Assert), f"assert inside, line {inner.lineno}"
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+                assert inner.func.id != "Path", f"Path() inside, line {inner.lineno}"
+            if isinstance(inner, ast.Attribute) and inner.attr == "raises":
+                raise AssertionError(f"pytest.raises inside, line {inner.lineno}")
+    helper = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_simulated_windows"
+    )
+    assert len(sets_nt) == 1, sets_nt  # only the helper sets os.name to "nt"
+    assert helper.lineno < sets_nt[0] <= (helper.end_lineno or 0)
+    assert simulations >= 20
+
+
 def test_fake_git_helper_plants_git_exe_when_os_name_is_nt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(os, "name", "nt")
-    exe = _fake_git_in(tmp_path / "trusted")
+    with _simulated_windows(monkeypatch):
+        exe = _fake_git_in(tmp_path / "trusted")
+        name = _platform_git_name()
     assert exe.name == "git.exe"
     assert exe.is_file()
-    assert _platform_git_name() == "git.exe"
+    assert name == "git.exe"
 
 
 def test_valid_absolute_path_entry_is_used(
@@ -607,16 +692,15 @@ def test_empty_dot_and_relative_path_entries_are_dropped(
     entry: str,
     windows: bool,
 ) -> None:
-    if windows:
-        # shutil.which on Windows would search the cwd first and refuse the
-        # planted git.exe, knocking out a later trusted git (SR N-6).
-        monkeypatch.setattr(os, "name", "nt")
     name = "git.exe" if windows else "git"
     _fake_git_in(elsewhere, name)  # ./git, reachable through "" and "."
     _fake_git_in(elsewhere / "bin", name)  # ./bin/git, reachable through the relative entries
     trusted = _fake_git_in(tmp_path / "trusted", name)
     _set_path(monkeypatch, entry, tmp_path / "trusted")
-    found = gitread._find_git(repo)
+    # On Windows, shutil.which would search the cwd first and refuse the
+    # planted git.exe, knocking out a later trusted git (SR N-6).
+    with _simulated_windows(monkeypatch) if windows else contextlib.nullcontext():
+        found = gitread._find_git(repo)
     assert found.path == os.path.realpath(trusted)
     assert found.search_path == str(tmp_path / "trusted")  # the PATH git runs with
 
@@ -709,14 +793,11 @@ def test_windows_looks_only_for_git_exe(
     for name in ("git", "git.cmd", "git.bat"):
         _fake_git_in(trusted, name)
     _set_path(monkeypatch, trusted)
-    monkeypatch.setattr(os, "name", "nt")
-    try:
-        with pytest.raises(GitUnavailable):
-            gitread._find_git(repo)
-        exe = _fake_git_in(trusted, "git.exe")
+    with pytest.raises(GitUnavailable), _simulated_windows(monkeypatch):
+        gitread._find_git(repo)
+    exe = _fake_git_in(trusted, "git.exe")
+    with _simulated_windows(monkeypatch):
         found = gitread._find_git(repo)
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
     assert found.path == os.path.realpath(exe)
 
 
@@ -726,12 +807,8 @@ def test_windows_git_exe_in_cwd_is_never_run(
     # Windows' own lookup can search the current folder first; ours never does.
     _fake_git_in(elsewhere, "git.exe")
     _set_path(monkeypatch, ".")
-    monkeypatch.setattr(os, "name", "nt")
-    try:
-        with pytest.raises(ComponentError) as info:
-            gitread._find_git(repo)
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch):
+        gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
@@ -796,11 +873,11 @@ def test_windows_cwd_git_exe_does_not_beat_a_trusted_path_entry(
 ) -> None:
     # N-6 (a): shutil.which on Windows searches the cwd first even when path=
     # is given. A planted git.exe in the cwd must not hide a trusted PATH git.
-    monkeypatch.setattr(os, "name", "nt")
     _fake_git_in(elsewhere, "git.exe")
     trusted = _fake_git_in(tmp_path / "trusted", "git.exe")
     _set_path(monkeypatch, tmp_path / "trusted")
-    found = gitread._find_git(repo)
+    with _simulated_windows(monkeypatch):
+        found = gitread._find_git(repo)
     assert found.path == os.path.realpath(trusted)
     assert found.search_path == str(tmp_path / "trusted")
 
@@ -809,12 +886,11 @@ def test_windows_git_cmd_bat_and_com_are_never_picked(
     repo: Path, tmp_path: Path, elsewhere: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # N-6 (b): PATHEXT is ignored; only git.exe counts on Windows.
-    monkeypatch.setattr(os, "name", "nt")
     folder = tmp_path / "trusted"
     for name in ("git.cmd", "git.bat", "git.com"):
         _fake_git_in(folder, name)
     _set_path(monkeypatch, folder)
-    with pytest.raises(GitUnavailable):
+    with pytest.raises(GitUnavailable), _simulated_windows(monkeypatch):
         gitread._find_git(repo)
 
 
@@ -844,8 +920,8 @@ def test_directory_named_git_is_skipped(
     _set_path(monkeypatch, first, tmp_path / "second")
     found = gitread._find_git(repo)
     assert found.path == os.path.realpath(trusted)
-    monkeypatch.setattr(os, "name", "nt")
-    found = gitread._find_git(repo)
+    with _simulated_windows(monkeypatch):
+        found = gitread._find_git(repo)
     assert found.path == os.path.realpath(trusted_win)
 
 
@@ -901,27 +977,17 @@ def test_is_within_posix_is_case_sensitive_and_ignores_windows_forms() -> None:
 # --- SR N-7 / N-8: Windows containment forms ---------------------------------------
 
 
-def _undo_windows(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "posix")
-    monkeypatch.setattr(os, "path", os.path)
-    monkeypatch.setattr(os, "pathsep", os.pathsep)
-
-
 def _nt_is_within(monkeypatch: pytest.MonkeyPatch, path: str, folder: str) -> bool:
     """``_is_within`` evaluated with Windows path rules."""
-    _windows_paths(monkeypatch, "C:\\")
-    try:
-        return gitread._is_within(path, folder)
-    finally:
-        _undo_windows(monkeypatch)
+    with _simulated_windows(monkeypatch, cwd="C:\\"):
+        within = gitread._is_within(path, folder)
+    return within
 
 
 def _nt_comparable(monkeypatch: pytest.MonkeyPatch, path: str) -> str | None:
-    _windows_paths(monkeypatch, "C:\\")
-    try:
-        return gitread._nt_comparable(path)
-    finally:
-        _undo_windows(monkeypatch)
+    with _simulated_windows(monkeypatch, cwd="C:\\"):
+        comparable = gitread._nt_comparable(path)
+    return comparable
 
 
 # (folder, path, expected): every expected value is written by hand from the
@@ -1068,17 +1134,13 @@ def test_git_under_share_root_or_extended_checkout_is_never_used(
     monkeypatch: pytest.MonkeyPatch, untrusted: str, git_dir: str, where: str
 ) -> None:
     repo = Path(untrusted if where == "repo" else "D:\\repo")  # built before os.name changes
-    _windows_paths(monkeypatch, "C:\\")
-    if where == "workspace":
-        monkeypatch.setenv("GITHUB_WORKSPACE", untrusted)
     monkeypatch.setenv("PATH", git_dir)
     _accept_as_git(monkeypatch, git_dir + "\\git.exe")
-    try:
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd="C:\\"):
+        if where == "workspace":
+            monkeypatch.setenv("GITHUB_WORKSPACE", untrusted)
         kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
-        with pytest.raises(ComponentError) as info:
-            gitread._find_git(repo)
-    finally:
-        _undo_windows(monkeypatch)
+        gitread._find_git(repo)
     assert kept == []
     assert git_dir in dropped
     assert info.value.message == gitread._UNTRUSTED_GIT
@@ -1093,30 +1155,22 @@ def test_realpath_check_refuses_git_under_share_root_or_extended_checkout(
     monkeypatch: pytest.MonkeyPatch, untrusted: str, git_dir: str, where: str
 ) -> None:
     repo = Path(untrusted if where == "repo" else "D:\\repo")  # built before os.name changes
-    _windows_paths(monkeypatch, "C:\\")
-    if where == "workspace":
-        monkeypatch.setenv("GITHUB_WORKSPACE", untrusted)
     monkeypatch.setenv("PATH", "E:\\tools")
     monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: git_dir + "\\git.exe")
-    try:
-        with pytest.raises(ComponentError) as info:
-            gitread._find_git(repo)
-    finally:
-        _undo_windows(monkeypatch)
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd="C:\\"):
+        if where == "workspace":
+            monkeypatch.setenv("GITHUB_WORKSPACE", untrusted)
+        gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
 def test_git_under_extended_length_cwd_is_never_used(monkeypatch: pytest.MonkeyPatch) -> None:
     repo = Path("D:\\repo")
-    _windows_paths(monkeypatch, _EXTENDED_REPO)
     monkeypatch.setenv("PATH", "c:\\repo\\tools")
     _accept_as_git(monkeypatch, "c:\\repo\\tools\\git.exe")
-    try:
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd=_EXTENDED_REPO):
         kept, _dropped = gitread._split_path(gitread._untrusted_folders(repo))
-        with pytest.raises(ComponentError) as info:
-            gitread._find_git(repo)
-    finally:
-        _undo_windows(monkeypatch)
+        gitread._find_git(repo)
     assert kept == []
     assert info.value.message == gitread._UNTRUSTED_GIT
 
@@ -1127,14 +1181,11 @@ def test_share_root_cwd_is_a_filesystem_root_like_a_drive_root(
     # I-14: the cwd rule is skipped when the cwd equals its anchor, and the
     # anchor of \\server\share is the share root, as C:\ is for C:.
     repo = Path("D:\\repo")
-    _windows_paths(monkeypatch, _SHARE_ROOT)
     tools = _SHARE_ROOT + "\\tools"
     monkeypatch.setenv("PATH", tools)
     _accept_as_git(monkeypatch, tools + "\\git.exe")
-    try:
+    with _simulated_windows(monkeypatch, cwd=_SHARE_ROOT):
         found = gitread._find_git(repo)
-    finally:
-        _undo_windows(monkeypatch)
     assert found.search_path == tools
 
 
@@ -1147,19 +1198,10 @@ def test_is_filesystem_root_posix() -> None:
 
 
 def test_is_filesystem_root_windows_drive_roots(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "nt")
-    monkeypatch.setattr(os, "path", ntpath)
-    try:
-        assert gitread._is_filesystem_root("C:\\") is True
-        assert gitread._is_filesystem_root("C:/") is True
-        assert gitread._is_filesystem_root("C:") is True
-        assert gitread._is_filesystem_root("Z:\\") is True
-        assert gitread._is_filesystem_root("C:\\Windows") is False
-        assert gitread._is_filesystem_root("Z:\\tools") is False
-        assert gitread._is_filesystem_root("git") is False
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "path", os.path)
+    paths = ["C:\\", "C:/", "C:", "Z:\\", "C:\\Windows", "Z:\\tools", "git"]
+    with _simulated_windows(monkeypatch, cwd="C:\\"):
+        roots = [gitread._is_filesystem_root(p) for p in paths]
+    assert roots == [True, True, True, True, False, False, False]
 
 
 def _posix_root_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1254,32 +1296,20 @@ def test_workspace_at_posix_root_still_drops_usr_bin(
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
-def _windows_paths(monkeypatch: pytest.MonkeyPatch, cwd: str) -> None:
-    monkeypatch.setattr(os, "name", "nt")
-    monkeypatch.setattr(os, "path", ntpath)
-    monkeypatch.setattr(os, "pathsep", ";")
-    monkeypatch.setattr(os, "getcwd", lambda: cwd)
-    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
-
-
 def test_cwd_at_windows_drive_root_keeps_git_on_that_drive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _windows_paths(monkeypatch, "C:\\")
+    repo = Path("D:\\repo")  # built before os.name changes (SR N-9)
     monkeypatch.setenv("PATH", "C:\\Program Files\\Git\\cmd")
-    repo = Path("D:\\repo")
-    kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
-    assert kept == ["C:\\Program Files\\Git\\cmd"]
-    assert "C:\\Program Files\\Git\\cmd" not in dropped
     exe = "C:\\Program Files\\Git\\cmd\\git.exe"
     _accept_as_git(monkeypatch, exe)
-    try:
+    with _simulated_windows(monkeypatch, cwd="C:\\"):
+        kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
         found = gitread._find_git(repo)
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "path", os.path)
-        monkeypatch.setattr(os, "pathsep", os.pathsep)
-    assert found.path == ntpath.realpath(exe)
+        real_exe = ntpath.realpath(exe)
+    assert kept == ["C:\\Program Files\\Git\\cmd"]
+    assert "C:\\Program Files\\Git\\cmd" not in dropped
+    assert found.path == real_exe
     assert found.search_path == "C:\\Program Files\\Git\\cmd"
 
 
@@ -1287,20 +1317,15 @@ def test_cwd_at_windows_drive_root_keeps_git_on_that_drive(
 def test_repo_at_windows_drive_root_never_uses_git_inside_it(
     monkeypatch: pytest.MonkeyPatch, root: str
 ) -> None:
-    _windows_paths(monkeypatch, root)
+    repo = Path(root)  # built before os.name changes (SR N-9)
     tools = root + "tools"
     monkeypatch.setenv("PATH", tools)
     _accept_as_git(monkeypatch, tools + "\\git.exe")
-    kept, dropped = gitread._split_path(gitread._untrusted_folders(Path(root)))
-    try:
-        assert kept == []
-        assert tools in dropped
-        with pytest.raises(ComponentError) as info:
-            gitread._find_git(Path(root))
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "path", os.path)
-        monkeypatch.setattr(os, "pathsep", os.pathsep)
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd=root):
+        kept, dropped = gitread._split_path(gitread._untrusted_folders(repo))
+        gitread._find_git(repo)
+    assert kept == []
+    assert tools in dropped
     assert info.value.message == gitread._UNTRUSTED_GIT
     assert info.value.component == "gitread"
 
@@ -1308,31 +1333,21 @@ def test_repo_at_windows_drive_root_never_uses_git_inside_it(
 def test_repo_at_windows_drive_root_with_no_git_is_git_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _windows_paths(monkeypatch, "C:\\")
+    repo = Path("C:\\")  # built before os.name changes (SR N-9)
     monkeypatch.setenv("PATH", "C:\\tools")
     monkeypatch.setattr(gitread, "_is_runnable_git", lambda _path: False)
-    try:
-        with pytest.raises(GitUnavailable):
-            gitread._find_git(Path("C:\\"))
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "path", os.path)
-        monkeypatch.setattr(os, "pathsep", os.pathsep)
+    with pytest.raises(GitUnavailable), _simulated_windows(monkeypatch, cwd="C:\\"):
+        gitread._find_git(repo)
 
 
 def test_realpath_check_refuses_git_inside_repo_at_windows_drive_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _windows_paths(monkeypatch, "C:\\")
+    repo = Path("C:\\")  # built before os.name changes (SR N-9)
     monkeypatch.setenv("PATH", "C:\\tools")
     monkeypatch.setattr(gitread, "_look_for_git", lambda _folders: "C:\\tools\\git.exe")
-    try:
-        with pytest.raises(ComponentError) as info:
-            gitread._find_git(Path("C:\\"))
-    finally:
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "path", os.path)
-        monkeypatch.setattr(os, "pathsep", os.pathsep)
+    with pytest.raises(ComponentError) as info, _simulated_windows(monkeypatch, cwd="C:\\"):
+        gitread._find_git(repo)
     assert info.value.message == gitread._UNTRUSTED_GIT
 
 
