@@ -100,6 +100,6 @@ def test_outcomes_are_frozen_and_keyword_only() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         outcome.fail_on = "any-stale"  # type: ignore[misc]
     with pytest.raises(TypeError):
-        AnalysisOutcome("none", False, False, False, False)  # type: ignore[misc]
+        AnalysisOutcome("none", False, False, False, False)  # type: ignore[call-arg]
     assert UsageErrorOutcome() == UsageErrorOutcome()
     assert RefusedTriggerOutcome() == RefusedTriggerOutcome()

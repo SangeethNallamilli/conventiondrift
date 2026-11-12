@@ -1,11 +1,12 @@
 """Unit tests for the component seam in conventiondrift.components (T-006a, I-14)."""
 
 import dataclasses
+import inspect
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 
@@ -13,19 +14,25 @@ from conventiondrift.checkers.base import Checker
 from conventiondrift.components import (
     ChangedFile,
     Components,
+    Extractor,
     GitHubClient,
     GitReaderProtocol,
+    History,
     PublishOutcome,
     Rendered,
+    Renderer,
     Side,
     TreeEntry,
 )
 from conventiondrift.model import (
     CheckerId,
     CheckerPolicy,
+    Conflict,
+    InstructionFile,
     Policy,
     ReportCounts,
     Result,
+    Rule,
     Thresholds,
     Window,
 )
@@ -113,7 +120,87 @@ def test_components_are_frozen_and_keyword_only() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         components.checkers = {}  # type: ignore[misc]
     with pytest.raises(TypeError):
-        Components(None)  # type: ignore[misc]
+        Components(None)  # type: ignore[call-arg]
+
+
+class _Extractor:
+    def extract(
+        self,
+        files: Sequence[InstructionFile],
+        policy: Policy,
+        checkers: Mapping[str, Checker],
+    ) -> tuple[Sequence[Rule], Sequence[Conflict]]:
+        self.seen = (tuple(files), policy, dict(checkers))
+        return ((), ())
+
+
+def test_extractor_protocol_is_called_through_components() -> None:
+    extractor = _Extractor()
+    components = Components(extractor=extractor)
+    assert components.extractor is not None
+    files = (InstructionFile(path="AGENTS.md", data=b"x", scope_dir="", via_paths_input=False),)
+    policy = _minimal_result().policy
+    assert components.extractor.extract(files, policy, {}) == ((), ())
+    assert extractor.seen == (files, policy, {})
+
+
+P = inspect.Parameter
+POS = P.POSITIONAL_OR_KEYWORD
+KW = P.KEYWORD_ONLY
+NO = P.empty
+
+# I-14, pinned: (name, kind, default) for every parameter after self.
+I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
+    (GitReaderProtocol, "resolve"): (("rev", POS, NO),),
+    (GitReaderProtocol, "is_shallow"): (),
+    (GitReaderProtocol, "has_object"): (("sha", POS, NO),),
+    (GitReaderProtocol, "merge_base"): (("a", POS, NO), ("b", POS, NO)),
+    (GitReaderProtocol, "commit_date"): (("sha", POS, NO),),
+    (GitReaderProtocol, "first_parent_chain"): (("sha", POS, NO), ("limit", POS, NO)),
+    (GitReaderProtocol, "patches"): (("from_sha", POS, NO), ("to_sha", POS, NO)),
+    (GitReaderProtocol, "tree"): (("sha", POS, NO),),
+    (GitReaderProtocol, "blob"): (("oid", POS, NO), ("max_bytes", POS, NO)),
+    (GitReaderProtocol, "changed_files"): (("base", POS, NO), ("head", POS, NO)),
+    (Extractor, "extract"): (("files", POS, NO), ("policy", POS, NO), ("checkers", POS, NO)),
+    (History, "recent"): (
+        ("git", POS, NO),
+        ("window", POS, NO),
+        ("sites", POS, NO),
+        ("scan_files", POS, ()),
+    ),
+    (Renderer, "render"): (("result", POS, NO), ("previous_comment", KW, NO)),
+    (GitHubClient, "publish"): (
+        ("repo", KW, NO),
+        ("pr_number", KW, NO),
+        ("run_head_sha", KW, NO),
+        ("comment", KW, NO),
+        ("sarif", KW, NO),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    I14_SIGNATURES.items(),
+    ids=[f"{proto.__name__}.{name}" for proto, name in I14_SIGNATURES],
+)
+def test_protocol_signatures_match_i14(
+    method: tuple[type, str], expected: tuple[tuple[str, Any, object], ...]
+) -> None:
+    params = list(inspect.signature(getattr(*method)).parameters.values())
+    assert params[0].name == "self"
+    assert tuple((p.name, p.kind, p.default) for p in params[1:]) == expected
+
+
+def test_every_protocol_method_is_pinned() -> None:
+    protocols = (GitReaderProtocol, Extractor, History, Renderer, GitHubClient)
+    declared = {
+        (proto, name)
+        for proto in protocols
+        for name, value in vars(proto).items()
+        if inspect.isfunction(value) and not name.startswith("_")
+    }
+    assert declared == set(I14_SIGNATURES)
 
 
 def test_components_take_factories_and_stand_ins() -> None:

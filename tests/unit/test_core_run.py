@@ -1,7 +1,7 @@
 """Unit tests for run(), the InternalError helper and error-time fail-on (T-006a, I-2, I-14)."""
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -57,6 +57,8 @@ def test_valid_components_are_kept(component: str) -> None:
         "core\n",
         "core x",
         "ćore",
+        # I-14's regex has no hyphen, so a hyphenated checker id falls back too (flagged).
+        "checker:http-client",
     ],
 )
 def test_invalid_components_become_core(component: str) -> None:
@@ -152,12 +154,12 @@ def test_run_maps_the_pipeline_outcome(
 
 @pytest.mark.parametrize("entry", ["action", "cli"])
 def test_run_passes_entry_through_and_never_reads_it_from_env(
-    monkeypatch: pytest.MonkeyPatch, entry: str
+    monkeypatch: pytest.MonkeyPatch, entry: Literal["action", "cli"]
 ) -> None:
     pipeline = _Recorder(UsageErrorOutcome())
     monkeypatch.setattr(core, "_pipeline", pipeline)
     env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "pull_request"}
-    run(["x"], env, entry=entry)  # type: ignore[arg-type]
+    run(["x"], env, entry=entry)
     assert pipeline.calls[0][:3] == (["x"], env, entry)
 
 
@@ -174,6 +176,8 @@ def test_run_uses_default_components_or_the_given_ones(monkeypatch: pytest.Monke
 def test_run_requires_entry() -> None:
     with pytest.raises(TypeError):
         run([], {})  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        run([], {}, "cli")  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -218,6 +222,46 @@ def test_component_system_exit_and_generator_exit_become_internal_errors(
     assert pipeline.context.internal_errors == (InternalError("core", type(exc).__name__ + SUFFIX),)
 
 
+@pytest.mark.parametrize("exc_type", [SystemExit, GeneratorExit])
+def test_component_exit_under_any_stale_fails_closed_and_withholds_its_argument(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exc_type: type[SystemExit | GeneratorExit],
+) -> None:
+    zero = _Recorder(exc_type(0), explicit_fail_on="any-stale")
+    monkeypatch.setattr(core, "_pipeline", zero)
+    assert run([], {}, entry="action") == 3
+
+    pipeline = _Recorder(exc_type("ghp_FAKE /home/x"), explicit_fail_on="any-stale")
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="cli") == 3
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    assert error == InternalError("core", exc_type.__name__ + SUFFIX)
+    out, err = capsys.readouterr()
+    for planted in ("ghp_FAKE", "/home/x"):
+        assert planted not in error.message
+        assert planted not in error.component
+        assert planted not in out
+        assert planted not in err
+
+
+def test_run_keeps_internal_errors_recorded_before_a_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    earlier = InternalError("checker:logging", "ComponentError" + SUFFIX)
+    pipeline = _Recorder(
+        ComponentError("render", PLANTED), internal_errors=(earlier,), explicit_fail_on="new-stale"
+    )
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="action") == 3
+    assert pipeline.context is not None
+    assert pipeline.context.internal_errors == (
+        earlier,
+        InternalError("render", "ComponentError" + SUFFIX),
+    )
+
+
 def test_run_lets_keyboard_interrupt_propagate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         core, "_pipeline", _Recorder(KeyboardInterrupt(), explicit_fail_on="any-stale")
@@ -226,9 +270,19 @@ def test_run_lets_keyboard_interrupt_propagate(monkeypatch: pytest.MonkeyPatch) 
         run([], {}, entry="cli")
 
 
-def test_unwired_pipeline_is_an_internal_error() -> None:
+def test_unwired_pipeline_is_an_internal_error(monkeypatch: pytest.MonkeyPatch) -> None:
     # Until T-028 lands the pipeline is not wired, and run() reports that as a core error.
+    contexts: list[RunContext] = []
+
+    def _captured() -> RunContext:
+        contexts.append(RunContext())
+        return contexts[-1]
+
+    monkeypatch.setattr(core, "RunContext", _captured)
     assert run(["check"], {}, entry="cli") == 0
+    assert [c.internal_errors for c in contexts] == [
+        (InternalError("core", "NotImplementedError" + SUFFIX),)
+    ]
     with pytest.raises(NotImplementedError):
         core._pipeline([], {}, "cli", Components(), RunContext())
 
