@@ -1,11 +1,14 @@
-"""Shared immutable boundary types (INTERFACES I-10, I-11; DESIGN §12 A-1).
+"""Shared immutable boundary types (INTERFACES I-10, I-11, I-13; DESIGN §12 A-1).
 
-Every component boundary carries these frozen dataclasses. Collections are
-tuples or frozensets so a value can't change after it is built. Field names
-and value sets follow I-10, I-11 and the I-9 report shapes.
+Every component boundary carries these frozen, slotted dataclasses. Collections
+are tuples or frozensets and ``Mapping`` fields hold read-only mappings
+(``types.MappingProxyType``). Paths are repo-relative POSIX strings. Field
+names and value sets follow I-13, which C11 maps one-to-one to the I-9 report.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -19,47 +22,23 @@ CheckerId = Literal[
     "type-hints",
     "package-manager",
 ]
-FailOn = Literal["none", "new-stale", "any-stale"]
-PolicySource = Literal["base", "head"]
+SkipReason = Literal[
+    "syntax error",
+    "not decodable",
+    "binary",
+    "size limit",
+    "symlink",
+    "outside repository",
+    "syntax newer than analyzer",
+    "special file",
+    "cap exceeded",
+    "walk limit",
+    "manifest parse error",
+]
 Case = Literal["made-stale-by-code", "stale-rule-added", "fixed", "pre-existing-stale", "removed"]
-SuggestionKind = Literal["replace", "tie", "remove-or-rewrite", "none"]
 
 
-@dataclass(frozen=True)
-class InstructionFile:
-    """An instruction file found by C4 (AGENTS.md, CLAUDE.md, ...)."""
-
-    path: str
-    data: bytes
-
-
-@dataclass(frozen=True)
-class PyFile:
-    """A Python file in scope: repo-relative POSIX path and its bytes (I-11 C4)."""
-
-    path: str
-    data: bytes
-
-
-@dataclass(frozen=True)
-class SkippedFile:
-    """A file that was not analyzed, with the reason shown in the report (I-9)."""
-
-    path: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class Policy:
-    """C5 output (I-11). Notes are summary lines; ``source`` says which side applied."""
-
-    effective_fail_on: FailOn
-    source: PolicySource
-    after_merge_notes: tuple[str, ...]
-    notes: tuple[str, ...]
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RuleMatch:
     """Result of mapping one rule sentence to a checker (I-10)."""
 
@@ -68,7 +47,7 @@ class RuleMatch:
     specificity: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Site:
     """One place in the code where a checker's option is used (I-10)."""
 
@@ -78,50 +57,166 @@ class Site:
     option: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FileContext:
-    """What a checker may know about the file it is looking at (I-10)."""
+    """What a checker may know about the file it is looking at (I-10, I-13 Q10)."""
 
     path: str
     is_test_file: bool
     is_script: bool
+    main_guard_spans: tuple[tuple[int, int], ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class InstructionFile:
+    """An instruction file found by C4, with the scope C4 gave it (I-13 Q3)."""
+
+    path: str
+    data: bytes
+    scope_dir: str
+    via_paths_input: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PyFile:
+    """A Python file in scope (I-11 C4)."""
+
+    path: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestFile:
+    """A package-manager manifest in scope (I-11 C4, I-13 Q2)."""
+
+    path: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class SkippedFile:
+    """A file that was not analyzed, with the reason shown in the report (I-9, I-13 Q5)."""
+
+    path: str
+    reason: SkipReason
+
+
+@dataclass(frozen=True, slots=True)
+class Thresholds:
+    """Verdict thresholds in percent, plus the minimum relevant sites (I-6, I-13)."""
+
+    holds: int
+    stale_overall: int
+    stale_recent: int
+    migrating_overall: int
+    migrating_recent: int
+    min_sites: int
+
+
+@dataclass(frozen=True, slots=True)
+class CheckerPolicy:
+    """One checker's settings; ``script_paths`` is empty except for logging (I-13)."""
+
+    enabled: bool
+    script_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class IgnoreEntry:
+    """One config ``ignore`` entry: by file and line, or by rule text (I-6, I-13)."""
+
+    file: str | None
+    line: int | None
+    text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Policy:
+    """C5 output: the effective settings for the run (I-11, I-13 Q6)."""
+
+    effective_fail_on: Literal["none", "new-stale", "any-stale"]
+    gated: bool
+    source: Literal["base", "head"]
+    history_days: int
+    thresholds: Thresholds
+    excludes: tuple[str, ...]
+    max_file_bytes: int
+    checkers: Mapping[CheckerId, CheckerPolicy]
+    ignores: tuple[IgnoreEntry, ...]
+    markers: Mapping[str, tuple[int, ...]]
+    paths: tuple[str, ...] | None
+    comment: bool
+    sarif: bool
+    after_merge_notes: tuple[str, ...]
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Rule:
-    """One extracted rule (I-11 C6). ``checker`` and ``match`` are None when not verifiable."""
+    """One extracted rule (I-11 C6, I-13). ``scope_dir`` "" means the whole repo."""
 
     id: str
     file: str
     line: int
     also_at: tuple[int, ...]
     text: str
+    normalized_text: str
     checker: CheckerId | None
     match: RuleMatch | None
     scope_dir: str
     ignored: bool
+    disabled: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Conflict:
-    """Rules with overlapping scope whose options clash, by rule id (I-9 ``conflicts``)."""
+    """Two conflicting rules, by sorted rule id (I-9 ``conflicts``, I-13)."""
 
-    rules: tuple[str, ...]
+    rules: tuple[str, str]
     checker: CheckerId
 
 
 class Verdict(StrEnum):
-    """The six verdicts; values are the exact I-9 strings."""
+    """The six verdicts; values are the exact I-9 strings (I-13 Q7)."""
 
     HOLDS = "Holds"
     STALE = "Stale"
     MIGRATING = "Migrating"
     CONTESTED = "Contested"
-    INSUFFICIENT_DATA = "Insufficient data"
+    INSUFFICIENT = "Insufficient data"
     NOT_VERIFIABLE = "Not verifiable"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class Counts:
+    """Site counts; the percentage is computed only for display, by C11."""
+
+    following: int
+    contradicting: int
+    relevant: int
+
+
+@dataclass(frozen=True, slots=True)
+class SiteResult:
+    """A site with whether it follows the rule and whether it is recent."""
+
+    site: Site
+    follows: bool
+    recent: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SideResult:
+    """C9 output for one rule on one side (I-13 Q7)."""
+
+    verdict: Verdict
+    sites: tuple[SiteResult, ...]
+    overall: Counts
+    recent: Counts | None
+    recent_unavailable_reason: Literal["no history", "no relevant sites in the window"] | None
+
+
+@dataclass(frozen=True, slots=True)
 class CausingFile:
     """A changed file whose sites for a rule changed (I-9 ``causing_files``)."""
 
@@ -130,7 +225,7 @@ class CausingFile:
     contradicting_delta: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Alternative:
     """A candidate option and its head site count (I-9 ``suggestion.alternatives``)."""
 
@@ -138,31 +233,75 @@ class Alternative:
     sites: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Suggestion:
-    """Suggested rewording for a rule (I-9 ``suggestion``)."""
+    """Suggested rewording for a rule (I-9 ``suggestion``, I-13 Q8)."""
 
-    kind: SuggestionKind
+    kind: Literal["replace", "tie", "remove-or-rewrite", "none"]
     named_option: str | None
     alternatives: tuple[Alternative, ...]
     new_text: str | None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RuleResult:
-    """C10 output per rule (I-11): the before/after case, causing files and suggestion."""
+    """C10 output, one per rule identity (I-11, I-13 Q8)."""
 
+    rule_id: str
+    base_rule: Rule | None
+    head_rule: Rule | None
+    base: SideResult | None
+    head: SideResult | None
+    conflict_with: tuple[str, ...]
     case: Case | None
     causing_files: tuple[CausingFile, ...]
     suggestion: Suggestion
 
 
-@dataclass(frozen=True)
-class Result:
-    """Everything C11 renders from (I-11 C11)."""
+@dataclass(frozen=True, slots=True)
+class Window:
+    """The recent-adherence window; ``end`` is timezone-aware (I-9, I-13)."""
 
+    end: datetime | None
+    days: int
+    available: bool
+    unavailable_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InternalError:
+    """An internal error as reported: component and fixed message only (DESIGN §4)."""
+
+    component: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReportCounts:
+    """Report-level counts (I-9 ``counts``)."""
+
+    stale: int
+    new_stale: int
+    rules_changed: int
+    rules_unchanged: int
+
+
+@dataclass(frozen=True, slots=True)
+class Result:
+    """Everything C11 renders from (I-11 C11, I-13 Q9)."""
+
+    mode: Literal["compare", "head-only", "scan"]
+    base_sha: str | None
+    head_sha: str
+    head_only_reason: Literal["shallow clone", "missing object", "no merge base"] | None
+    window: Window
     policy: Policy
     instruction_files: tuple[InstructionFile, ...]
     skipped_files: tuple[SkippedFile, ...]
     rule_results: tuple[RuleResult, ...]
     conflicts: tuple[Conflict, ...]
+    unattached_markers: tuple[tuple[str, int], ...]
+    internal_errors: tuple[InternalError, ...]
+    counts: ReportCounts
+    notes: tuple[str, ...]
+    analyzer_python: str
