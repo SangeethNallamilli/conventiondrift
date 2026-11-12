@@ -98,19 +98,24 @@ def internal_error(exc: BaseException) -> InternalError:
 def error_fail_on(
     explicit: str | None, base_config: FailOn | None, *, config_known_present: bool = False
 ) -> FailOn:
-    """``fail-on`` for a run that failed before policy loaded (I-14 Q5, D-PM-32, SR-015).
+    """``fail-on`` for a run that failed before policy loaded (I-14 Q5, D-PM-32, SR-015, SR F1).
 
     The explicit input or flag when present and valid wins. Otherwise the base
-    config's value if it was already read. Otherwise, if the policy-side tree is
-    known to contain a config file that wasn't read, ``new-stale``, so the run
-    fails closed with exit 3; that value is an internal gate only, never a
-    configured ``fail-on``. Otherwise ``none``.
+    config's value if it was already read. Otherwise ``new-stale`` if a non-empty
+    explicit value was given but isn't valid (SR F1: a typo or look-alike such as
+    ``"none "`` must not open the gate), or if the policy-side tree is known to
+    contain a config file that wasn't read (D-PM-32). Either way the run fails
+    closed with exit 3, and that value is an internal gate only, never a
+    configured ``fail-on``. Otherwise ``none``; an empty explicit value counts as
+    unset.
     """
     for value in _FAIL_ON_VALUES:
         if explicit == value:
             return value
     if base_config is not None:
         return base_config
+    if explicit:
+        return "new-stale"
     if config_known_present:
         return "new-stale"
     return "none"

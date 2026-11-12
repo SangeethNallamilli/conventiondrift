@@ -115,7 +115,7 @@ def test_exact_message_text() -> None:
         ("none", "any-stale", "none"),
         (None, "new-stale", "new-stale"),
         ("bogus", "any-stale", "any-stale"),
-        ("NEW-STALE", None, "none"),
+        ("NEW-STALE", None, "new-stale"),  # SR F1: an invalid explicit value fails closed
         ("", None, "none"),
         (None, None, "none"),
     ],
@@ -146,6 +146,47 @@ def test_error_fail_on_with_config_known_present(
     explicit: str | None, base: Any, expected: str
 ) -> None:
     assert error_fail_on(explicit, base, config_known_present=True) == expected
+
+
+INVALID_EXPLICIT = [
+    "bogus",
+    "NEW-STALE",
+    " none",
+    "none ",
+    "none\n",
+    "none\x00",
+    "n\u043ene",  # "none" with a Cyrillic small o (U+043E)
+    "\uff4e\uff4f\uff4e\uff45",  # fullwidth "none" (U+FF4E U+FF4F U+FF4E U+FF45)
+]
+
+
+@pytest.mark.parametrize("explicit", INVALID_EXPLICIT)
+def test_invalid_explicit_fail_on_fails_closed(explicit: str) -> None:
+    # SR F1: with no base value and no known config, an invalid explicit value is new-stale.
+    assert error_fail_on(explicit, None) == "new-stale"
+    assert error_fail_on(explicit, None, config_known_present=False) == "new-stale"
+
+
+@pytest.mark.parametrize("explicit", INVALID_EXPLICIT)
+def test_invalid_explicit_fail_on_exits_3_through_run(
+    monkeypatch: pytest.MonkeyPatch, explicit: str
+) -> None:
+    pipeline = _Recorder(RuntimeError(), explicit_fail_on=explicit)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="cli") == 3
+    assert pipeline.context is not None
+    assert pipeline.context.internal_errors == (InternalError("core", "RuntimeError" + SUFFIX),)
+
+
+def test_empty_explicit_fail_on_still_counts_as_unset() -> None:
+    assert error_fail_on("", None) == "none"
+    assert error_fail_on("", None, config_known_present=True) == "new-stale"
+
+
+@pytest.mark.parametrize("base", ["none", "new-stale", "any-stale"])
+@pytest.mark.parametrize("explicit", ["bogus", "none ", "n\u043ene"])
+def test_valid_base_value_beats_an_invalid_explicit_value(explicit: str, base: Any) -> None:
+    assert error_fail_on(explicit, base) == base
 
 
 def test_config_known_present_is_keyword_only_and_off_by_default() -> None:
@@ -244,7 +285,7 @@ def test_run_requires_entry() -> None:
         ({"explicit_fail_on": "none", "base_fail_on": "any-stale"}, 0),
         ({"base_fail_on": "any-stale"}, 3),
         ({"explicit_fail_on": "invalid", "base_fail_on": "new-stale"}, 3),
-        ({"explicit_fail_on": "invalid"}, 0),
+        ({"explicit_fail_on": "invalid"}, 3),  # SR F1
     ],
 )
 def test_run_reports_a_raising_pipeline_with_the_fail_on_known_so_far(
