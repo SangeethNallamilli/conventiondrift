@@ -72,7 +72,9 @@ REASON_BINARY: Final = "binary"
 REASON_NOT_DECODABLE: Final = "not decodable"
 # FIFOs, sockets, devices, and a folder where a file was expected (I-13).
 REASON_SPECIAL: Final = "special file"
-# Backslash or drive-form names found in the repo tree, e.g. ``a\\b.py`` (D-PM-28).
+# Tree names Windows cannot hold or reads differently (D-PM-28 as narrowed, I-13): a
+# backslash, a trailing dot or space, a device name, a lone surrogate, a name too long
+# for the OS, and a ``:`` only when ``os.name == "nt"``.
 REASON_UNSUPPORTED: Final = "unsupported path"
 # Permission denied, I/O error, a file that vanished after listing, any other OS error (I-13).
 REASON_UNREADABLE: Final = "unreadable"
@@ -96,6 +98,16 @@ _FOREIGN_BOMS: Final = (
     codecs.BOM_UTF16_BE,
 )
 _READ_CHUNK: Final = 65_536
+
+
+def _has_lone_surrogate(segment: str) -> bool:
+    """True if ``segment`` holds a code point in U+D800..U+DFFF (SR N1, I-13).
+
+    Python strings never pair surrogates, so this covers a stray ``\\ud800`` and the
+    ``\\udc80``-``\\udcff`` that ``surrogateescape`` (``os.fsdecode``) makes from
+    non-UTF-8 bytes. A plain scan, not ``encode``, so nothing is encoded first.
+    """
+    return any("\ud800" <= ch <= "\udfff" for ch in segment)
 
 
 def _windows_only_form(segment: str, *, colon: bool) -> bool:
@@ -134,6 +146,11 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
       ``os.name == "nt"``, where it would open an NTFS stream; on POSIX such
       names are analyzed normally (AC-N3.13 needs a ``::warning::`` file name).
 
+    A lone surrogate (U+D800..U+DFFF) in any segment, including the ``\\udc80``
+    style names ``surrogateescape`` decoding gives for non-UTF-8 bytes, gets the
+    same split (SR N1, I-13), so it never reaches ``os.fsencode`` and no
+    ``UnicodeEncodeError`` escapes.
+
     Traversal and absolute forms win over these. Glob characters are left
     alone, so the same check serves ``exclude`` entries. Plain string tests
     only: no regex, linear in ``value``.
@@ -144,7 +161,7 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
     colon = origin == "input" or os.name == "nt"  # read per call, so tests can patch it
-    if any(_windows_only_form(p, colon=colon) for p in parts):
+    if any(_has_lone_surrogate(p) or _windows_only_form(p, colon=colon) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
 

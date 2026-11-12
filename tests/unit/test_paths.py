@@ -284,3 +284,61 @@ def test_read_colon_tree_name_on_posix(tmp_path: Path, opened: list[object], nam
         read_worktree_file(tmp_path, f"src/{name}", "python", origin="input")
     assert exc.value.reason == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
+
+
+# ---- SR N1 on T-009 (I-13): lone surrogates are rejected before any encoding ----------
+
+LONE_SURROGATES = [
+    "a\ud800.py",  # first surrogate
+    "x/\udfff/y.py",  # last surrogate, in a folder segment
+    "a\udc80.py",  # what surrogateescape (os.fsdecode) makes of the byte 0x80
+    "src/caf\udce9.py",  # ... and of a Latin-1 0xE9
+    "\udbff",  # a high surrogate alone as the whole name
+    "\ud83d\ude00.py",  # a UTF-16 pair stays two lone code points in a Python str
+]
+
+
+@pytest.mark.parametrize("value", LONE_SURROGATES)
+@pytest.mark.parametrize(
+    ("origin", "expected"), [("tree", REASON_UNSUPPORTED), ("input", REASON_OUTSIDE)]
+)
+def test_lone_surrogate_split_by_origin(
+    value: str, origin: PathOrigin, expected: str, os_name: str, opened: list[object]
+) -> None:
+    with pytest.raises(FileSkipped) as exc:
+        validate_relpath(value, origin=origin)
+    assert exc.value.reason == expected
+    with pytest.raises(FileSkipped) as exc2:  # never a UnicodeEncodeError
+        read_worktree_file("/nonexistent", value, "python", origin=origin)
+    assert exc2.value.reason == expected
+    assert opened == [], "nothing may be opened for a rejected path"
+
+
+@pytest.mark.parametrize("value", ["../\ud800.py", "/\udc80", "a\udc80\x00"])
+def test_traversal_wins_over_lone_surrogate(value: str) -> None:
+    with pytest.raises(FileSkipped) as exc:
+        validate_relpath(value, origin="tree")
+    assert exc.value.reason == REASON_OUTSIDE
+
+
+@pytest.mark.parametrize("value", ["a\ud7ff.py", "a\ue000.py", "\U0001f600.py", "caf\xe9.py"])
+@pytest.mark.parametrize("origin", ["input", "tree"])
+def test_code_points_next_to_the_surrogate_range_are_fine(value: str, origin: PathOrigin) -> None:
+    assert validate_relpath(value, origin=origin) == value
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="needs a file system that takes non-UTF-8 names"
+)
+def test_real_non_utf8_tree_name_is_unsupported(tmp_path: Path, opened: list[object]) -> None:
+    """A real file named with the byte 0xFF is listed as ``\\udcff`` and never opened."""
+    fd = os.open(os.fsencode(tmp_path) + b"/a\xff.py", os.O_WRONLY | os.O_CREAT, 0o600)
+    os.write(fd, b"x = 1\n")
+    os.close(fd)
+    (name,) = os.listdir(tmp_path)
+    assert name == "a\udcff.py"
+    opened.clear()
+    with pytest.raises(FileSkipped) as exc:
+        read_worktree_file(tmp_path, name, "python", origin="tree")
+    assert exc.value.reason == REASON_UNSUPPORTED
+    assert opened == [], "nothing may be opened for a rejected path"
