@@ -1,0 +1,464 @@
+# T-003 CI. Every third-party uses: is pinned to a full 40-character SHA
+# with a version comment (R7.3, AC-N3.11). This workflow never uses
+# pull_request_target or workflow_run (R5.2, AC-N3.5).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONHASHSEED: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  HYPOTHESIS_SEED: "20261112"
+
+jobs:
+  pin-lint:
+    name: pin-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Lint action pins and forbidden triggers
+        run: python3 scripts/ci/check_action_pins.py
+
+  dco:
+    name: dco
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Check Signed-off-by on each PR commit
+        env:
+          DCO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DCO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci/check_dco.py
+
+  lockfile:
+    name: lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          enable-cache: false
+      - name: Recompile lockfiles and require a match
+        run: python3 scripts/ci/check_lockfiles.py
+
+  lint:
+    name: lint
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python3 scripts/ci/check_no_pypi_yaml.py
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: ruff check
+        run: ruff check src
+        # ruff excludes src/conventiondrift/_vendor/, so S506 (unsafe YAML loaders)
+        # covers only our own code, not the vendored tree.
+
+  types:
+    name: types
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: mypy --strict src and tests/unit (D-TL-21)
+        env:
+          MYPYPATH: src
+        run: mypy --strict src tests/unit
+
+
+  test:
+    # SPEC §6.1 / AC-N5.2: every CLI test must pass on every OS × Python
+    # combination. Platform skips belong in individual tests, not jobs.
+    name: test (${{ matrix.os }}, ${{ matrix.python-version }})
+    needs: [lockfile]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS legs run in the report-only `test-macos` job below (D-TL-30).
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Report the default runner git version
+        run: git --version
+      - name: CONTRIBUTING setup (Windows)
+        if: runner.os == 'Windows'
+        # Job default is bash -e -o pipefail, so a failed native command
+        # stops the step (L-5). Do not use pwsh here.
+        run: |
+          # Translation of the CONTRIBUTING.md Unix setup (TW-OPEN). This is
+          # the Windows install path for this matrix leg. The job fails if
+          # install or later tests fail (AC-N5.2); no continue-on-error.
+          python -m venv .venv
+          .venv/Scripts/python scripts/ci/install_pinned_pip.py
+          .venv/Scripts/python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          .venv/Scripts/python -m pip install --no-deps --no-build-isolation -e .
+          echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
+          .venv/Scripts/conventiondrift --version
+      - name: Install hash-pinned pip, then hashed locks
+        if: runner.os != 'Windows'
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        if: runner.os != 'Windows'
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python scripts/ci/check_no_pypi_yaml.py
+      - name: pytest with coverage (offline paths, fixed seed)
+        run: |
+          # Write the startup .pth into purelib (site-packages). On Windows,
+          # site.getsitepackages()[0] is the venv root, which site processes
+          # before site-packages is on sys.path, so `import coverage` failed
+          # there and leaked a traceback into child-process stderr.
+          python -c "import pathlib, sysconfig; pathlib.Path(sysconfig.get_path('purelib')).joinpath('coverage_startup.pth').write_text('import coverage; coverage.process_startup()\\n')"
+          export COVERAGE_PROCESS_START="${PWD}/pyproject.toml"
+          # Full offline suite: unit/spec/snapshot/property/fixtures/harness/
+          # release (non-network) / security when present. Network tests are
+          # deselected by default once PR #12's marker is on the tree.
+          # Windows legs include tests/security (D-TL-19 / SR-013 PATH-hijack)
+          # when those tests exist; pytest discovers them from tests/.
+          python -m coverage run --parallel-mode -m pytest tests -rs --hypothesis-seed="${HYPOTHESIS_SEED}"
+          python -m coverage combine
+          python -m coverage json -o coverage.json
+          python -m coverage report --show-missing
+      - name: Coverage gate (90/85 overall; 95 branch on critical modules when present)
+        run: python scripts/ci/check_coverage.py coverage.json
+
+  test-macos:
+    # Report-only since D-TL-30 (TL decision, fast mode): macos-latest runners
+    # were not being assigned, so these legs are not in the `ci` aggregate's
+    # needs and do not block merges. Same install and test steps as the
+    # non-Windows `test` legs. FOLLOW-UP: move macOS back into `test` (and so
+    # into `ci`) once macOS runners are reliably assigned.
+    name: test-macos (report-only) (${{ matrix.python-version }})
+    needs: [lockfile]
+    runs-on: macos-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Report the default runner git version
+        run: git --version
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python scripts/ci/check_no_pypi_yaml.py
+      - name: pytest with coverage (offline paths, fixed seed)
+        run: |
+          python -c "import pathlib, sysconfig; pathlib.Path(sysconfig.get_path('purelib')).joinpath('coverage_startup.pth').write_text('import coverage; coverage.process_startup()\\n')"
+          export COVERAGE_PROCESS_START="${PWD}/pyproject.toml"
+          python -m coverage run --parallel-mode -m pytest tests -rs --hypothesis-seed="${HYPOTHESIS_SEED}"
+          python -m coverage combine
+          python -m coverage json -o coverage.json
+          python -m coverage report --show-missing
+      - name: Coverage gate (90/85 overall; 95 branch on critical modules when present)
+        run: python scripts/ci/check_coverage.py coverage.json
+
+  build:
+    name: build
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install hash-pinned pip, then the build lock
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt
+      - name: python -m build --no-isolation
+        run: python -m build --no-isolation
+
+  vendor-network:
+    name: vendor-network
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python3 scripts/ci/check_no_pypi_yaml.py
+      # tests/release is on main (#12). test_vendor_manifest is marked network
+      # and fetches the pinned sdist; this job has network.
+      - name: Network vendor checks (pytest -m network tests/release)
+        run: python -m pytest -m network tests/release --hypothesis-seed="${HYPOTHESIS_SEED}"
+
+  secret-scan:
+    name: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # run_gitleaks.py extracts with tarfile filter='data' (PEP 706, 3.12+)
+          python-version: "3.12"
+      - name: Run checksum-pinned gitleaks
+        run: python3 scripts/ci/run_gitleaks.py
+
+  dependency-scan:
+    name: dependency-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: OSV scan of lockfiles and vendored PyYAML 6.0.3
+        run: python3 scripts/ci/check_dependency_vulns.py
+
+
+  git-minimum:
+    name: git-minimum
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # Tech Lead (D-TL-18): minimum supported git is 2.30, latest 2.30.x.
+    # sha256 verified against https://www.kernel.org/pub/software/scm/git/sha256sums.asc
+    # (git-2.30.9.tar.xz). The installer reads only these env vars.
+    env:
+      GIT_MIN_VERSION: "2.30.9"
+      GIT_MIN_SHA256: "4e3985a641d9ebdfec9e56b370cdbe362a672d9b45270c1acb1406cdab0f5bb4"
+      # Kernel.org checksum autosigner (not Junio C Hamano). See scripts/ci/keys/.
+      GIT_MIN_SIGNER_FPR: "B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1"
+    # Digest of python:3.12-bookworm (index digest from registry-1.docker.io;
+    # linux/amd64 manifest sha256:3c3ba8ad4c85eb63b7568f806434f14e33370056985da7fdf2673621cb1d7e93).
+    # Python 3.12+ is required for tarfile filter='data' (L-7). Bookworm keeps
+    # the compiler toolchain stable for the 2.30.9 source build.
+    container:
+      image: python:3.12-bookworm@sha256:4209fae09a3e20afd863e528bfddc235da5fd5977983e1996cd54cc9a72e6267 # 3.12-bookworm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Git build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates gettext gnupg libcurl4-openssl-dev \
+            libexpat1-dev libssl-dev make zlib1g-dev
+      - name: GPG-verify and build checksum-pinned minimum Git
+        run: python3 scripts/ci/install_git_min.py
+      - name: Confirm PATH git is the pinned minimum
+        run: |
+          command -v git
+          git --version
+          expected="git version ${GIT_MIN_VERSION}"
+          if [ "$(git --version)" != "$expected" ]; then
+            echo "expected ${expected}" >&2
+            exit 1
+          fi
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: pytest against the minimum Git (offline suite)
+        run: python -m pytest tests --hypothesis-seed="${HYPOTHESIS_SEED}"
+
+
+
+  mutation:
+    # Report-only since D-TL-29: not in the `ci` aggregate's needs.
+    # Needs SR review: new dependency mutmut==3.8.1, separate hashed lock.
+    # GATES.md / D-TL-17: overall ≥80%, critical modules ≥90% when present.
+    # Runs on pull_request and on push to main (same triggers as this workflow).
+    name: mutation
+    needs: [lockfile]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No cache input: do not share a pip/setup-python cache with any
+      # release or publish job. PyPI PyYAML is allowed only in this job.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install hash-pinned pip, then the mutation lock
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/mutation.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Vendored yaml isolation (PyPI PyYAML is installed here)
+        env:
+          PYTHONPATH: scripts/ci
+        run: python3 scripts/ci/check_mutation_yaml.py
+      - name: Mutation gate (80 overall / 90 critical; needs SR review)
+        env:
+          PYTHONPATH: scripts/ci
+        run: python3 scripts/ci/check_mutation.py
+
+
+  ci:
+    name: ci
+    if: always()
+    needs:
+      - pin-lint
+      - dco
+      - lockfile
+      - lint
+      - types
+      - test
+      - build
+      - vendor-network
+      - git-minimum
+      # mutation is report-only (D-TL-29, TL decision): it still runs on
+      # every PR and push, but is not part of the required aggregate.
+      # test-macos is report-only (D-TL-30, TL decision) until macOS
+      # runners are reliably assigned; restore it to blocking then.
+      - secret-scan
+      - dependency-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - name: All required jobs passed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          failed = []
+          for name, data in needs.items():
+              result = data.get("result")
+              # dco is skipped on push to main; every other required job must succeed.
+              if result == "success":
+                  continue
+              if name == "dco" and result == "skipped":
+                  continue
+              failed.append(f"{name}={result}")
+          if failed:
+              print("required jobs not green:", ", ".join(failed), file=sys.stderr)
+              sys.exit(1)
+          print("ok: required CI jobs passed")
+          PY

@@ -4,8 +4,8 @@ Every component boundary carries these frozen, slotted dataclasses. Collections
 are tuples or frozensets and ``Mapping`` fields hold read-only mappings
 (``types.MappingProxyType``). Paths are repo-relative POSIX strings. Field
 names and value sets follow I-13, which C11 maps one-to-one to the I-9 report.
-``__post_init__`` checks only the structural invariants I-13 lists and raises
-``ValueError`` when one is broken.
+``__post_init__`` checks the structural invariants I-13 lists and the I-10
+``RuleMatch`` validity conditions, and raises ``ValueError`` when one is broken.
 """
 
 from collections.abc import Iterable, Mapping
@@ -64,6 +64,12 @@ class RuleMatch:
     preferred: frozenset[str]
     prohibited: frozenset[str]
     specificity: int
+
+    def __post_init__(self) -> None:
+        if not (self.preferred | self.prohibited):
+            raise ValueError("RuleMatch preferred and prohibited must not both be empty")
+        if self.preferred & self.prohibited:
+            raise ValueError("RuleMatch preferred and prohibited must be disjoint")
 
 
 @dataclass(frozen=True, slots=True)

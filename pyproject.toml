@@ -67,6 +67,8 @@ select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "A", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+# CI helpers shell out to git/uv/pip and fetch pinned artifacts.
+"scripts/ci/**" = ["S603", "S607", "S310", "S202"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -75,3 +77,24 @@ files = ["src"]
 warn_unreachable = true
 # Vendored PyYAML is third-party source; do not type-check it under strict.
 exclude = ["conventiondrift/_vendor/yaml/"]
+
+[tool.coverage.run]
+branch = true
+parallel = true
+source = ["conventiondrift"]
+# Vendored third-party code is not measured against the merge-gate thresholds.
+omit = ["*/conventiondrift/_vendor/*"]
+relative_files = true
+
+[tool.coverage.report]
+omit = ["*/conventiondrift/_vendor/*"]
+
+
+# T-003 mutation job. mutmut==3.8.1 is a new dependency and needs SR review.
+# GATES.md thresholds are enforced by scripts/ci/check_mutation.py, not here.
+[tool.mutmut]
+source_paths = ["src/conventiondrift"]
+do_not_mutate = ["src/conventiondrift/_vendor/*"]
+also_copy = ["scripts/ci", "tools"]
+pytest_add_cli_args = ["-p", "mutation_yaml_guard"]
+pytest_add_cli_args_test_selection = ["tests"]
