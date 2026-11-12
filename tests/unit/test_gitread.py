@@ -11,6 +11,7 @@ import io
 import ntpath
 import os
 import posixpath
+import shlex
 import shutil
 import subprocess
 import sys
@@ -42,17 +43,37 @@ _TEST_GIT_ENV = {
     "GIT_AUTHOR_EMAIL": "t@example.invalid",
     "GIT_COMMITTER_NAME": "t",
     "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    # Windows: a Python started by git (the sentinel drivers) needs SYSTEMROOT.
+    **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),
 }
 
+#: Every fixture git call: no CRLF conversion, so objects and files are byte-exact.
+_TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 
-def _git(repo: Path, *args: str, date: str | None = None) -> str:
-    """Test helper only: set up fixture repos (not the code under test)."""
+
+def _git_bytes(
+    repo: Path, *args: str, date: str | None = None, stdin: bytes | None = None
+) -> bytes:
+    """Test helper only: run the test machine's git on a fixture repo.
+
+    Binary stdin and stdout (no newline translation). A failure raises with the
+    command, exit code and git's stderr, so a CI log shows why.
+    """
     env = dict(_TEST_GIT_ENV, HOME=str(repo))
     if date is not None:
         env["GIT_AUTHOR_DATE"] = date
         env["GIT_COMMITTER_DATE"] = date
-    out = _REAL_RUN([_GIT, *args], cwd=repo, env=env, check=True, capture_output=True, text=True)
-    return out.stdout.strip()
+    argv = [_GIT, *_TEST_GIT_FLAGS, *args]
+    out = _REAL_RUN(argv, cwd=repo, env=env, input=stdin, capture_output=True, check=False)
+    if out.returncode != 0:
+        stderr = out.stderr.decode("utf-8", errors="replace")
+        raise AssertionError(f"fixture git failed (exit {out.returncode}): {argv}\n{stderr}")
+    return bytes(out.stdout)
+
+
+def _git(repo: Path, *args: str, date: str | None = None) -> str:
+    """Test helper only: set up fixture repos (not the code under test)."""
+    return _git_bytes(repo, *args, date=date).decode("utf-8").strip()
 
 
 def _commit(repo: Path, msg: str, date: str | None = None) -> str:
@@ -70,6 +91,57 @@ def _sh_path(path: Path) -> str:
     """``path`` quoted for a ``#!/bin/sh`` script, in forward slashes so Git for
     Windows' sh does not eat the backslashes of ``C:\\...``."""
     return "'" + path.as_posix() + "'"
+
+
+def _write_lf(path: Path, text: str) -> None:
+    """Write ``text`` with LF line ends on every OS (a ``#!/bin/sh\\r`` line
+    names no interpreter, so a CRLF script never runs under Git for Windows)."""
+    path.write_bytes(text.encode("utf-8"))
+
+
+def _sentinel_driver(tmp_path: Path) -> tuple[str, Path]:
+    """A hostile driver command and the sentinel it creates when git runs it.
+
+    The command is ``"<python>" "<script>"`` with forward slashes, so it runs
+    through git's shell on POSIX and under Git for Windows alike, with no
+    ``#!/bin/sh`` script. The script writes the sentinel and echoes the file
+    named by its first argument (a textconv driver's input), if it can.
+    """
+    sentinel = tmp_path / "sentinel"
+    script = tmp_path / "evil.py"
+    _write_lf(
+        script,
+        "import pathlib, sys\n"
+        f"pathlib.Path({sentinel.as_posix()!r}).write_text('ran\\n')\n"
+        "try:\n"
+        "    sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n"
+        "except (IndexError, OSError):\n"
+        "    pass\n",
+    )
+    python = Path(sys.executable).as_posix()
+    return f'"{python}" "{script.as_posix()}"', sentinel
+
+
+def _sentinel_program(tmp_path: Path, sentinel: Path) -> Path:
+    """A ``#!/bin/sh`` program (LF line ends) that creates ``sentinel``.
+
+    For settings git runs without a shell (``gpg.program``) and for hooks.
+    """
+    program = tmp_path / "evil.sh"
+    _write_lf(program, f'#!/bin/sh\ntouch {_sh_path(sentinel)}\ncat "$1" 2>/dev/null\nexit 0\n')
+    program.chmod(0o755)
+    return program
+
+
+def test_sentinel_driver_command_runs_and_echoes_its_input(tmp_path: Path) -> None:
+    command, sentinel = _sentinel_driver(tmp_path)
+    data = tmp_path / "input.txt"
+    data.write_bytes(b"payload\n")
+    # The same shell form git uses for a textconv driver: the command, then the file.
+    argv = [*shlex.split(command), str(data)]
+    out = _REAL_RUN(argv, capture_output=True, check=False)
+    assert (out.returncode, out.stdout) == (0, b"payload\n")
+    assert sentinel.read_text() == "ran\n"
 
 
 @pytest.fixture
@@ -230,7 +302,8 @@ def test_systemroot_passed_only_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_
     ceiling = os.path.realpath(tmp_path)  # a real folder on this platform
     with _simulated_windows(monkeypatch):
         nt_env = gitread._environment("/h", "/bin", repo_dir)
-    posix_env = gitread._environment("/h", "/bin", repo_dir)
+    with _simulated_posix_name(monkeypatch):  # a real Windows runner has os.name "nt"
+        posix_env = gitread._environment("/h", "/bin", repo_dir)
     base = dict(gitread.FIXED_ENV, PATH="/bin", HOME="/h", GIT_CEILING_DIRECTORIES=ceiling)
     assert nt_env == dict(base, SYSTEMROOT=r"C:\Windows")
     assert posix_env == base
@@ -256,24 +329,30 @@ def test_global_config_in_inherited_home_is_ignored(
 
 
 def test_hostile_repo_config_runs_nothing(repo: Path, tmp_path: Path) -> None:
-    sentinel = tmp_path / "sentinel"
+    # Shell-run settings get the portable Python driver (shown to run under
+    # git by test_plain_git_control_runs_the_hostile_textconv); hooks and
+    # gpg.program, which git starts without a shell, get an LF sh program.
+    run, sentinel = _sentinel_driver(tmp_path)
+    program = _sentinel_program(tmp_path, sentinel)
     hooks = tmp_path / "hooks"
     hooks.mkdir()
-    script = tmp_path / "evil.sh"
-    script.write_text(f"#!/bin/sh\ntouch {_sh_path(sentinel)}\n")
-    script.chmod(0o755)
     for hook in ("post-checkout", "pre-commit", "reference-transaction", "post-index-change"):
-        (hooks / hook).write_text(f"#!/bin/sh\ntouch {_sh_path(sentinel)}\n")
+        (hooks / hook).write_bytes(program.read_bytes())
         (hooks / hook).chmod(0o755)
-    run, hook_dir = _config_path(script), _config_path(hooks)
-    with (repo / ".git" / "config").open("a") as cfg:
-        cfg.write(
-            f"[core]\n\tfsmonitor = {run}\n\thooksPath = {hook_dir}\n\tpager = {run}\n"
-            f'[diff]\n\texternal = {run}\n[diff "x"]\n\ttextconv = {run}\n'
-            f'[filter "x"]\n\tsmudge = {run}\n\tclean = {run}\n'
-            f"[log]\n\tshowSignature = true\n[gpg]\n\tprogram = {run}\n"
-        )
-    (repo / ".gitattributes").write_text("* diff=x filter=x\n")
+    settings = {
+        "core.fsmonitor": run,
+        "core.hooksPath": _config_path(hooks),
+        "core.pager": run,
+        "diff.external": run,
+        "diff.x.textconv": run,
+        "filter.x.smudge": run,
+        "filter.x.clean": run,
+        "log.showSignature": "true",
+        "gpg.program": _config_path(program),
+    }
+    for key, value in settings.items():
+        _git(repo, "config", key, value)  # git writes the escaping, quotes included
+    _write_lf(repo / ".gitattributes", "* diff=x filter=x\n")
     reader = GitReader(repo)
     head = reader.resolve("HEAD")
     assert reader.is_shallow() is False
@@ -627,6 +706,29 @@ def _simulated_windows(
         monkeypatch.setattr(os, "path", _REAL_OS_PATH)
         monkeypatch.setattr(os, "pathsep", _REAL_PATHSEP)
         monkeypatch.setattr(os, "getcwd", _REAL_GETCWD)
+
+
+@contextlib.contextmanager
+def _simulated_posix_name(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run the body with ``os.name == "posix"`` only (path rules unchanged).
+
+    For code that branches on ``os.name`` alone, such as ``_environment``.
+    Same rules as ``_simulated_windows``: no ``Path()`` or assert inside, and
+    ``os.name`` is restored before any assertion runs.
+    """
+    monkeypatch.setattr(os, "name", "posix")
+    try:
+        yield
+    finally:
+        monkeypatch.setattr(os, "name", _REAL_OS_NAME)
+
+
+def test_simulated_posix_name_restores_os_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(RuntimeError), _simulated_posix_name(monkeypatch):
+        inside = os.name
+        raise RuntimeError
+    assert inside == "posix"
+    assert os.name == _REAL_OS_NAME
 
 
 def test_simulated_windows_restores_os_even_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2064,28 +2166,19 @@ def _drop_diff_flag(monkeypatch: pytest.MonkeyPatch, flag: str) -> None:
     monkeypatch.setattr(gitread, "_DIFF_FLAGS", tuple(f for f in gitread._DIFF_FLAGS if f != flag))
 
 
-def _sentinel_script(tmp_path: Path) -> tuple[Path, Path]:
-    sentinel = tmp_path / "sentinel"
-    script = tmp_path / "evil.sh"
-    script.write_text(f'#!/bin/sh\ntouch {_sh_path(sentinel)}\ncat "$1" 2>/dev/null\nexit 0\n')
-    script.chmod(0o755)
-    return script, sentinel
-
-
 @pytest.fixture
 def textconv_repo(repo: Path, tmp_path: Path) -> tuple[Path, Path, str]:
-    """A repo whose config and attributes run a sentinel script as a textconv driver."""
-    script, sentinel = _sentinel_script(tmp_path)
-    (repo / "f.txt").write_text("a\n")
+    """A repo whose config and attributes run a sentinel driver as textconv."""
+    run, sentinel = _sentinel_driver(tmp_path)
+    _write_lf(repo / "f.txt", "a\n")
     _git(repo, "add", "f.txt")
     _commit(repo, "add f")
-    (repo / "f.txt").write_text("b\n")
+    _write_lf(repo / "f.txt", "b\n")
     _git(repo, "add", "f.txt")
     head = _commit(repo, "change f")
-    with (repo / ".git" / "config").open("a") as cfg:
-        run = _config_path(script)
-        cfg.write(f'[diff "x"]\n\ttextconv = {run}\n[diff]\n\texternal = {run}\n')
-    (repo / ".gitattributes").write_text("* diff=x\n")
+    _git(repo, "config", "diff.x.textconv", run)
+    _git(repo, "config", "diff.external", run)
+    _write_lf(repo / ".gitattributes", "* diff=x\n")
     return repo, sentinel, head
 
 
@@ -2144,26 +2237,19 @@ def _signed_commit(repo: Path) -> str:
         "committer t <t@example.invalid> 1700000000 +0000\n"
         "gpgsig -----BEGIN PGP SIGNATURE-----\n \n abc\n -----END PGP SIGNATURE-----\n\nsigned\n"
     )
-    env = dict(_TEST_GIT_ENV, HOME=str(repo))
-    out = _REAL_RUN(
-        [_GIT, "hash-object", "-t", "commit", "-w", "--stdin"],
-        cwd=repo,
-        env=env,
-        input=body,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return out.stdout.strip()
+    # Bytes with LF only: text-mode stdin would send CRLF on Windows.
+    out = _git_bytes(repo, "hash-object", "-t", "commit", "-w", "--stdin", stdin=body.encode())
+    return out.decode("ascii").strip()
 
 
 def test_log_show_signature_false_is_load_bearing(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    script, sentinel = _sentinel_script(tmp_path)
+    sentinel = tmp_path / "sentinel"
+    program = _sentinel_program(tmp_path, sentinel)  # gpg.program runs without a shell
     signed = _signed_commit(repo)
     _git(repo, "config", "log.showSignature", "true")
-    _git(repo, "config", "gpg.program", _config_path(script))
+    _git(repo, "config", "gpg.program", _config_path(program))
     assert GitReader(repo).commit_date(signed) == datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC)
     assert not sentinel.exists()
     _drop_config(monkeypatch, "log.showSignature=false")
