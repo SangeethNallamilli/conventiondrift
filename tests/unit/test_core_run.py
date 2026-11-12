@@ -1,5 +1,6 @@
 """Unit tests for run(), the InternalError helper and error-time fail-on (T-006a, I-2, I-14)."""
 
+import inspect
 from collections.abc import Mapping
 from typing import Any, Literal, get_args
 
@@ -119,7 +120,38 @@ def test_exact_message_text() -> None:
     ],
 )
 def test_error_fail_on_order(explicit: str | None, base: Any, expected: str) -> None:
+    # No keyword: config_known_present defaults to False, the pre-D-PM-32 behaviour.
     assert error_fail_on(explicit, base) == expected
+    assert error_fail_on(explicit, base, config_known_present=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("explicit", "base", "expected"),
+    [
+        # (a) an explicit valid value wins even when a config is known to exist.
+        ("none", None, "none"),
+        ("any-stale", None, "any-stale"),
+        ("none", "any-stale", "none"),
+        # the base config's value wins over known-present, including "none".
+        (None, "none", "none"),
+        (None, "any-stale", "any-stale"),
+        ("bogus", "none", "none"),
+        # (b) known present, nothing read: fail closed with the internal gate.
+        (None, None, "new-stale"),
+        ("bogus", None, "new-stale"),
+    ],
+)
+def test_error_fail_on_with_config_known_present(
+    explicit: str | None, base: Any, expected: str
+) -> None:
+    assert error_fail_on(explicit, base, config_known_present=True) == expected
+
+
+def test_config_known_present_is_keyword_only_and_off_by_default() -> None:
+    param = inspect.signature(error_fail_on).parameters["config_known_present"]
+    assert (param.kind, param.default) == (inspect.Parameter.KEYWORD_ONLY, False)
+    with pytest.raises(TypeError):
+        error_fail_on(None, None, True)  # type: ignore[call-arg]
 
 
 class _Recorder:
@@ -312,8 +344,50 @@ def test_unwired_pipeline_is_an_internal_error(monkeypatch: pytest.MonkeyPatch) 
 
 def test_run_context_defaults() -> None:
     context = RunContext()
-    assert (context.explicit_fail_on, context.base_fail_on, context.internal_errors) == (
-        None,
-        None,
-        (),
-    )
+    assert (
+        context.explicit_fail_on,
+        context.base_fail_on,
+        context.config_known_present,
+        context.internal_errors,
+    ) == (None, None, False, ())
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        ({"config_known_present": True}, 3),
+        ({"config_known_present": False}, 0),
+        ({}, 0),
+        ({"config_known_present": True, "explicit_fail_on": "none"}, 0),
+        ({"config_known_present": True, "base_fail_on": "none"}, 0),
+        ({"config_known_present": True, "base_fail_on": "any-stale"}, 3),
+    ],
+)
+def test_run_uses_config_known_present_for_an_early_crash(
+    monkeypatch: pytest.MonkeyPatch, context: dict[str, Any], expected: int
+) -> None:
+    pipeline = _Recorder(RuntimeError(PLANTED), **context)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="action") == expected
+    assert pipeline.context is not None
+    # The internal error is recorded either way, so exit 0 still writes the section.
+    assert pipeline.context.internal_errors == (InternalError("core", "RuntimeError" + SUFFIX),)
+
+
+@pytest.mark.parametrize("entry", ["action", "cli"])
+def test_internal_gate_is_not_presented_as_a_configured_fail_on(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entry: Literal["action", "cli"],
+) -> None:
+    # D-PM-32 case (b): "new-stale" is an internal gate only. Nothing in src renders a
+    # fail-on or policy source yet; the renderer task owns the summary wording.
+    pipeline = _Recorder(RuntimeError(), config_known_present=True)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry=entry) == 3
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    out, err = capsys.readouterr()
+    for text in (error.component, error.message, out, err):
+        assert "fail-on" not in text
+        assert "new-stale" not in text
