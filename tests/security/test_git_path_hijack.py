@@ -17,13 +17,14 @@ runs them on a real Windows runner.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import shutil
 import stat
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -292,6 +293,22 @@ def _same_file(left: str | Path, right: str | Path) -> bool:
     )
 
 
+@contextlib.contextmanager
+def _os_name(name: str) -> Iterator[None]:
+    """Set ``os.name`` only around the call under test, then restore it.
+
+    On Python 3.11, a failed assertion that builds ``pathlib.Path`` while
+    ``os.name == "nt"`` on a POSIX host crashes pytest with INTERNALERROR
+    (T26-6). Path objects used by the caller must be built before entering.
+    """
+    previous = os.name
+    os.name = name
+    try:
+        yield
+    finally:
+        os.name = previous
+
+
 def _search_entries(search_path: str) -> list[str]:
     return [entry for entry in search_path.split(os.pathsep) if entry]
 
@@ -522,6 +539,51 @@ def test_cwd_at_filesystem_root_still_resolves_trusted_git_outside_checkout(
     resolved = gitread._find_git(repo)
 
     assert Path(resolved.path).resolve() == trusted_git.resolve()
+    _assert_not_executed(sentinel)
+
+
+@pytest.mark.parametrize("empty_kind", ["leading", "trailing", "doubled"])
+def test_empty_path_entries_are_dropped_when_cwd_is_filesystem_root(
+    empty_kind: str,
+    hijack_layout: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-14: drop empty PATH entries even when the cwd is a filesystem root.
+
+    The cwd containment rule is skipped at ``/`` or a drive root (WORKDIR /).
+    Empty entries must still be dropped by the empty-entry rule itself, not
+    sent through the realpath / containment check. ``realpath('')`` is the
+    cwd, so a mutant that routes ``''`` through that check keeps the empty
+    entry when the cwd is a root, and ``search_path`` becomes ``:<trusted>``
+    or ``<trusted>::``. I-14 says to drop empty entries and that
+    ``search_path`` is the kept entries joined with ``os.pathsep``, so the
+    expected value is the trusted folder alone.
+    """
+    repo = hijack_layout["repo"]
+    trusted = hijack_layout["trusted"]
+    sentinel = hijack_layout["sentinel"]
+    trusted_git = _write_fake_git(trusted, _platform_git_name(), sentinel)
+    trusted_str = str(trusted)
+    # Three empty-entry classes from I-14 ("Drop empty entries"): a leading
+    # separator, a trailing separator, and a doubled separator. Expected
+    # search_path is written from that rule, not from _split_path.
+    sep = os.pathsep
+    if empty_kind == "leading":
+        path_value = f"{sep}{trusted_str}"
+    elif empty_kind == "trailing":
+        path_value = f"{trusted_str}{sep}"
+    elif empty_kind == "doubled":
+        path_value = f"{trusted_str}{sep}{sep}"
+    else:
+        raise AssertionError(f"unknown empty_kind {empty_kind}")
+    monkeypatch.setenv("PATH", path_value)
+    monkeypatch.chdir(Path(hijack_layout["root"].anchor))
+    monkeypatch.delenv("GITHUB_WORKSPACE", raising=False)
+
+    resolved = gitread._find_git(repo)
+
+    assert Path(resolved.path).resolve() == trusted_git.resolve()
+    assert resolved.search_path == trusted_str
     _assert_not_executed(sentinel)
 
 
@@ -823,22 +885,31 @@ def test_windows_pathext_order_never_picks_cmd_bat_or_com(
     """SR-013 / N-6: PATHEXT is ignored; only git.exe counts on Windows.
 
     ``git.cmd``, ``git.bat`` and ``git.com`` sit in an earlier PATH folder than
-    ``git.exe``, and PATHEXT lists those extensions first. The walk must still
-    resolve the later git.exe and must not raise ComponentError.
+    ``git.exe``, and PATHEXT lists ``.CMD``, ``.BAT`` and ``.COM`` before
+    ``.EXE``. The walk must still resolve the later git.exe and must not raise
+    ComponentError.
     """
-    monkeypatch.setattr(os, "name", "nt")
-    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    # Build every Path and plant every file before patching os.name. On
+    # Python 3.11, constructing pathlib.Path with os.name == "nt" on a POSIX
+    # host crashes (T26-6).
     shims = hijack_layout["root"] / "shims"
     exe_dir = hijack_layout["trusted"]
+    repo = hijack_layout["repo"]
     for name in ("git.cmd", "git.bat", "git.com"):
         _plant_named(shims, name)
     trusted = _plant_named(exe_dir, "git.exe")
     _set_path(monkeypatch, shims, exe_dir)
+    monkeypatch.setenv("PATHEXT", ".CMD;.BAT;.COM;.EXE")
+    expected_search_path = os.pathsep.join([str(shims), str(exe_dir)])
+    trusted_as_str = str(trusted)
 
-    resolved = gitread._find_git(hijack_layout["repo"])
+    with _os_name("nt"):
+        resolved = gitread._find_git(repo)
+        resolved_path = resolved.path
+        resolved_search_path = resolved.search_path
 
-    assert _same_file(resolved.path, trusted)
-    assert resolved.search_path == os.pathsep.join([str(shims), str(exe_dir)])
+    assert _same_file(resolved_path, trusted_as_str)
+    assert resolved_search_path == expected_search_path
 
 
 @pytest.mark.parametrize("where", ["repo", "cwd"])
@@ -853,16 +924,26 @@ def test_planted_windows_git_exe_does_not_knock_out_trusted_git(
     on Windows prepends the current folder even when ``path=`` is given, so a
     planted git.exe would fail the containment re-check and raise ComponentError
     instead of using the later trusted git. The walk must resolve the trusted
-    one and must not raise.
+    one and must not raise. The ``[repo]`` case chdirs into the checkout so it
+    models the Actions layout where the checkout is the cwd (T26-7).
     """
-    monkeypatch.setattr(os, "name", "nt")
+    # Build every Path and plant every file before patching os.name (T26-6).
     repo = hijack_layout["repo"]
-    planted_in = repo if where == "repo" else hijack_layout["cwd"]
+    cwd = hijack_layout["cwd"]
+    trusted_dir = hijack_layout["trusted"]
+    planted_in = repo if where == "repo" else cwd
     _plant_named(planted_in, "git.exe")
-    trusted = _plant_named(hijack_layout["trusted"], "git.exe")
-    _set_path(monkeypatch, hijack_layout["trusted"])
+    trusted = _plant_named(trusted_dir, "git.exe")
+    _set_path(monkeypatch, trusted_dir)
+    if where == "repo":
+        monkeypatch.chdir(repo)
+    expected_search_path = str(trusted_dir)
+    trusted_as_str = str(trusted)
 
-    resolved = gitread._find_git(repo)
+    with _os_name("nt"):
+        resolved = gitread._find_git(repo)
+        resolved_path = resolved.path
+        resolved_search_path = resolved.search_path
 
-    assert _same_file(resolved.path, trusted)
-    assert resolved.search_path == str(hijack_layout["trusted"])
+    assert _same_file(resolved_path, trusted_as_str)
+    assert resolved_search_path == expected_search_path
