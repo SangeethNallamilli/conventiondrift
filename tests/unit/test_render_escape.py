@@ -474,8 +474,8 @@ _RESIDUAL_MESSAGE = r"^residual control character after mapping$"
 @pytest.mark.parametrize("func", [workflow_cmd, workflow_prop], ids=lambda f: f.__name__)
 @pytest.mark.parametrize(
     "residual",
-    ["\r", "\n", "\x00", "\x7f", "\x85", "\u202e", "\u2028", "\ud800"],
-    ids=["CR", "LF", "NUL", "DEL", "C1", "Cf bidi", "Zl", "Cs"],
+    ["\r", "\n", "\x00", "\x7f", "\x85", "\u202e", "\u2028", "\u2029", "\ud800"],
+    ids=["CR", "LF", "NUL", "DEL", "C1", "Cf bidi", "Zl", "Zp", "Cs"],
 )
 def test_workflow_fails_closed_if_mapping_is_bypassed(
     monkeypatch: pytest.MonkeyPatch,
@@ -492,7 +492,7 @@ def test_workflow_fails_closed_if_mapping_is_bypassed(
 
 
 def test_workflow_guard_is_silent_when_mapping_ran() -> None:
-    hostile = "a\nb\rc" + "\x00\x7f\x85\u202e\u2028\ud800"
+    hostile = "a\nb\rc" + "\x00\x7f\x85\u202e\u2028\u2029\ud800"
     assert workflow_cmd(hostile)
     assert workflow_prop(hostile)
 
