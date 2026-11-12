@@ -75,7 +75,7 @@ def exit_code(outcome: RunOutcome) -> int:
 _COMPONENT = re.compile(r"[a-z][a-z0-9_]*(:[a-z0-9_-]+)?")
 
 
-def internal_error(exc: Exception | SystemExit | GeneratorExit) -> InternalError:
+def internal_error(exc: BaseException) -> InternalError:
     """The reportable form of a caught exception (I-14 Q6, sanitizing).
 
     Only the component name and the exception class are used; the exception's
@@ -151,17 +151,20 @@ def run(
 ) -> int:
     """The single entrypoint for ``conventiondrift.action`` and ``conventiondrift.cli`` (I-2).
 
-    ``entry`` is passed by the caller and never inferred from ``env``. Any
-    ``Exception``, ``SystemExit`` or ``GeneratorExit`` from the pipeline becomes an
-    ``InternalError`` and the run exits per I-4 with the ``fail-on`` known so far
-    (I-14). Only ``KeyboardInterrupt`` propagates.
+    ``entry`` is passed by the caller and never inferred from ``env``. Every
+    ``BaseException`` from the pipeline (including ``SystemExit``,
+    ``GeneratorExit`` and ``asyncio.CancelledError``) becomes an ``InternalError``
+    and the run exits per I-4 with the ``fail-on`` known so far (I-14, SR F3).
+    Only ``KeyboardInterrupt`` propagates.
     """
     context = RunContext()
     try:
         outcome = _pipeline(argv, env, entry, components or Components(), context)
-    # I-14: argument parsing never raises SystemExit, so a SystemExit or GeneratorExit here
-    # came from a component and must not pass the gate. Only KeyboardInterrupt propagates.
-    except (Exception, SystemExit, GeneratorExit) as exc:  # noqa: BLE001 -- I-14: all but KeyboardInterrupt become an InternalError
+    except KeyboardInterrupt:
+        raise
+    # I-14, SR F3: argument parsing never raises SystemExit, so any BaseException here came
+    # from a component and must not pass the gate. Only KeyboardInterrupt propagates.
+    except BaseException as exc:  # noqa: BLE001 -- I-14, SR F3: all but KeyboardInterrupt become an InternalError
         context.internal_errors += (internal_error(exc),)
         outcome = AnalysisOutcome(
             fail_on=error_fail_on(

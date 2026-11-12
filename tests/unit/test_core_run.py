@@ -1,7 +1,8 @@
 """Unit tests for run(), the InternalError helper and error-time fail-on (T-006a, I-2, I-14)."""
 
+import asyncio
 import inspect
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, get_args
 
 import pytest
@@ -315,6 +316,48 @@ def test_run_keeps_internal_errors_recorded_before_a_raise(
         earlier,
         InternalError("render", "ComponentError" + SUFFIX),
     )
+
+
+GHP_FAKE = "ghp_FAKE0123456789"
+HOST_PATH = "/home/runner/secret/x"
+
+
+class Boom(BaseException):
+    """A bare BaseException subclass a component might raise."""
+
+
+Bóom = type("Bóom", (BaseException,), {})
+
+
+@pytest.mark.parametrize(
+    ("make", "name"),
+    [
+        (lambda: asyncio.CancelledError(GHP_FAKE, HOST_PATH), "CancelledError"),
+        (lambda: Boom(GHP_FAKE, HOST_PATH), "Boom"),
+        (lambda: Bóom(GHP_FAKE, HOST_PATH), "Exception"),
+    ],
+    ids=["CancelledError", "Boom", "non-ascii-name"],
+)
+@pytest.mark.parametrize(("fail_on", "expected"), [("none", 0), ("new-stale", 3), ("any-stale", 3)])
+def test_run_turns_any_base_exception_into_an_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    make: Callable[[], BaseException],
+    name: str,
+    fail_on: str,
+    expected: int,
+) -> None:
+    # SR F3: every BaseException except KeyboardInterrupt is caught and fails closed.
+    pipeline = _Recorder(make(), explicit_fail_on=fail_on)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="action") == expected
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    assert error == InternalError("core", name + SUFFIX)
+    out, err = capsys.readouterr()
+    for planted in (GHP_FAKE, HOST_PATH):
+        for text in (error.component, error.message, out, err):
+            assert planted not in text
 
 
 def test_run_lets_keyboard_interrupt_propagate(monkeypatch: pytest.MonkeyPatch) -> None:
