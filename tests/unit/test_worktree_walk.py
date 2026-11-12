@@ -6,6 +6,8 @@ from __future__ import annotations
 import errno
 import os
 import socket
+import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -264,11 +266,13 @@ def test_fallback_rechecks_the_folder_after_listing(
     real = os.scandir
 
     def racing(path: str) -> object:
-        it = real(path)
+        # Swap after the walk took the folder's ids and before it lists: the listing is
+        # of the other folder. Renaming before scandir opens the folder also works on
+        # Windows, which may refuse to rename a folder with an open listing handle.
         if path.endswith("sub"):
             (repo / "sub").rename(tmp_path / "moved")
             (tmp_path / "elsewhere").rename(repo / "sub")  # another real folder
-        return it
+        return real(path)
 
     monkeypatch.setattr(os, "scandir", racing)
     res = walk_worktree(repo)
@@ -350,3 +354,60 @@ def test_junction_is_symlink(
     res = walk_worktree(tmp_path)
     assert res.files == ("a.py",)
     assert res.skipped == (SkippedFile("junction", "symlink"),)
+
+
+def test_reparse_point_attribute_is_symlink(
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's own check reads FILE_ATTRIBUTE_REPARSE_POINT (a simulated Windows lstat)."""
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False)
+    make(tmp_path, "a.py", "j/x.py", "r.py")
+    real = os.lstat
+
+    class FakeStat:
+        def __init__(self, st: os.stat_result) -> None:
+            self._st = st
+            self.st_file_attributes = 0x400
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._st, name)
+
+    def fake(path: str, *a: object, **k: object) -> object:
+        st = real(path, *a, **k)  # type: ignore[arg-type]
+        return FakeStat(st) if os.fsdecode(path).endswith(("j", "r.py")) else st
+
+    monkeypatch.setattr(os, "lstat", fake)
+    res = walk_worktree(tmp_path)
+    assert res.files == ("a.py",)
+    assert res.skipped == (SkippedFile("j", "symlink"), SkippedFile("r.py", "symlink"))
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="real Windows behaviour; runs on windows-latest"
+)
+def test_windows_real_junction_is_never_entered(tmp_path: Path) -> None:
+    """A real NTFS junction, inside the repo or out, is "symlink" and never listed."""
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        import _winapi
+
+        assert not d._USE_DIR_FD, "Windows walks through the by-path fallback"
+        outside = tmp_path / "outside"
+        make(outside, "secret.py")
+        repo = tmp_path / "repo"
+        make(repo, "a.py", "real/x.py")
+        links = [repo / "j_in", repo / "j_out"]
+        _winapi.CreateJunction(str(repo / "real"), str(links[0]))
+        _winapi.CreateJunction(str(outside), str(links[1]))
+        try:
+            assert all(
+                os.lstat(j).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT for j in links
+            )
+            res = walk_worktree(repo)
+        finally:
+            for j in links:
+                os.rmdir(j)  # removes the junction itself, never its target
+        assert res.files == ("a.py", "real/x.py")
+        assert res.skipped == (SkippedFile("j_in", "symlink"), SkippedFile("j_out", "symlink"))
+        assert (outside / "secret.py").exists()
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")

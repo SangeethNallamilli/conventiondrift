@@ -177,8 +177,9 @@ def test_hard_exclude_regexes_and_check_are_linear(text: str) -> None:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     (tmp_path / ".git").mkdir()
-    (tmp_path / ".git" / "config").write_text("[core]\n\tfsmonitor = evil\n")
-    (tmp_path / "AGENTS.md").write_text("- Use httpx\n")
+    # Bytes, not text: write_text would write CRLF on Windows (PR #23 windows-latest).
+    (tmp_path / ".git" / "config").write_bytes(b"[core]\n\tfsmonitor = evil\n")
+    (tmp_path / "AGENTS.md").write_bytes(b"- Use httpx\n")
     return tmp_path
 
 
@@ -234,7 +235,7 @@ def test_check_uses_only_the_relative_path_not_the_root(tmp_path: Path) -> None:
     # A checkout that itself lives under ".git" or "node_modules" is still read.
     root = tmp_path / "node_modules" / ".GIT" / "repo"
     root.mkdir(parents=True)
-    (root / "AGENTS.md").write_text("- Use httpx\n")
+    (root / "AGENTS.md").write_bytes(b"- Use httpx\n")
     assert read_unless_hard_excluded(root, "AGENTS.md", "instruction", origin="tree")
     assert read_unless_hard_excluded(str(root), "AGENTS.md", "instruction", origin="input")
 
