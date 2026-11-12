@@ -7,6 +7,7 @@ Test Engineer. The AC each case exercises is given in a comment instead.
 import ast
 import inspect
 import os
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
@@ -579,6 +580,86 @@ def test_side_result_match_outside_options_is_not_verifiable(match: RuleMatch) -
     no_history = build(FIVE_REQUESTS, None, rule=rule)
     _assert_not_verifiable_side(with_history)
     _assert_not_verifiable_side(no_history)
+    assert with_history.verdict is not H
+    assert no_history.verdict is not H
+
+
+# I-10: option strings are exact members of the checker's options. Case,
+# surrounding whitespace and Unicode normalization are not applied, so a
+# preferred or prohibited value that only matches after one of those steps
+# is outside options. C9's backstop (I-10) is Not verifiable, never Holds.
+# Expected verdicts are written from that rule, not from the implementation.
+NFC_CAFE = unicodedata.normalize("NFC", "café")
+NFD_CAFE = unicodedata.normalize("NFD", "café")
+EXACT_HTTPX = frozenset({"httpx"})
+EXACT_CAFE = frozenset({NFC_CAFE})
+OUTSIDE_BY_NORMALIZATION = (
+    (
+        "case-preferred",
+        EXACT_HTTPX,
+        RuleMatch(preferred=frozenset({"HTTPX"}), prohibited=frozenset(), specificity=0),
+    ),
+    (
+        "case-prohibited",
+        EXACT_HTTPX,
+        RuleMatch(preferred=frozenset(), prohibited=frozenset({"HTTPX"}), specificity=0),
+    ),
+    (
+        "whitespace-preferred",
+        EXACT_HTTPX,
+        RuleMatch(preferred=frozenset({"httpx "}), prohibited=frozenset(), specificity=0),
+    ),
+    (
+        "whitespace-prohibited",
+        EXACT_HTTPX,
+        RuleMatch(preferred=frozenset(), prohibited=frozenset({"httpx "}), specificity=0),
+    ),
+    (
+        "nfc-preferred",
+        EXACT_CAFE,
+        RuleMatch(preferred=frozenset({NFD_CAFE}), prohibited=frozenset(), specificity=0),
+    ),
+    (
+        "nfc-prohibited",
+        EXACT_CAFE,
+        RuleMatch(preferred=frozenset(), prohibited=frozenset({NFD_CAFE}), specificity=0),
+    ),
+)
+
+
+def test_outside_options_normalization_cases_cover_each_class() -> None:
+    assert NFC_CAFE != NFD_CAFE
+    assert unicodedata.normalize("NFC", NFD_CAFE) == NFC_CAFE
+    labels = {label for label, _, _ in OUTSIDE_BY_NORMALIZATION}
+    for kind in ("case", "whitespace", "nfc"):
+        assert f"{kind}-preferred" in labels
+        assert f"{kind}-prohibited" in labels
+    # Each row uses a string that is not an exact member of options.
+    for label, options, match in OUTSIDE_BY_NORMALIZATION:
+        assert match.preferred.isdisjoint(options), label
+        assert match.prohibited.isdisjoint(options), label
+
+
+@pytest.mark.parametrize(
+    ("options", "match"),
+    [(options, match) for _, options, match in OUTSIDE_BY_NORMALIZATION],
+    ids=[label for label, _, _ in OUTSIDE_BY_NORMALIZATION],
+)
+def test_side_result_outside_options_is_exact_match_only(
+    options: frozenset[str], match: RuleMatch
+) -> None:
+    # I-10: HTTPX is not "httpx", "httpx " is not "httpx", and NFD café is not
+    # NFC café. The match is invalid, so the side is Not verifiable with no
+    # sites, and the verdict is never Holds. Sites use the checker option so
+    # a normalizing subset check would count them and could yield Holds.
+    rule = replace(RULE, match=match)
+    sites = [site("src/a.py", i, next(iter(options))) for i in range(1, 6)]
+    with_history = build(sites, frozenset({("src/a.py", 1)}), rule=rule, options=options)
+    no_history = build(sites, None, rule=rule, options=options)
+    _assert_not_verifiable_side(with_history)
+    _assert_not_verifiable_side(no_history)
+    assert with_history.verdict is NV
+    assert no_history.verdict is NV
     assert with_history.verdict is not H
     assert no_history.verdict is not H
 
