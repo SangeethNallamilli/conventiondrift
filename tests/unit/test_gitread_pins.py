@@ -101,6 +101,7 @@ def history(tmp_path: Path) -> tuple[Path, str, str, Path]:
     _write(repo, "old/one.py", "".join(f"one_{i} = {i}\n" for i in range(10)))
     _write(repo, "old/two.py", "".join(f"two_{i} = {i}\n" for i in range(10)))
     _write(repo, "caf\xe9.py", "x = 1\n")
+    _write(repo, "note.md", "hello\n")
     (repo / "sub").mkdir()  # an unpopulated submodule, so `add -A` keeps the gitlink
     _git(repo, "add", "-A")
     _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{SHA},sub")
@@ -120,6 +121,7 @@ def history(tmp_path: Path) -> tuple[Path, str, str, Path]:
         (repo / f"old/{name}.py").unlink()
         _write(repo, f"new/{new}.py", body)
     _write(repo, "caf\xe9.py", "x = 2\n")
+    _write(repo, "note.md", "hello world\n")
     _git(repo, "add", "-A")
     _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{SHA2},sub")
     _commit(repo, "everything")
@@ -148,8 +150,9 @@ def history(tmp_path: Path) -> tuple[Path, str, str, Path]:
     return repo, root, head, tmp_path / "gpg-ran"
 
 
-#: Every hostile key the I-14 item 9 test names, with its value. ``{gpg}`` and
-#: ``{order}`` become paths to a marker-writing gpg program and an order file.
+#: Every hostile key the I-14 item 9 test names, with its value. ``{gpg}``,
+#: ``{order}`` and ``{textconv}`` become paths to a marker-writing gpg program,
+#: an order file, and a textconv driver (CR1 #7).
 HOSTILE_CONFIG: tuple[tuple[str, str], ...] = (
     ("diff.noprefix", "true"),
     ("diff.mnemonicPrefix", "true"),
@@ -168,8 +171,9 @@ HOSTILE_CONFIG: tuple[tuple[str, str], ...] = (
     ("gpg.program", "{gpg}"),
     ("color.ui", "always"),
     ("color.diff", "always"),
+    ("diff.x.textconv", "{textconv}"),
 )
-HOSTILE_ATTRIBUTES: tuple[str, ...] = ("*.py -diff", "*.txt diff=evil")
+HOSTILE_ATTRIBUTES: tuple[str, ...] = ("*.py -diff", "*.txt diff=evil", "*.md diff=x")
 
 
 def _make_hostile(
@@ -181,10 +185,14 @@ def _make_hostile(
     gpg = repo.parent / "fake-gpg"
     gpg.write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexit 1\n")
     gpg.chmod(0o755)
+    textconv_marker = marker.parent / "textconv-ran"
+    textconv = repo.parent / "fake-textconv"
+    textconv.write_text(f"#!/bin/sh\necho ran >> '{textconv_marker}'\necho TEXTCONV\ncat \"$1\"\n")
+    textconv.chmod(0o755)
     order = repo.parent / "order.txt"
     order.write_text("z.py\nnotes.txt\nsub\n")
     for key, value in config:
-        _git(repo, "config", key, value.format(gpg=gpg, order=order))
+        _git(repo, "config", key, value.format(gpg=gpg, order=order, textconv=textconv))
     if attributes:
         _write(repo, ".gitattributes", "".join(line + "\n" for line in attributes))
 
@@ -216,6 +224,8 @@ def test_hostile_repo_config_does_not_change_any_output(
     assert hostile[1] == clean[1]  # changed_files: strictly identical
     assert hostile[2] == clean[2]  # tree: strictly identical
     assert not marker.exists()  # gpg never ran
+    assert not (marker.parent / "textconv-ran").exists()  # textconv never ran
+    assert b"TEXTCONV" not in hostile[0]
     # the clean output really covers the pinned shapes
     patch = clean[0]
     assert b"rename from old/one.py\nrename to new/uno.py\n" in patch
@@ -382,6 +392,7 @@ PIN_DEFEATS: dict[str, str] = {
     "-O<orderfile>": "diff.orderFile",
     "--no-color": "color.ui / color.diff",
     "core.quotePath=true": "core.quotePath=false",
+    "--no-textconv": "diff.x.textconv",
 }
 #: Pins whose hostile key can't change gitread's output on its own, and why. I-14
 #: item 9 ("Argv and stream details") keeps them as defence in depth, pinned by an
@@ -397,7 +408,7 @@ PIN_PAIRED: frozenset[str] = frozenset({"--no-show-signature", "log.showSignatur
 #: security flags (pinned by test_gitread.py and the fsmonitor/hostile-config tests).
 NOT_DIFF_CONFIG_PINS: frozenset[str] = frozenset(
     {"--first-parent", "--max-count=10000", "-m", "--root", "-p", "-U0", "--format=%x00%H"}
-    | {"-r", "-z", "--name-status", "--no-ext-diff", "--no-textconv"}
+    | {"-r", "-z", "--name-status", "--no-ext-diff"}
     | {"core.fsmonitor=false", "core.hooksPath=/dev/null", "core.untrackedCache=false"}
     | {"diff.external=", "core.pager=cat", "protocol.allow=never"}
     | {"safe.bareRepository=explicit", "log.diffMerges=first-parent"}
@@ -435,8 +446,10 @@ KEY_PINNED_BY: dict[str, str | None] = {
     "gpg.program": "log.showSignature=false",
     "color.ui": "--no-color",
     "color.diff": "--no-color",
+    "diff.x.textconv": "--no-textconv",
     "*.py -diff": "--text",
     "*.txt diff=evil": None,
+    "*.md diff=x": "--no-textconv",
 }
 
 
@@ -566,6 +579,7 @@ def test_each_hostile_setting_alone_changes_nothing(
     _assert_same_patches(clean[0], hostile[0])
     assert hostile[1:] == clean[1:]
     assert not marker.exists()
+    assert not (marker.parent / "textconv-ran").exists()
 
 
 def _git_version() -> tuple[int, int]:
