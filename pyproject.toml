@@ -12,8 +12,8 @@ dynamic = ["version"]
 description = "Checks whether a Python codebase still follows the rules written in its AGENTS.md / CLAUDE.md, and reports what a pull request changed."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
+license = "Apache-2.0 AND MIT"
+license-files = ["LICENSE", "src/conventiondrift/_vendor/LICENSE"]
 # No runtime dependencies (ADR-0002): stdlib plus vendored code under _vendor/ only.
 dependencies = []
 classifiers = [
@@ -39,7 +39,7 @@ where = ["src"]
 include = ["conventiondrift", "conventiondrift.*"]
 
 [tool.setuptools.package-data]
-"conventiondrift._vendor" = ["MANIFEST"]
+"conventiondrift._vendor" = ["MANIFEST", "LICENSE"]
 
 [tool.setuptools.dynamic]
 version = { attr = "conventiondrift.__version__" }
@@ -54,6 +54,8 @@ addopts = "-p no:cacheprovider"
 target-version = "py311"
 line-length = 100
 src = ["src", "tests"]
+# Vendored files must stay byte-identical to the pinned sdist (ADR-0002).
+extend-exclude = ["src/conventiondrift/_vendor/yaml/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "A", "RUF"]
@@ -66,3 +68,5 @@ python_version = "3.11"
 strict = true
 files = ["src"]
 warn_unreachable = true
+# Vendored PyYAML is third-party source; do not type-check it under strict.
+exclude = ["conventiondrift/_vendor/yaml/"]
