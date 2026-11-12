@@ -17,7 +17,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
+import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -63,6 +66,7 @@ def git_version() -> tuple[int, ...]:
         ["git", "--version"],  # noqa: S607 - git from PATH by design
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     ).stdout
     m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out)
@@ -72,17 +76,86 @@ def git_version() -> tuple[int, ...]:
 
 
 def base_git_env(home: Path) -> dict[str, str]:
-    """A fixed environment for the fixture's own git calls (not the tool's)."""
+    """A fixed environment for the fixture's own git calls (not the tool's).
+
+    Config is isolated (no system or global file). HOME and USERPROFILE point
+    at `home`. SYSTEMROOT and the other Windows runtime variables are kept so
+    git.exe can start; PATH is the host PATH so git itself is found.
+    """
     env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": os.environ.get("PATH", os.defpath),
         "HOME": str(home),
+        "USERPROFILE": str(home),
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": str(_isolated_gitconfig(home)),
         "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
         "TZ": "UTC",
     }
+    for key in _HOST_RUNTIME_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
     return env
+
+
+SYMLINK_UNAVAILABLE_REASON = "OS cannot create symlinks (Windows without Developer Mode)"
+
+# Host variables git (and, on Windows, git.exe itself) still need. HOME and
+# USERPROFILE are set separately, to a private tmp home, and are not copied.
+_HOST_RUNTIME_KEYS = (
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "TMP",
+    "TEMP",
+    "TMPDIR",
+)
+
+
+def symlinks_available() -> bool:
+    """True if this process can create a symbolic link in a temporary directory."""
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target"
+            target.write_bytes(b"x")
+            link = Path(td) / "link"
+            os.symlink(target.name, link)
+            return link.is_symlink()
+    except (OSError, NotImplementedError):
+        return False
+
+
+def _isolated_gitconfig(home: Path) -> Path:
+    """Empty file used as GIT_CONFIG_GLOBAL (os.devnull is not reliable on Windows).
+
+    Always truncated, so a leftover or planted config in a reused home cannot
+    leak aliases or identity into fixture git calls.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = home / "isolated.gitconfig"
+    cfg.write_text("", encoding="utf-8")
+    return cfg
+
+
+def _rmtree(path: Path) -> None:
+    """Remove a tree, clearing read-only bits first (Windows .git objects)."""
+
+    def _retry(fn: Any, p: str, _exc: Any) -> None:
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        except OSError:
+            pass
+        fn(p)
+
+    # onexc is 3.12+; onerror remains the 3.11 fallback (signatures differ in
+    # the third argument, which _retry ignores).
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:
+        shutil.rmtree(path, onerror=_retry)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -222,9 +295,13 @@ class GitRepo:
         target.parent.mkdir(parents=True, exist_ok=True)
         data = content.encode("utf-8") if isinstance(content, str) else content
         target.write_bytes(data)
-        if executable:
+        # Filesystem executable bits are POSIX-only; the index mode is set on
+        # every OS with `git update-index --chmod=+x` so tests see 100755.
+        if executable and os.name != "nt":
             target.chmod(0o755)
         self.git("add", "--", relpath)
+        if executable:
+            self.git("update-index", "--chmod=+x", "--", relpath)
         return target
 
     def write_many(self, files: Mapping[str, str | bytes]) -> None:
@@ -242,6 +319,16 @@ class GitRepo:
         self.git("mv", "--", src, dst)
 
     def symlink(self, relpath: str, target: str) -> None:
+        """Create a worktree symlink and stage it.
+
+        Only symlink-specific tests call this. If the OS cannot create
+        symlinks, this skips with SYMLINK_UNAVAILABLE_REASON; fixtures and
+        tests that do not need a symlink never reach this method.
+        """
+        if not symlinks_available():
+            import pytest
+
+            pytest.skip(SYMLINK_UNAVAILABLE_REASON)
         link = self.path / relpath
         link.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, link)
@@ -401,9 +488,42 @@ class GitRepo:
             )
         return PullRequest(number, base_branch, head_branch, base_tip, head, mb)
 
+    def _merge_trees(self, merge_base: str, base_tip: str, head: str) -> str:
+        """Three-way merge tree using plumbing that exists in git 2.30 (D-TL-18).
+
+        `git merge-tree --write-tree` needs 2.38+. This uses a temporary
+        GIT_INDEX_FILE so the worktree is not checked out and the repository
+        index is left untouched. Raises RuntimeError if the merge conflicts.
+        """
+        # A missing path, not an empty file: git rejects a 0-byte index
+        # ("index file smaller than expected").
+        td = tempfile.mkdtemp(prefix="cd-merge-index-")
+        index_path = str(Path(td) / "index")
+        env = {"GIT_INDEX_FILE": index_path}
+        try:
+            self.git(
+                "read-tree",
+                "-i",
+                "-m",
+                "--aggressive",
+                merge_base,
+                base_tip,
+                head,
+                env=env,
+            )
+            unmerged = self.git("ls-files", "-u", env=env, check=False)
+            if unmerged:
+                raise RuntimeError(
+                    "github_merge_commit: merge conflicts between "
+                    f"{base_tip} and {head}:\n{unmerged}"
+                )
+            return self.git("write-tree", env=env)
+        finally:
+            _rmtree(Path(td))
+
     def github_merge_commit(self, pr: PullRequest, *, date: DateLike) -> PullRequest:
         """Create refs/pull/<n>/merge the way GitHub does: parents (base tip, PR head)."""
-        tree = self.git("merge-tree", "--write-tree", pr.base_tip, pr.head).splitlines()[0]
+        tree = self._merge_trees(pr.merge_base, pr.base_tip, pr.head)
         sha = self.commit_tree(
             tree, [pr.base_tip, pr.head], f"Merge {pr.head} into {pr.base_tip}", date=date
         )
@@ -437,7 +557,8 @@ class GitRepo:
         return dict(line.split(" ", 1) for line in out.splitlines() if line)
 
     def remove(self) -> None:
-        shutil.rmtree(self.path, ignore_errors=True)
+        if self.path.exists():
+            _rmtree(self.path)
 
 
 # ---------------------------------------------------------------------- oracle

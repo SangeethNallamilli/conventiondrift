@@ -241,18 +241,19 @@ def probe_cli(workdir: Path) -> str | None:
     run on a one-commit repo. Returns a skip reason or None."""
     repo = workdir / "probe"
     repo.mkdir(parents=True, exist_ok=True)
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": str(workdir),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_AUTHOR_NAME": "p",
-        "GIT_AUTHOR_EMAIL": "p@example.invalid",
-        "GIT_COMMITTER_NAME": "p",
-        "GIT_COMMITTER_EMAIL": "p@example.invalid",
-        "GIT_AUTHOR_DATE": "@1780000000 +0000",
-        "GIT_COMMITTER_DATE": "@1780000000 +0000",
-    }
+    from fixtures.gitrepo import base_git_env
+
+    env = base_git_env(workdir)
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "p",
+            "GIT_AUTHOR_EMAIL": "p@example.invalid",
+            "GIT_COMMITTER_NAME": "p",
+            "GIT_COMMITTER_EMAIL": "p@example.invalid",
+            "GIT_AUTHOR_DATE": "@1780000000 +0000",
+            "GIT_COMMITTER_DATE": "@1780000000 +0000",
+        }
+    )
     if not (repo / ".git").exists():
         for args in (["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "p"]):
             subprocess.run(  # noqa: S603 - argv list, no shell
