@@ -6,6 +6,8 @@ from types import MappingProxyType
 from typing import Any, Literal, get_args, get_type_hints
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 from conventiondrift import model
 from conventiondrift.model import (
@@ -696,3 +698,90 @@ def test_rule_match_error_does_not_echo_option_values() -> None:
     with pytest.raises(ValueError) as excinfo:
         RuleMatch(preferred=frozenset({hostile}), prohibited=frozenset({hostile}), specificity=0)
     assert hostile not in str(excinfo.value)
+
+
+# D-TL-25: the two I-10 invalid classes, using the same union and intersection
+# checks as RuleMatch.__post_init__.
+def _rule_match_invalid_class(preferred: frozenset[str], prohibited: frozenset[str]) -> str | None:
+    if not (preferred | prohibited):
+        return "empty_union"
+    if preferred & prohibited:
+        return "overlap"
+    return None
+
+
+_RULEMATCH_INVALID_CLASSES = frozenset({"empty_union", "overlap"})
+_RULEMATCH_INVALID_MATCH = {
+    "empty_union": "must not both be empty",
+    "overlap": "must be disjoint",
+}
+
+# replace() a valid MATCH (preferred={httpx}, prohibited={requests}) into each class.
+_REPLACE_INVALID_CASES: tuple[tuple[str, frozenset[str], frozenset[str]], ...] = (
+    ("empty_union", frozenset(), frozenset()),
+    ("overlap", MATCH.preferred, frozenset({"httpx"})),
+)
+
+# Explicit property inputs so both invalid classes are always drawn, plus valid cases.
+_PROPERTY_EXAMPLES: tuple[tuple[frozenset[str], frozenset[str], int], ...] = (
+    (frozenset(), frozenset(), 0),
+    (frozenset({"a"}), frozenset({"a"}), 1),
+    (frozenset({"a", "b"}), frozenset({"b", "c"}), 2),
+    (frozenset({"a"}), frozenset(), 1),
+    (frozenset(), frozenset({"b"}), 1),
+    (frozenset({"a"}), frozenset({"b"}), 2),
+)
+
+_OPTION_SETS = st.frozensets(st.sampled_from(("a", "b", "c", "d")), max_size=4)
+
+
+def test_rule_match_replace_cases_cover_invalid_classes() -> None:
+    covered = set()
+    for invalid_class, preferred, prohibited in _REPLACE_INVALID_CASES:
+        assert _rule_match_invalid_class(preferred, prohibited) == invalid_class
+        covered.add(invalid_class)
+    assert covered == _RULEMATCH_INVALID_CLASSES
+
+
+@pytest.mark.parametrize(("invalid_class", "preferred", "prohibited"), _REPLACE_INVALID_CASES)
+def test_rule_match_replace_rejects_invalid_state(
+    invalid_class: str, preferred: frozenset[str], prohibited: frozenset[str]
+) -> None:
+    with pytest.raises(ValueError, match=_RULEMATCH_INVALID_MATCH[invalid_class]):
+        dataclasses.replace(MATCH, preferred=preferred, prohibited=prohibited)
+
+
+def test_rule_match_property_examples_cover_invalid_classes() -> None:
+    covered = {
+        cls
+        for preferred, prohibited, _ in _PROPERTY_EXAMPLES
+        if (cls := _rule_match_invalid_class(preferred, prohibited)) is not None
+    }
+    assert covered == _RULEMATCH_INVALID_CLASSES
+
+
+@given(
+    preferred=_OPTION_SETS,
+    prohibited=_OPTION_SETS,
+    specificity=st.integers(min_value=-100, max_value=100),
+)
+@example(preferred=frozenset(), prohibited=frozenset(), specificity=0)
+@example(preferred=frozenset({"a"}), prohibited=frozenset({"a"}), specificity=1)
+@example(preferred=frozenset({"a", "b"}), prohibited=frozenset({"b", "c"}), specificity=2)
+@example(preferred=frozenset({"a"}), prohibited=frozenset(), specificity=1)
+@example(preferred=frozenset(), prohibited=frozenset({"b"}), specificity=1)
+@example(preferred=frozenset({"a"}), prohibited=frozenset({"b"}), specificity=2)
+@settings(max_examples=80, deadline=None, derandomize=True)
+def test_rule_match_constructs_iff_union_nonempty_and_disjoint(
+    preferred: frozenset[str], prohibited: frozenset[str], specificity: int
+) -> None:
+    invalid_class = _rule_match_invalid_class(preferred, prohibited)
+    if invalid_class is None:
+        match = RuleMatch(preferred=preferred, prohibited=prohibited, specificity=specificity)
+        assert match.preferred == preferred
+        assert match.prohibited == prohibited
+        assert match.specificity == specificity
+    else:
+        assert invalid_class in _RULEMATCH_INVALID_CLASSES
+        with pytest.raises(ValueError, match=_RULEMATCH_INVALID_MATCH[invalid_class]):
+            RuleMatch(preferred=preferred, prohibited=prohibited, specificity=specificity)
