@@ -26,6 +26,7 @@ env:
   PYTHONHASHSEED: "0"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   HYPOTHESIS_SEED: "20261112"
+  UV_VERSION: "0.13.7"
 
 jobs:
   pin-lint:
@@ -105,7 +106,11 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.13.7"
+          version: "${{ env.UV_VERSION }}"
+          # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
+          # for the archive this runner downloads. A missing OS/arch key yields
+          # a sentinel that fails verification rather than skipping the check.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
           enable-cache: false
       - name: Recompile lockfiles and require a match
         run: python3 scripts/ci/check_lockfiles.py
@@ -195,7 +200,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.13.7"
+          version: "${{ env.UV_VERSION }}"
           # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
           # for the archive this runner downloads. A missing OS/arch key yields
           # a sentinel that fails verification rather than skipping the check.
@@ -203,22 +208,25 @@ jobs:
           enable-cache: false
       # Test/test-macos only (contents: read, no secrets or id-token).
       # Restore on pull_request; restore and save on push, schedule, and
-      # workflow_dispatch. Key is runner.os, the Python version, and
-      # hashFiles of the committed lockfiles. Hash-checked uv installs
-      # still use --require-hashes and --only-binary=:all:. UV_CACHE_DIR
-      # is set on the install steps (runner.* is not available in job env).
+      # workflow_dispatch. Key is runner.os, runner.arch, UV_VERSION, the
+      # Python version, and hashFiles of the committed lockfiles. uv does
+      # not re-hash wheels from its cache; cache integrity relies on
+      # GitHub cache scoping (PR runs restore only; only
+      # main/schedule/dispatch runs save). Installs still use
+      # --require-hashes and --only-binary=:all:. UV_CACHE_DIR is set on
+      # the install steps (runner.* is not available in job env).
       - name: Restore the uv package cache
         if: github.event_name == 'pull_request'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/uv-pkg-cache
-          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Restore and save the uv package cache
         if: github.event_name != 'pull_request'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/uv-pkg-cache
-          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
       - name: CONTRIBUTING setup (Windows)
@@ -308,7 +316,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.13.7"
+          version: "${{ env.UV_VERSION }}"
           # Official sha256 from https://github.com/astral-sh/uv/releases/download/0.13.7/sha256.sum
           # for the archive this runner downloads. A missing OS/arch key yields
           # a sentinel that fails verification rather than skipping the check.
@@ -316,22 +324,25 @@ jobs:
           enable-cache: false
       # Test/test-macos only (contents: read, no secrets or id-token).
       # Restore on pull_request; restore and save on push, schedule, and
-      # workflow_dispatch. Key is runner.os, the Python version, and
-      # hashFiles of the committed lockfiles. Hash-checked uv installs
-      # still use --require-hashes and --only-binary=:all:. UV_CACHE_DIR
-      # is set on the install steps (runner.* is not available in job env).
+      # workflow_dispatch. Key is runner.os, runner.arch, UV_VERSION, the
+      # Python version, and hashFiles of the committed lockfiles. uv does
+      # not re-hash wheels from its cache; cache integrity relies on
+      # GitHub cache scoping (PR runs restore only; only
+      # main/schedule/dispatch runs save). Installs still use
+      # --require-hashes and --only-binary=:all:. UV_CACHE_DIR is set on
+      # the install steps (runner.* is not available in job env).
       - name: Restore the uv package cache
         if: github.event_name == 'pull_request'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/uv-pkg-cache
-          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Restore and save the uv package cache
         if: github.event_name != 'pull_request'
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ runner.temp }}/uv-pkg-cache
-          key: uv-test-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
+          key: uv-test-${{ runner.os }}-${{ runner.arch }}-uv${{ env.UV_VERSION }}-${{ matrix.python-version }}-${{ hashFiles('requirements/build.txt', 'requirements/dev.txt') }}
       - name: Report the default runner git version
         run: git --version
       - name: Install hashed locks with uv
