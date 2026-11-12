@@ -280,18 +280,34 @@ def _untrusted_folders(repo_dir: Path) -> list[str]:
     return folders
 
 
+def _is_absolute_entry(entry: str) -> bool:
+    """True iff the ``PATH`` entry is absolute in the I-14 sense.
+
+    On POSIX this is ``os.path.isabs``. On Windows (keyed on the path module,
+    as in ``_is_within``) the entry must also name a drive or share: a rooted
+    entry such as ``\\tools`` or ``/usr/bin`` means that folder on whatever
+    drive is current, so it is relative and dropped. Python 3.13's
+    ``ntpath.isabs`` already says so; 3.11's calls it absolute, and this keeps
+    both versions on the 3.13 rule.
+    """
+    if not os.path.isabs(entry):
+        return False
+    return os.path is not ntpath or bool(os.path.splitdrive(entry)[0])
+
+
 def _split_path(untrusted: Sequence[str]) -> tuple[list[str], list[str]]:
     """Split ``PATH`` into kept entries and dropped ones (I-14 step 1).
 
     Dropped: empty entries, ``.`` and every other relative entry (returned as the
-    absolute folder they would mean), and every entry whose real path is inside an
-    ``untrusted`` folder.
+    absolute folder they would mean; on Windows that includes a drive-less
+    rooted entry, see ``_is_absolute_entry``), and every entry whose real path
+    is inside an ``untrusted`` folder.
     """
     raw = os.environ.get("PATH")
     kept: list[str] = []
     dropped: list[str] = []
     for entry in [] if raw is None else raw.split(os.pathsep):
-        if not entry or not os.path.isabs(entry):
+        if not entry or not _is_absolute_entry(entry):
             dropped.append(os.path.abspath(entry or os.curdir))
         elif any(_is_within(os.path.realpath(entry), f) for f in untrusted):
             dropped.append(entry)
