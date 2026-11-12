@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
-from fixtures.gitrepo import GitRepo, days_before, git_date, recent_lines
+from fixtures.gitrepo import (
+    SYMLINK_UNAVAILABLE_REASON,
+    GitRepo,
+    base_git_env,
+    days_before,
+    git_date,
+    recent_lines,
+)
 
 T = dt.datetime(2026, 6, 15, 12, 0, tzinfo=dt.UTC)
 
@@ -136,3 +147,124 @@ def test_init_without_dash_b_for_old_git(tmp_path: Path, monkeypatch: pytest.Mon
     r.commit_files("c", {"a.txt": "a\n"}, date="2026-01-01T00:00:00+00:00")
     assert r.current_branch() == "trunk"
     assert gitrepo.git_version() >= (1,)
+
+
+def test_base_git_env_isolates_config_and_keeps_windows_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+    monkeypatch.setenv("WINDIR", r"C:\Windows")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    monkeypatch.setenv("TMP", str(tmp_path / "tmp"))
+    env = base_git_env(home)
+    assert env["HOME"] == str(home)
+    assert env["USERPROFILE"] == str(home)
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    cfg = Path(env["GIT_CONFIG_GLOBAL"])
+    assert cfg.is_file()
+    assert cfg.read_text(encoding="utf-8") == ""
+    assert cfg != Path(os.devnull)
+    assert env["SYSTEMROOT"] == r"C:\Windows"
+    assert env["WINDIR"] == r"C:\Windows"
+    assert env["COMSPEC"].endswith("cmd.exe")
+    assert env["PATH"] == os.environ.get("PATH", os.defpath)
+    monkeypatch.delenv("PATH", raising=False)
+    env_no_path = base_git_env(home)
+    assert env_no_path["PATH"] == os.defpath
+
+
+def test_executable_bit_is_recorded_in_the_index(tmp_path: Path) -> None:
+    r = GitRepo.init(tmp_path / "r")
+    r.write("script.sh", "#!/bin/sh\necho hi\n", executable=True)
+    r.write("plain.txt", "nope\n")
+    sha = r.commit("modes", date="2026-01-01T00:00:00+00:00")
+    script = r.git("ls-tree", sha, "--", "script.sh")
+    plain = r.git("ls-tree", sha, "--", "plain.txt")
+    assert script.startswith("100755"), script
+    assert plain.startswith("100644"), plain
+
+
+def test_symlink_is_recorded_in_the_index(tmp_path: Path) -> None:
+    r = GitRepo.init(tmp_path / "r")
+    r.write("target.txt", "hello\n")
+    r.symlink("the-link", "target.txt")
+    sha = r.commit("link", date="2026-01-01T00:00:00+00:00")
+    out = r.git("ls-tree", sha, "--", "the-link")
+    assert out.startswith("120000"), out
+    assert r.git("show", f"{sha}:the-link") == "target.txt"
+
+
+def test_forced_symlink_unavailability_skips_only_symlink_cases(tmp_path: Path) -> None:
+    """Monkeypatching the probe skips only symlink-specific cases, each with a reason."""
+    if os.environ.get("CD_INNER_PYTEST") == "1":
+        return
+    plugin = tmp_path / "force_no_symlinks.py"
+    plugin.write_text(
+        "def pytest_configure():\n"
+        "    from fixtures import gitrepo\n"
+        "    gitrepo.symlinks_available = lambda: False\n",
+        encoding="utf-8",
+    )
+    junit = tmp_path / "junit.xml"
+    repo = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["CD_INNER_PYTEST"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join([str(plugin.parent), env.get("PYTHONPATH", "")]).rstrip(
+        os.pathsep
+    )
+    proc = subprocess.run(  # noqa: S603 - argv list, no shell
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/fixtures/test_gitrepo.py",
+            "tests/fixtures/test_builders.py",
+            "tests/spec/test_cli_contract.py",
+            "-k",
+            "not test_forced_symlink_unavailability",
+            "-p",
+            "force_no_symlinks",
+            "-p",
+            "no:cacheprovider",
+            "--junitxml",
+            str(junit),
+            "-q",
+            "--tb=line",
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert junit.is_file(), proc.stdout + proc.stderr
+    skipped: list[tuple[str, str]] = []
+    unexpected: list[str] = []
+    failed: list[str] = []
+    for case in ET.parse(junit).iter("testcase"):  # noqa: S314 - our own pytest junit
+        name = case.get("name") or ""
+        classname = case.get("classname") or ""
+        node = f"{classname}::{name}"
+        skip = case.find("skipped")
+        if skip is not None:
+            message = skip.get("message") or (skip.text or "")
+            typ = skip.get("type") or ""
+            if SYMLINK_UNAVAILABLE_REASON in message:
+                skipped.append((node, message))
+            elif "xfail" not in typ.lower() and "xfail" not in message.lower():
+                unexpected.append(f"{node} typ={typ!r} ({message})")
+        elif case.find("failure") is not None or case.find("error") is not None:
+            failed.append(node)
+    assert failed == [], f"inner run failures: {failed}\n{proc.stdout}\n{proc.stderr}"
+    assert unexpected == [], f"non-symlink skips: {unexpected}"
+    assert skipped, (
+        "expected symlink tests to skip when the probe is forced off; "
+        f"exit={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    )
+    for node, message in skipped:
+        test_name = node.rsplit("::", 1)[-1]
+        assert "symlink" in test_name, f"non-symlink test skipped: {node} ({message})"

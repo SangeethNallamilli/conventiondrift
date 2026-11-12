@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -221,3 +222,22 @@ def test_exceptions_rules_have_separate_expected_verdicts(smoke: tuple) -> None:
             assert v["expected_verdict"] == "Holds"
     findings = [f for per_ref in m["expected_findings"].values() for f in per_ref]
     assert not {f["text"] for f in findings} & {narrow, wide}
+
+
+def test_git_env_isolates_config_and_keeps_windows_runtime() -> None:
+    """The generator's git env is isolated and keeps Windows runtime variables."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gen_bench_repo", GEN)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    env = mod.git_env()
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    cfg = Path(env["GIT_CONFIG_GLOBAL"])
+    assert cfg.is_file()
+    assert cfg.read_text(encoding="utf-8") == ""
+    assert cfg != Path(os.devnull)
+    assert env["USERPROFILE"] == env["HOME"]
+    assert env["PATH"] == os.environ.get("PATH", os.defpath)

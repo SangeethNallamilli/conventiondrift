@@ -340,13 +340,36 @@ class Stream:
 
 
 def git_env() -> dict[str, str]:
-    return {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": tempfile.gettempdir(),
+    """Isolated git env that still starts git.exe on Windows."""
+    home = Path(tempfile.gettempdir()) / "cd-bench-git-home"
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = home / "isolated.gitconfig"
+    if not cfg.exists():
+        cfg.write_text("", encoding="utf-8")
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(home),
+        "USERPROFILE": str(home),
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": str(cfg),
+        "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
+        "TZ": "UTC",
     }
+    for key in (
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
 
 
 def git(repo: Path, *args: str) -> str:

@@ -17,7 +17,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -63,6 +65,7 @@ def git_version() -> tuple[int, ...]:
         ["git", "--version"],  # noqa: S607 - git from PATH by design
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     ).stdout
     m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out)
@@ -71,17 +74,78 @@ def git_version() -> tuple[int, ...]:
     return tuple(int(x) for x in m.groups() if x is not None)
 
 
+SYMLINK_UNAVAILABLE_REASON = "OS cannot create symlinks (Windows without Developer Mode)"
+
+# Host variables git (and, on Windows, git.exe itself) still need. HOME and
+# USERPROFILE are set separately, to a private tmp home, and are not copied.
+_HOST_RUNTIME_KEYS = (
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "TMP",
+    "TEMP",
+    "TMPDIR",
+)
+
+
+def symlinks_available() -> bool:
+    """True if this process can create a symbolic link in a temporary directory."""
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "target"
+            target.write_bytes(b"x")
+            link = Path(td) / "link"
+            os.symlink(target.name, link)
+            return link.is_symlink()
+    except (OSError, NotImplementedError):
+        return False
+
+
+def _isolated_gitconfig(home: Path) -> Path:
+    """Empty file used as GIT_CONFIG_GLOBAL (os.devnull is not reliable on Windows)."""
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = home / "isolated.gitconfig"
+    if not cfg.exists():
+        cfg.write_text("", encoding="utf-8")
+    return cfg
+
+
+def _rmtree(path: Path) -> None:
+    """Remove a tree, clearing read-only bits first (Windows .git objects)."""
+
+    def _retry(fn: Any, p: str, _exc: Any) -> None:
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        except OSError:
+            pass
+        fn(p)
+
+    shutil.rmtree(path, onerror=_retry)
+
+
 def base_git_env(home: Path) -> dict[str, str]:
-    """A fixed environment for the fixture's own git calls (not the tool's)."""
+    """A fixed environment for the fixture's own git calls (not the tool's).
+
+    Config is isolated (no system or global file). HOME and USERPROFILE point
+    at `home`. SYSTEMROOT and the other Windows runtime variables are kept so
+    git.exe can start; PATH is the host PATH so git itself is found.
+    """
     env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": os.environ.get("PATH", os.defpath),
         "HOME": str(home),
+        "USERPROFILE": str(home),
         "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_GLOBAL": str(_isolated_gitconfig(home)),
         "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
         "TZ": "UTC",
     }
+    for key in _HOST_RUNTIME_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
     return env
 
 
@@ -222,9 +286,13 @@ class GitRepo:
         target.parent.mkdir(parents=True, exist_ok=True)
         data = content.encode("utf-8") if isinstance(content, str) else content
         target.write_bytes(data)
-        if executable:
+        # Filesystem executable bits are POSIX-only; the index mode is set on
+        # every OS with `git update-index --chmod=+x` so tests see 100755.
+        if executable and os.name != "nt":
             target.chmod(0o755)
         self.git("add", "--", relpath)
+        if executable:
+            self.git("update-index", "--chmod=+x", "--", relpath)
         return target
 
     def write_many(self, files: Mapping[str, str | bytes]) -> None:
@@ -242,6 +310,16 @@ class GitRepo:
         self.git("mv", "--", src, dst)
 
     def symlink(self, relpath: str, target: str) -> None:
+        """Create a worktree symlink and stage it.
+
+        Only symlink-specific tests call this. If the OS cannot create
+        symlinks, this skips with SYMLINK_UNAVAILABLE_REASON; fixtures and
+        tests that do not need a symlink never reach this method.
+        """
+        if not symlinks_available():
+            import pytest
+
+            pytest.skip(SYMLINK_UNAVAILABLE_REASON)
         link = self.path / relpath
         link.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, link)
@@ -437,7 +515,8 @@ class GitRepo:
         return dict(line.split(" ", 1) for line in out.splitlines() if line)
 
     def remove(self) -> None:
-        shutil.rmtree(self.path, ignore_errors=True)
+        if self.path.exists():
+            _rmtree(self.path)
 
 
 # ---------------------------------------------------------------------- oracle
