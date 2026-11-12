@@ -338,15 +338,55 @@ def test_stream_named_read_is_never_opened(repo: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(os, "open", spy_open)
     monkeypatch.setattr(os, "lstat", spy_lstat)
     for relpath in (".git::$INDEX_ALLOCATION/config", ".GIT:stream"):
-        # Tree names: the I-5 match runs after cutting at ':'. Typed values with
-        # a ':' are already "outside repository" (I-13) before the match.
-        got = read_unless_hard_excluded(repo, relpath, "config", origin="tree")
-        assert isinstance(got, AlwaysExcluded)
-        assert got.note == "`" + relpath + "` is always excluded"
+        # Tree names: on POSIX the I-5 match runs after cutting at ':'; on Windows
+        # a tree name with ':' is already "unsupported path" (I-13) before the
+        # match (SR L-B). Typed values with a ':' are "outside repository" (I-13)
+        # everywhere. Either way the name is never opened or lstat-ed.
+        tree_result = _tree_read_as(os.name, repo, relpath)
+        if os.name == "nt":
+            assert tree_result == "unsupported path"
+        else:
+            assert isinstance(tree_result, AlwaysExcluded)
+            assert tree_result.note == "`" + relpath + "` is always excluded"
         with pytest.raises(FileSkipped) as exc:
             read_unless_hard_excluded(repo, relpath, "config", origin="input")
         assert exc.value.reason == "outside repository"
     assert opened == []
+
+
+def _tree_read_as(name: str, repo: Path, relpath: str) -> AlwaysExcluded | str:
+    """Read ``relpath`` as a tree name with ``os.name`` set to ``name`` only around the
+    call (SR N-9: restored before any assert); a FileSkipped becomes its reason."""
+    real = os.name
+    os.name = name
+    try:
+        got = read_unless_hard_excluded(repo, relpath, "config", origin="tree")
+    except FileSkipped as exc:
+        return exc.reason
+    finally:
+        os.name = real
+    assert isinstance(got, AlwaysExcluded)
+    return got
+
+
+@pytest.mark.parametrize("name", ["posix", "nt"])
+def test_stream_named_tree_read_per_os_is_never_opened(
+    name: str, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SR L-B: both OS branches run on every runner. On "nt" the tree name is
+    "unsupported path" (I-13); on "posix" it is AlwaysExcluded (I-5 after the ':' cut).
+    Neither opens nor lstat-s anything."""
+    touched: list[object] = []
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: touched.append(p))
+    monkeypatch.setattr(os, "lstat", lambda p, *a, **k: touched.append(p))
+    for relpath in (".git::$INDEX_ALLOCATION/config", ".GIT:stream"):
+        got = _tree_read_as(name, repo, relpath)
+        if name == "nt":
+            assert got == "unsupported path"
+        else:
+            assert isinstance(got, AlwaysExcluded)
+            assert got.note == "`" + relpath + "` is always excluded"
+    assert touched == []
 
 
 # ---- SR L1: the unguarded worktree read is private to safefs --------------------------
