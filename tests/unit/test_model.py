@@ -648,3 +648,51 @@ def test_rule_accepts_scope_dir_without_edge_slashes(scope_dir: str) -> None:
 def test_rule_rejects_scope_dir_with_edge_slash(scope_dir: str) -> None:
     with pytest.raises(ValueError, match="leading or trailing slash"):
         dataclasses.replace(RULE, scope_dir=scope_dir)
+
+
+# --- I-10 RuleMatch validity (CR2 B1 on #25) ----------------------------------------
+
+
+def test_rule_match_rejects_empty_preferred_and_prohibited() -> None:
+    with pytest.raises(ValueError, match="must not both be empty"):
+        RuleMatch(preferred=frozenset(), prohibited=frozenset(), specificity=1)
+
+
+@pytest.mark.parametrize(
+    ("preferred", "prohibited"),
+    [
+        (frozenset({"httpx"}), frozenset({"httpx"})),
+        (frozenset({"httpx", "requests", "urllib"}), frozenset({"requests", "urllib", "aiohttp"})),
+    ],
+)
+def test_rule_match_rejects_overlapping_preferred_and_prohibited(
+    preferred: frozenset[str], prohibited: frozenset[str]
+) -> None:
+    with pytest.raises(ValueError, match="must be disjoint"):
+        RuleMatch(preferred=preferred, prohibited=prohibited, specificity=1)
+
+
+def test_rule_match_accepts_only_preferred() -> None:
+    match = RuleMatch(preferred=frozenset({"httpx"}), prohibited=frozenset(), specificity=1)
+    assert match.preferred == frozenset({"httpx"})
+    assert match.prohibited == frozenset()
+
+
+def test_rule_match_accepts_only_prohibited() -> None:
+    match = RuleMatch(preferred=frozenset(), prohibited=frozenset({"print"}), specificity=1)
+    assert match.preferred == frozenset()
+    assert match.prohibited == frozenset({"print"})
+
+
+def test_rule_match_accepts_disjoint_nonempty_sets() -> None:
+    match = RuleMatch(
+        preferred=frozenset({"httpx"}), prohibited=frozenset({"requests"}), specificity=2
+    )
+    assert match == MATCH
+
+
+def test_rule_match_error_does_not_echo_option_values() -> None:
+    hostile = "untrusted-option<SECRET>"
+    with pytest.raises(ValueError) as excinfo:
+        RuleMatch(preferred=frozenset({hostile}), prohibited=frozenset({hostile}), specificity=0)
+    assert hostile not in str(excinfo.value)
