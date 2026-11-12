@@ -172,11 +172,20 @@ def _plant_named(folder: Path, name: str) -> Path:
 
 
 def _symlink_or_skip(link: Path, target: Path) -> None:
-    """Create ``link`` -> ``target``, or skip when the platform cannot symlink."""
+    """Create ``link`` -> ``target``.
+
+    Skip only on a local non-Windows machine without CI, where symlink
+    support may be missing. Under CI, GitHub Actions, or on Windows, a
+    failure is a hard fail so a windows-latest run cannot hide the
+    post-walk proof in the skipped count (CR2 S1, SR D-002).
+    """
     try:
         link.symlink_to(target)
     except OSError as exc:
-        pytest.skip(f"symlinks are not supported on this platform: {exc}")
+        message = f"failed to create symlink {link} -> {target}: {exc}"
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.platform == "win32":
+            pytest.fail(message)
+        pytest.skip(message)
 
 
 def _write_reader_git(folder: Path, name: str, marker: Path) -> Path:
@@ -886,6 +895,38 @@ def test_gitreader_runs_trusted_git_and_never_executes_a_planted_one(
 # ---------------------------------------------------------------------------
 # T26-3: second-check and per-entry realpath (symlink mutants)
 # ---------------------------------------------------------------------------
+
+
+def _raise_symlink_oserror(*_args: object, **_kwargs: object) -> None:
+    raise OSError("simulated symlink failure")
+
+
+def test_symlink_or_skip_fails_under_ci_when_symlink_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CR2 S1 / SR D-002: a symlink OSError is a hard fail when CI is set."""
+    monkeypatch.setattr(os, "symlink", _raise_symlink_oserror)
+    monkeypatch.setenv("CI", "1")
+    link = tmp_path / "link"
+    target = tmp_path / "target"
+    target.write_text("x", encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception, match="simulated symlink failure"):
+        _symlink_or_skip(link, target)
+
+
+def test_symlink_or_skip_skips_locally_when_symlink_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CR2 S1: skip remains only for local non-Windows development without CI."""
+    monkeypatch.setattr(os, "symlink", _raise_symlink_oserror)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    link = tmp_path / "link"
+    target = tmp_path / "target"
+    target.write_text("x", encoding="utf-8")
+    with pytest.raises(pytest.skip.Exception, match="simulated symlink failure"):
+        _symlink_or_skip(link, target)
 
 
 def test_git_symlink_in_a_kept_folder_to_a_planted_binary_is_refused(
