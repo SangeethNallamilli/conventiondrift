@@ -70,7 +70,25 @@ def test_invalid_components_become_core(component: str) -> None:
     assert internal_error(ComponentError(component, PLANTED)).component == "core"
 
 
-@pytest.mark.parametrize("name", ["Ërror", "Bad Name", "Bad\nName", "1Error", "", "a-b"])
+@pytest.mark.parametrize("component", ["checker:http-client-", "checker:a--b"])
+def test_trailing_and_doubled_suffix_hyphens_are_kept(component: str) -> None:
+    # I-14's suffix class [a-z0-9_-]+ allows these, so they pass through unchanged.
+    assert internal_error(ComponentError(component, PLANTED)).component == component
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Ërror",
+        "Bad Name",
+        "Bad\nName",
+        "1Error",
+        "",
+        "a-b",
+        "Bad\u202eError",  # Cf: right-to-left override (bidi)
+        "Bad\u200bError",  # Cf: zero-width space
+    ],
+)
 def test_class_names_that_are_not_ascii_identifiers_become_exception(name: str) -> None:
     exc = type(name, (Exception,), {})()
     assert internal_error(exc) == InternalError("core", "Exception" + SUFFIX)
