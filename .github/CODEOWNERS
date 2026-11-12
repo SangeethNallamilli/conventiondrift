@@ -2,3 +2,9 @@
 /.github/workflows/ @SangeethNallamilli
 /action.yml @SangeethNallamilli
 /.github/CODEOWNERS @SangeethNallamilli
+# Supply chain and security docs (SR, 2026-11-12). Add /entry/ once it exists (T-24).
+/pyproject.toml @SangeethNallamilli
+/requirements/ @SangeethNallamilli
+/src/conventiondrift/_vendor/ @SangeethNallamilli
+/SECURITY.md @SangeethNallamilli
+/THREAT-MODEL.md @SangeethNallamilli
