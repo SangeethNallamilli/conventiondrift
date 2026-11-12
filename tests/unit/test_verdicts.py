@@ -6,8 +6,10 @@ Test Engineer. The AC each case exercises is given in a comment instead.
 
 import ast
 import inspect
+import os
 from collections.abc import Collection
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from hypothesis import given
@@ -569,15 +571,145 @@ def test_side_result_invariants(
 
 # --- purity ----------------------------------------------------------------------------
 
+# The allowlist and forbidden names are the original purity contract (I-11 C9).
+_ALLOWED_IMPORT_ROOTS = frozenset({"__future__", "collections", "conventiondrift", "typing"})
+_FORBIDDEN_NAMES = frozenset({"open", "print", "exec", "eval", "compile", "__import__", "float"})
 
-def test_module_is_pure() -> None:
-    tree = ast.parse(inspect.getsource(verdicts))
+# Exact ImportFrom mutmut 3.8.1 injects (trampoline_templates.trampoline_imports).
+_MUTMUT_TRAMPOLINE_MODULE = "mutmut.mutation.trampoline"
+_MUTMUT_TRAMPOLINE_ALIASES = frozenset(
+    {("wrap_in_trampoline", "_mutmut_mutated"), ("MutantDict", None)}
+)
+_MUTANT_UNDER_TEST_ENV = "MUTANT_UNDER_TEST"
+
+_PURE_PREAMBLE = """from collections.abc import Collection, Iterable, Sequence
+from typing import Literal
+
+from conventiondrift.model import (
+    Counts, Rule, RuleMatch, SideResult, Site, SiteResult, Thresholds, Verdict)
+"""
+
+_MUTMUT_TRAMPOLINE_SOURCE = (
+    "from mutmut.mutation.trampoline import wrap_in_trampoline as _mutmut_mutated, MutantDict\n"
+)
+
+
+def _resolved_source_file(module_file: str | None) -> Path:
+    """Prefer the pristine source when mutmut 3.x has copied a tree into mutants/."""
+    if not module_file:
+        raise AssertionError("module has no source file")
+    path = Path(module_file).resolve()
+    parts = path.parts
+    indexes = [i for i, part in enumerate(parts) if part == "mutants"]
+    if not indexes:
+        return path
+    # The last 'mutants' segment is mutmut's copy root (a parent dir may share the name).
+    idx = indexes[-1]
+    original = Path(*parts[:idx]) / Path(*parts[idx + 1 :])
+    if original.is_file():
+        return original
+    return path
+
+
+def _is_exact_mutmut_trampoline_import(node: ast.AST) -> bool:
+    if not isinstance(node, ast.ImportFrom):
+        return False
+    if node.module != _MUTMUT_TRAMPOLINE_MODULE or node.level != 0:
+        return False
+    aliases = frozenset((alias.name, alias.asname) for alias in node.names)
+    return aliases == _MUTMUT_TRAMPOLINE_ALIASES
+
+
+def _imported_roots(tree: ast.AST, *, allow_mutmut_trampoline: bool) -> set[str]:
     imported: set[str] = set()
     for node in ast.walk(tree):
+        if allow_mutmut_trampoline and _is_exact_mutmut_trampoline_import(node):
+            continue
         if isinstance(node, ast.Import):
             imported.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom):
             imported.add((node.module or "").split(".")[0])
-    assert imported <= {"__future__", "collections", "conventiondrift", "typing"}
+    return imported
+
+
+def _assert_source_is_pure(source: str, *, allow_mutmut_trampoline: bool = False) -> None:
+    tree = ast.parse(source)
+    imported = _imported_roots(tree, allow_mutmut_trampoline=allow_mutmut_trampoline)
+    assert imported <= _ALLOWED_IMPORT_ROOTS
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    assert not names & {"open", "print", "exec", "eval", "compile", "__import__", "float"}
+    assert not names & _FORBIDDEN_NAMES
+
+
+def _allow_mutmut_trampoline(source_path: Path) -> bool:
+    # Only when the file we read is the mutants/ copy (the original was missing)
+    # and mutmut has set MUTANT_UNDER_TEST. A coincidental env var on the
+    # pristine source must not widen the allowlist.
+    return "mutants" in source_path.parts and _MUTANT_UNDER_TEST_ENV in os.environ
+
+
+def test_module_is_pure() -> None:
+    # Read the on-disk source, not inspect.getsource(module). mutmut 3.x copies
+    # mutated sources into mutants/ and injects a trampoline that imports mutmut;
+    # the runtime module's AST would then fail this test and abort the job.
+    path = _resolved_source_file(inspect.getsourcefile(verdicts) or verdicts.__file__)
+    _assert_source_is_pure(
+        path.read_text(encoding="utf-8"),
+        allow_mutmut_trampoline=_allow_mutmut_trampoline(path),
+    )
+
+
+def test_purity_check_prefers_pristine_source_over_mutants_copy(tmp_path: Path) -> None:
+    original = tmp_path / "src" / "conventiondrift" / "verdicts.py"
+    mutated = tmp_path / "mutants" / "src" / "conventiondrift" / "verdicts.py"
+    original.parent.mkdir(parents=True)
+    mutated.parent.mkdir(parents=True)
+    original.write_text(_PURE_PREAMBLE, encoding="utf-8")
+    mutated.write_text(_MUTMUT_TRAMPOLINE_SOURCE + "import os\n" + _PURE_PREAMBLE, encoding="utf-8")
+    assert _resolved_source_file(str(mutated)) == original.resolve()
+    # The chosen (pristine) file is pure even though the mutants/ copy is not.
+    chosen = _resolved_source_file(str(mutated))
+    _assert_source_is_pure(chosen.read_text(encoding="utf-8"), allow_mutmut_trampoline=False)
+
+
+def test_purity_check_rejects_a_forbidden_import() -> None:
+    # A real stdlib import must still fail, including under the trampoline exception.
+    dirty = _MUTMUT_TRAMPOLINE_SOURCE + _PURE_PREAMBLE + "import os\n"
+    with pytest.raises(AssertionError):
+        _assert_source_is_pure(dirty, allow_mutmut_trampoline=False)
+    with pytest.raises(AssertionError):
+        _assert_source_is_pure(dirty, allow_mutmut_trampoline=True)
+    with pytest.raises(AssertionError):
+        _assert_source_is_pure(_PURE_PREAMBLE + "import subprocess\n", allow_mutmut_trampoline=True)
+
+
+def test_purity_check_allows_mutmut_trampoline_only_when_exact_and_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mutated = tmp_path / "mutants" / "src" / "conventiondrift" / "verdicts.py"
+    mutated.parent.mkdir(parents=True)
+    trampoline_src = _MUTMUT_TRAMPOLINE_SOURCE + _PURE_PREAMBLE
+    mutated.write_text(trampoline_src, encoding="utf-8")
+    # No pristine sibling: the mutants/ file is what's on disk.
+    assert _resolved_source_file(str(mutated)) == mutated.resolve()
+
+    monkeypatch.delenv(_MUTANT_UNDER_TEST_ENV, raising=False)
+    assert _allow_mutmut_trampoline(mutated) is False
+    with pytest.raises(AssertionError):
+        _assert_source_is_pure(trampoline_src, allow_mutmut_trampoline=False)
+
+    monkeypatch.setenv(_MUTANT_UNDER_TEST_ENV, "stats")
+    assert _allow_mutmut_trampoline(mutated) is True
+    _assert_source_is_pure(trampoline_src, allow_mutmut_trampoline=True)
+
+    # A non-exact mutmut import is never allowed, even with the env var.
+    for dirty in (
+        "import mutmut\n" + _PURE_PREAMBLE,
+        "from mutmut import mutmut\n" + _PURE_PREAMBLE,
+        "from mutmut.mutation.trampoline import wrap_in_trampoline\n" + _PURE_PREAMBLE,
+    ):
+        with pytest.raises(AssertionError):
+            _assert_source_is_pure(dirty, allow_mutmut_trampoline=True)
+
+    # The env var alone must not widen the allowlist for the pristine source.
+    pristine = tmp_path / "src" / "conventiondrift" / "verdicts.py"
+    assert _allow_mutmut_trampoline(pristine) is False
