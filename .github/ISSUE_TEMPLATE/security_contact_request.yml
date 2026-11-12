@@ -1,0 +1,17 @@
+name: Security contact request
+description: Only if private vulnerability reporting isn't available to you. Ask for a private contact; don't describe the problem here.
+title: "Security contact request"
+labels: ["security contact request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not include any details of the vulnerability in this issue.** This issue is public.
+        Please first try the private "Report a vulnerability" button on the Security tab. Use this form only if that isn't available to you, and a maintainer will reach out with a private way to share the details. See SECURITY.md.
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have not included any vulnerability details in this issue.
+          required: true
