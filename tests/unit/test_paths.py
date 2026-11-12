@@ -13,7 +13,7 @@ from conventiondrift.discover.safefs import (
     REASON_OUTSIDE,
     REASON_UNSUPPORTED,
     PathOrigin,
-    read_worktree_file,
+    _read_worktree_file,
     validate_relpath,
 )
 from conventiondrift.errors import FileSkipped
@@ -57,7 +57,7 @@ def test_validate_relpath_rejects(value: str, tmp_path: Path, opened: list[objec
         validate_relpath(value, origin="input")
     assert exc.value.reason == REASON_OUTSIDE
     with pytest.raises(FileSkipped) as exc2:
-        read_worktree_file(tmp_path, value, "config", origin="input")
+        _read_worktree_file(tmp_path, value, "config", origin="input")
     assert exc2.value.reason == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -208,14 +208,14 @@ def test_colon_tree_name_is_analyzed_on_posix(
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY + COLON_VALUES)
 def test_read_rejects_typed_windows_only_value(value: str) -> None:
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file("/nonexistent", value, "python", origin="input")
+        _read_worktree_file("/nonexistent", value, "python", origin="input")
     assert exc.value.reason == REASON_OUTSIDE
 
 
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY)
 def test_read_skips_windows_only_tree_name(value: str) -> None:
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file("/nonexistent", value, "python", origin="tree")
+        _read_worktree_file("/nonexistent", value, "python", origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
 
 
@@ -248,7 +248,7 @@ def test_read_tree_name_with_backslash_is_unsupported(tmp_path: Path, opened: li
     (tmp_path / "a\\b.py").write_bytes(b"x = 1\n")
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file(tmp_path, "a\\b.py", "python", origin="tree")
+        _read_worktree_file(tmp_path, "a\\b.py", "python", origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -267,7 +267,7 @@ def test_read_tree_name_in_later_segment_is_unsupported(
     )
     for origin, expected in cases:
         with pytest.raises(FileSkipped) as exc:
-            read_worktree_file(tmp_path, f"src/{name}", "python", origin=origin)
+            _read_worktree_file(tmp_path, f"src/{name}", "python", origin=origin)
         assert exc.value.reason == expected
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -278,9 +278,61 @@ def test_read_colon_tree_name_on_posix(tmp_path: Path, opened: list[object], nam
     """``src/c:x.py`` is a normal file on POSIX: read for a tree name, refused when typed."""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / name).write_bytes(b"x = 1\n")
-    assert read_worktree_file(tmp_path, f"src/{name}", "python", origin="tree") == b"x = 1\n"
+    assert _read_worktree_file(tmp_path, f"src/{name}", "python", origin="tree") == b"x = 1\n"
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file(tmp_path, f"src/{name}", "python", origin="input")
+        _read_worktree_file(tmp_path, f"src/{name}", "python", origin="input")
     assert exc.value.reason == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
+
+
+# ---- SR N1 / I-13 ruling 3: lone surrogates are rejected before any encoding ---------
+
+# I-13: U+D800..U+DFFF, including surrogateescape results, are "unsupported path"
+# for tree names and "outside repository" for typed values. Traversal still wins.
+LONE_SURROGATES = [
+    "a\ud800.py",  # first surrogate  -- FIX: need real escapes in the file
+    "x/\udfff/y.py",
+    "a\udc80.py",
+    "src/caf\udce9.py",
+    "\udbff",
+]
+
+
+@pytest.mark.parametrize("value", LONE_SURROGATES)
+@pytest.mark.parametrize(
+    ("origin", "expected"), [("tree", REASON_UNSUPPORTED), ("input", REASON_OUTSIDE)]
+)
+def test_lone_surrogate_split_by_origin(value: str, origin: PathOrigin, expected: str) -> None:
+    # No os.name patch: the split is the same on every OS (I-13, SR N1).
+    with pytest.raises(FileSkipped) as exc:
+        validate_relpath(value, origin=origin)
+    assert exc.value.reason == expected
+    with pytest.raises(FileSkipped) as exc2:
+        _read_worktree_file("/nonexistent", value, "python", origin=origin)
+    assert exc2.value.reason == expected
+
+
+def test_every_surrogate_code_point_is_rejected() -> None:
+    """D-TL-25: the whole U+D800..U+DFFF range, alone and inside a name, both origins."""
+    for cp in range(0xD800, 0xE000):
+        for value in (chr(cp), f"src/a{chr(cp)}b.py"):
+            with pytest.raises(FileSkipped) as exc:
+                validate_relpath(value, origin="tree")
+            assert exc.value.reason == REASON_UNSUPPORTED
+            with pytest.raises(FileSkipped) as exc2:
+                validate_relpath(value, origin="input")
+            assert exc2.value.reason == REASON_OUTSIDE
+
+
+@pytest.mark.parametrize("value", ["../\ud800.py", "/\udc80", "a\udc80\x00"])
+def test_traversal_wins_over_lone_surrogate(value: str) -> None:
+    with pytest.raises(FileSkipped) as exc:
+        validate_relpath(value, origin="tree")
+    assert exc.value.reason == REASON_OUTSIDE
+
+
+@pytest.mark.parametrize("value", ["a\ud7ff.py", "a\ue000.py", "caf\xe9.py", "ok.py"])
+@pytest.mark.parametrize("origin", ["input", "tree"])
+def test_code_points_next_to_the_surrogate_range_are_fine(value: str, origin: PathOrigin) -> None:
+    assert validate_relpath(value, origin=origin) == value

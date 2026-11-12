@@ -12,6 +12,7 @@ import pytest
 
 import conventiondrift.discover.safefs as d
 from conventiondrift.discover.safefs import WalkResult, walk_worktree
+from conventiondrift.errors import ComponentError
 from conventiondrift.model import SkippedFile
 
 POSIX = os.name == "posix"
@@ -158,6 +159,7 @@ def test_depth_cap(tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatc
 
 
 def test_real_depth_cap_is_64(tmp_path: Path, strategy: str) -> None:
+    """I-13 ruling 5: the root is depth 0; depth 64 is entered; 65 is a walk-limit entry."""
     assert d.WALK_MAX_DEPTH == 64
     deep = "/".join(["d"] * 64)
     make(tmp_path, f"{deep}/ok.py", f"{deep}/e/no.py")
@@ -228,8 +230,13 @@ def test_unreadable_folder(tmp_path: Path, strategy: str) -> None:
 
 
 def test_root_that_cannot_be_listed(tmp_path: Path, strategy: str) -> None:
-    res = walk_worktree(tmp_path / "missing")
-    assert res == WalkResult((), (SkippedFile(".", "unreadable"),), 0)
+    """I-13 ruling 2 / QA F1: a missing or unlistable root is ComponentError('discover')."""
+    missing = tmp_path / "missing"
+    with pytest.raises(ComponentError) as exc:
+        walk_worktree(missing)
+    assert exc.value.component == "discover"
+    assert str(missing) not in exc.value.message
+    assert str(tmp_path) not in exc.value.message
 
 
 def test_folder_swapped_for_a_symlink_after_lstat(
@@ -350,3 +357,68 @@ def test_junction_is_symlink(
     res = walk_worktree(tmp_path)
     assert res.files == ("a.py",)
     assert res.skipped == (SkippedFile("junction", "symlink"),)
+
+
+@pytest.mark.skipif(not POSIX or os.geteuid() == 0, reason="needs POSIX permissions, not root")
+def test_unlistable_root_is_a_discover_error(tmp_path: Path, strategy: str) -> None:
+    """I-13 ruling 2: a root that exists but cannot be listed also fails closed."""
+    tmp_path.chmod(0)
+    try:
+        with pytest.raises(ComponentError) as exc:
+            walk_worktree(tmp_path)
+        assert exc.value.component == "discover"
+        assert str(tmp_path) not in exc.value.message
+    finally:
+        tmp_path.chmod(0o755)
+
+
+def test_realpath_failure_on_the_root_is_a_discover_error(
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(path: object) -> str:
+        raise OSError(errno.EIO, "boom", str(path))
+
+    monkeypatch.setattr(os.path, "realpath", boom)
+    with pytest.raises(ComponentError) as exc:
+        walk_worktree(tmp_path)
+    assert exc.value.component == "discover"
+    assert str(tmp_path) not in exc.value.message
+
+
+def test_hard_excluded_names_count_toward_the_entry_cap(
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-13 ruling 5: every listed name counts, hard-excluded ones included."""
+    make(tmp_path, ".git/x", "node_modules/y", "a/1.py", "a/2.py", "z.py")
+    # Root names, sorted: .git, a, node_modules, z.py (4). Cap 5: a has 2 children
+    # and would take the total to 6, so a is one "walk limit" entry.
+    monkeypatch.setattr(d, "WALK_MAX_ENTRIES", 5)
+    res = walk_worktree(tmp_path)
+    assert res.files == ("z.py",)
+    assert res.skipped == (SkippedFile("a", "walk limit"),)
+    assert res.entries == 4
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs a file system that takes non-UTF-8 names")
+def test_non_utf8_tree_name_is_unsupported_path(tmp_path: Path, strategy: str) -> None:
+    """I-13 ruling 3 / QA F2: a surrogateescape name is SkippedFile with a U+XXXX path."""
+    weird = tmp_path / "weird"
+    weird.mkdir()
+    fd = os.open(os.fsencode(weird) + b"/\xff.py", os.O_WRONLY | os.O_CREAT, 0o600)
+    os.write(fd, b"x = 1\n")
+    os.close(fd)
+    (name,) = os.listdir(weird)
+    assert name == "\udcff.py"
+    res = walk_worktree(tmp_path)
+    assert res.files == ()
+    # Expected path is I-14's U+XXXX form, taken from the spec, not from the helper.
+    assert res.skipped == (SkippedFile("weird/U+DCFF.py", "unsupported path"),)
+
+
+@pytest.mark.skipif(not POSIX, reason="Windows cannot create a name containing ':'")
+def test_ntfs_stream_style_names_are_not_entered(tmp_path: Path, strategy: str) -> None:
+    """SR L2: '.git::$INDEX_ALLOCATION' and '.GIT:stream' are hard-excluded by name."""
+    make(tmp_path, "ok.py", ".git::$INDEX_ALLOCATION/config", ".GIT:stream")
+    res = walk_worktree(tmp_path)
+    assert res.files == ("ok.py",)
+    assert res.skipped == ()

@@ -4,9 +4,11 @@ These are the only safe way C4 (and C5, for the config file and its path
 entries) turns an untrusted repo-relative path into bytes or text:
 
 * :func:`validate_relpath` - repo-root containment on the string (R2.1, AC-N3.8).
-* :func:`read_worktree_file` - no symlinks on any component, ``O_NOFOLLOW``,
+* :func:`_read_worktree_file` - no symlinks on any component, ``O_NOFOLLOW``,
   ``fstat`` regular-file and size check on the same handle before reading,
   ``realpath`` containment (R2.2, R2.3, AC-N3.7, AC-N3.9, DESIGN §12 A-3 #1).
+  Private to this module (SR L1); named reads go through
+  :func:`read_unless_hard_excluded`.
 * :func:`check_size` - the same size rule for bytes whose length is known
   before they are read (git blobs).
 * :func:`decode_text` - binary detection and decoding: UTF-8 everywhere,
@@ -35,7 +37,7 @@ import tokenize
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from conventiondrift.errors import FileSkipped
+from conventiondrift.errors import ComponentError, FileSkipped
 from conventiondrift.model import SkippedFile, SkipReason
 
 __all__ = [
@@ -54,6 +56,7 @@ __all__ = [
     "REGEXES",
     "WALK_MAX_DEPTH",
     "WALK_MAX_ENTRIES",
+    "AlwaysExcluded",
     "EntryKind",
     "FileKind",
     "PathOrigin",
@@ -64,7 +67,6 @@ __all__ = [
     "has_hard_excluded_component",
     "is_hard_excluded",
     "read_unless_hard_excluded",
-    "read_worktree_file",
     "size_limit",
     "validate_relpath",
     "walk_worktree",
@@ -98,6 +100,8 @@ REASON_WALK_LIMIT: Final = "walk limit"
 # enters folders at most this many components deep. Read per call, so tests can patch them.
 WALK_MAX_ENTRIES = 500_000
 WALK_MAX_DEPTH = 64
+# I-13 ruling 2: fixed ComponentError("discover") message; never a host path.
+_ROOT_UNLISTABLE: Final = "repository root could not be listed"
 
 # Windows reserved device names (D-PM-28 #5, SR-012 F5): a segment whose part before
 # the first dot, without trailing spaces, is one of these, in any case: "nul.txt", "Com1.py".
@@ -158,6 +162,25 @@ def _windows_only_form(segment: str, *, colon: bool) -> bool:
     )
 
 
+def _has_lone_surrogate(segment: str) -> bool:
+    """True if ``segment`` holds a code point in U+D800..U+DFFF (SR N1, I-13).
+
+    Python strings never pair surrogates, so this covers a stray U+D800 and the
+    U+DC80..U+DCFF that ``surrogateescape`` (``os.fsdecode``) makes from
+    non-UTF-8 bytes. A plain scan, not ``encode``, so nothing is encoded first.
+    """
+    return any(0xD800 <= ord(ch) <= 0xDFFF for ch in segment)
+
+
+def _escape_unsupported_path(path: str) -> str:
+    """I-14 ``U+XXXX`` label for lone surrogates in a tree name (I-13 ruling 3).
+
+    ``render/escape.py`` (T-023) is the display escaping module and is not in
+    this tree; this uses the same I-14 form (uppercase hex, at least 4 digits).
+    """
+    return "".join(f"U+{ord(ch):04X}" if _has_lone_surrogate(ch) else ch for ch in path)
+
+
 def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     """Return ``value`` as a normalized repo-relative POSIX path, or reject it.
 
@@ -179,6 +202,11 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
       ``os.name == "nt"``, where it would open an NTFS stream; on POSIX such
       names are analyzed normally (AC-N3.13 needs a ``::warning::`` file name).
 
+    A lone surrogate (U+D800..U+DFFF) in any segment, including the U+DC80-style
+    names ``surrogateescape`` decoding gives for non-UTF-8 bytes, gets the
+    same split (SR N1, I-13), so it never reaches ``os.fsencode`` and no
+    ``UnicodeEncodeError`` escapes.
+
     Traversal and absolute forms win over these. Glob characters are left
     alone, so the same check serves ``exclude`` entries. Plain string tests
     only: no regex, linear in ``value``.
@@ -189,7 +217,7 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
     colon = origin == "input" or os.name == "nt"  # read per call, so tests can patch it
-    if any(_windows_only_form(p, colon=colon) for p in parts):
+    if any(_has_lone_surrogate(p) or _windows_only_form(p, colon=colon) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
 
@@ -347,7 +375,7 @@ def _open_by_path(root_real: str, parts: list[str]) -> int:
     return fd
 
 
-def read_worktree_file(
+def _read_worktree_file(
     root: str | os.PathLike[str],
     relpath: str,
     kind: FileKind,
@@ -457,8 +485,12 @@ def is_hard_excluded(component: str) -> bool:
     (``GIT~1``, ``GI1A2B~1``, ``NODE_M~1``). Name only, whatever the entry's type,
     so a ``.git`` gitlink file or symlink is excluded too. Never pass the
     checkout's own absolute path, or a parent of it, to this check.
+
+    A ``:`` starts an NTFS stream name (SR L2). The stream suffix is cut off
+    before the I-5 steps, so ``.git::$INDEX_ALLOCATION`` and ``.GIT:stream``
+    are excluded on every OS.
     """
-    name = component.translate(_DROP_IGNORABLE).rstrip(". ").casefold()
+    name = component.split(":", 1)[0].translate(_DROP_IGNORABLE).rstrip(". ").casefold()
     return (
         name in _HARD_EXCLUDED_NAMES
         or _GIT_SHORT_NAME.fullmatch(name) is not None
@@ -471,6 +503,21 @@ def has_hard_excluded_component(relpath: str) -> bool:
     return any(is_hard_excluded(part) for part in relpath.split("/"))
 
 
+@dataclass(frozen=True, slots=True)
+class AlwaysExcluded:
+    """A configured ``paths:`` entry that names a hard-excluded path (I-13 ruling 1).
+
+    This is not a :class:`~conventiondrift.model.SkippedFile`. The caller adds
+    ``note`` to the summary and drops the entry.
+    """
+
+    path: str  # validated repo-relative POSIX path
+
+    @property
+    def note(self) -> str:
+        return f"`{self.path}` is always excluded"
+
+
 def read_unless_hard_excluded(
     root: str | os.PathLike[str],
     relpath: str,
@@ -478,20 +525,19 @@ def read_unless_hard_excluded(
     *,
     max_file_bytes: int | None = None,
     origin: PathOrigin,
-) -> bytes | None:
-    """:func:`read_worktree_file`, or ``None`` without touching the filesystem if any
-    component of the validated ``relpath`` is hard-excluded (I-5, SR N4).
+) -> bytes | AlwaysExcluded:
+    """:func:`_read_worktree_file`, or :class:`AlwaysExcluded` without touching the
+    filesystem if any component of the validated ``relpath`` is hard-excluded
+    (I-5, SR N4, I-13 ruling 1).
 
     For named reads such as a config ``paths:`` entry. The path is validated first,
     so traversal and Windows-only forms keep their I-13 reasons; only the
     repo-relative path is checked, never ``root``.
     """
     rel = validate_relpath(relpath, origin=origin)
-    # QUESTION: (Architect) should a typed `paths:` entry that names a hard-excluded
-    # file add a note? I-5 only says "skip the path"; I-13 has no SkipReason for it.
     if has_hard_excluded_component(rel):
-        return None
-    return read_worktree_file(root, rel, kind, max_file_bytes=max_file_bytes, origin=origin)
+        return AlwaysExcluded(rel)
+    return _read_worktree_file(root, rel, kind, max_file_bytes=max_file_bytes, origin=origin)
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,13 +563,21 @@ def walk_worktree(root: str | os.PathLike[str]) -> WalkResult:
       the total past :data:`WALK_MAX_ENTRIES`, is "walk limit", and so is every
       folder reached after the total is spent. Folders are walked in sorted name
       order, so the result is the same for the same tree.
-    * No ``OSError`` escapes: it becomes a fixed reason, as for reads. A root that
-      can't be listed is reported with the path ``"."``.
+    * No ``OSError`` escapes: it becomes a fixed reason, as for reads. A root
+      that can't be listed raises :class:`ComponentError` ``("discover")``
+      (I-13 ruling 2), which fails closed. Hitting the entry cap at the root is
+      a ``"walk limit"`` entry with the path ``"."``, like any other folder.
+    * A name that is not valid UTF-8 (a lone surrogate from ``surrogateescape``)
+      is :class:`SkippedFile` with the I-14 ``U+XXXX`` path and
+      ``"unsupported path"`` (I-13 ruling 3, SR N1).
 
     Effective excludes and ``.gitignore`` are not applied here; callers filter.
     """
-    walk = _Walk(os.path.realpath(root))
-    walk.folder([], None)
+    try:
+        walk = _Walk(os.path.realpath(root))
+        walk.folder([], None)
+    except OSError:
+        raise ComponentError("discover", _ROOT_UNLISTABLE) from None
     return WalkResult(
         tuple(sorted(walk.files, key=os.fsencode)),
         tuple(sorted(walk.skipped, key=lambda s: os.fsencode(s.path))),
@@ -544,8 +598,15 @@ class _Walk:
         self.spent = False
 
     def skip(self, parts: list[str], reason: SkipReason) -> None:
-        # QUESTION: (Architect) "." for a root that can't be listed or is over the cap.
-        self.skipped.append(SkippedFile("/".join(parts) or ".", reason))
+        path = "/".join(parts) or "."
+        if any(_has_lone_surrogate(part) for part in parts):
+            path = _escape_unsupported_path(path)
+        self.skipped.append(SkippedFile(path, reason))
+
+    def _root_or_skip(self, parts: list[str], exc: FileSkipped | OSError) -> None:
+        if not parts:
+            raise ComponentError("discover", _ROOT_UNLISTABLE) from None
+        self.skip(parts, _skip_reason(exc))
 
     def folder(self, parts: list[str], parent_fd: int | None) -> None:
         if self.spent:
@@ -554,7 +615,7 @@ class _Walk:
         try:
             handle = self.open(parts, parent_fd)
         except (FileSkipped, OSError) as exc:
-            self.skip(parts, _skip_reason(exc))
+            self._root_or_skip(parts, exc)
             return
         try:
             self.visit(handle, parts)
@@ -574,7 +635,7 @@ class _Walk:
         try:
             names = self.listing(handle, parts)
         except (FileSkipped, OSError) as exc:
-            self.skip(parts, _skip_reason(exc))
+            self._root_or_skip(parts, exc)
             return
         if names is None:
             self.spent = True
@@ -612,8 +673,6 @@ class _Walk:
         if is_hard_excluded(name):
             return  # I-5: never lstat-ed, listed, entered or reported
         child = [*parts, name]
-        # QUESTION: (Architect) a name that is not valid UTF-8 (a lone surrogate under
-        # surrogateescape) is listed as is; T-009 N1 decides its reason.
         try:
             validate_relpath(name, origin="tree")
             if isinstance(handle, int):
