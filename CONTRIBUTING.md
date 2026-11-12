@@ -31,7 +31,7 @@ A CI check fails any pull request that has a commit without a sign-off.
 
 You need Python 3.11 or newer and git. The commands below are for macOS and Linux.
 
-conventiondrift itself also supports Windows. Windows setup steps will be added here once they've been tested on a Windows machine; until then, the commands below won't work as written in Windows shells.
+The conventiondrift command-line tool also runs on Windows (the GitHub Action runs only on Linux runners). Windows setup steps will be added here once they've been tested on a Windows machine; until then, the commands below won't work as written in Windows shells.
 
 <!-- TW-OPEN: add Windows (PowerShell) setup once tested, e.g. on the T-003 Windows runner. -->
 
