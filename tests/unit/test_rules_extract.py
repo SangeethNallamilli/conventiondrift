@@ -462,6 +462,15 @@ def test_policy_side_markers_override_the_files_own() -> None:
     assert [r.ignored for r in result.rules] == [False, False]
 
 
+def test_policy_markers_pairs_are_accepted_as_is() -> None:
+    # I-13 Policy.markers holds plain (line, alone_on_line) pairs; they pass straight through.
+    text = "- Use a.\n- Use b.\n"
+    pairs: tuple[tuple[int, bool], ...] = ((1, True), (2, False))
+    result = extract_file("AGENTS.md", text.encode(), markers=pairs)
+    assert [(r.line, r.ignored) for r in result.rules] == [(1, False), (2, True)]
+    assert Marker(4, True) == (4, True)
+
+
 def test_attach_markers_directly() -> None:
     markers = (Marker(3, True), Marker(5, False), Marker(9, True), Marker(10, False))
     assert attach_markers({4, 5, 7}, markers) == (frozenset({4, 5}), (9, 10))

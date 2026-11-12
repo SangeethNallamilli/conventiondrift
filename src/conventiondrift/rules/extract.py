@@ -34,7 +34,7 @@ import re
 from bisect import bisect_right
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, NamedTuple
 
 __all__ = [
     "MARKER",
@@ -124,9 +124,11 @@ class Candidate:
     text: str
 
 
-@dataclass(frozen=True, slots=True)
-class Marker:
-    """An I-7 marker found on ``line``; ``alone`` when nothing else is on that line."""
+class Marker(NamedTuple):
+    """An I-7 marker found on ``line``; ``alone`` when nothing else is on that line.
+
+    A ``(line, alone_on_line)`` pair, the element type of I-13 ``Policy.markers``.
+    """
 
     line: int
     alone: bool
@@ -311,7 +313,7 @@ def find_markers(text: str) -> tuple[Marker, ...]:
 
 
 def attach_markers(
-    rule_lines: Collection[int], markers: Sequence[Marker]
+    rule_lines: Collection[int], markers: Sequence[tuple[int, bool]]
 ) -> tuple[frozenset[int], tuple[int, ...]]:
     """I-7 attachment: ``(ignored rule start lines, unattached marker lines)``.
 
@@ -321,16 +323,18 @@ def attach_markers(
     """
     ignored: set[int] = set()
     unattached: list[int] = []
-    for marker in markers:
-        target = marker.line + 1 if marker.alone else marker.line
+    for line, alone in markers:
+        target = line + 1 if alone else line
         if target in rule_lines:
             ignored.add(target)
         else:
-            unattached.append(marker.line)
+            unattached.append(line)
     return frozenset(ignored), tuple(unattached)
 
 
-def extract_file(path: str, data: bytes, *, markers: Sequence[Marker] | None = None) -> FileRules:
+def extract_file(
+    path: str, data: bytes, *, markers: Sequence[tuple[int, bool]] | None = None
+) -> FileRules:
     """Extract the rules of one instruction file (DESIGN §7 steps 1-3, R2.6, I-7).
 
     ``markers`` defaults to the markers in ``data`` itself. A caller whose
