@@ -24,7 +24,6 @@ import codecs
 import errno
 import io
 import os
-import re
 import stat
 import tokenize
 from typing import Final, Literal
@@ -76,7 +75,13 @@ REASON_UNSUPPORTED: Final = "unsupported path"
 # Permission denied, I/O error, a file that vanished after listing, any other OS error (I-13).
 REASON_UNREADABLE: Final = "unreadable"
 
-_DRIVE: Final = re.compile(r"[A-Za-z]:")  # anchored with .match; linear, no repetition
+# Windows reserved device names (D-PM-28 #5, SR-012 F5): a segment whose part before
+# the first dot, without trailing spaces, is one of these, in any case: "nul.txt", "Com1.py".
+_DEVICE_NAMES: Final = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
 # BOMs that mean "this is not UTF-8 text" (UTF-32 first: its LE BOM starts with UTF-16's).
 _FOREIGN_BOMS: Final = (
     codecs.BOM_UTF32_LE,
@@ -87,25 +92,43 @@ _FOREIGN_BOMS: Final = (
 _READ_CHUNK: Final = 65_536
 
 
+def _windows_only_form(segment: str) -> bool:
+    """True for a segment Windows cannot hold or reads differently (D-PM-28 #5).
+
+    A backslash, a ``:`` anywhere (drive forms like ``c:x.py`` and ``:`` streams),
+    a trailing dot or space, or a reserved device name with or without an extension.
+    """
+    return (
+        "\\" in segment
+        or ":" in segment
+        or segment.endswith((".", " "))
+        or segment.split(".", 1)[0].rstrip(" ").upper() in _DEVICE_NAMES
+    )
+
+
 def validate_relpath(value: str, origin: PathOrigin = "input") -> str:
     """Return ``value`` as a normalized repo-relative POSIX path, or reject it.
 
     Rejected with ``FileSkipped("outside repository")`` (R2.1, AC-N3.8):
     absolute paths, any ``..`` segment, a NUL character, and values that
-    normalize to nothing. A backslash anywhere or a Windows drive prefix
-    (``C:``) is also "outside repository" for a value the user typed
-    (``origin="input"``: ``paths``, ``config``, ``exclude``, ignore entries),
-    but "unsupported path" for a name found in the repo tree
-    (``origin="tree"``), such as ``a\\b.py`` or ``c:x.py`` (D-PM-28).
-    ``.`` and empty segments are dropped, so ``./a//b/`` becomes ``a/b``. Glob
-    characters are left alone, so the same check serves ``exclude`` entries.
+    normalize to nothing. ``.`` and empty segments are dropped, so ``./a//b/``
+    becomes ``a/b``.
+
+    Windows-only forms in **any** segment (D-PM-28 #5): a backslash, a ``:``
+    (``c:x.py``, ``src/c:x.py``, ``a.py:stream``), a trailing dot or space, or a
+    device name such as ``CON``, ``nul.txt`` or ``Com1.py``. They are "outside
+    repository" for a value the user typed (``origin="input"``: ``paths``,
+    ``config``, ``exclude``, ignore entries) and "unsupported path" for a name
+    found in the repo tree (``origin="tree"``). Traversal and absolute forms
+    win over these. Glob characters are left alone, so the same check serves
+    ``exclude`` entries. Plain string tests only: no regex, linear in ``value``.
     """
     if not value or "\x00" in value or value.startswith("/"):
         raise FileSkipped(REASON_OUTSIDE)
     parts = [p for p in value.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
         raise FileSkipped(REASON_OUTSIDE)
-    if "\\" in value or _DRIVE.match(value):
+    if any(_windows_only_form(p) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
 
