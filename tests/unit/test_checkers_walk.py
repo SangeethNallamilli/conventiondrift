@@ -15,6 +15,7 @@ from conventiondrift.checkers.walk import (
     SiteDefect,
     Walker,
     collect,
+    file_context,
     in_main_guard,
     is_test_file,
     main_guard_spans,
@@ -22,7 +23,7 @@ from conventiondrift.checkers.walk import (
     site_defect,
 )
 from conventiondrift.errors import FileSkipped
-from conventiondrift.model import FileContext, Site
+from conventiondrift.model import FileContext, Site, SkipReason
 
 PRINT = CallChecker("logging", frozenset({"print", "log"}))
 
@@ -118,6 +119,86 @@ def test_main_guard_ignores_anything_else(src: str) -> None:
     assert spans(src) == ()
 
 
+# Nesting kinds and both operand orders (I-13 C7 ruling 6). Expected spans are
+# written by hand from the source lines, not computed by the production code.
+_NAME_FIRST = "__name__ == '__main__'"
+_MAIN_FIRST = "'__main__' == __name__"
+
+# Each template has one `{t}` placeholder for the guard test. Spans point at the
+# body of that guard.
+GUARD_COUNTS: list[tuple[str, tuple[tuple[int, int], ...]]] = [
+    ("try:\n    if {t}:\n        a()\nexcept Exception:\n    pass\n", ((3, 3),)),
+    ("try:\n    x = 1\nexcept Exception:\n    if {t}:\n        a()\n", ((5, 5),)),
+    ("try:\n    x = 1\nexcept Exception:\n    pass\nelse:\n    if {t}:\n        a()\n", ((7, 7),)),
+    ("try:\n    x = 1\nfinally:\n    if {t}:\n        a()\n", ((5, 5),)),
+    ("with x:\n    if {t}:\n        a()\n", ((3, 3),)),
+    ("if x:\n    if {t}:\n        a()\n", ((3, 3),)),
+    ("if x:\n    y = 1\nelse:\n    if {t}:\n        a()\n", ((5, 5),)),
+    ("if x:\n    y = 1\nelif y:\n    if {t}:\n        a()\n", ((5, 5),)),
+    ("for x in y:\n    if {t}:\n        a()\n", ((3, 3),)),
+    ("for x in y:\n    z = 1\nelse:\n    if {t}:\n        a()\n", ((5, 5),)),
+    ("while x:\n    if {t}:\n        a()\n", ((3, 3),)),
+    ("match x:\n    case 1:\n        if {t}:\n            a()\n", ((4, 4),)),
+]
+
+GUARD_DOES_NOT_COUNT: list[str] = [
+    "def f():\n    if {t}:\n        a()\n",
+    "async def f():\n    if {t}:\n        a()\n",
+    "class C:\n    if {t}:\n        a()\n",
+    "class C:\n    def f(self):\n        if {t}:\n            a()\n",
+    "def f():\n    try:\n        if {t}:\n            a()\n    except Exception:\n        pass\n",
+    "async def f():\n    async with x:\n        if {t}:\n            a()\n",
+]
+
+
+@pytest.mark.parametrize("test", [_NAME_FIRST, _MAIN_FIRST], ids=["name-first", "main-first"])
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    GUARD_COUNTS,
+    ids=[
+        "try-body",
+        "try-except",
+        "try-else",
+        "try-finally",
+        "with",
+        "if",
+        "else",
+        "elif",
+        "for",
+        "for-else",
+        "while",
+        "match",
+    ],
+)
+def test_a_guard_inside_a_module_level_compound_statement_counts(
+    template: str, expected: tuple[tuple[int, int], ...], test: str
+) -> None:
+    assert spans(template.format(t=test)) == expected
+
+
+@pytest.mark.parametrize("test", [_NAME_FIRST, _MAIN_FIRST], ids=["name-first", "main-first"])
+@pytest.mark.parametrize(
+    "template",
+    GUARD_DOES_NOT_COUNT,
+    ids=["def", "async-def", "class", "method", "def-try", "async-with"],
+)
+def test_a_guard_nested_in_a_def_class_or_lambda_does_not_count(template: str, test: str) -> None:
+    assert spans(template.format(t=test)) == ()
+
+
+def test_a_lambda_in_an_expression_does_not_hide_a_sibling_guard() -> None:
+    # A lambda cannot hold an ``if`` statement; ruling 6 still requires that we
+    # never walk into one. A later module-level guard must still count.
+    src = "f = (lambda: __name__ == '__main__')\nif __name__ == '__main__':\n    a()\n"
+    assert spans(src) == ((3, 3),)
+
+
+def test_file_context_builder_sets_flags_and_spans() -> None:
+    tree = ast.parse("x = 1\nif __name__ == '__main__':\n    f()\n")
+    ctx = file_context("tests/a.py", tree, is_test_file=True, is_script=True)
+    assert ctx == FileContext("tests/a.py", True, True, ((3, 3),))
+
+
 def test_in_main_guard_is_inclusive_at_both_ends() -> None:
     ctx = FileContext("a.py", False, False, ((3, 5), (9, 9)))
     assert [line for line in range(1, 11) if in_main_guard(ctx, line)] == [3, 4, 5, 9]
@@ -125,14 +206,15 @@ def test_in_main_guard_is_inclusive_at_both_ends() -> None:
 
 # --- parse (R2.4, AC-E.14, SEC-T09) -------------------------------------------------------
 
-# Expected reasons are written by hand from DESIGN §4 / I-13, not read from the table.
+# Expected reasons are written by hand from I-13 C7 rulings 1-2, not read from the table.
 EXPECTED_REASON = {
     SyntaxError: "syntax error",
-    RecursionError: "syntax error",
-    MemoryError: "syntax error",
+    RecursionError: "cap exceeded",
     UnicodeDecodeError: "not decodable",
     ValueError: "syntax error",
 }
+
+RESERVED_SKIP_REASON = "syntax newer than analyzer"
 
 
 def test_expected_reasons_cover_the_parse_table() -> None:
@@ -167,6 +249,20 @@ def test_an_unlisted_parse_exception_propagates(monkeypatch: pytest.MonkeyPatch)
         parse(b"x = 1\n")
 
 
+def test_syntax_newer_than_analyzer_stays_in_the_enum_but_is_never_emitted() -> None:
+    assert RESERVED_SKIP_REASON in get_args(SkipReason)
+    assert RESERVED_SKIP_REASON not in {reason for _, reason in PARSE_SKIP_REASONS}
+    # PEP 695 type-parameter syntax is a SyntaxError on 3.11 and valid later.
+    # Either way C7 must not emit the reserved reason (ruling 1).
+    src = b"type X[T] = int\n"
+    try:
+        tree = parse(src)
+    except FileSkipped as skip:
+        assert skip.reason == "syntax error"
+    else:
+        assert isinstance(tree, ast.Module)
+
+
 @pytest.mark.parametrize(
     "src",
     [
@@ -176,15 +272,25 @@ def test_an_unlisted_parse_exception_propagates(monkeypatch: pytest.MonkeyPatch)
         b"a = 1\x00\n",
         b"x = '\xe9'\n",  # not UTF-8 and no coding cookie
         b"# coding: bogus\nx = 1\n",
-        b"a" + b".b" * 200_000,  # RecursionError during AST construction
-        b"-" * 200_000 + b"1",  # MemoryError: parser stack overflow
     ],
-    ids=["syntax", "indent", "parens", "nul", "latin1", "cookie", "recursion", "memory"],
+    ids=["syntax", "indent", "parens", "nul", "latin1", "cookie"],
 )
 def test_real_hostile_sources_are_skipped_as_syntax_errors(src: bytes) -> None:
     with pytest.raises(FileSkipped) as info:
         parse(src)
     assert info.value.reason == "syntax error"
+    assert info.value.reason != RESERVED_SKIP_REASON
+
+
+def test_a_recursion_error_from_parse_skips_the_file_as_cap_exceeded() -> None:
+    with pytest.raises(FileSkipped) as info:
+        parse(b"a" + b".b" * 200_000)
+    assert info.value.reason == "cap exceeded"
+
+
+def test_a_memory_error_from_parse_propagates() -> None:
+    with pytest.raises(MemoryError):
+        parse(b"-" * 200_000 + b"1")
 
 
 def test_parse_honours_a_coding_cookie_and_a_bom() -> None:
@@ -320,6 +426,22 @@ def test_file_context_carries_scope_flags_and_main_guard_spans() -> None:
 def test_a_skipped_file_has_no_sites_and_no_nodes() -> None:
     outcome = Walker([PRINT]).walk(job("src/broken.py", "def (:\n"))
     assert (outcome.skipped, outcome.sites, outcome.nodes) == ("syntax error", (), 0)
+
+
+def test_a_file_that_overflows_the_parser_is_skipped_as_cap_exceeded() -> None:
+    outcome = Walker([PRINT]).walk(job("src/deep.py", b"a" + b".b" * 200_000))
+    assert (outcome.skipped, outcome.sites, outcome.nodes) == ("cap exceeded", (), 0)
+
+
+def test_a_recursion_error_from_the_walk_skips_the_file_as_cap_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(path: str, tree: ast.Module, *, is_test_file: bool, is_script: bool) -> FileContext:
+        raise RecursionError
+
+    monkeypatch.setattr(walk, "file_context", boom)
+    outcome = Walker([PRINT]).walk(job("src/a.py", "x = 1\n"))
+    assert (outcome.skipped, outcome.sites, outcome.nodes) == ("cap exceeded", (), 0)
 
 
 def test_deep_nesting_does_not_overflow_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -24,8 +24,7 @@ Handler = Callable[[ast.AST, FileContext], Iterable[Site]]
 
 PARSE_SKIP_REASONS: tuple[tuple[type[BaseException], SkipReason], ...] = (
     (SyntaxError, "syntax error"),
-    (RecursionError, "syntax error"),
-    (MemoryError, "syntax error"),
+    (RecursionError, "cap exceeded"),
     (UnicodeDecodeError, "not decodable"),
     (ValueError, "syntax error"),
 )
@@ -33,8 +32,11 @@ PARSE_SKIP_REASONS: tuple[tuple[type[BaseException], SkipReason], ...] = (
 
 Checked in order, so ``UnicodeDecodeError`` is matched before its base
 ``ValueError``. ``SyntaxError`` covers ``IndentationError`` and "too many nested
-parentheses"; ``RecursionError`` and ``MemoryError`` are CPython's limits on deep
-or complex source (SEC-T09).
+parentheses"; every ``SyntaxError`` is ``"syntax error"`` in v1, and
+``"syntax newer than analyzer"`` is reserved and never emitted (I-13 C7
+ruling 1). A ``RecursionError`` is ``"cap exceeded"`` (ruling 2). A
+``MemoryError`` is not in this table: it propagates and becomes
+``ComponentError("checkers")`` at the pool.
 """
 
 SiteDefect = Literal["not a site", "wrong file", "unknown option", "bad position"]
@@ -92,18 +94,68 @@ def _is_main_guard(test: ast.expr) -> bool:
     return (is_name(pair[0]) and is_main(pair[1])) or (is_main(pair[0]) and is_name(pair[1]))
 
 
-def main_guard_spans(tree: ast.Module) -> tuple[tuple[int, int], ...]:
-    """(first, last) lines of the body of each module-level ``if __name__ == "__main__":``.
+_SKIP_NESTING = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+"""A ``__main__`` guard nested in one of these does not count (I-13 C7 ruling 6)."""
 
-    Only the body counts: an ``else`` branch runs on import too. Both operand
-    orders are accepted. Spans are in file order (I-13 Q10).
+
+def _statement_blocks(node: ast.AST) -> tuple[list[ast.stmt], ...]:
+    """Statement lists on ``node``, in source order; expressions are not walked.
+
+    Walking only statement lists means a ``lambda`` in a test or iterator is
+    never entered, which is what ruling 6 requires.
+    """
+    if isinstance(node, ast.If):
+        return (node.body, node.orelse)
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        return (node.body, node.orelse)
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return (node.body,)
+    if isinstance(node, (ast.Try, ast.TryStar)):
+        return (node.body, *(h.body for h in node.handlers), node.orelse, node.finalbody)
+    if isinstance(node, ast.Match):
+        return tuple(c.body for c in node.cases)
+    return ()
+
+
+def main_guard_spans(tree: ast.Module) -> tuple[tuple[int, int], ...]:
+    """(first, last) lines of the body of each counted ``if __name__ == "__main__":``.
+
+    A guard counts unless it is nested inside a ``def``, ``async def``,
+    ``class`` or ``lambda``. Guards inside module-level ``try``, ``with``,
+    ``if`` or ``else`` (and other compound statements) count. Both operand
+    orders are accepted. Only the body is in the span: an ``else`` branch
+    runs on import too, but is still searched for nested guards. Spans are
+    in file order (I-13 C7 ruling 6).
     """
     spans: list[tuple[int, int]] = []
-    for stmt in tree.body:
+    stack: list[ast.stmt] = list(reversed(tree.body))
+    while stack:
+        stmt = stack.pop()
+        if isinstance(stmt, _SKIP_NESTING):
+            continue
         if isinstance(stmt, ast.If) and _is_main_guard(stmt.test):
             first, last = stmt.body[0], stmt.body[-1]
             spans.append((first.lineno, last.end_lineno or last.lineno))
+        for block in reversed(_statement_blocks(stmt)):
+            stack.extend(reversed(block))
     return tuple(spans)
+
+
+def file_context(
+    path: str, tree: ast.Module, *, is_test_file: bool, is_script: bool
+) -> FileContext:
+    """The I-13 ``FileContext`` for one Python file (C7 ruling 3).
+
+    C7 exposes this builder; T-028 compares base and head contexts and adds
+    every ``.py`` whose context differs to the reparse set (ADR-0004
+    Amendment 1).
+    """
+    return FileContext(
+        path=path,
+        is_test_file=is_test_file,
+        is_script=is_script,
+        main_guard_spans=main_guard_spans(tree),
+    )
 
 
 def in_main_guard(ctx: FileContext, line: int) -> bool:
@@ -223,32 +275,33 @@ class Walker:
             tree = parse(job.data)
         except FileSkipped as skip:
             return FileOutcome(job.path, skip.reason, (), 0)
-        ctx = FileContext(
-            path=job.path,
-            is_test_file=job.is_test_file,
-            is_script=job.is_script,
-            main_guard_spans=main_guard_spans(tree),
-        )
         found: dict[str, set[Site]] = {cid: set() for cid in self._options}
         files = frozenset((job.path,))
         nodes = 0
-        # An explicit stack, not recursion: hostile nesting can't overflow the walk (SEC-T09).
-        stack: list[ast.AST] = [tree]
-        while stack:
-            node = stack.pop()
-            nodes += 1
-            for cid, handler in self._handlers_for(type(node)):
-                if cid in self.failed:
-                    continue
-                try:
-                    found[cid].update(collect(handler(node, ctx), files, self._options[cid]))
-                except KeyboardInterrupt:
-                    raise
-                except BaseException as exc:  # noqa: BLE001 -- I-11: a failing checker is isolated
-                    self.failed[cid] = type(exc).__name__
-            children = list(ast.iter_child_nodes(node))
-            children.reverse()
-            stack.extend(children)
+        try:
+            ctx = file_context(
+                job.path, tree, is_test_file=job.is_test_file, is_script=job.is_script
+            )
+            # An explicit stack, not recursion: hostile nesting can't overflow the walk (SEC-T09).
+            stack: list[ast.AST] = [tree]
+            while stack:
+                node = stack.pop()
+                nodes += 1
+                for cid, handler in self._handlers_for(type(node)):
+                    if cid in self.failed:
+                        continue
+                    try:
+                        found[cid].update(collect(handler(node, ctx), files, self._options[cid]))
+                    except KeyboardInterrupt:
+                        raise
+                    except BaseException as exc:  # noqa: BLE001 -- I-11: a failing checker is isolated
+                        self.failed[cid] = type(exc).__name__
+                children = list(ast.iter_child_nodes(node))
+                children.reverse()
+                stack.extend(children)
+        except RecursionError:
+            # From the walk itself, not from a checker (those are isolated above).
+            return FileOutcome(job.path, "cap exceeded", (), 0)
         sites = tuple(
             (cid, tuple(sorted(found[cid], key=site_key)))
             for cid in sorted(found)

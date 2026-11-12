@@ -241,11 +241,11 @@ def context_changed_paths(
 ) -> frozenset[str]:
     """Paths among ``paths`` whose console-script status differs between base and head.
 
-    A file's sites depend on its ``FileContext`` as well as its bytes, and
-    ``is_script`` depends on the side's ``pyproject.toml`` (A-4). An unchanged
-    file whose entry-point status changed must be re-analyzed with the base
-    flags, so T-028 adds these paths to ``changed_head_paths`` and passes their
-    (unchanged) bytes in the base analysis (ADR-0004).
+    T-028 owns the reparse set: git-changed ``.py`` files plus every ``.py``
+    whose ``FileContext`` differs between base and head (I-13 C7 ruling 3,
+    ADR-0004 Amendment 1). C7 exposes ``walk.file_context`` for that
+    comparison. This helper only covers the entry-point half of
+    ``is_script`` and is kept as a convenience.
     """
     flipped = head_entry_points ^ base_entry_points
     return frozenset(p for p in paths if p in flipped)
@@ -261,8 +261,10 @@ def incremental_base(
     **all** base manifests, since manifest sites are not per file and are always
     recomputed (ADR-0004). ``changed_head_paths`` holds every head path whose
     sites may differ: added, modified, renamed-to and copied-to paths, plus
-    ``context_changed_paths``. Head Python sites and skips outside that set are
-    reused as they are. A checker that failed on either side is dropped.
+    every ``.py`` whose ``FileContext`` differs between the two sides
+    (I-13 C7 ruling 3, ADR-0004 Amendment 1). Head Python sites and skips
+    outside that set are reused as they are. A checker that failed on either
+    side is dropped.
 
     Raises ``ValueError`` if ``base_changed`` covers a path that head reuses,
     which means the changed set is incomplete (a caller bug).
