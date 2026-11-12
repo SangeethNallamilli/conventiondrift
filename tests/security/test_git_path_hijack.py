@@ -23,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -157,6 +158,123 @@ def _plant_all_names(folder: Path, sentinel: Path) -> list[Path]:
     return [_write_fake_git(folder, name, sentinel) for name in _GIT_NAMES]
 
 
+def _plant_named(folder: Path, name: str) -> Path:
+    """Create a file with ``name`` for PATH-walk tests; it is not executed."""
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / name
+    if name.lower().endswith(".exe"):
+        dest.write_bytes(b"")
+    else:
+        dest.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return dest
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    """Create ``link`` -> ``target``, or skip when the platform cannot symlink."""
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks are not supported on this platform: {exc}")
+
+
+def _write_reader_git(folder: Path, name: str, marker: Path) -> Path:
+    """Runnable fake git for a public GitReader call.
+
+    Writes ``marker`` on every execution, prints a parseable 2.30 ``--version``,
+    and answers ``--is-shallow-repository`` with ``false``.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / name
+    if os.name == "nt" and name.lower().endswith(".exe"):
+        sentinel_lit = str(marker).replace("\\", "\\\\").replace('"', '\\"')
+        verbatim = str(marker).replace('"', '""')
+        source = (
+            "#include <stdio.h>\n#include <string.h>\n"
+            "int main(int argc, char **argv) {\n"
+            f'    FILE *f = fopen("{sentinel_lit}", "w");\n'
+            '    if (f) { fputs("trusted\\n", f); fclose(f); }\n'
+            "    for (int i = 1; i < argc; i++) {\n"
+            '        if (strcmp(argv[i], "--version") == 0) {\n'
+            '            fputs("git version 2.30.0\\n", stdout);\n'
+            "            return 0;\n"
+            "        }\n"
+            '        if (strcmp(argv[i], "--is-shallow-repository") == 0) {\n'
+            '            fputs("false\\n", stdout);\n'
+            "            return 0;\n"
+            "        }\n"
+            "    }\n"
+            "    return 1;\n"
+            "}\n"
+        )
+        csharp = (
+            "using System;\nusing System.IO;\n"
+            "class FakeGit {\n"
+            "  static int Main(string[] args) {\n"
+            f'    File.WriteAllText(@"{verbatim}", "trusted\\n");\n'
+            "    foreach (string arg in args) {\n"
+            '      if (arg == "--version") {\n'
+            '        Console.Write("git version 2.30.0\\n"); return 0;\n'
+            "      }\n"
+            '      if (arg == "--is-shallow-repository") {\n'
+            '        Console.Write("false\\n"); return 0;\n'
+            "      }\n"
+            "    }\n"
+            "    return 1;\n"
+            "  }\n"
+            "}\n"
+        )
+        src = dest.with_suffix(".c")
+        src.write_text(source, encoding="utf-8")
+        cs_path = dest.with_suffix(".cs")
+        cs_path.write_text(csharp, encoding="utf-8")
+        compilers = (
+            ["gcc", "-O0", "-s", "-o", str(dest), str(src)],
+            ["clang", "-O0", "-s", "-o", str(dest), str(src)],
+            ["cl", "/nologo", "/Fe" + str(dest), str(src)],
+        )
+        errors: list[str] = []
+        for argv in compilers:
+            completed = _run_tool(argv)
+            if completed is None:
+                continue
+            if completed.returncode == 0 and dest.exists():
+                return dest
+            errors.append(f"{argv[0]}: {completed.stderr or completed.stdout}")
+        ps = (
+            "Add-Type -OutputType ConsoleApplication "
+            f"-OutputAssembly '{dest}' "
+            f"-TypeDefinition (Get-Content -Raw '{cs_path}')"
+        )
+        completed = _run_tool(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps])
+        if completed is not None and completed.returncode == 0 and dest.exists():
+            return dest
+        if completed is not None:
+            errors.append(f"powershell: {completed.stderr or completed.stdout}")
+        raise RuntimeError(
+            "could not compile a runnable GitReader git stub; tried gcc, clang, "
+            "cl, and PowerShell Add-Type. " + " | ".join(errors)
+        )
+    lines = [
+        "#!/bin/sh",
+        f"printf 'trusted\\n' > {_sh_quote(str(marker))}",
+        'for arg in "$@"; do',
+        '  if [ "$arg" = --version ]; then',
+        "    printf 'git version 2.30.0\\n'",
+        "    exit 0",
+        "  fi",
+        '  if [ "$arg" = --is-shallow-repository ]; then',
+        "    printf 'false\\n'",
+        "    exit 0",
+        "  fi",
+        "done",
+        "exit 1",
+    ]
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return dest
+
+
 def _set_path(monkeypatch: pytest.MonkeyPatch, *entries: str | Path) -> None:
     monkeypatch.setenv("PATH", os.pathsep.join(str(entry) for entry in entries))
 
@@ -165,6 +283,13 @@ def _is_inside(path: Path, folder: Path) -> bool:
     real = path.resolve()
     root = folder.resolve()
     return real == root or real.is_relative_to(root)
+
+
+def _same_file(left: str | Path, right: str | Path) -> bool:
+    """Compare real paths without constructing pathlib.Path after os.name patches."""
+    return os.path.normcase(os.path.realpath(str(left))) == os.path.normcase(
+        os.path.realpath(str(right))
+    )
 
 
 def _search_entries(search_path: str) -> list[str]:
@@ -365,7 +490,10 @@ def test_trusted_git_is_used_and_search_path_excludes_untrusted(
             )
     for dropped in (".", "relbin"):
         assert dropped not in entries
-    assert "" not in resolved.search_path.split(os.pathsep) or resolved.search_path == ""
+    # search_path is the PATH git runs with: no empty entries, and only the
+    # kept trusted folder (exactly), so a kept "" cannot hide as an empty path.
+    assert resolved.search_path == str(trusted)
+    assert "" not in resolved.search_path.split(os.pathsep)
     assert any(Path(entry).resolve() == trusted.resolve() for entry in entries)
     _assert_not_executed(sentinel)
 
@@ -564,3 +692,177 @@ def test_run_bounded_stderr_secret_is_never_echoed(tmp_path: Path) -> None:
         )
     assert info.value.component == "gitread"
     _assert_no_secret(_exc_text(info.value))
+
+
+# ---------------------------------------------------------------------------
+# T26-1: public GitReader path really executes the resolved git
+# ---------------------------------------------------------------------------
+
+
+def test_gitreader_runs_trusted_git_and_never_executes_a_planted_one(
+    hijack_layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A public GitReader call would run a planted git if resolution slipped.
+
+    The trusted fake must actually run (its marker is written) for ``is_shallow``.
+    The env ``PATH`` given to ``_run_bounded`` equals ``search_path``, not the
+    unfiltered process PATH (I-14: git runs with the filtered PATH).
+    """
+    repo = hijack_layout["repo"]
+    cwd = hijack_layout["cwd"]
+    workspace = hijack_layout["workspace"]
+    trusted = hijack_layout["trusted"]
+    planted_sentinel = hijack_layout["sentinel"]
+    trusted_marker = hijack_layout["root"] / "trusted-marker"
+    _plant_all_names(repo, planted_sentinel)
+    _plant_all_names(cwd, planted_sentinel)
+    trusted_git = _write_reader_git(trusted, _platform_git_name(), trusted_marker)
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(workspace))
+    _set_path(monkeypatch, repo, cwd, workspace, ".", "", "relbin", trusted)
+    unfiltered = os.environ["PATH"]
+
+    recorded: list[dict[str, str]] = []
+    real_run = gitread._run_bounded
+
+    def spy(
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        label: str,
+        max_stdout: int,
+        timeout: float,
+    ) -> gitread._Output:
+        recorded.append(env)
+        return real_run(
+            argv,
+            cwd=cwd,
+            env=env,
+            label=label,
+            max_stdout=max_stdout,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(gitread, "_run_bounded", spy)
+
+    resolved = gitread._find_git(repo)
+    assert Path(resolved.path).resolve() == trusted_git.resolve()
+    assert resolved.search_path == str(trusted)
+    assert gitread.GitReader(repo).is_shallow() is False
+
+    _assert_not_executed(planted_sentinel)
+    assert trusted_marker.is_file(), "trusted git was not executed on the public path"
+    assert trusted_marker.read_text(encoding="utf-8") == "trusted\n"
+    assert recorded, "GitReader issued no bounded git call"
+    for env in recorded:
+        assert env["PATH"] == resolved.search_path
+        assert env["PATH"] != unfiltered
+
+
+# ---------------------------------------------------------------------------
+# T26-3: second-check and per-entry realpath (symlink mutants)
+# ---------------------------------------------------------------------------
+
+
+def test_git_symlink_in_a_kept_folder_to_a_planted_binary_is_refused(
+    hijack_layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-14 second path check: realpath of the binary must not be in the repo.
+
+    The PATH entry itself stays outside the checkout, so only the post-walk
+    realpath re-check refuses a ``git`` that is a symlink to a planted binary.
+    Skipping that check would resolve the planted git.
+    """
+    repo = hijack_layout["repo"]
+    sentinel = hijack_layout["sentinel"]
+    planted = _write_fake_git(repo, _platform_git_name(), sentinel)
+    outside = hijack_layout["root"] / "outside"
+    outside.mkdir()
+    _symlink_or_skip(outside / _platform_git_name(), planted)
+    _set_path(monkeypatch, outside)
+
+    with pytest.raises(ComponentError) as info:
+        gitread._find_git(repo)
+    _assert_dropped_git_error(info.value)
+    _assert_not_executed(sentinel)
+
+
+def test_symlink_path_entry_into_the_repo_is_dropped_when_trusted_git_follows(
+    hijack_layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-14 per-entry realpath: a PATH folder symlinked into the repo is dropped.
+
+    Without realpath the entry looks innocent, the walk would hit the planted
+    git first, and the binary re-check would fail closed instead of using the
+    later trusted git.
+    """
+    repo = hijack_layout["repo"]
+    trusted = hijack_layout["trusted"]
+    sentinel = hijack_layout["sentinel"]
+    _plant_all_names(repo / "tools", sentinel)
+    innocent = hijack_layout["root"] / "innocent"
+    _symlink_or_skip(innocent, repo / "tools")
+    trusted_git = _write_fake_git(trusted, _platform_git_name(), sentinel)
+    _set_path(monkeypatch, innocent, trusted)
+
+    resolved = gitread._find_git(repo)
+
+    assert Path(resolved.path).resolve() == trusted_git.resolve()
+    assert resolved.search_path == str(trusted)
+    _assert_not_executed(sentinel)
+
+
+# ---------------------------------------------------------------------------
+# T26-2 / N-6: simulated Windows (os.name = nt, as in test_gitread.py @ 153d43c)
+# ---------------------------------------------------------------------------
+
+
+def test_windows_pathext_order_never_picks_cmd_bat_or_com(
+    hijack_layout: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SR-013 / N-6: PATHEXT is ignored; only git.exe counts on Windows.
+
+    ``git.cmd``, ``git.bat`` and ``git.com`` sit in an earlier PATH folder than
+    ``git.exe``, and PATHEXT lists those extensions first. The walk must still
+    resolve the later git.exe and must not raise ComponentError.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    shims = hijack_layout["root"] / "shims"
+    exe_dir = hijack_layout["trusted"]
+    for name in ("git.cmd", "git.bat", "git.com"):
+        _plant_named(shims, name)
+    trusted = _plant_named(exe_dir, "git.exe")
+    _set_path(monkeypatch, shims, exe_dir)
+
+    resolved = gitread._find_git(hijack_layout["repo"])
+
+    assert _same_file(resolved.path, trusted)
+    assert resolved.search_path == os.pathsep.join([str(shims), str(exe_dir)])
+
+
+@pytest.mark.parametrize("where", ["repo", "cwd"])
+def test_planted_windows_git_exe_does_not_knock_out_trusted_git(
+    where: str,
+    hijack_layout: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SR N-6: a git.exe in the checkout root or cwd must not hide a trusted git.
+
+    Simulated ``os.name == "nt"`` as in test_gitread.py at 153d43c. ``shutil.which``
+    on Windows prepends the current folder even when ``path=`` is given, so a
+    planted git.exe would fail the containment re-check and raise ComponentError
+    instead of using the later trusted git. The walk must resolve the trusted
+    one and must not raise.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    repo = hijack_layout["repo"]
+    planted_in = repo if where == "repo" else hijack_layout["cwd"]
+    _plant_named(planted_in, "git.exe")
+    trusted = _plant_named(hijack_layout["trusted"], "git.exe")
+    _set_path(monkeypatch, hijack_layout["trusted"])
+
+    resolved = gitread._find_git(repo)
+
+    assert _same_file(resolved.path, trusted)
+    assert resolved.search_path == str(hijack_layout["trusted"])
