@@ -7,10 +7,12 @@ import codecs
 import encodings.aliases
 import errno
 import os
+import re
 import socket
 import stat
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -931,3 +933,55 @@ def test_fallback_recheck_passes_for_an_unchanged_path(
     assert read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
     mine = [p for p in seen if p.startswith(str(tmp_path / "a"))]  # realpath lstats too
     assert mine[-6:] == [str(tmp_path / p) for p in ("a", "a/b", "a/b/m.py")] * 2
+
+
+# ---- SR-012 F7 / R2.5: regex registry and ReDoS-style linearity ----------------------
+
+REDOS_BUDGET_S = 2.0  # generous: each case below takes milliseconds
+ADVERSARIAL = [
+    "a" * 100_000,
+    "c:" * 50_000,
+    ":" * 100_000,
+    "\\" * 100_000,
+    "." * 99_999 + "x",
+    " " * 99_999 + "x",
+    "a/" * 50_000,
+    "./" * 50_000 + "a",
+    ("con." * 25_000),
+    ("nul " * 25_000) + ".txt",
+]
+
+
+def test_every_module_regex_is_registered() -> None:
+    found = {id(v) for v in vars(d).values() if isinstance(v, re.Pattern)}
+    assert found <= {id(p) for p in d.REGEXES}, "add new regexes to safefs.REGEXES"
+
+
+@pytest.mark.parametrize("text", ADVERSARIAL, ids=lambda t: f"{t[:6]!r}x{len(t)}")
+def test_registered_regexes_are_linear(text: str) -> None:
+    for pattern in d.REGEXES:
+        start = time.perf_counter()
+        pattern.search(text)
+        pattern.match(text)
+        assert time.perf_counter() - start < REDOS_BUDGET_S, pattern.pattern
+
+
+@pytest.mark.parametrize("origin", ["tree", "input"])
+@pytest.mark.parametrize("text", ADVERSARIAL, ids=lambda t: f"{t[:6]!r}x{len(t)}")
+def test_validate_relpath_is_linear_on_long_hostile_names(text: str, origin: PathOrigin) -> None:
+    start = time.perf_counter()
+    try:
+        d.validate_relpath(text, origin=origin)
+    except FileSkipped:
+        pass
+    assert time.perf_counter() - start < REDOS_BUDGET_S
+
+
+def test_decode_text_cookie_is_linear_on_a_long_hostile_line() -> None:
+    data = b"# coding" + b":" * 100_000 + b" " + b"-" * 100_000 + b"\n"
+    start = time.perf_counter()
+    try:
+        decode_text(data, "python")
+    except FileSkipped:
+        pass
+    assert time.perf_counter() - start < REDOS_BUDGET_S

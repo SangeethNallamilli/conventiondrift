@@ -24,6 +24,7 @@ import codecs
 import errno
 import io
 import os
+import re
 import stat
 import tokenize
 from typing import Final, Literal
@@ -42,6 +43,7 @@ __all__ = [
     "REASON_SYMLINK",
     "REASON_UNREADABLE",
     "REASON_UNSUPPORTED",
+    "REGEXES",
     "EntryKind",
     "FileKind",
     "PathOrigin",
@@ -82,6 +84,10 @@ _DEVICE_NAMES: Final = frozenset(
     + [f"COM{i}" for i in range(1, 10)]
     + [f"LPT{i}" for i in range(1, 10)]
 )
+# SECURITY-RULES R2.5: every regex this module applies to repo text is listed here
+# and gets a ReDoS unit test. There are none today: path checks are plain string
+# operations. A test fails if a compiled pattern appears in the module but not here.
+REGEXES: Final[tuple[re.Pattern[str], ...]] = ()
 # BOMs that mean "this is not UTF-8 text" (UTF-32 first: its LE BOM starts with UTF-16's).
 _FOREIGN_BOMS: Final = (
     codecs.BOM_UTF32_LE,
