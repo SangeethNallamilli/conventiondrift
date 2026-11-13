@@ -35,10 +35,20 @@ def make(root: Path, *files: str) -> None:
 
 
 def symlink(target: Path, link: Path, *, is_dir: bool = False) -> None:
+    """Create ``link`` -> ``target``.
+
+    Skip only on a local non-Windows machine without CI, where symlink support may
+    be missing. Under CI, GitHub Actions, or on Windows, a failure is a hard fail so
+    a CI run cannot hide these tests in the skipped count (as in #40's
+    ``_symlink_or_skip``).
+    """
     try:
         link.symlink_to(target, target_is_directory=is_dir)
-    except OSError as exc:  # Windows without developer mode
-        pytest.skip(f"symlinks unavailable: {exc.strerror}")
+    except OSError as exc:
+        message = f"failed to create symlink {link} -> {target}: {exc}"
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.platform == "win32":
+            pytest.fail(message)
+        pytest.skip(message)
 
 
 def lstat_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -91,15 +101,25 @@ def test_hard_excluded_folders_are_never_entered(
     assert not any(d.is_hard_excluded(os.path.basename(p)) for p in seen)  # not even lstat-ed
 
 
-def test_git_symlink_and_gitlink_file_are_skipped_silently(tmp_path: Path, strategy: str) -> None:
+def test_git_symlinks_are_skipped_silently(tmp_path: Path, strategy: str) -> None:
     outside = tmp_path / "outside"
     make(outside, "config", "x.py")
     repo = tmp_path / "repo"
     make(repo, "a.py")
     symlink(outside, repo / ".git", is_dir=True)
     symlink(outside, repo / "NODE_MODULES", is_dir=True)
+    res = walk_worktree(repo)
+    assert res.files == ("a.py",)
+    assert res.skipped == ()
+
+
+def test_gitlink_file_is_skipped_silently(tmp_path: Path, strategy: str) -> None:
+    outside = tmp_path / "outside"
+    make(outside, "config", "x.py")
+    repo = tmp_path / "repo"
+    make(repo, "a.py")
     (repo / "sub").mkdir()
-    (repo / "sub" / ".git").write_text("gitdir: ../../outside\n")  # submodule gitlink
+    (repo / "sub" / ".git").write_bytes(b"gitdir: ../../outside\n")  # submodule gitlink
     res = walk_worktree(repo)
     assert res.files == ("a.py",)
     assert res.skipped == ()
@@ -245,7 +265,9 @@ def test_folder_swapped_for_a_symlink_after_lstat(
 
     def racing(path: str, *a: object, **k: object) -> os.stat_result:
         st = real(path, *a, **k)  # type: ignore[arg-type]
-        if os.fsdecode(path).endswith("sub") and not (repo / "sub").is_symlink():
+        # Only the saved, unpatched lstat in here: Path.is_symlink goes through os.lstat
+        # on 3.14+, which would re-enter this wrapper (RecursionError).
+        if os.fsdecode(path).endswith("sub") and not stat.S_ISLNK(real(repo / "sub").st_mode):
             (repo / "sub").rename(tmp_path / "moved")
             symlink(outside, repo / "sub", is_dir=True)
         return st
