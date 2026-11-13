@@ -769,15 +769,82 @@ def test_real_transport_caps_the_response_size(
         HttpClientTransport().request("GET", f"{server.base}/", {}, None, 5.0)
 
 
-def test_real_stalled_server_ends_at_the_deadline_not_the_per_read_timeout(
-    serve: Callable[[Handler], Server],
-) -> None:
-    # Outcome plus a generous bound: the per-read cap alone would take 10 s.
-    server = serve(stall)
+REAL_DEADLINE = 1.5  # the transport's overall deadline for one request, in seconds
+REAL_SLACK = 1.5  # allowed wall-time overrun on a loaded CI runner
+DRIP_EVERY = 0.2  # well under the deadline, so no single read times out
+CLOCK_RATE = 1.03
+"""The transport's clock runs 3 % fast in the real-socket tests (about 45 ms over
+1.5 s). A socket timeout or timer that ends a clock tick early (Windows timers
+can) then still lands past the deadline, so the outcome does not depend on
+timer granularity. The waits themselves are real."""
+
+
+def _tracked_sockets() -> tuple[list[socket.socket], github.SocketFactory]:
+    made: list[socket.socket] = []
+
+    def factory(family: socket.AddressFamily, kind: socket.SocketKind, proto: int) -> socket.socket:
+        sock = socket.socket(family, kind, proto)
+        made.append(sock)
+        return sock
+
+    return made, factory
+
+
+def _fast_clock() -> Callable[[], float]:
+    start = time.monotonic()
+    return lambda: start + (time.monotonic() - start) * CLOCK_RATE
+
+
+def _timed_request(server: Server) -> tuple[float, list[socket.socket]]:
+    made, factory = _tracked_sockets()
+    transport = HttpClientTransport(clock=_fast_clock(), socket_factory=factory)
     start = time.monotonic()
     with pytest.raises(DeadlineExceeded):
-        HttpClientTransport().request("GET", f"{server.base}/", {}, None, 0.3)
-    assert time.monotonic() - start < REQUEST_TIMEOUT_SECONDS / 2
+        transport.request("GET", f"{server.base}/", {}, None, REAL_DEADLINE)
+    return time.monotonic() - start, made
+
+
+def test_real_stalled_server_ends_at_the_overall_deadline(
+    serve: Callable[[Handler], Server],
+) -> None:
+    # The server accepts and never answers. The per-read cap alone would wait
+    # REQUEST_TIMEOUT_SECONDS; the overall deadline ends the call first.
+    before = set(threading.enumerate())
+    server = serve(stall)
+    elapsed, made = _timed_request(server)
+    assert REAL_DEADLINE * 0.9 < elapsed < REAL_DEADLINE + REAL_SLACK
+    assert [s.fileno() for s in made] == [-1]  # the client socket is closed
+    server.close()
+    assert set(threading.enumerate()) <= before  # server, watchdog: all joined
+
+
+def test_real_slow_drip_server_ends_at_the_overall_deadline(
+    serve: Callable[[Handler], Server],
+) -> None:
+    # One byte of the status line every DRIP_EVERY seconds: every read gets
+    # data well inside its own timeout, so only the overall deadline can end
+    # the call. Undisturbed, the reply would take far longer than the deadline.
+    sent: list[int] = []
+    reply = HEADERS
+
+    def drip(conn: socket.socket, stop: threading.Event) -> None:
+        read_request(conn)
+        for byte in reply:
+            if stop.wait(DRIP_EVERY):
+                return
+            conn.sendall(bytes([byte]))
+            sent.append(byte)
+
+    assert len(reply) * DRIP_EVERY > 10 * REAL_DEADLINE
+    before = set(threading.enumerate())
+    server = serve(drip)
+    elapsed, made = _timed_request(server)
+    assert REAL_DEADLINE * 0.9 < elapsed < REAL_DEADLINE + REAL_SLACK
+    assert len(sent) >= 2  # reads were succeeding when the deadline hit
+    assert len(sent) < len(reply)
+    assert [s.fileno() for s in made] == [-1]
+    server.close()
+    assert set(threading.enumerate()) <= before  # server, watchdog: all joined
 
 
 def _dead_port() -> int:
