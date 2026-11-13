@@ -247,9 +247,11 @@ class _Dll:
     def __init__(self, name: str, *, use_last_error: bool) -> None:
         self.name = name
         self.use_last_error = use_last_error
-        self.OpenThread = _Function()
-        self.CancelSynchronousIo = _Function()
-        self.CloseHandle = _Function()
+
+    def __getattr__(self, attr: str) -> _Function:
+        function = _Function()
+        setattr(self, attr, function)
+        return function
 
 
 def test_kernel32_uses_handle_sized_prototypes(monkeypatch: pytest.MonkeyPatch) -> None:
