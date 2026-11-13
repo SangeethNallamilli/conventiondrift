@@ -554,8 +554,8 @@ def read_unless_hard_excluded(
     repo-relative path is checked, never ``root``.
     """
     rel = validate_relpath(relpath, origin=origin)
-    # QUESTION: (Architect) should a typed `paths:` entry that names a hard-excluded
-    # file add a note? I-5 only says "skip the path"; I-13 has no SkipReason for it.
+    # A hard-excluded `paths:` entry is dropped, not a SkippedFile. I-13 scan-walk
+    # ruling 1 adds a summary note for it; that note comes in the T-010b follow-up.
     if has_hard_excluded_component(rel):
         return None
     return read_worktree_file(root, rel, kind, max_file_bytes=max_file_bytes, origin=origin)
@@ -611,7 +611,8 @@ class _Walk:
         self.spent = False
 
     def skip(self, parts: list[str], reason: SkipReason) -> None:
-        # QUESTION: (Architect) "." for a root that can't be listed or is over the cap.
+        # The root is reported as ".". I-13 scan-walk ruling 2 makes an unlistable root
+        # a ComponentError("discover") in the T-010b follow-up; a root over the cap stays ".".
         self.skipped.append(SkippedFile("/".join(parts) or ".", reason))
 
     def folder(self, parts: list[str], parent_fd: int | None) -> None:
@@ -679,8 +680,8 @@ class _Walk:
         if is_hard_excluded(name):
             return  # I-5: never lstat-ed, listed, entered or reported
         child = [*parts, name]
-        # QUESTION: (Architect) a name that is not valid UTF-8 (a lone surrogate under
-        # surrogateescape) is listed as is; T-009 N1 decides its reason.
+        # A name that is not valid UTF-8 (a lone surrogate under surrogateescape) is listed
+        # as is here; I-13 scan-walk ruling 3 makes it "unsupported path" in the follow-up.
         try:
             validate_relpath(name, origin="tree")
             if isinstance(handle, int):
