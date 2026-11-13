@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import typing
 from pathlib import Path
 
 import pytest
@@ -18,11 +19,13 @@ import pytest
 import conventiondrift.discover.safefs as d
 from conventiondrift.discover.safefs import (
     HARD_EXCLUDE_IGNORABLE,
+    AlwaysExcluded,
     has_hard_excluded_component,
     is_hard_excluded,
     read_unless_hard_excluded,
 )
 from conventiondrift.errors import FileSkipped
+from conventiondrift.model import SkippedFile
 
 NAMES = sorted(d._HARD_EXCLUDED_NAMES)
 IGNORABLE = sorted(HARD_EXCLUDE_IGNORABLE)
@@ -214,7 +217,7 @@ def test_paths_entry_naming_git_config_is_never_opened(
         assert relpath.startswith("x/..")
         assert exc.reason == "outside repository"
     else:
-        assert got is None
+        assert isinstance(got, AlwaysExcluded)
     assert opened == []
 
 
@@ -228,7 +231,9 @@ def test_tree_origin_and_size_limit_pass_through(repo: Path) -> None:
     (repo / "big.md").write_bytes(b"x" * 2048)
     with pytest.raises(FileSkipped, match="size limit"):
         read_unless_hard_excluded(repo, "big.md", "instruction", origin="tree", max_file_bytes=1024)
-    assert read_unless_hard_excluded(repo, "node_modules/x.py", "python", origin="tree") is None
+    got = read_unless_hard_excluded(repo, "node_modules/x.py", "python", origin="tree")
+    assert isinstance(got, AlwaysExcluded)
+    assert got.path == "node_modules/x.py"
 
 
 def test_check_uses_only_the_relative_path_not_the_root(tmp_path: Path) -> None:
@@ -244,3 +249,165 @@ def test_no_dollar_anchor_in_safefs_source() -> None:
     src = Path(d.__file__).read_text(encoding="utf-8")
     for m in re.finditer(r're\.compile\((r?"[^"]*")', src):
         assert "$" not in m.group(1)
+
+
+# ---- I-13 ruling 1 / QA F3: the "`<path>` is always excluded" note --------------------
+
+
+def test_paths_entry_note_comes_from_i13_text(repo: Path) -> None:
+    """I-13 ruling 1: dropped with `` `<path>` is always excluded ``, never a SkippedFile."""
+    relpath = ".git/config"
+    got = read_unless_hard_excluded(repo, relpath, "config", origin="input")
+    assert isinstance(got, AlwaysExcluded)
+    # object: mypy proves the classes disjoint, but the test pins it at run time.
+    assert not isinstance(typing.cast(object, got), (SkippedFile, FileSkipped))
+    assert got.path == relpath
+    # Expected wording is from I-13, not from AlwaysExcluded.note.
+    assert got.note == "`" + relpath + "` is always excluded"
+
+
+def test_paths_entry_note_uses_the_validated_path(repo: Path) -> None:
+    got = read_unless_hard_excluded(repo, "./.GIT/config", "config", origin="input")
+    assert isinstance(got, AlwaysExcluded)
+    assert got.path == ".GIT/config"
+    assert got.note == "`.GIT/config` is always excluded"
+
+
+# ---- QA F5: casefold(), not lower(), per I-5 step 3 -----------------------------------
+
+
+def test_casefold_not_lower_is_required_by_i5() -> None:
+    """I-5 step 3 folds with ``str.casefold()``. U+017F (long s) casefolds to ``s``.
+
+    ``node_module`` + U+017F therefore equals ``node_modules`` after casefold and is
+    hard-excluded; ``str.lower()`` leaves U+017F in place and would miss it.
+    """
+    name = "node_module\u017f"
+    assert name.casefold() == "node_modules"  # Unicode, not this module
+    assert name.lower() != "node_modules"
+    assert is_hard_excluded(name)
+    # The I-5 step lives in the function body, not only in a docstring (a first-
+    # occurrence replace of casefold() would otherwise hit the docstring and survive).
+    import inspect
+
+    body = inspect.getsource(is_hard_excluded).split('"""', 2)[-1]
+    assert ".casefold()" in body
+    assert ".lower()" not in body
+
+
+# ---- SR L2: NTFS stream names are hard-excluded on every OS ---------------------------
+
+# I-5 runs on the component after cutting at the first ':'.
+STREAM_EXCLUDED = [
+    ".git::$INDEX_ALLOCATION",
+    ".git::$INDEX_ALLOCATION/config",
+    ".GIT:stream",
+    ".Git:stream/config",
+    "node_modules:stream/x.py",
+    "GIT~1::$DATA/config",
+]
+STREAM_NOT_EXCLUDED = [
+    "file.py:stream",
+    "gitx~1:x",
+    "src/a.py::$DATA",
+    "foo:bar",
+]
+
+
+@pytest.mark.parametrize("relpath", STREAM_EXCLUDED, ids=ascii)
+def test_ntfs_stream_names_are_hard_excluded(relpath: str) -> None:
+    assert has_hard_excluded_component(relpath)
+    assert is_hard_excluded(relpath.split("/")[0])
+
+
+@pytest.mark.parametrize("relpath", STREAM_NOT_EXCLUDED, ids=ascii)
+def test_stream_suffix_does_not_exclude_an_ordinary_name(relpath: str) -> None:
+    assert not has_hard_excluded_component(relpath)
+
+
+def test_stream_named_read_is_never_opened(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[object] = []
+    real_open, real_lstat = os.open, os.lstat
+
+    def spy_open(path: object, *a: object, **k: object) -> int:
+        opened.append(path)
+        return real_open(path, *a, **k)  # type: ignore[arg-type]
+
+    def spy_lstat(path: object, *a: object, **k: object) -> os.stat_result:
+        opened.append(path)
+        return real_lstat(path, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "lstat", spy_lstat)
+    for relpath in (".git::$INDEX_ALLOCATION/config", ".GIT:stream"):
+        # Tree names: on POSIX the I-5 match runs after cutting at ':'; on Windows
+        # a tree name with ':' is already "unsupported path" (I-13) before the
+        # match (SR L-B). Typed values with a ':' are "outside repository" (I-13)
+        # everywhere. Either way the name is never opened or lstat-ed.
+        tree_result = _tree_read_as(os.name, repo, relpath)
+        if os.name == "nt":
+            assert tree_result == "unsupported path"
+        else:
+            assert isinstance(tree_result, AlwaysExcluded)
+            assert tree_result.note == "`" + relpath + "` is always excluded"
+        with pytest.raises(FileSkipped) as exc:
+            read_unless_hard_excluded(repo, relpath, "config", origin="input")
+        assert exc.value.reason == "outside repository"
+    assert opened == []
+
+
+def _tree_read_as(name: str, repo: Path, relpath: str) -> AlwaysExcluded | str:
+    """Read ``relpath`` as a tree name with ``os.name`` set to ``name`` only around the
+    call (SR N-9: restored before any assert); a FileSkipped becomes its reason."""
+    real = os.name
+    os.name = name
+    try:
+        got = read_unless_hard_excluded(repo, relpath, "config", origin="tree")
+    except FileSkipped as exc:
+        return exc.reason
+    finally:
+        os.name = real
+    assert isinstance(got, AlwaysExcluded)
+    return got
+
+
+@pytest.mark.parametrize("name", ["posix", "nt"])
+def test_stream_named_tree_read_per_os_is_never_opened(
+    name: str, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SR L-B: both OS branches run on every runner. On "nt" the tree name is
+    "unsupported path" (I-13); on "posix" it is AlwaysExcluded (I-5 after the ':' cut).
+    Neither opens nor lstat-s anything."""
+    touched: list[object] = []
+    monkeypatch.setattr(os, "open", lambda p, *a, **k: touched.append(p))
+    monkeypatch.setattr(os, "lstat", lambda p, *a, **k: touched.append(p))
+    for relpath in (".git::$INDEX_ALLOCATION/config", ".GIT:stream"):
+        got = _tree_read_as(name, repo, relpath)
+        if name == "nt":
+            assert got == "unsupported path"
+        else:
+            assert isinstance(got, AlwaysExcluded)
+            assert got.note == "`" + relpath + "` is always excluded"
+    assert touched == []
+
+
+# ---- SR L1: the unguarded worktree read is private to safefs --------------------------
+
+
+def test_unguarded_worktree_read_is_private_to_safefs() -> None:
+    """Fail if any src module other than safefs references the unguarded read."""
+    root = Path(d.__file__).resolve().parents[1]  # conventiondrift package
+    pattern = re.compile(r"(?<![\w])_?read_worktree_file\b")
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        if "_vendor" in path.parts or path.name == "safefs.py":
+            continue
+        if pattern.search(path.read_text(encoding="utf-8")):
+            offenders.append(path.as_posix())
+    assert offenders == []
+    src = Path(d.__file__).read_text(encoding="utf-8")
+    assert re.search(r"^def _read_worktree_file\(", src, re.M)
+    assert not re.search(r"^def read_worktree_file\(", src, re.M)
+    assert "read_worktree_file" not in d.__all__
+    assert hasattr(d, "_read_worktree_file")
+    assert not hasattr(d, "read_worktree_file")

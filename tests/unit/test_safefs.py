@@ -34,10 +34,10 @@ from conventiondrift.discover.safefs import (
     REASON_UNSUPPORTED,
     FileKind,
     PathOrigin,
+    _read_worktree_file,
     check_size,
     decode_text,
     entry_kind,
-    read_worktree_file,
     size_limit,
 )
 from conventiondrift.errors import FileSkipped
@@ -66,7 +66,7 @@ def outside() -> Iterator[Path]:
 
 
 def _reason(fn: object, *args: object, **kw: object) -> str:
-    if fn is read_worktree_file and "origin" not in kw:
+    if fn is _read_worktree_file and "origin" not in kw:
         # The config file path is typed by the user; every other kind is a tree name.
         kw["origin"] = "input" if "config" in args else "tree"
     with pytest.raises(FileSkipped) as exc:
@@ -91,9 +91,9 @@ def test_read_size_limit_boundary(case: str, tmp_path: Path, strategy: str) -> N
     f = tmp_path / rel
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_bytes(b"a" * limit)  # exactly the limit: read
-    assert read_worktree_file(tmp_path, rel, kind, origin="tree") == b"a" * limit
+    assert _read_worktree_file(tmp_path, rel, kind, origin="tree") == b"a" * limit
     f.write_bytes(b"a" * (limit + 1))  # one byte over: skipped
-    assert _reason(read_worktree_file, tmp_path, rel, kind) == REASON_SIZE
+    assert _reason(_read_worktree_file, tmp_path, rel, kind) == REASON_SIZE
     check_size(limit, kind)
     assert _reason(check_size, limit + 1, kind) == REASON_SIZE
 
@@ -109,7 +109,7 @@ def test_size_checked_on_handle_before_any_read(
         return b""
 
     monkeypatch.setattr(os, "read", spy)
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SIZE
+    assert _reason(_read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SIZE
     assert calls == [], "an oversized file must not be read at all"
 
 
@@ -119,7 +119,7 @@ def test_file_growing_after_fstat_is_still_size_limit(
     (tmp_path / "c.yml").write_bytes(b"x")
     real_read = os.read
     monkeypatch.setattr(os, "read", lambda fd, n: b"y" * n if n > 1 else real_read(fd, n))
-    assert _reason(read_worktree_file, tmp_path, "c.yml", "config") == REASON_SIZE
+    assert _reason(_read_worktree_file, tmp_path, "c.yml", "config") == REASON_SIZE
 
 
 def test_read_never_requests_more_than_limit_plus_one(
@@ -134,7 +134,7 @@ def test_read_never_requests_more_than_limit_plus_one(
         return real_read(fd, n)
 
     monkeypatch.setattr(os, "read", spy)
-    assert len(read_worktree_file(tmp_path, "c.yml", "config", origin="input")) == CONFIG_MAX_BYTES
+    assert len(_read_worktree_file(tmp_path, "c.yml", "config", origin="input")) == CONFIG_MAX_BYTES
     assert sum(asked) <= CONFIG_MAX_BYTES + 1
 
 
@@ -158,10 +158,10 @@ def test_size_limit_override_only_lowers(
 def test_lowered_limit_applies_to_reads(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "m.py").write_bytes(b"#" * 1025)
     assert (
-        _reason(read_worktree_file, tmp_path, "m.py", "python", max_file_bytes=1024) == REASON_SIZE
+        _reason(_read_worktree_file, tmp_path, "m.py", "python", max_file_bytes=1024) == REASON_SIZE
     )
     assert (
-        len(read_worktree_file(tmp_path, "m.py", "python", max_file_bytes=1025, origin="tree"))
+        len(_read_worktree_file(tmp_path, "m.py", "python", max_file_bytes=1025, origin="tree"))
         == 1025
     )
 
@@ -209,7 +209,7 @@ def test_check_size_honours_a_lowered_limit() -> None:
 
 def test_empty_file_reads_empty(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "AGENTS.md").write_bytes(b"")
-    assert read_worktree_file(tmp_path, "AGENTS.md", "instruction", origin="tree") == b""
+    assert _read_worktree_file(tmp_path, "AGENTS.md", "instruction", origin="tree") == b""
 
 
 # ---- AC-N3.9 symlinks (R2.2, A-3 #1) --------------------------------------------------
@@ -246,7 +246,7 @@ def test_symlink_kinds_skipped(
         _symlink(tmp_path / ".conventiondrift.yml", tmp_path / "real.yml")  # inside target
         rel, kind = ".conventiondrift.yml", "config"
     monkeypatch.setattr(os, "open", spy)
-    assert _reason(read_worktree_file, tmp_path, rel, kind) == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, rel, kind) == REASON_SYMLINK
     assert not any(str(outside) in p for p in read_paths)
     assert not any(p.endswith(("secret.txt", "x.py", "real.yml")) for p in read_paths)
 
@@ -254,7 +254,9 @@ def test_symlink_kinds_skipped(
 @pytest.mark.skipif(not POSIX, reason="POSIX")
 def test_config_symlink_to_outside(tmp_path: Path, outside: Path, strategy: str) -> None:
     _symlink(tmp_path / ".conventiondrift.yml", outside / "secret.txt")
-    assert _reason(read_worktree_file, tmp_path, ".conventiondrift.yml", "config") == REASON_SYMLINK
+    assert (
+        _reason(_read_worktree_file, tmp_path, ".conventiondrift.yml", "config") == REASON_SYMLINK
+    )
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX")
@@ -262,21 +264,21 @@ def test_symlinked_parent_inside_repo_is_still_symlink(tmp_path: Path, strategy:
     (tmp_path / "real").mkdir()
     (tmp_path / "real/a.py").write_text("x = 1\n")
     _symlink(tmp_path / "alias", tmp_path / "real")
-    assert _reason(read_worktree_file, tmp_path, "alias/a.py", "python") == REASON_SYMLINK
-    assert read_worktree_file(tmp_path, "real/a.py", "python", origin="tree") == b"x = 1\n"
+    assert _reason(_read_worktree_file, tmp_path, "alias/a.py", "python") == REASON_SYMLINK
+    assert _read_worktree_file(tmp_path, "real/a.py", "python", origin="tree") == b"x = 1\n"
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX")
 def test_deep_component_symlink(tmp_path: Path, outside: Path, strategy: str) -> None:
     (tmp_path / "a/b").mkdir(parents=True)
     _symlink(tmp_path / "a/b/c", outside)
-    assert _reason(read_worktree_file, tmp_path, "a/b/c/x.py", "python") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "a/b/c/x.py", "python") == REASON_SYMLINK
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX")
 def test_dangling_symlink(tmp_path: Path, strategy: str) -> None:
     _symlink(tmp_path / "AGENTS.md", tmp_path / "nope")
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SYMLINK
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX")
@@ -285,7 +287,7 @@ def test_repo_root_given_through_symlink_is_fine(tmp_path: Path, strategy: str) 
     (tmp_path / "repo/AGENTS.md").write_text("- Use httpx\n")
     _symlink(tmp_path / "rootlink", tmp_path / "repo")
     assert (
-        read_worktree_file(tmp_path / "rootlink", "AGENTS.md", "instruction", origin="tree")
+        _read_worktree_file(tmp_path / "rootlink", "AGENTS.md", "instruction", origin="tree")
         == b"- Use httpx\n"
     )
 
@@ -307,7 +309,7 @@ def test_swap_to_symlink_after_lstat_final(
         return st
 
     monkeypatch.setattr(os, "lstat", racing_lstat)
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SYMLINK
 
 
 @pytest.mark.skipif(not d._USE_DIR_FD, reason="needs openat")
@@ -326,7 +328,7 @@ def test_swap_to_symlink_after_lstat_dir(
         return st
 
     monkeypatch.setattr(os, "lstat", racing_lstat)
-    assert _reason(read_worktree_file, tmp_path, "docs/AGENTS.md", "instruction") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "docs/AGENTS.md", "instruction") == REASON_SYMLINK
 
 
 @pytest.mark.skipif(not POSIX, reason="POSIX")
@@ -341,7 +343,7 @@ def test_fallback_detects_swapped_inode(tmp_path: Path, monkeypatch: pytest.Monk
         "lstat",
         lambda p: real_lstat(tmp_path / "b.py") if str(p).endswith("a.py") else real_lstat(p),
     )
-    assert _reason(read_worktree_file, tmp_path, "a.py", "python") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "a.py", "python") == REASON_SYMLINK
 
 
 def test_reparse_point_counts_as_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -363,7 +365,7 @@ def test_reparse_point_counts_as_symlink(tmp_path: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(
         os, "lstat", lambda p: FakeStat(real_lstat(p)) if str(p).endswith("j") else real_lstat(p)
     )
-    assert _reason(read_worktree_file, tmp_path, "j/a.py", "python") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "j/a.py", "python") == REASON_SYMLINK
 
 
 def test_realpath_containment_defence_in_depth(
@@ -377,7 +379,7 @@ def test_realpath_containment_defence_in_depth(
         "realpath",
         lambda p: "/elsewhere/AGENTS.md" if str(p).endswith("AGENTS.md") else real_realpath(p),
     )
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_OUTSIDE
+    assert _reason(_read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_OUTSIDE
 
 
 def test_realpath_outside_for_a_missing_file_is_outside_repository(
@@ -390,7 +392,7 @@ def test_realpath_outside_for_a_missing_file_is_outside_repository(
         "realpath",
         lambda p: "/elsewhere/x.py" if str(p).endswith("x.py") else real_realpath(p),
     )
-    assert _reason(read_worktree_file, tmp_path, "gone/x.py", "python") == REASON_OUTSIDE
+    assert _reason(_read_worktree_file, tmp_path, "gone/x.py", "python") == REASON_OUTSIDE
 
 
 def test_reparse_point_pointing_outside_is_symlink(
@@ -419,7 +421,7 @@ def test_reparse_point_pointing_outside_is_symlink(
         "realpath",
         lambda p: "/elsewhere/a.py" if str(p).endswith("a.py") else real_realpath(p),
     )
-    assert _reason(read_worktree_file, tmp_path, "j/a.py", "python") == REASON_SYMLINK
+    assert _reason(_read_worktree_file, tmp_path, "j/a.py", "python") == REASON_SYMLINK
 
 
 def test_sibling_prefix_is_not_contained(tmp_path: Path) -> None:
@@ -461,7 +463,7 @@ def test_fifo_skipped_without_opening(tmp_path: Path, strategy: str) -> None:
     os.mkfifo(tmp_path / "AGENTS.md")
     reason = _within(
         FIFO_TIMEOUT_S,
-        lambda: _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction"),
+        lambda: _reason(_read_worktree_file, tmp_path, "AGENTS.md", "instruction"),
     )
     assert reason == REASON_SPECIAL
 
@@ -485,7 +487,7 @@ def test_fifo_swapped_in_before_open_does_not_hang(
 
     monkeypatch.setattr(os, "lstat", fake_lstat)
     reason = _within(
-        FIFO_TIMEOUT_S, lambda: _reason(read_worktree_file, tmp_path, "a.py", "python")
+        FIFO_TIMEOUT_S, lambda: _reason(_read_worktree_file, tmp_path, "a.py", "python")
     )
     assert reason == REASON_SPECIAL
 
@@ -496,14 +498,14 @@ def test_socket_skipped(strategy: str) -> None:
         s = socket.socket(socket.AF_UNIX)
         try:
             s.bind(os.path.join(t, "x.py"))
-            assert _reason(read_worktree_file, t, "x.py", "python") == REASON_SPECIAL
+            assert _reason(_read_worktree_file, t, "x.py", "python") == REASON_SPECIAL
         finally:
             s.close()
 
 
 def test_directory_where_file_expected(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "AGENTS.md").mkdir()
-    assert _reason(read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SPECIAL
+    assert _reason(_read_worktree_file, tmp_path, "AGENTS.md", "instruction") == REASON_SPECIAL
 
 
 def test_fstat_must_show_regular_file(
@@ -513,7 +515,7 @@ def test_fstat_must_show_regular_file(
     real_fstat = os.fstat
     fake = os.stat_result((stat.S_IFIFO | 0o644, *real_fstat(0)[1:]))
     monkeypatch.setattr(os, "fstat", lambda fd: fake)
-    assert _reason(read_worktree_file, tmp_path, "a.py", "python") in (
+    assert _reason(_read_worktree_file, tmp_path, "a.py", "python") in (
         REASON_SPECIAL,
         REASON_SYMLINK,  # by_path compares inodes first
     )
@@ -541,8 +543,8 @@ def test_entry_kind_symlink(tmp_path: Path) -> None:
 def test_normal_nested_read(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "src/pkg").mkdir(parents=True)
     (tmp_path / "src/pkg/m.py").write_bytes(b"x = 1\n")
-    assert read_worktree_file(tmp_path, "./src//pkg/m.py", "python", origin="tree") == b"x = 1\n"
-    assert read_worktree_file(str(tmp_path), "src/pkg/m.py", "python", origin="tree") == b"x = 1\n"
+    assert _read_worktree_file(tmp_path, "./src//pkg/m.py", "python", origin="tree") == b"x = 1\n"
+    assert _read_worktree_file(str(tmp_path), "src/pkg/m.py", "python", origin="tree") == b"x = 1\n"
 
 
 def test_no_fd_leak(tmp_path: Path, strategy: str) -> None:
@@ -554,14 +556,14 @@ def test_no_fd_leak(tmp_path: Path, strategy: str) -> None:
     os.mkfifo(tmp_path / "a/fifo.py")
     before = len(os.listdir("/proc/self/fd"))
     for _ in range(20):
-        read_worktree_file(tmp_path, "a/ok.py", "python", origin="tree")
+        _read_worktree_file(tmp_path, "a/ok.py", "python", origin="tree")
         for bad in ("a/big.py", "a/fifo.py"):
             with pytest.raises(FileSkipped):
-                read_worktree_file(tmp_path, bad, "python", origin="tree")
+                _read_worktree_file(tmp_path, bad, "python", origin="tree")
         with pytest.raises(FileSkipped):
-            read_worktree_file(tmp_path, "a/none.py", "python", origin="tree")
+            _read_worktree_file(tmp_path, "a/none.py", "python", origin="tree")
         with pytest.raises(FileSkipped):
-            read_worktree_file(tmp_path, "a/ok.py/x.py", "python", origin="tree")
+            _read_worktree_file(tmp_path, "a/ok.py/x.py", "python", origin="tree")
     assert len(os.listdir("/proc/self/fd")) == before
 
 
@@ -645,7 +647,7 @@ def test_bomless_utf16_is_binary() -> None:
 
 def test_read_then_decode_end_to_end(tmp_path: Path, strategy: str) -> None:
     (tmp_path / "x.py").write_bytes(b"\x00\x01")
-    raw = read_worktree_file(tmp_path, "x.py", "python", origin="tree")
+    raw = _read_worktree_file(tmp_path, "x.py", "python", origin="tree")
     assert _reason(decode_text, raw, "python") == REASON_BINARY
 
 
@@ -693,7 +695,7 @@ def _chain(exc: BaseException) -> Iterator[BaseException]:
 def _skip_without_leak(root: Path, rel: str, *, origin: PathOrigin = "tree") -> str:
     """Read ``rel``; it must be skipped with nothing but the fixed reason in the exception."""
     with pytest.raises(FileSkipped) as info:
-        read_worktree_file(root, rel, "python", origin=origin)
+        _read_worktree_file(root, rel, "python", origin=origin)
     exc = info.value
     assert exc.__cause__ is None
     assert exc.__context__ is None
@@ -961,7 +963,7 @@ def test_non_oserror_propagates(
     (tmp_path / "a.py").write_text("x")
     _fail_on(monkeypatch, "fstat", _track_fds(monkeypatch, "a.py"), RuntimeError("bug"))
     with pytest.raises(RuntimeError, match="bug"):
-        read_worktree_file(tmp_path, "a.py", "python", origin="tree")
+        _read_worktree_file(tmp_path, "a.py", "python", origin="tree")
 
 
 # ---- SR-012 F1: a hostile coding cookie never escapes as an exception (R2.4) ----------
@@ -1048,7 +1050,7 @@ def test_fallback_recheck_passes_for_an_unchanged_path(
         return real_lstat(p)
 
     monkeypatch.setattr(os, "lstat", spy)
-    assert read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
+    assert _read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
     mine = [p for p in seen if p.startswith(str(tmp_path / "a"))]  # realpath lstats too
     assert mine[-6:] == [str(tmp_path / p) for p in ("a", "a/b", "a/b/m.py")] * 2
 
@@ -1198,7 +1200,7 @@ def test_windows_fallback_reads_an_unchanged_ntfs_file(tmp_path: Path) -> None:
             os.close(fd)
         by_name = os.lstat(f)
         assert (by_handle.st_dev, by_handle.st_ino) == (by_name.st_dev, by_name.st_ino)
-        assert read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
+        assert _read_worktree_file(tmp_path, "a/b/m.py", "python", origin="tree") == b"x = 1\n"
     else:  # the skipif keeps other platforms out
         pytest.fail("Windows-only")
 

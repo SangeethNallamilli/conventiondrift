@@ -17,7 +17,7 @@ from conventiondrift.discover.safefs import (
     REASON_OUTSIDE,
     REASON_UNSUPPORTED,
     PathOrigin,
-    read_worktree_file,
+    _read_worktree_file,
     validate_relpath,
 )
 from conventiondrift.errors import FileSkipped
@@ -61,7 +61,7 @@ def test_validate_relpath_rejects(value: str, tmp_path: Path, opened: list[objec
         validate_relpath(value, origin="input")
     assert exc.value.reason == REASON_OUTSIDE
     with pytest.raises(FileSkipped) as exc2:
-        read_worktree_file(tmp_path, value, "config", origin="input")
+        _read_worktree_file(tmp_path, value, "config", origin="input")
     assert exc2.value.reason == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -257,14 +257,14 @@ def test_colon_tree_name_is_analyzed_on_posix(value: str, expected: str) -> None
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY + COLON_VALUES)
 def test_read_rejects_typed_windows_only_value(value: str) -> None:
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file("/nonexistent", value, "python", origin="input")
+        _read_worktree_file("/nonexistent", value, "python", origin="input")
     assert exc.value.reason == REASON_OUTSIDE
 
 
 @pytest.mark.parametrize("value", ALWAYS_WINDOWS_ONLY)
 def test_read_skips_windows_only_tree_name(value: str) -> None:
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file("/nonexistent", value, "python", origin="tree")
+        _read_worktree_file("/nonexistent", value, "python", origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
 
 
@@ -303,7 +303,7 @@ def test_read_tree_name_with_backslash_is_unsupported(tmp_path: Path, opened: li
         (tmp_path / "a\\b.py").write_bytes(b"x = 1\n")
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file(tmp_path, "a\\b.py", "python", origin="tree")
+        _read_worktree_file(tmp_path, "a\\b.py", "python", origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -322,7 +322,7 @@ def test_read_tree_name_in_later_segment_is_unsupported(
     )
     for origin, expected in cases:
         with pytest.raises(FileSkipped) as exc:
-            read_worktree_file(tmp_path, f"src/{name}", "python", origin=origin)
+            _read_worktree_file(tmp_path, f"src/{name}", "python", origin=origin)
         assert exc.value.reason == expected
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -333,10 +333,10 @@ def test_read_colon_tree_name_on_posix(tmp_path: Path, opened: list[object], nam
     """``src/c:x.py`` is a normal file on POSIX: read for a tree name, refused when typed."""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / name).write_bytes(b"x = 1\n")
-    assert read_worktree_file(tmp_path, f"src/{name}", "python", origin="tree") == b"x = 1\n"
+    assert _read_worktree_file(tmp_path, f"src/{name}", "python", origin="tree") == b"x = 1\n"
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file(tmp_path, f"src/{name}", "python", origin="input")
+        _read_worktree_file(tmp_path, f"src/{name}", "python", origin="input")
     assert exc.value.reason == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -362,7 +362,7 @@ def test_lone_surrogate_split_by_origin(
 ) -> None:
     assert _reason_as(os_name, validate_relpath, value, origin=origin) == expected
     # Never a UnicodeEncodeError: it would propagate out of _reason_as and fail the test.
-    got = _reason_as(os_name, read_worktree_file, "/nonexistent", value, "python", origin=origin)
+    got = _reason_as(os_name, _read_worktree_file, "/nonexistent", value, "python", origin=origin)
     assert got == expected
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -404,7 +404,7 @@ def test_real_non_utf8_tree_name_is_unsupported(tmp_path: Path, opened: list[obj
     assert name == "a\udcff.py"
     opened.clear()
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file(tmp_path, name, "python", origin="tree")
+        _read_worktree_file(tmp_path, name, "python", origin="tree")
     assert exc.value.reason == REASON_UNSUPPORTED
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -476,7 +476,7 @@ def test_unknown_origin_is_treated_as_typed(
 ) -> None:
     # Simulated POSIX, where a tree name with ':' would be accepted.
     assert _reason_as("posix", validate_relpath, value, origin=origin) == REASON_OUTSIDE
-    got = _reason_as("posix", read_worktree_file, "/nonexistent", value, "python", origin=origin)
+    got = _reason_as("posix", _read_worktree_file, "/nonexistent", value, "python", origin=origin)
     assert got == REASON_OUTSIDE
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -484,7 +484,7 @@ def test_unknown_origin_is_treated_as_typed(
 @pytest.mark.parametrize("origin", UNKNOWN_ORIGINS)
 def test_unknown_origin_name_too_long_is_outside_repository(origin: object, tmp_path: Path) -> None:
     with pytest.raises(FileSkipped) as exc:
-        read_worktree_file(tmp_path, "n" * 5000 + ".py", "python", origin=origin)  # type: ignore[arg-type]
+        _read_worktree_file(tmp_path, "n" * 5000 + ".py", "python", origin=origin)  # type: ignore[arg-type]
     assert exc.value.reason == REASON_OUTSIDE
 
 
@@ -505,7 +505,7 @@ def test_unknown_origin_name_too_long_is_outside_repository(origin: object, tmp_
 def test_windows_segment_over_255_units_is_refused_before_any_open(
     origin: str, expected: str, value: str, opened: list[object]
 ) -> None:
-    got = _reason_as("nt", read_worktree_file, "/nonexistent", value, "python", origin=origin)
+    got = _reason_as("nt", _read_worktree_file, "/nonexistent", value, "python", origin=origin)
     assert got == expected
     assert opened == [], "nothing may be opened for a rejected path"
 
@@ -581,13 +581,13 @@ def test_windows_real_alternate_data_stream_is_never_opened(
         opened.clear()
         for name in ("a.py:s", "a.py:s:$DATA", "a.py::$DATA", "c:a.py", "./a.py:s"):
             with pytest.raises(FileSkipped) as exc:
-                read_worktree_file(tmp_path, name, "python", origin="tree")
+                _read_worktree_file(tmp_path, name, "python", origin="tree")
             assert exc.value.reason == REASON_UNSUPPORTED, name
             with pytest.raises(FileSkipped) as exc2:
-                read_worktree_file(tmp_path, name, "python", origin="input")
+                _read_worktree_file(tmp_path, name, "python", origin="input")
             assert exc2.value.reason == REASON_OUTSIDE, name
         assert opened == [], "no stream (or drive-relative path) may be opened"
-        assert read_worktree_file(tmp_path, "a.py", "python", origin="tree") == b"x = 1\n"
+        assert _read_worktree_file(tmp_path, "a.py", "python", origin="tree") == b"x = 1\n"
     else:  # the skipif keeps other platforms out
         pytest.fail("Windows-only")
 
@@ -611,13 +611,13 @@ def test_windows_real_device_names_are_never_opened(tmp_path: Path, opened: list
         opened.clear()
         for name in WINDOWS_DEVICE_PATHS:
             with pytest.raises(FileSkipped) as exc:
-                read_worktree_file(tmp_path, name, "python", origin="tree")
+                _read_worktree_file(tmp_path, name, "python", origin="tree")
             assert exc.value.reason == REASON_UNSUPPORTED, name
             with pytest.raises(FileSkipped) as exc2:
-                read_worktree_file(tmp_path, name, "config", origin="input")
+                _read_worktree_file(tmp_path, name, "config", origin="input")
             assert exc2.value.reason == REASON_OUTSIDE, name
         assert opened == [], "no device may be opened"
         # The folder itself is readable, so the refusals above come from the name check.
-        assert read_worktree_file(tmp_path, "src/ok.py", "python", origin="tree") == b"x = 1\n"
+        assert _read_worktree_file(tmp_path, "src/ok.py", "python", origin="tree") == b"x = 1\n"
     else:  # the skipif keeps other platforms out
         pytest.fail("Windows-only")
