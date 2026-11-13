@@ -237,7 +237,7 @@ def _textconv_command(tmp_path: Path, marker: Path) -> str:
 
 
 @pytest.fixture
-def git_temp_in_private_home(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+def git_temp_in_private_home(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Give gitread's git a temp dir so a planted gpg/textconv CAN run on Windows.
 
     Production's env carries no TEMP/TMP/TMPDIR, so on Windows git cannot create
