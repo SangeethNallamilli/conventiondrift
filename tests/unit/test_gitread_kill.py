@@ -79,10 +79,33 @@ def test_git_runs_in_its_own_session(tmp_path: Path) -> None:
     assert out.stdout == b"True\n"
 
 
+SIGKILL = 9  # stubbed on every OS: Windows' signal module has no SIGKILL
+
+
+class _OsAs:
+    """gitread's view of ``os`` as another OS; the real ``os`` (and pathlib) is untouched."""
+
+    def __init__(self, name: str, **overrides: Any) -> None:
+        self.name = name
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(os, attr)
+
+
+def _as_posix(monkeypatch: pytest.MonkeyPatch, killpg: Any) -> None:
+    monkeypatch.setattr(gitread, "os", _OsAs("posix", killpg=killpg))
+    monkeypatch.setattr(signal, "SIGKILL", SIGKILL, raising=False)
+
+
+def _as_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gitread, "os", _OsAs("nt"))
+
+
 def test_process_group_kwargs_per_os(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "posix")
+    _as_posix(monkeypatch, killpg=None)
     assert gitread._process_group_kwargs() == {"start_new_session": True}
-    monkeypatch.setattr(os, "name", "nt")
+    _as_windows(monkeypatch)
     assert gitread._process_group_kwargs() == {"creationflags": 0x200}
 
 
@@ -109,29 +132,26 @@ class _Proc:
 
 
 def test_posix_kill_signals_the_whole_group(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "posix")
     sent: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "killpg", lambda pid, sig: sent.append((pid, sig)), raising=False)
+    _as_posix(monkeypatch, killpg=lambda pid, sig: sent.append((pid, sig)))
     proc = _Proc()
     gitread._kill_tree(proc)  # type: ignore[arg-type]
-    assert sent == [(4242, signal.SIGKILL)]
+    assert sent == [(4242, SIGKILL)]
     assert proc.events == ["kill", "wait"]
 
 
 def test_posix_kill_of_an_empty_group_still_reaps(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "posix")
-
     def gone(_pid: int, _sig: int) -> None:
         raise ProcessLookupError
 
-    monkeypatch.setattr(os, "killpg", gone, raising=False)
+    _as_posix(monkeypatch, killpg=gone)
     proc = _Proc(kill_error=True)
     gitread._kill_tree(proc)  # type: ignore[arg-type]
     assert proc.events == ["kill", "wait"]
 
 
 def test_windows_kill_runs_taskkill_by_absolute_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "nt")
+    _as_windows(monkeypatch)
     monkeypatch.setattr(gitread, "_system32", lambda: "C:\\Windows\\System32")
     runs: list[dict[str, Any]] = []
 
@@ -157,7 +177,7 @@ def test_windows_kill_runs_taskkill_by_absolute_path(monkeypatch: pytest.MonkeyP
 def test_windows_kill_falls_back_to_kill_when_taskkill_fails(
     monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
-    monkeypatch.setattr(os, "name", "nt")
+    _as_windows(monkeypatch)
     monkeypatch.setattr(gitread, "_system32", lambda: "C:\\Windows\\System32")
 
     def run(*_a: Any, **_k: Any) -> Any:
@@ -199,8 +219,7 @@ def test_system32_failure_is_an_os_error(monkeypatch: pytest.MonkeyPatch, length
 
 
 def test_reaping_waits_a_bounded_time_and_never_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(os, "name", "posix")
-    monkeypatch.setattr(os, "killpg", lambda _pid, _sig: None, raising=False)
+    _as_posix(monkeypatch, killpg=lambda _pid, _sig: None)
     proc = _Proc(wait_hangs=True)
     gitread._kill_tree(proc)  # type: ignore[arg-type]  # returns despite the timeout
     assert proc.wait_timeouts == [5.0]  # _REAP_TIMEOUT_SECONDS, by hand

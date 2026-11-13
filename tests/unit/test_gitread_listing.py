@@ -183,6 +183,8 @@ def test_tree_lists_every_file_with_mode_oid_and_size(repo: Path, spy: list[Call
     _write(repo, "pkg/sub/b.py", b"")
     _write(repo, "run.sh", "#!/bin/sh\n")
     (repo / "run.sh").chmod(0o755)
+    _git(repo, "add", "-A")
+    _git(repo, "update-index", "--chmod=+x", "run.sh")  # the exec bit on every OS
     head = _commit(repo)
     entries = GitReader(repo).tree(head)
     assert [(e[0], e[2], e[3]) for e in entries] == [
@@ -468,7 +470,7 @@ def test_close_is_idempotent_and_safe_before_use(repo: Path) -> None:
 
 def test_batch_process_reports_eof_and_reads_lines(tmp_path: Path) -> None:
     proc = gitread._start_batch(
-        [sys.executable, "-c", "import sys; sys.stdout.write('ab\\ncdef')"],
+        [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'ab\\ncdef')"],
         cwd=tmp_path,
         env=dict(os.environ),
         label="log",

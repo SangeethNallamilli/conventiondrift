@@ -78,7 +78,8 @@ def _script(mode: str, check: str, batch: str) -> str:
         "    if out == 'SLEEP':\n"
         "        time.sleep(30)\n"
         "    stop = out.endswith('|EXIT') or not out.endswith('\\n')\n"
-        "    sys.stdout.write(out.removesuffix('|EXIT')); sys.stdout.flush()\n"
+        "    sys.stdout.buffer.write(out.removesuffix('|EXIT').encode())\n"
+        "    sys.stdout.buffer.flush()  # binary: no newline translation on Windows\n"
         "    if stop:\n"
         "        sys.exit(0)\n"
     )
