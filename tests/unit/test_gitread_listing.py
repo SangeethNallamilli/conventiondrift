@@ -210,8 +210,15 @@ def test_tree_keeps_symlinks_odd_names_and_gitlinks(repo: Path) -> None:
     _write(repo, "sp ace\tand\nnewline.py", "")
     _write(repo, "caf\xe9.py", "")
     _write(repo, "x::warning::y.py", "")
-    (repo / os.fsdecode(b"raw\xff.py")).write_bytes(b"")
+    raw = os.fsdecode(b"raw\xff.py")
+    if sys.platform != "darwin":
+        (repo / raw).write_bytes(b"")
     _git(repo, "add", "-A")
+    if sys.platform == "darwin":
+        # APFS rejects non-UTF-8 file names (EILSEQ, errno 92): put the name straight
+        # into the index instead, so the tree still holds the raw byte.
+        empty = _git(repo, "hash-object", "-w", os.devnull)
+        _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{empty},{raw}")
     _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{SHA},sub")
     _git(repo, "commit", "-q", "-m", "c")
     entries = {e[3]: e for e in GitReader(repo).tree(_git(repo, "rev-parse", "HEAD"))}

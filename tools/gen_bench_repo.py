@@ -728,10 +728,15 @@ def measure(repo: Path, prof: Profile) -> dict:
     }
 
 
+# Plain POSIX ERE only. `\b` is a GNU/compat-regex extension: macOS git runs
+# `git grep -E` through the system regcomp without REG_ENHANCED, where `\b` never
+# matches, so every census came back 0 there (CON-11). `([^[:alnum:]_]|$)` is the
+# same end-of-word test, and `-c` counts lines, so the counts don't change.
+_WORD_END = "([^[:alnum:]_]|$)"
 _EXCEPT = {
     "bare": r"^[[:space:]]+except:",
-    "Exception": r"^[[:space:]]+except Exception\b",
-    "all": r"^[[:space:]]+except\b",
+    "Exception": r"^[[:space:]]+except Exception" + _WORD_END,
+    "all": r"^[[:space:]]+except" + _WORD_END,
 }
 
 
@@ -747,6 +752,8 @@ def exception_census(repo: Path, ref: str) -> dict[str, int]:
             text=True,
             check=False,
         )
+        if proc.returncode not in (0, 1):  # 1 = no match; anything else is a git error
+            raise RuntimeError(f"git grep -E {pattern!r} {ref} failed: {proc.stderr.strip()}")
         out[key] = sum(int(line.rsplit(":", 1)[1]) for line in proc.stdout.splitlines())
     return out
 

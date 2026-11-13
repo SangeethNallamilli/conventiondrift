@@ -22,7 +22,7 @@ GEN = benchlib.GENERATOR
 
 
 def _gen(profile: str, seed: int, out: Path) -> dict:
-    subprocess.run(  # noqa: S603 - argv list, no shell
+    proc = subprocess.run(  # noqa: S603 - argv list, no shell
         [
             sys.executable,
             str(GEN),
@@ -33,10 +33,21 @@ def _gen(profile: str, seed: int, out: Path) -> dict:
             "--out",
             str(out),
         ],
-        check=True,
+        check=False,
         capture_output=True,
     )
+    # CON-11: a failure shows the generator's stderr (e.g. its composition errors).
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
     return json.loads(out.with_name(out.name + ".manifest.json").read_text(encoding="utf-8"))
+
+
+def test_failed_generator_call_shows_its_stderr(tmp_path: Path) -> None:
+    """CON-11: a failing `_gen` names the generator's stderr, not just the exit code."""
+    with pytest.raises(AssertionError, match=r"invalid choice: .?no-such-profile") as exc:
+        _gen("no-such-profile", 7, tmp_path / "out")
+    # The message itself is the stderr (argparse's usage line), not only pytest's
+    # introspection of the CompletedProcess repr.
+    assert str(exc.value).startswith("usage: gen_bench_repo.py")
 
 
 def _git(repo: Path, *args: str) -> str:
