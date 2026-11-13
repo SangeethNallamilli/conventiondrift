@@ -22,7 +22,7 @@ GEN = benchlib.GENERATOR
 
 
 def _gen(profile: str, seed: int, out: Path) -> dict:
-    subprocess.run(  # noqa: S603 - argv list, no shell
+    proc = subprocess.run(  # noqa: S603 - argv list, no shell
         [
             sys.executable,
             str(GEN),
@@ -33,9 +33,11 @@ def _gen(profile: str, seed: int, out: Path) -> dict:
             "--out",
             str(out),
         ],
-        check=True,
+        check=False,
         capture_output=True,
     )
+    # CON-11: a failure shows the generator's stderr (e.g. its composition errors).
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
     return json.loads(out.with_name(out.name + ".manifest.json").read_text(encoding="utf-8"))
 
 
