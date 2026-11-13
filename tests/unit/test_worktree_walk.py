@@ -567,9 +567,7 @@ def test_hard_excluded_names_count_toward_the_entry_cap(
 
 @pytest.mark.skipif(os.name != "posix", reason="needs a file system that takes non-UTF-8 names")
 @pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason="APFS rejects a file name that is not valid UTF-8 (EILSEQ, errno 92), "
-    "so the b'\\xff.py' precondition can't be created on macOS",
+    sys.platform == "darwin", reason="APFS rejects non-UTF-8 file names (EILSEQ, errno 92)"
 )
 def test_non_utf8_tree_name_is_unsupported_path(tmp_path: Path, strategy: str) -> None:
     """I-13 ruling 3 / QA F2: a surrogateescape name is SkippedFile with a U+XXXX path."""
