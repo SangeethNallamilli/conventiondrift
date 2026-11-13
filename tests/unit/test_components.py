@@ -2,11 +2,11 @@
 
 import dataclasses
 import inspect
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, get_args
+from typing import Any, get_args, get_type_hints
 
 import pytest
 
@@ -108,14 +108,32 @@ class _Client:
         run_head_sha: str,
         comment: str | None,
         sarif: str | None,
+        sarif_commit_sha: str,
+        sarif_ref: str,
     ) -> tuple[PublishOutcome, str | None]:
         return ("skipped", "read-only token")
+
+    def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]:
+        return (False, None)
 
 
 def test_components_default_to_none() -> None:
     components = Components()
     assert tuple(f.name for f in dataclasses.fields(components)) == FIELDS
     assert all(getattr(components, name) is None for name in FIELDS)
+
+
+def test_components_field_types_are_pinned() -> None:
+    # Runtime pin of I-14's Components types, e.g. a one-arg github_client factory fails here.
+    assert get_type_hints(Components) == {
+        "git_reader": Callable[[Path], GitReaderProtocol] | None,
+        "checkers": Mapping[str, Checker] | None,
+        "extractor": Extractor | None,
+        "history": History | None,
+        "renderer": Renderer | None,
+        "github_client": Callable[[str, str], GitHubClient] | None,
+        "github_base_url": str | None,
+    }
 
 
 def test_components_are_frozen_and_keyword_only() -> None:
@@ -179,7 +197,10 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
         ("run_head_sha", KW, NO),
         ("comment", KW, NO),
         ("sarif", KW, NO),
+        ("sarif_commit_sha", KW, NO),
+        ("sarif_ref", KW, NO),
     ),
+    (GitHubClient, "lookup"): (("repo", KW, NO), ("pr_number", KW, NO)),
 }
 
 
@@ -235,8 +256,15 @@ def test_components_take_factories_and_stand_ins() -> None:
     assert components.github_client is not None
     client = components.github_client("http://127.0.0.1:8080", "fake-token")
     assert client.publish(
-        repo="o/r", pr_number=1, run_head_sha="a" * 40, comment=None, sarif=None
+        repo="o/r",
+        pr_number=1,
+        run_head_sha="a" * 40,
+        comment=None,
+        sarif=None,
+        sarif_commit_sha="c" * 40,
+        sarif_ref="refs/pull/1/merge",
     ) == ("skipped", "read-only token")
+    assert client.lookup(repo="o/r", pr_number=1) == (False, None)
     variant = dataclasses.replace(components, github_base_url=None)
     assert variant.git_reader is git_factory
     assert variant.github_base_url is None

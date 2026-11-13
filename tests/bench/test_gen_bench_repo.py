@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -57,6 +62,80 @@ def smoke(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, dict]:
     return out, _gen("smoke", 7, out)
 
 
+def test_git_env_isolates_config_and_keeps_windows_runtime() -> None:
+    """The generator's git env is isolated and keeps Windows runtime variables."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("gen_bench_repo", GEN)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    env = mod.git_env()
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    cfg = Path(env["GIT_CONFIG_GLOBAL"])
+    assert cfg.is_file()
+    assert cfg.read_text(encoding="utf-8") == ""
+    assert cfg != Path(os.devnull)
+    assert env["USERPROFILE"] == env["HOME"]
+    assert env["PATH"] == os.environ.get("PATH", os.defpath)
+
+
+def test_git_env_ignores_poisoned_shared_gitconfig() -> None:
+    """A planted config in the old shared cd-bench-git-home location has no effect."""
+    import importlib.util
+
+    old_home = Path(tempfile.gettempdir()) / "cd-bench-git-home"
+    old_home.mkdir(parents=True, exist_ok=True)
+    poison = old_home / "isolated.gitconfig"
+    previous = poison.read_text(encoding="utf-8") if poison.exists() else None
+    poison.write_text("[user]\n\tname = poison\n[alias]\n\tident = !echo pwned\n", encoding="utf-8")
+    try:
+        spec = importlib.util.spec_from_file_location("gen_bench_repo", GEN)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        env = mod.git_env()
+        cfg = Path(env["GIT_CONFIG_GLOBAL"])
+        assert cfg.resolve() != poison.resolve()
+        assert Path(env["HOME"]).resolve() != old_home.resolve()
+        assert cfg.read_text(encoding="utf-8") == ""
+        # --global + a non-repo cwd, so this worktree's config cannot leak in.
+        empty = Path(tempfile.mkdtemp())
+        try:
+            got_name = subprocess.run(
+                ["git", "config", "--global", "--get", "user.name"],  # noqa: S607 - git from PATH by design
+                env=env,
+                cwd=empty,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert "poison" not in got_name.stdout
+            assert got_name.returncode != 0
+            alias = subprocess.run(
+                ["git", "ident"],  # noqa: S607 - git from PATH by design
+                env=env,
+                cwd=empty,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert "pwned" not in alias.stdout
+            assert alias.returncode != 0
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+    finally:
+        if previous is None:
+            try:
+                poison.unlink()
+            except OSError:
+                pass
+        else:
+            poison.write_text(previous, encoding="utf-8")
+
+
 def test_b500_composition_matches_spec(b500_pair: tuple) -> None:
     _, m, _, _ = b500_pair
     assert m["composition_errors"] == []
@@ -86,8 +165,13 @@ def test_b500_composition_matches_spec(b500_pair: tuple) -> None:
 def test_b500_same_seed_identical_shas_and_trees(b500_pair: tuple) -> None:
     a, ma, b, mb = b500_pair
     assert ma == mb  # manifest is byte-for-byte content-identical (no timings in it)
+    assert (
+        a.with_name(a.name + ".manifest.json").read_bytes()
+        == b.with_name(b.name + ".manifest.json").read_bytes()
+    )
     assert _git(a, "for-each-ref") == _git(b, "for-each-ref")
     assert _git(a, "rev-list", "--all") == _git(b, "rev-list", "--all")
+    assert ma["composition"]["refs"] == mb["composition"]["refs"]
     assert _git(a, "rev-parse", "main^{tree}") == _git(b, "rev-parse", "main^{tree}")
 
 
@@ -221,3 +305,55 @@ def test_exceptions_rules_have_separate_expected_verdicts(smoke: tuple) -> None:
             assert v["expected_verdict"] == "Holds"
     findings = [f for per_ref in m["expected_findings"].values() for f in per_ref]
     assert not {f["text"] for f in findings} & {narrow, wide}
+
+
+def _load_generator() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("gen_bench_repo", GEN)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_init_without_dash_b_for_old_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """git < 2.28 has no `git init -b`; the generator falls back to symbolic-ref."""
+    from fixtures import gitrepo
+
+    gen = _load_generator()
+    calls: list[tuple[str, ...]] = []
+    real_git = gen.git
+
+    def wrapped(repo: Path, *args: str) -> str:
+        calls.append(args)
+        return real_git(repo, *args)
+
+    monkeypatch.setattr(gitrepo, "git_version", lambda: (2, 27, 0))
+    monkeypatch.setattr(gen, "git", wrapped)
+    out = tmp_path / "smoke"
+    gen.generate(gen.PROFILES["smoke"], 7, out)
+    assert _git(out, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    init_calls = [c for c in calls if c and c[0] == "init"]
+    assert init_calls == [("init", "-q", ".")]
+    assert any(c[:2] == ("symbolic-ref", "HEAD") for c in calls)
+    assert not any("-b" in c for c in init_calls)
+
+
+@pytest.fixture(scope="module")
+def b10k_pair(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, dict, Path, dict]:
+    d = tmp_path_factory.mktemp("gen10k")
+    a, b = d / "b10k_a", d / "b10k_b"
+    return a, _gen("b10k", benchlib.BENCH_SEED, a), b, _gen("b10k", benchlib.BENCH_SEED, b)
+
+
+def test_b10k_same_seed_identical_manifest_and_refs(b10k_pair: tuple) -> None:
+    """Same seed yields a byte-identical manifest and the same refs (and trees)."""
+    a, ma, b, mb = b10k_pair
+    assert ma == mb
+    assert (
+        a.with_name(a.name + ".manifest.json").read_bytes()
+        == b.with_name(b.name + ".manifest.json").read_bytes()
+    )
+    assert _git(a, "for-each-ref") == _git(b, "for-each-ref")
+    assert ma["composition"]["refs"] == mb["composition"]["refs"]
+    assert _git(a, "rev-parse", "main^{tree}") == _git(b, "rev-parse", "main^{tree}")
