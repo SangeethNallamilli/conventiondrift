@@ -54,7 +54,9 @@ def _fake_git(tmp_path: Path, parent_exits: bool, escapes: bool, payload: str) -
         "        kw['start_new_session'] = True\n"
         "child = subprocess.Popen("
         "[sys.executable, '-c', 'import time; time.sleep(20)'], **kw)\n"
-        f"open({str(tmp_path / 'grandchild.pid')!r}, 'w').write(str(child.pid))\n"
+        # Atomic: the pid file appears whole or not at all (written, then renamed).
+        f"open({str(tmp_path / 'grandchild.tmp')!r}, 'w').write(str(child.pid))\n"
+        f"os.replace({str(tmp_path / 'grandchild.tmp')!r}, {str(tmp_path / 'grandchild.pid')!r})\n"
         f"sys.stdout.write({payload!r}); sys.stdout.flush()\n"
         + ("sys.exit(0)\n" if parent_exits else "time.sleep(20)\n")
     )
@@ -162,11 +164,60 @@ def _gone_soon(pid: int) -> bool:
     return False
 
 
-def _use_fake(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> None:
+#: Longest wait for the fake git to start its grandchild (a slow runner's cold start).
+READY_LIMIT = 30.0
+
+
+class _Gate:
+    """Make gitread's deadline count from the grandchild's start, not git's spawn.
+
+    The fake git writes grandchild.pid only once its grandchild is running.
+    Interpreter startup alone took longer than TIMEOUT on a macOS runner (main
+    d7e911b, job 131748449282): the kill fired before the fake had started the
+    grandchild, so grandchild.pid never existed and the case proved nothing.
+
+    gitread reads ``_clock()`` right after spawning git to set its deadline. Once
+    the fake is spawned (:meth:`arm`), the next read blocks until the pid file
+    exists, so every kill below has a pipe-holding grandchild to deal with, and
+    :attr:`ready_at` is when it started (the test bounds the kill from there).
+    Reads before that (``GitReader``'s real-git version check) pass through.
+    """
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.pidfile = tmp_path / "grandchild.pid"
+        self.armed = False
+        self.ready_at: float | None = None
+
+    def arm(self) -> None:
+        self.armed = True
+
+    def wait(self) -> float:
+        """Block until the fake has written grandchild.pid (bounded); return when."""
+        if self.ready_at is None:
+            end = time.monotonic() + READY_LIMIT
+            while not self.pidfile.exists():
+                assert time.monotonic() < end, "the fake git never started its grandchild"
+                time.sleep(0.01)
+            self.ready_at = time.monotonic()
+        return self.ready_at
+
+    def clock(self) -> float:
+        if self.armed:
+            self.wait()
+        return time.monotonic()
+
+
+#: Longest wait for the fake git to start its grandchild (a slow runner's cold start).
+READY_LIMIT = 30.0
+
+
+def _use_fake(monkeypatch: pytest.MonkeyPatch, argv: list[str], gate: _Gate) -> None:
     real = gitread._start_batch
 
     def start(_argv: list[str], **kwargs: Any) -> Any:
-        return real(argv, **kwargs)
+        process = real(argv, **kwargs)
+        gate.arm()
+        return process
 
     monkeypatch.setattr(gitread, "_start_batch", start)
     monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", TIMEOUT)
@@ -179,48 +230,60 @@ def _repo(tmp_path: Path) -> Path:
 
 
 # Each trigger drives one kill path; it gets the fake git argv and returns nothing.
-def _run_bounded_timeout(tmp_path: Path, argv: list[str], _m: pytest.MonkeyPatch) -> None:
+def _run_bounded_timeout(
+    tmp_path: Path, argv: list[str], _m: pytest.MonkeyPatch, gate: _Gate
+) -> None:
+    gate.arm()  # _run_bounded spawns the fake, then sets its deadline
     with pytest.raises(ComponentError, match="git log timed out"):
         gitread._run_bounded(
             argv, cwd=tmp_path, env=dict(os.environ), label="log", max_stdout=4096, timeout=TIMEOUT
         )
 
 
-def _run_bounded_cap(tmp_path: Path, argv: list[str], _m: pytest.MonkeyPatch) -> None:
+def _run_bounded_cap(tmp_path: Path, argv: list[str], _m: pytest.MonkeyPatch, gate: _Gate) -> None:
+    gate.arm()
     with pytest.raises(ComponentError, match="git log output too large"):
         gitread._run_bounded(
             argv, cwd=tmp_path, env=dict(os.environ), label="log", max_stdout=3, timeout=10.0
         )
 
 
-def _reader_close(tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_fake(monkeypatch, argv)
+def _reader_close(
+    tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch, gate: _Gate
+) -> None:
+    _use_fake(monkeypatch, argv, gate)
     reader = GitReader(_repo(tmp_path))
     reader._batch_process("--batch-check")
-    time.sleep(0.3)  # let the grandchild start
+    gate.wait()  # no deadline on this path: wait for the grandchild directly
     reader.close()
 
 
-def _blob_failure(tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_fake(monkeypatch, argv)
+def _blob_failure(
+    tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch, gate: _Gate
+) -> None:
+    _use_fake(monkeypatch, argv, gate)
     with pytest.raises(ComponentError):  # the fake prints no header: timeout or bad output
         GitReader(_repo(tmp_path)).blob(SHA, 10)
 
 
-def _patches_close(tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_fake(monkeypatch, argv)
+def _patches_close(
+    tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch, gate: _Gate
+) -> None:
+    _use_fake(monkeypatch, argv, gate)
     stream = GitReader(_repo(tmp_path)).patches(SHA, SHA2)
     assert next(stream) == b"xxxxx"
     stream.close()
 
 
-def _patches_timeout(tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    _use_fake(monkeypatch, argv)
+def _patches_timeout(
+    tmp_path: Path, argv: list[str], monkeypatch: pytest.MonkeyPatch, gate: _Gate
+) -> None:
+    _use_fake(monkeypatch, argv, gate)
     with pytest.raises(ComponentError, match="git log timed out"):
         list(GitReader(_repo(tmp_path)).patches(SHA, SHA2))
 
 
-Trigger = Callable[[Path, list[str], pytest.MonkeyPatch], None]
+Trigger = Callable[[Path, list[str], pytest.MonkeyPatch, _Gate], None]
 #: (caller in gitread that kills, what it is called on, trigger, what git prints).
 TRIGGERS: dict[str, tuple[str, Trigger, str]] = {
     "_run_bounded timeout": ("_run_bounded", _run_bounded_timeout, ""),
@@ -269,10 +332,12 @@ def test_a_pipe_holding_grandchild_never_stretches_a_kill(
     parent_exits, escapes = KINDS[kind]
     _, trigger, payload = TRIGGERS[path]
     argv = _fake_git(tmp_path, parent_exits, escapes, payload)
-    begin = time.monotonic()
+    gate = _Gate(tmp_path)
+    monkeypatch.setattr(gitread, "_clock", gate.clock)
     try:
-        trigger(tmp_path, argv, monkeypatch)
-        assert time.monotonic() - begin < PROMPT
+        trigger(tmp_path, argv, monkeypatch, gate)
+        assert gate.ready_at is not None, "the kill came before the grandchild started"
+        assert time.monotonic() - gate.ready_at < PROMPT
         pid = int((tmp_path / "grandchild.pid").read_text())
         if escapes:
             assert _alive(pid)  # outside git's group: not ours to kill, and not waited for
