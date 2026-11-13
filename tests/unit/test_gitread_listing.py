@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.fixtures.gitrepo import SYMLINK_UNAVAILABLE_REASON, symlinks_available
 
 from conventiondrift import gitread
 from conventiondrift.errors import ComponentError, FileSkipped, GitUnavailable
@@ -24,6 +25,7 @@ from conventiondrift.gitread import GitReader
 
 _REAL_RUN = subprocess.run
 _GIT = shutil.which("git") or "git"
+_TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 _ENV = {
     "PATH": os.environ.get("PATH", ""),
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -43,7 +45,9 @@ def _git(repo: Path, *args: str, date: str | None = None) -> str:
     env = dict(_ENV, HOME=str(repo))
     if date is not None:
         env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = date
-    out = _REAL_RUN([_GIT, *args], cwd=repo, env=env, check=True, capture_output=True)
+    out = _REAL_RUN(
+        [_GIT, *_TEST_GIT_FLAGS, *args], cwd=repo, env=env, check=True, capture_output=True
+    )
     return out.stdout.decode().strip()
 
 
@@ -57,6 +61,11 @@ def _commit(repo: Path, msg: str = "c", date: str | None = None) -> str:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "--allow-empty", "-m", msg, date=date)
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _require_symlinks() -> None:
+    if not symlinks_available():
+        pytest.skip(SYMLINK_UNAVAILABLE_REASON)
 
 
 @pytest.fixture
@@ -204,11 +213,32 @@ def test_tree_of_an_empty_commit_is_empty(repo: Path) -> None:
     assert GitReader(repo).tree(_commit(repo)) == []
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks and odd names need a POSIX filesystem")
 def test_tree_keeps_symlinks_odd_names_and_gitlinks(repo: Path) -> None:
+    """Symlink, gitlink, café, and space names; these can be set up on Windows."""
+    _require_symlinks()
+    _git(repo, "config", "core.symlinks", "true")
     os.symlink("target", repo / "link")
-    _write(repo, "sp ace\tand\nnewline.py", "")
+    _write(repo, "sp ace.py", "")  # space; tab is rejected by Win32 (Invalid argument)
     _write(repo, "caf\xe9.py", "")
+    _git(repo, "add", "-A")
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{SHA},sub")
+    _git(repo, "commit", "-q", "-m", "c")
+    entries = {e[3]: e for e in GitReader(repo).tree(_git(repo, "rev-parse", "HEAD"))}
+    assert entries["link"][0] == "120000" and entries["link"][2] == 6
+    assert entries["sub"] == ("160000", SHA, None, "sub")
+    assert "sp ace.py" in entries
+    assert "caf\xe9.py" in entries
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "NTFS/Win32 forbids :, tab, newline, and a raw 0xff byte in file names, "
+        "so the fixture can't be checked out"
+    ),
+)
+def test_tree_keeps_ntfs_illegal_names(repo: Path) -> None:
+    _write(repo, "sp ace\tand\nnewline.py", "")
     _write(repo, "x::warning::y.py", "")
     raw = os.fsdecode(b"raw\xff.py")
     if sys.platform != "darwin":
@@ -219,13 +249,9 @@ def test_tree_keeps_symlinks_odd_names_and_gitlinks(repo: Path) -> None:
         # into the index instead, so the tree still holds the raw byte.
         empty = _git(repo, "hash-object", "-w", os.devnull)
         _git(repo, "update-index", "--add", "--cacheinfo", f"100644,{empty},{raw}")
-    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{SHA},sub")
     _git(repo, "commit", "-q", "-m", "c")
     entries = {e[3]: e for e in GitReader(repo).tree(_git(repo, "rev-parse", "HEAD"))}
-    assert entries["link"][0] == "120000" and entries["link"][2] == 6
-    assert entries["sub"] == ("160000", SHA, None, "sub")
     assert "sp ace\tand\nnewline.py" in entries
-    assert "caf\xe9.py" in entries
     assert "x::warning::y.py" in entries
     assert "raw\udcff.py" in entries  # undecodable byte kept losslessly (surrogateescape)
 
@@ -566,8 +592,9 @@ def test_changed_files_rename_only_change_is_one_rename(repo: Path) -> None:
     assert GitReader(repo).changed_files(base, head) == [("R", "a/mod.py", "b/mod.py")]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks need a POSIX filesystem")
 def test_changed_files_type_change(repo: Path) -> None:
+    _require_symlinks()
+    _git(repo, "config", "core.symlinks", "true")
     _write(repo, "x", "data")
     base = _commit(repo)
     (repo / "x").unlink()

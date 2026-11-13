@@ -178,7 +178,6 @@ def test_real_slow_chunks_time_out_on_the_overall_deadline(
     assert started[0]._proc.returncode is not None  # killed and reaped
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups; Windows is stubbed")
 def test_running_out_kills_the_whole_tree(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -203,11 +202,18 @@ def _gone(pid: int) -> bool:
             os.kill(pid, 0)
         except ProcessLookupError:
             return True
-        try:
-            if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                return True
-        except OSError:
+        except PermissionError:
             pass
+        except OSError:
+            return True
+        else:
+            if os.name == "nt":
+                continue
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    return True
+            except OSError:
+                pass
     return False
 
 

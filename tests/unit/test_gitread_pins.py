@@ -13,7 +13,9 @@ import re
 import shutil
 import stat
 import subprocess
-from collections.abc import Callable
+import sys
+import tempfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,8 @@ from conventiondrift.gitread import GitReader
 
 _REAL_RUN = subprocess.run
 _GIT = shutil.which("git") or "git"
+_TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+_TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 _ENV = {
     "PATH": os.environ.get("PATH", ""),
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -41,10 +45,19 @@ SHA2 = "cd" * 20
 _HUNK = re.compile(rb"(@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@).*")
 
 
+@pytest.fixture(autouse=True)
+def _fixture_git_temp(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Git for Windows has no /tmp: textconv and signature checks need TEMP."""
+    with tempfile.TemporaryDirectory(prefix="conventiondrift-git-temp-") as folder:
+        for name in _TEMP_VARS:
+            monkeypatch.setitem(_ENV, name, folder)
+        yield
+
+
 def _git(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
     """Test helper only: plain git, no hardening."""
     out = _REAL_RUN(
-        [_GIT, *args],
+        [_GIT, *_TEST_GIT_FLAGS, *args],
         cwd=repo,
         env=dict(_ENV, HOME=str(repo)),
         check=True,
@@ -176,23 +189,94 @@ HOSTILE_CONFIG: tuple[tuple[str, str], ...] = (
 HOSTILE_ATTRIBUTES: tuple[str, ...] = ("*.py -diff", "*.txt diff=evil", "*.md diff=x")
 
 
+def _sh_path(path: Path) -> str:
+    """Quote ``path`` for a ``#!/bin/sh`` script, in forward slashes."""
+    return "'" + path.as_posix() + "'"
+
+
+def _write_lf(path: Path, text: str) -> None:
+    """Write ``text`` with LF line ends on every OS (Git for Windows' sh)."""
+    path.write_bytes(text.encode("utf-8"))
+
+
+def _config_path(path: Path) -> str:
+    """``path`` as a git config value: forward slashes, so Windows has no ``\\U``."""
+    return path.as_posix()
+
+
+def _require_symlinks() -> None:
+    from tests.fixtures.gitrepo import SYMLINK_UNAVAILABLE_REASON, symlinks_available
+
+    if not symlinks_available():
+        pytest.skip(SYMLINK_UNAVAILABLE_REASON)
+
+
+def _gpg_program(tmp_path: Path, marker: Path) -> Path:
+    """An LF ``#!/bin/sh`` gpg.program (git starts this without a shell)."""
+    program = tmp_path / "fake-gpg.sh"
+    _write_lf(program, f"#!/bin/sh\necho ran >> {_sh_path(marker)}\nexit 1\n")
+    program.chmod(0o755)
+    return program
+
+
+def _textconv_command(tmp_path: Path, marker: Path) -> str:
+    """A Python textconv driver: writes ``marker``, prints TEXTCONV, echoes its input."""
+    script = tmp_path / "fake-textconv.py"
+    _write_lf(
+        script,
+        "import pathlib, sys\n"
+        f"pathlib.Path({marker.as_posix()!r}).write_text('ran\\n')\n"
+        "sys.stdout.buffer.write(b'TEXTCONV\\n')\n"
+        "try:\n"
+        "    sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n"
+        "except (IndexError, OSError):\n"
+        "    pass\n",
+    )
+    python = Path(sys.executable).as_posix()
+    return f'"{python}" "{script.as_posix()}"'
+
+
+@pytest.fixture
+def git_temp_in_private_home(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Give gitread's git a temp dir so a planted gpg/textconv CAN run on Windows.
+
+    Production's env carries no TEMP/TMP/TMPDIR, so on Windows git cannot create
+    the temp file those programs need. A load-bearing drop-the-pin test must
+    show the pin, not a missing temp dir, is what stops them (same as #40).
+    """
+    real = gitread._environment
+    handed_out: list[str] = []
+
+    def with_temp(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
+        env = real(home, search_path, repo_dir)
+        folder = os.path.join(home, "tmp")
+        os.makedirs(folder, exist_ok=True)
+        handed_out.append(folder)
+        env.update(dict.fromkeys(_TEMP_VARS, folder))
+        return env
+
+    monkeypatch.setattr(gitread, "_environment", with_temp)
+    return handed_out
+
+
 def _make_hostile(
     repo: Path,
     marker: Path,
     config: tuple[tuple[str, str], ...] = HOSTILE_CONFIG,
     attributes: tuple[str, ...] = HOSTILE_ATTRIBUTES,
 ) -> None:
-    gpg = repo.parent / "fake-gpg"
-    gpg.write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexit 1\n")
-    gpg.chmod(0o755)
+    gpg = _gpg_program(repo.parent, marker)
     textconv_marker = marker.parent / "textconv-ran"
-    textconv = repo.parent / "fake-textconv"
-    textconv.write_text(f"#!/bin/sh\necho ran >> '{textconv_marker}'\necho TEXTCONV\ncat \"$1\"\n")
-    textconv.chmod(0o755)
+    textconv = _textconv_command(repo.parent, textconv_marker)
     order = repo.parent / "order.txt"
-    order.write_text("z.py\nnotes.txt\nsub\n")
+    _write_lf(order, "z.py\nnotes.txt\nsub\n")
     for key, value in config:
-        _git(repo, "config", key, value.format(gpg=gpg, order=order, textconv=textconv))
+        _git(
+            repo,
+            "config",
+            key,
+            value.format(gpg=_config_path(gpg), order=_config_path(order), textconv=textconv),
+        )
     if attributes:
         _write(repo, ".gitattributes", "".join(line + "\n" for line in attributes))
 
@@ -209,10 +293,6 @@ def _outputs(repo: Path, root: str, head: str) -> tuple[bytes, Any, Any]:
         reader.close()
 
 
-_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="the fake gpg is a POSIX shell script")
-
-
-@_POSIX_ONLY
 def test_hostile_repo_config_does_not_change_any_output(
     history: tuple[Path, str, str, Path],
 ) -> None:
@@ -238,7 +318,6 @@ def test_hostile_repo_config_does_not_change_any_output(
     assert everything.index(b"a/a.py") < everything.index(b"a/z.py")  # not orderFile's
 
 
-@_POSIX_ONLY
 def test_control_hostile_config_changes_plain_git(history: tuple[Path, str, str, Path]) -> None:
     """Without the pins, the same hostile files do change git's output and run gpg."""
     repo, root, head, marker = history
@@ -256,7 +335,6 @@ def test_control_hostile_config_changes_plain_git(history: tuple[Path, str, str,
     assert marker.exists()
 
 
-@_POSIX_ONLY
 def test_hostile_funcname_text_is_the_only_difference(
     history: tuple[Path, str, str, Path],
 ) -> None:
@@ -321,8 +399,8 @@ def test_no_placeholder_means_no_orderfile(tmp_path: Path) -> None:
     assert os.listdir(tmp_path) == []
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks need a POSIX filesystem")
 def test_a_planted_orderfile_is_refused_not_reused(tmp_path: Path) -> None:
+    _require_symlinks()
     target = tmp_path / "target"
     target.write_text("keep")
     home = tmp_path / "home"
@@ -470,10 +548,12 @@ def _drop(monkeypatch: pytest.MonkeyPatch, *pins: str) -> None:
         monkeypatch.setattr(gitread, name, kept)
 
 
-@_POSIX_ONLY
 @pytest.mark.parametrize("pin", sorted(PIN_DEFEATS))
 def test_dropping_any_one_pin_breaks_the_comparison(
-    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch, pin: str
+    history: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    pin: str,
+    git_temp_in_private_home: list[str],
 ) -> None:
     repo, root, head, marker = history
     _drop(monkeypatch, pin)
@@ -550,9 +630,10 @@ def test_each_backstop_pin_is_present_where_i14_lists_it(
         assert present == (sub in BACKSTOP_CALLS[pin]), (pin, sub)
 
 
-@_POSIX_ONLY
 def test_dropping_both_signature_guards_runs_gpg(
-    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+    history: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    git_temp_in_private_home: list[str],
 ) -> None:
     repo, _, head, marker = history
     _drop(monkeypatch, *PIN_PAIRED)
@@ -561,7 +642,6 @@ def test_dropping_both_signature_guards_runs_gpg(
     assert marker.exists()
 
 
-@_POSIX_ONLY
 @pytest.mark.parametrize(
     ("config", "attributes"),
     [((item,), ()) for item in HOSTILE_CONFIG] + [((), (line,)) for line in HOSTILE_ATTRIBUTES],
@@ -623,6 +703,46 @@ def test_hostile_log_diff_merges_keeps_first_parent_diff(
     assert first.count(b"diff --git") == 1
 
 
+def test_log_diff_merges_pin_is_safe_on_the_supported_minimum(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CR1 floor: git 2.30 accepts ``-c log.diffMerges=first-parent`` (no error).
+
+    Merge patches are byte-identical with and without that pin on git 2.30,
+    and stay byte-identical with a planted hostile ``log.diffMerges``. The
+    four 2.31+ defeat tests stay version-gated; this is the 2.30 coverage
+    those skips must not be read as dropping.
+    """
+    repo, _, head, _ = history
+    pin = "log.diffMerges=first-parent"
+    assert pin in gitread.HARDENING_CONFIG
+    with_pin = b"".join(GitReader(repo).patches(None, head))
+    first = with_pin.split(b"\x00")[1]  # newest first: the merge
+    assert first.startswith(head.encode() + b"\n")
+    assert b"+from_the_side = 1\n" in first
+
+    with monkeypatch.context() as mp:
+        _drop(mp, pin)
+        without_pin = b"".join(GitReader(repo).patches(None, head))
+    if _git_version() < (2, 31):
+        assert without_pin == with_pin
+
+    for value in ("off", "separate", "combined", "remerge"):
+        _git(repo, "config", "log.diffMerges", value)
+        hostile = b"".join(GitReader(repo).patches(None, head))
+        assert hostile == with_pin
+
+    # git itself must not error on the key, even when 2.30 does not know it
+    out = _REAL_RUN(
+        [_GIT, "-c", pin, "log", "-1", "--format=%H", "--end-of-options", head],
+        cwd=repo,
+        env=dict(_ENV, HOME=str(repo)),
+        capture_output=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == head.encode()
+
+
 def test_hostile_grafts_do_not_reparent_history(history: tuple[Path, str, str, Path]) -> None:
     repo, root, head, _ = history
     clean_chain = GitReader(repo).first_parent_chain(head, 10)
@@ -647,8 +767,8 @@ def test_graft_file_is_a_fresh_empty_0600_file_in_home(tmp_path: Path) -> None:
     assert gitread._graft_file(str(tmp_path)) == str(path)  # same home: reused, not recreated
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks need a POSIX filesystem")
 def test_a_planted_graft_file_is_refused_not_reused(tmp_path: Path) -> None:
+    _require_symlinks()
     target = tmp_path / "target"
     target.write_text("commit-sha parent-sha\n")
     home = tmp_path / "home"
