@@ -42,7 +42,7 @@ Never construct a `pathlib.Path` (or a platform-specific `Path` subclass) while 
 
 A required `windows-latest` job must run `tests/security`, including the PATH-hijack tests, and be green before T-007 (and later the SR-013 stack) merges. Tests that are meaningful only on Windows must actually run there; a skip under `CI`/`GITHUB_ACTIONS` is a failure of that gate, not a pass.
 
-T-008 behaviour tests that can be set up on Windows run there (sentinels, process-tree kills, `core.symlinks=true`, planted orderfile/graft symlinks). A test may be skipped on an OS only if its precondition cannot be set up there (D-PM-21, AC-N5.2). The platform skip register is TRACEABILITY.md §5.7 in the team docs; after the T-008 variants, the T-008 Windows / old-git skips are only the five legitimate ones listed there, plus the leftover `test_tree_keeps_ntfs_illegal_names` row (colon, newline, and a raw 0xff byte).
+T-008 behaviour tests that can be set up on Windows run there (sentinels, process-tree kills, `core.symlinks=true`, planted orderfile/graft symlinks). A test may be skipped on an OS only if its precondition cannot be set up there (D-PM-21, AC-N5.2). The platform skip register is TRACEABILITY.md §5.7 in the team docs; after the T-008 variants, the T-008 Windows / old-git skips are only the five legitimate ones listed there, plus the leftover `test_tree_keeps_ntfs_illegal_names` row (colon, newline, and a raw 0xff byte). Distinct additional rows cover `test_real_non_utf8_tree_name_is_unsupported` (non-Linux: the fixture needs a file system that can store a raw `0xff` name) and `test_non_executable_posix_git_is_skipped_for_a_later_folder` (Windows has no execute bit; the Windows counterpart already runs).
 
 ## 7. xfail policy
 
