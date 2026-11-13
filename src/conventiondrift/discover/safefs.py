@@ -729,8 +729,9 @@ class _Walk:
         if is_hard_excluded(name):
             return  # I-5: never lstat-ed, listed, entered or reported
         child = [*parts, name]
-        # A name that is not valid UTF-8 (a lone surrogate under surrogateescape) is listed
-        # as is here; I-13 scan-walk ruling 3 makes it "unsupported path" in the follow-up.
+        # A name that is not valid UTF-8 (a lone surrogate under surrogateescape) fails
+        # validate_relpath(origin="tree") as "unsupported path" before any lstat, and
+        # skip() reports it with the I-14 U+XXXX path (I-13 scan-walk ruling 3).
         try:
             validate_relpath(name, origin="tree")
             if isinstance(handle, int):
