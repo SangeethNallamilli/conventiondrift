@@ -88,7 +88,13 @@ class Renderer(Protocol):
 
 
 class GitHubClient(Protocol):
-    """C12. Never raises for HTTP errors; returns (outcome, note)."""
+    """C12. Never raises for HTTP errors; returns (outcome, note).
+
+    ``sarif_commit_sha`` / ``sarif_ref`` are ``GITHUB_SHA`` / ``GITHUB_REF``
+    (I-5), passed unchanged by T-028 (I-13 C12 ruling 7). ``lookup`` returns
+    (our comment exists, note). It is read-only and never raises; T-028 calls
+    it before rendering (I-13 C12 ruling 1).
+    """
 
     def publish(
         self,
@@ -98,7 +104,11 @@ class GitHubClient(Protocol):
         run_head_sha: str,
         comment: str | None,
         sarif: str | None,
+        sarif_commit_sha: str,
+        sarif_ref: str,
     ) -> tuple[PublishOutcome, str | None]: ...
+
+    def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]: ...
 
 
 @dataclass(frozen=True, kw_only=True)
