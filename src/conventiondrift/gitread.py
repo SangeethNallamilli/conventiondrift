@@ -612,6 +612,19 @@ _TASKKILL_TIMEOUT_SECONDS = 10.0
 #: (CR2 S1: no kill or close path waits without a bound).
 _REAP_TIMEOUT_SECONDS = 5.0
 _READER_JOIN_SECONDS = 1.0
+#: Windows: longest time spent cancelling a reader's blocked read before the
+#: close is handed to a background thread, and the pause between attempts.
+_CANCEL_READ_SECONDS = 0.5
+_CANCEL_POLL_SECONDS = 0.05
+#: ``OpenThread`` access right that ``CancelSynchronousIo`` needs.
+_THREAD_TERMINATE = 0x0001
+#: Windows job object constants (I-13 C3 Windows kill-scope ruling).
+_JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9  # JOBOBJECTINFOCLASS value
+#: ``OpenProcess`` rights that ``AssignProcessToJobObject`` needs.
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
 
 
 def _process_group_kwargs() -> dict[str, Any]:
@@ -636,18 +649,23 @@ def _system32() -> str:
     return buffer.value
 
 
-def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
+def _kill_tree(proc: "subprocess.Popen[bytes]", job: "_Job | None" = None) -> None:
     """Kill git and every process it started, then reap git (SR N-4).
 
     POSIX: ``SIGKILL`` to git's process group (its own session, see
     :func:`_process_group_kwargs`); this also reaches a grandchild that outlived
-    git. Windows: ``<System32>\\taskkill.exe /T /F /PID <pid>`` by absolute path,
-    never looked up on ``PATH``. Either way ``proc.kill()`` follows as a fallback,
+    git. Windows: ``TerminateJobObject`` on git's job (:func:`_assign_job`), which
+    also reaches a grandchild that outlived git and leaves breakaway processes
+    alone. Only when git could not be put in a job,
+    ``<System32>\\taskkill.exe /T /F /PID <pid>`` by absolute path, never looked
+    up on ``PATH``, best-effort. Either way ``proc.kill()`` follows as a fallback,
     and git is reaped, waiting at most :data:`_REAP_TIMEOUT_SECONDS`. Every kill
     path calls this, also when git itself has already exited (CR2 S1), because a
     grandchild may still hold its pipes.
     """
-    if os.name == "nt":
+    if job is not None:
+        job.terminate()
+    elif os.name == "nt":
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(  # noqa: S603 (absolute System32 path, fixed argv, no shell)
                 [os.path.join(_system32(), "taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],
@@ -667,6 +685,159 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
         proc.wait(_REAP_TIMEOUT_SECONDS)
 
 
+def _kernel32() -> Any:
+    """``kernel32`` with handle-sized prototypes for the calls below; Windows only."""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+    kernel32.OpenThread.restype = ctypes.c_void_p
+    kernel32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.CancelSynchronousIo.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    return kernel32
+
+
+def _job_limits(flags: int) -> Any:
+    """A ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` with only ``LimitFlags`` set."""
+    import ctypes
+
+    class _Basic(ctypes.Structure):
+        _fields_ = (
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        )
+
+    class _Extended(ctypes.Structure):
+        _fields_ = (
+            ("BasicLimitInformation", _Basic),
+            ("IoInfo", ctypes.c_uint64 * 6),  # IO_COUNTERS
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        )
+
+    info = _Extended()
+    info.BasicLimitInformation.LimitFlags = flags
+    return info
+
+
+class _Job:
+    """A Windows job object holding git and everything it starts (I-13 C3).
+
+    The handle is closed exactly once, by :meth:`terminate` or :meth:`close`;
+    closing it also kills whatever is left in the job (``KILL_ON_JOB_CLOSE``).
+    """
+
+    def __init__(self, kernel32: Any, handle: int) -> None:
+        self._kernel32 = kernel32
+        self._handle: int | None = handle
+
+    def terminate(self) -> None:
+        """Kill every process in the job, then close the handle."""
+        if self._handle is not None:
+            with contextlib.suppress(OSError):
+                self._kernel32.TerminateJobObject(self._handle, 1)
+        self.close()
+
+    def close(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                self._kernel32.CloseHandle(handle)
+
+
+def _assign_job(proc: "subprocess.Popen[bytes]") -> _Job | None:
+    """Windows: put a just-started git in a new kill-on-close job; else ``None``.
+
+    Called right after ``Popen`` returns, before any read or write. Children that
+    git starts later are in the job too, unless started with
+    ``CREATE_BREAKAWAY_FROM_JOB`` (allowed by ``BREAKAWAY_OK``: those escaped).
+    Accepted residual risk (I-13 C3 item 5): a child git starts before the
+    assignment is not in the job. Any failure returns ``None``, and that call
+    falls back to ``taskkill`` (:func:`_kill_tree`); no handle is leaked.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = _kernel32()
+        handle = kernel32.CreateJobObjectW(None, None)
+    except (OSError, AttributeError):
+        return None
+    if not handle:
+        return None
+    job = _Job(kernel32, handle)
+    info = _job_limits(_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    import ctypes
+
+    if not kernel32.SetInformationJobObject(
+        handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        job.close()
+        return None
+    process = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, 0, proc.pid)
+    if not process:
+        job.close()
+        return None
+    try:
+        assigned = kernel32.AssignProcessToJobObject(handle, process)
+    finally:
+        kernel32.CloseHandle(process)
+    if not assigned:
+        job.close()
+        return None
+    return job
+
+
+def _cancel_blocked_read(reader: threading.Thread) -> None:
+    """Windows: make a reader's blocked pipe read fail, waiting a bounded time.
+
+    A read on a synchronous pipe holds the C runtime's lock on the fd, so closing
+    the fd under it waits until a process still holding the pipe's other end
+    writes or exits. ``CancelSynchronousIo`` ends that read with an error, so the
+    reader returns. It is retried, since the reader may be between two reads.
+    Any failure just returns; :func:`_close_when_done` never blocks either way.
+    """
+    try:
+        kernel32 = _kernel32()
+        handle = kernel32.OpenThread(_THREAD_TERMINATE, 0, reader.native_id)
+    except (OSError, AttributeError, TypeError):
+        return
+    if not handle:
+        return
+    try:
+        end = _clock() + _CANCEL_READ_SECONDS
+        while reader.is_alive() and _clock() < end:
+            kernel32.CancelSynchronousIo(handle)
+            reader.join(_CANCEL_POLL_SECONDS)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _close_raw(raw: object) -> None:
+    with contextlib.suppress(OSError, ValueError):
+        cast(io.RawIOBase, raw).close()
+
+
 def _close_when_done(stream: object, reader: threading.Thread) -> None:
     """Close a pipe once its reader is done, or close the raw fd if it is not.
 
@@ -674,18 +845,26 @@ def _close_when_done(stream: object, reader: threading.Thread) -> None:
     process outside git's group still holds the pipe we must not call
     ``stream.close()``. Closing the underlying raw file (CR1 #4) marks the
     wrapper closed without taking that lock, so nothing here blocks and the
-    pipe is not leaked.
+    pipe is not leaked. On Windows closing the raw file still waits for the
+    blocked read, so the read is cancelled first (:func:`_cancel_blocked_read`);
+    if the reader still runs after that, the raw close is left to a daemon
+    thread, which finishes once the holder lets go, and this returns at once.
     """
     reader.join(_READER_JOIN_SECONDS)
     pipe = cast(io.BufferedIOBase, stream)
+    if os.name == "nt" and reader.is_alive():
+        _cancel_blocked_read(reader)
     if not reader.is_alive():
         with contextlib.suppress(OSError):
             pipe.close()
         return
     raw = getattr(pipe, "raw", None)
-    if raw is not None:
-        with contextlib.suppress(OSError, ValueError):
-            raw.close()
+    if raw is None:
+        return
+    if os.name == "nt":
+        threading.Thread(target=_close_raw, args=(raw,), daemon=True).start()
+    else:
+        _close_raw(raw)
 
 
 def _run_bounded(
@@ -719,6 +898,7 @@ def _run_bounded(
         )
     except OSError as exc:
         raise GitUnavailable("git could not be started") from exc
+    job = _assign_job(proc)
     assert proc.stdout is not None and proc.stderr is not None  # noqa: S101 (PIPE above)
     chunks: list[bytes] = []
     over = threading.Event()
@@ -746,7 +926,9 @@ def _run_bounded(
                 failure = "timed out"
     finally:
         if failure is not None or proc.poll() is None:
-            _kill_tree(proc)
+            _kill_tree(proc, job)
+        elif job is not None:
+            job.close()
         _close_when_done(proc.stdout, readers[0])
         _close_when_done(proc.stderr, readers[1])
     if failure is not None:
@@ -765,8 +947,11 @@ class _BatchProcess:
     ``ComponentError("gitread")`` is raised and the caller kills the process.
     """
 
-    def __init__(self, proc: "subprocess.Popen[bytes]", label: str) -> None:
+    def __init__(
+        self, proc: "subprocess.Popen[bytes]", label: str, job: _Job | None = None
+    ) -> None:
         self._proc = proc
+        self._job = job
         self._label = label
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=_QUEUE_CHUNKS)
         self._buffer = bytearray()
@@ -867,7 +1052,7 @@ class _BatchProcess:
         the pipes; no step waits without a bound.
         """
         self._stop.set()
-        _kill_tree(self._proc)
+        _kill_tree(self._proc, self._job)
         self.close_stdin()
         _close_when_done(self._proc.stdout, self._threads[0])
         _close_when_done(self._proc.stderr, self._threads[1])
@@ -895,7 +1080,7 @@ def _start_batch(
         )
     except OSError as exc:
         raise GitUnavailable("git could not be started") from exc
-    return _BatchProcess(proc, label)
+    return _BatchProcess(proc, label, _assign_job(proc))
 
 
 class GitReader:
