@@ -40,8 +40,10 @@ KINDS: dict[str, tuple[bool, bool]] = {
 
 def _fake_git(tmp_path: Path, parent_exits: bool, escapes: bool, payload: str) -> list[str]:
     """A git that starts a 20 s grandchild holding stdin/stdout/stderr, then prints."""
-    # On Windows, leaving the group is CREATE_NEW_PROCESS_GROUP (0x200);
-    # start_new_session is POSIX-only.
+    # On Windows, escaping git's kill scope means leaving its job object:
+    # CREATE_BREAKAWAY_FROM_JOB (0x01000000) together with
+    # CREATE_NEW_PROCESS_GROUP (0x200). 0x200 alone stays in the job and is
+    # killed with git (CON-13 AC3). start_new_session is POSIX-only.
     code = (
         "import os, subprocess, sys, time\n"
         "kw = {}\n"
