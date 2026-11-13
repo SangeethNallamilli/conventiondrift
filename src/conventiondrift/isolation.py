@@ -1,27 +1,23 @@
 """Worker isolation for C7's spawn pool (INTERFACES I-13 C7 ruling 8, ADR-0002 Amendment 4).
 
-Spawn workers and the resource tracker start as ``python -c ...`` in the
-parent's current folder. Without ``-I`` or ``-P`` that folder goes first on the
-child's ``sys.path``, so files planted in an analyzed repo (``struct.py``,
-``multiprocessing/``, ``concurrent/``...) would run in every worker (SR C-1 on
-#31). Two layers stop that:
+C7's pool processes must import only the installed package and the standard
+library, never modules from the analyzed repository or the current folder.
+Two layers check that:
 
-* **Parent pre-check** (``pool_allowed``), before any process exists: the pool
-  runs only when ``sys.flags.isolated or sys.flags.safe_path``, or when the
-  environment is honoured (no ``-E``), ``PYTHONSAFEPATH`` is unset or exactly
-  ``"1"`` and is then set for every child, and no ``sys.path`` entry is ``""``,
-  ``"."``, the current folder or the analyzed root (compared by ``path_key``)
-  (spawn copies the parent's ``sys.path`` into each child). Otherwise C7 runs
-  the checkers inline.
+* **Parent pre-check** (``pool_allowed``), before any process exists. Always:
+  no ``sys.path`` entry may be ``""``, ``"."``, the current folder or the
+  analyzed root (compared as resolved paths, see ``unsafe_path_entries``);
+  spawn copies the parent's ``sys.path`` into each child. Then either
+  ``sys.flags.isolated or sys.flags.safe_path`` holds, or the environment is
+  honoured (no ``-E``) and ``PYTHONSAFEPATH`` is unset or exactly ``"1"`` and
+  is then set for every child. Otherwise C7 runs the checkers inline.
 * **Worker backstop** (``worker_backstop``), the pool initializer, which runs
   before any task is unpickled: it requires ``safe_path`` or ``isolated`` and
   the same clean ``sys.path``, and raises ``ComponentError("checkers")``
   otherwise.
 
 This module lives outside ``checkers/`` because that package must not import
-``os`` (I-10 purity). It imports only the stdlib and ``conventiondrift.errors``,
-and children import it only after the pre-check has proved that no ``sys.path``
-entry the repo controls comes before the installed package.
+``os`` (I-10 purity). It imports only the stdlib and ``conventiondrift.errors``.
 """
 
 import os
@@ -56,6 +52,10 @@ class Flags(Protocol):
 CURRENT_FOLDER_SPELLINGS = ("", os.curdir)
 """``sys.path`` entries that always mean the current folder (SR condition (a))."""
 
+NUL = "\0"
+"""Never part of a real path: a path holding one is refused before any
+resolving, on every OS, since not every platform's ``realpath`` rejects it."""
+
 
 def _strip_separators(path: str) -> str:
     """``path`` without trailing separators, except a root's own separator."""
@@ -74,17 +74,34 @@ def unsafe_path_entries(entries: Iterable[object], cwd: str, root: str | None) -
     """Whether any entry is ``""``, ``"."``, the current folder or the analyzed root.
 
     Entries are compared by ``path_key``, so a relative path or a symlink to
-    either folder counts too. An entry that isn't a ``str`` or can't be
-    resolved counts as unsafe (fail closed).
+    either folder counts too; as a backstop, an entry whose ``os.stat`` matches
+    either folder's counts as well. An entry that isn't a ``str`` or can't be
+    resolved, or that holds a NUL, counts as unsafe (fail closed); so does a NUL
+    in ``cwd`` or ``root``, or a ``cwd`` or ``root`` that can't be resolved or
+    stat-ed. An entry that can't be stat-ed (often one that doesn't exist) is
+    judged by ``path_key`` alone: the backstop can only add a match.
     """
-    banned = {path_key(cwd)} if root is None else {path_key(cwd), path_key(root)}
+    folders = [cwd] if root is None else [cwd, root]
+    if any(NUL in folder for folder in folders):
+        return True
+    try:
+        banned = {path_key(folder) for folder in folders}
+        banned_stats = [os.stat(folder) for folder in folders]
+    except (OSError, ValueError):
+        return True
     for entry in entries:
-        if not isinstance(entry, str) or entry in CURRENT_FOLDER_SPELLINGS:
+        if not isinstance(entry, str) or entry in CURRENT_FOLDER_SPELLINGS or NUL in entry:
             return True
         try:
             if path_key(entry) in banned:
                 return True
         except (OSError, ValueError):
+            return True
+        try:
+            entry_stat = os.stat(entry)
+        except (OSError, ValueError):
+            continue
+        if any(os.path.samestat(entry_stat, folder) for folder in banned_stats):
             return True
     return False
 
@@ -99,23 +116,24 @@ def pool_allowed(
 ) -> bool:
     """The parent pre-check: whether C7 may start its spawn pool.
 
-    With ``-I`` or ``-P`` (``isolated``/``safe_path``) children inherit the flag,
-    so the pool is allowed and ``environ`` is left alone. Otherwise the pool is
-    allowed only when ``-E`` is off (children would ignore ``PYTHONSAFEPATH``),
-    ``PYTHONSAFEPATH`` is unset or exactly ``"1"`` (any other value, empty
-    included, counts as unsafe), and no ``path`` entry is unsafe (see
-    ``unsafe_path_entries``); then ``PYTHONSAFEPATH=1`` is set in ``environ`` and
-    stays set afterwards. Any other case returns ``False`` and C7 runs inline.
+    First, always: no ``path`` entry may be unsafe (see ``unsafe_path_entries``);
+    the flags below don't change what spawn copies into each child. Then, with
+    ``-I`` or ``-P`` (``isolated``/``safe_path``) children inherit the flag, so
+    the pool is allowed and ``environ`` is left alone. Otherwise the pool is
+    allowed only when ``-E`` is off (children would ignore ``PYTHONSAFEPATH``)
+    and ``PYTHONSAFEPATH`` is unset or exactly ``"1"`` (any other value, empty
+    included, counts as unsafe); then ``PYTHONSAFEPATH=1`` is set in ``environ``
+    and stays set afterwards. Any other case returns ``False`` and C7 runs inline.
     """
+    entries = sys.path if path is None else path
+    if unsafe_path_entries(entries, os.getcwd() if cwd is None else cwd, root):
+        return False
     if flags.isolated or flags.safe_path:
         return True
     if flags.ignore_environment:
         return False
     env = os.environ if environ is None else environ
     if env.get(SAFE_PATH_VAR, SAFE_PATH_VALUE) != SAFE_PATH_VALUE:
-        return False
-    entries = sys.path if path is None else path
-    if unsafe_path_entries(entries, os.getcwd() if cwd is None else cwd, root):
         return False
     env[SAFE_PATH_VAR] = SAFE_PATH_VALUE
     return True

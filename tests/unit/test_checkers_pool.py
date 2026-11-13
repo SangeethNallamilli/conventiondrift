@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import functools
+import importlib
 import multiprocessing
 import multiprocessing.context
 import os
@@ -190,7 +191,10 @@ def test_a_checker_failing_on_one_file_is_dropped_everywhere_and_reported() -> N
 
 
 def test_a_testkit_fault_in_ast_handlers_is_isolated() -> None:
-    testkit = pytest.importorskip("conventiondrift_testkit")  # under tests/, never shipped
+    # A hard import: the testkit is under tests/ (pytest's pythonpath), never
+    # shipped, and always present. import_module because mypy checks
+    # tests/unit without tests/ on its path.
+    testkit = importlib.import_module("conventiondrift_testkit")
     faulty = testkit.FaultyComponent(HTTP, fail_on={"ast_handlers"})
     result = analyze(FILES, checkers={"http-client": faulty, "logging": PRINT}, is_script=never)
     assert result.failed == ("http-client",)
@@ -280,6 +284,12 @@ def test_a_memory_error_on_the_pool_path_is_a_checkers_component_error() -> None
     with pytest.raises(ComponentError) as info:
         analyze(files, checkers=reg(PRINT), is_script=never, max_workers=2)
     assert info.value.component == "checkers"
+
+
+def test_a_keyboard_interrupt_from_manifest_sites_is_re_raised_not_isolated() -> None:
+    interrupted = ManifestChecker("interrupted")
+    with pytest.raises(KeyboardInterrupt):
+        analyze(FILES, checkers=reg(interrupted, PRINT), is_script=never, manifests=MANIFESTS)
 
 
 @pytest.mark.parametrize("max_workers", [1, 2])
@@ -409,17 +419,24 @@ def test_without_the_repo_root_the_same_sys_path_uses_the_pool(
     assert result.workers == 2
 
 
+@pytest.mark.parametrize("given", ["the root", "no root"])
 def test_the_worker_backstop_also_refuses_the_repo_root(
-    outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    given: str, outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # PYTHONSAFEPATH=1 gives the workers safe_path, so the only thing the
+    # backstop can refuse is the root on sys.path ("no root" is the control).
     analyzed = tmp_path / "analyzed"
     analyzed.mkdir()
     monkeypatch.syspath_prepend(str(analyzed))
     monkeypatch.setattr("conventiondrift.checkers.pool.pool_allowed", lambda root: True)
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    root = str(analyzed) if given == "the root" else None
+    if root is None:
+        result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+        assert result.workers == 2
+        return
     with pytest.raises(ComponentError) as info:
-        analyze(
-            _many(65), checkers=reg(PRINT), is_script=never, max_workers=2, repo_root=str(analyzed)
-        )
+        analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2, repo_root=root)
     assert info.value.message == "process pool failed: BrokenProcessPool"
 
 

@@ -1,24 +1,20 @@
-"""C-1 regression: planted repo modules never run in C7's processes (I-13 C7 ruling 8).
+"""Launch tests for C7's worker isolation (I-13 C7 ruling 8).
 
-SR C-1 on #31: spawn workers and the resource tracker start as ``python -c`` in
-the analyzed repo, so without ``-I``/``-P`` a repo's ``struct.py``,
-``pickle.py``, ``multiprocessing/`` or ``concurrent/`` would be imported there.
+Checks that C7's pool processes import only the installed package and the
+standard library, whichever way the analyzer is launched, and that the run
+falls back to inline whenever that can't be guaranteed.
 
-How the CLI is launched here: the real console script (``conventiondrift =
-conventiondrift.cli:main``) is still the T-001 placeholder and never reaches
-C7, so it can't exercise the pool. Each test writes a wrapper in the exact form
-pip generates for a console script, pointing at ``isolation_driver.main``,
-outside the repo (as pip puts it in ``bin/``/``Scripts/``). Pip's file imports
-the entry point from site-packages; here one extra line puts this tree's
-``src`` and ``tests/unit`` on ``sys.path`` instead (first, so a test venv's own
-install of another checkout can't win; neither folder holds a stdlib name), so
-it also works under ``-I`` and ``-E``, which ignore ``PYTHONPATH``. The wrapper
-is run as ``python <wrapper>`` with no ``-I``, just as the ``#!`` line or the
-``.exe`` launcher runs it.
+How the CLI is launched here: the real console script is still the T-001
+placeholder and never reaches C7, so each test writes a wrapper in the exact
+form pip generates for a console script, pointing at
+``isolation_driver.main``, outside the repo (as pip puts it in
+``bin/``/``Scripts/``). One extra line puts this tree's ``src`` and
+``tests/unit`` first on ``sys.path`` in place of site-packages, so it also works
+under ``-I`` and ``-E``, which ignore ``PYTHONPATH``.
 
-Each planted module writes ``<marker dir>/<module>-<pid>`` (outside the repo)
-and then loads the real stdlib module, so a run that imports one still works
-and only the marker gives it away.
+The test repository holds modules that record the pid of any process that
+imports them, outside the repo, and then load the real module, so the run
+still works and only the record shows which processes imported them.
 """
 
 import json
@@ -29,7 +25,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from checker_standins import read_records
+from checker_standins import read_records, symlink_or_skip_locally
 
 UNIT = Path(__file__).resolve().parent
 SRC = UNIT.parents[1] / "src"
@@ -230,20 +226,37 @@ def test_python_dash_m_conventiondrift_from_the_repo_imports_no_repo_module(
     assert _markers(markers) == []
 
 
+def test_safe_path_with_the_repo_root_on_pythonpath_runs_the_checkers_inline(
+    setup: tuple[Path, Path, Path, Path],
+) -> None:
+    # -P removes the script's folder from sys.path, but not PYTHONPATH entries:
+    # the path check applies under -P too. Only markers from other processes
+    # than the launcher count (the launcher's own imports are outside C7).
+    base, markers, hostile, clean = setup
+    elsewhere = base / "elsewhere"
+    elsewhere.mkdir()
+    env = dict(_env(), PYTHONPATH=str(hostile))
+    script = str(_wrapper(base))
+    run = _launch([sys.executable, "-P", script], hostile, base / "rec-p", env, cwd=elsewhere)
+    _assert_inline(run)
+    assert {m.rsplit("-", 1)[1] for m in _markers(markers)} <= {str(run.pid)}
+    assert run.report == _clean_report(base, clean).report
+
+
 @pytest.mark.parametrize("reach", ["symlink", "relative path"])
 def test_pythonpath_reaching_the_repo_root_runs_the_checkers_inline(
     reach: str, setup: tuple[Path, Path, Path, Path]
 ) -> None:
     # Launched from another folder, so only the repo_root rule (realpath of the
     # root and of each sys.path entry) can see that PYTHONPATH names the repo.
-    # The launcher itself imports the planted modules (PYTHONPATH says so, and
+    # The launcher itself imports the recording modules (PYTHONPATH says so, and
     # C7 can't change that), so only markers from other processes count.
     base, markers, hostile, clean = setup
     elsewhere = base / "elsewhere"
     elsewhere.mkdir()
     if reach == "symlink":
         entry = base / "repo-link"
-        entry.symlink_to(hostile, target_is_directory=True)
+        symlink_or_skip_locally(entry, hostile, is_dir=True)
         pythonpath = str(entry)
     else:
         pythonpath = os.path.join(os.pardir, hostile.name)

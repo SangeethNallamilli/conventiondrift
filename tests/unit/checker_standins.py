@@ -8,7 +8,10 @@ import json
 import os
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from pathlib import Path
 from typing import Literal
+
+import pytest
 
 from conventiondrift.model import CheckerId, FileContext, RuleMatch, Site
 
@@ -168,7 +171,9 @@ class ManifestChecker:
     inputs: Inputs = MANIFEST_ONLY
     options = frozenset({"uv", "pip"})
 
-    def __init__(self, fault: Literal["none", "raises", "wrong file"] = "none") -> None:
+    def __init__(
+        self, fault: Literal["none", "raises", "wrong file", "interrupted"] = "none"
+    ) -> None:
         self.fault = fault
         self.asked_for_handlers = False
 
@@ -181,6 +186,8 @@ class ManifestChecker:
     def manifest_sites(self, files: Mapping[str, bytes]) -> Iterable[Site]:
         if self.fault == "raises":
             raise RuntimeError("boom")
+        if self.fault == "interrupted":
+            raise KeyboardInterrupt
         out = [
             Site(p, 1, 0, o)
             for p, data in files.items()
@@ -228,3 +235,20 @@ def read_records(record_dir: str) -> list[dict[str, object]]:
         with open(os.path.join(record_dir, name), encoding="utf-8") as src:
             found.append(json.load(src))
     return found
+
+
+def symlink_or_skip_locally(link: Path, target: Path, *, is_dir: bool = False) -> None:
+    """Create ``link`` -> ``target``.
+
+    Skip only on a local non-Windows machine without CI, where symlink support
+    may be missing. Under CI, GitHub Actions, or on Windows, a failure is a hard
+    fail, so a CI run can't hide these tests in the skipped count (the same
+    rule as #40's ``_symlink_or_skip`` and #28's ``symlink``).
+    """
+    try:
+        link.symlink_to(target, target_is_directory=is_dir)
+    except OSError as exc:
+        message = f"failed to create symlink {link} -> {target}: {exc}"
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.platform == "win32":
+            pytest.fail(message)
+        pytest.skip(message)

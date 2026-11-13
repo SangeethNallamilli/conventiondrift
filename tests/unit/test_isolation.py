@@ -7,16 +7,19 @@ values are written by hand.
 
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
+from checker_standins import symlink_or_skip_locally
 
 from conventiondrift import isolation
 from conventiondrift.errors import ComponentError
 from conventiondrift.isolation import (
     BACKSTOP_MESSAGE,
     CURRENT_FOLDER_SPELLINGS,
+    NUL,
     SAFE_PATH_VALUE,
     SAFE_PATH_VAR,
     check_worker,
@@ -75,6 +78,18 @@ def test_the_pre_check_trusts_isolated_or_safe_path_and_leaves_the_env_alone(
     assert env == {}
 
 
+@pytest.mark.parametrize("flags", [replace(PLAIN, isolated=1), replace(PLAIN, safe_path=True)])
+@pytest.mark.parametrize("which", ["empty", "dot", "cwd", "root"])
+def test_the_path_check_applies_under_isolated_or_safe_path_too(
+    flags: FakeFlags, which: str, dirs: tuple[str, str, str]
+) -> None:
+    cwd, root, site = dirs
+    bad = {"empty": "", "dot": ".", "cwd": cwd, "root": root}[which]
+    env: dict[str, str] = {}
+    assert pool_allowed(root, flags=flags, environ=env, path=[site, bad], cwd=cwd) is False
+    assert env == {}
+
+
 def test_the_pre_check_refuses_the_pool_under_dash_e(dirs: tuple[str, str, str]) -> None:
     cwd, root, site = dirs
     env: dict[str, str] = {}
@@ -105,10 +120,7 @@ def test_the_pre_check_compares_resolved_paths(tmp_path: Path) -> None:
     real = tmp_path / "repo"
     real.mkdir()
     link = tmp_path / "link"
-    try:
-        link.symlink_to(real, target_is_directory=True)
-    except OSError:
-        pytest.skip("this account can't create symlinks (Windows without the privilege)")
+    symlink_or_skip_locally(link, real, is_dir=True)
     env: dict[str, str] = {}
     assert pool_allowed(None, flags=PLAIN, environ=env, path=[str(link)], cwd=str(real)) is False
     assert env == {}
@@ -133,6 +145,78 @@ def test_the_pre_check_writes_os_environ_by_default(
 def test_an_unresolvable_entry_counts_as_unsafe(dirs: tuple[str, str, str]) -> None:
     cwd, root, _ = dirs
     assert unsafe_path_entries(["bad\0entry"], cwd, root) is True
+
+
+def test_the_stat_backstop_matches_a_folder_path_key_misses(
+    dirs: tuple[str, str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A realpath that doesn't follow links: only the stat comparison can match.
+    cwd, root, site = dirs
+    link = tmp_path / "link"
+    symlink_or_skip_locally(link, Path(root), is_dir=True)
+    monkeypatch.setattr(os.path, "realpath", os.path.abspath)
+    assert unsafe_path_entries([site], cwd, root) is False
+    assert unsafe_path_entries([site, str(link)], cwd, root) is True
+
+
+def test_an_entry_that_cannot_be_stat_ed_is_judged_by_path_key_alone(
+    dirs: tuple[str, str, str], tmp_path: Path
+) -> None:
+    cwd, root, site = dirs
+    missing = str(tmp_path / "missing")
+    assert unsafe_path_entries([site, missing], cwd, root) is False
+
+
+@pytest.mark.parametrize("which", ["cwd", "root"])
+def test_a_folder_that_cannot_be_stat_ed_fails_closed(
+    which: str, dirs: tuple[str, str, str], tmp_path: Path
+) -> None:
+    cwd, root, site = dirs
+    missing = str(tmp_path / "missing")
+    given_cwd, given_root = (missing, root) if which == "cwd" else (cwd, missing)
+    assert unsafe_path_entries([site], given_cwd, given_root) is True
+
+
+@pytest.mark.parametrize("error", [OSError, ValueError])
+def test_an_entry_whose_resolving_raises_counts_as_unsafe(
+    error: type[Exception], dirs: tuple[str, str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd, root, site = dirs
+    real = os.path.realpath
+
+    def raising(path: str) -> str:
+        if path == site:
+            raise error("unresolvable")
+        return real(path)
+
+    monkeypatch.setattr(os.path, "realpath", raising)
+    assert unsafe_path_entries([site], cwd, root) is True
+
+
+def test_the_nul_constant() -> None:
+    assert NUL == "\x00"
+
+
+def _truncating_realpath(real: Callable[[str], str]) -> Callable[[str], str]:
+    """What ``ntpath.realpath`` does with a NUL on Windows: cut the path there
+    instead of raising (seen on windows-latest; on Linux ``ntpath.realpath`` is
+    only ``abspath``, so the stub stands in on every OS)."""
+    return lambda path: real(path.split("\x00", 1)[0])
+
+
+@pytest.mark.parametrize("where", ["entry", "cwd", "root"])
+def test_a_nul_is_unsafe_even_where_realpath_truncates_instead_of_raising(
+    where: str, dirs: tuple[str, str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd, root, site = dirs
+    monkeypatch.setattr(os.path, "realpath", _truncating_realpath(os.path.realpath))
+    assert unsafe_path_entries([site], cwd, root) is False  # control: the stub resolves
+    entry, given_cwd, given_root = {
+        "entry": (site + "\x00tail", cwd, root),
+        "cwd": (site, cwd + "\x00tail", root),
+        "root": (site, cwd, root + "\x00tail"),
+    }[where]
+    assert unsafe_path_entries([entry], given_cwd, given_root) is True
 
 
 def test_without_a_root_only_empty_and_cwd_are_compared(dirs: tuple[str, str, str]) -> None:
@@ -198,7 +282,7 @@ def test_the_root_is_compared_through_a_symlink(tmp_path: Path) -> None:
     real = tmp_path / "repo"
     real.mkdir()
     link = tmp_path / "link"
-    link.symlink_to(real, target_is_directory=True)
+    symlink_or_skip_locally(link, real, is_dir=True)
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     assert unsafe_path_entries([str(link)], str(cwd), str(real)) is True
@@ -265,3 +349,46 @@ def test_the_initializer_checks_this_processes_flags_path_cwd_and_root(
     monkeypatch.setattr(isolation, "check_worker", record)
     worker_backstop("/the/root")
     assert seen == [(sys.flags, sys.path, os.getcwd(), "/the/root")]
+
+
+# --- the symlink helper's skip rule -------------------------------------------------------
+
+
+def _symlinks_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("symlinks unavailable")
+
+    monkeypatch.setattr(Path, "symlink_to", refuse)
+
+
+@pytest.mark.parametrize(
+    ("ci", "github_actions", "platform"),
+    [("true", None, "linux"), (None, "true", "linux"), (None, None, "win32")],
+)
+def test_the_symlink_helper_fails_under_ci_or_windows(
+    ci: str | None,
+    github_actions: str | None,
+    platform: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in (("CI", ci), ("GITHUB_ACTIONS", github_actions)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "platform", platform)
+    _symlinks_fail(monkeypatch)
+    with pytest.raises(pytest.fail.Exception):
+        symlink_or_skip_locally(tmp_path / "link", tmp_path)
+
+
+def test_the_symlink_helper_skips_only_locally_off_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    _symlinks_fail(monkeypatch)
+    with pytest.raises(pytest.skip.Exception):
+        symlink_or_skip_locally(tmp_path / "link", tmp_path)
