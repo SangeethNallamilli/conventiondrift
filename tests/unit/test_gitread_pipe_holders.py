@@ -14,6 +14,7 @@ import ast
 import inspect
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -58,21 +59,96 @@ def _fake_git(tmp_path: Path, parent_exits: bool, escapes: bool, payload: str) -
     return [sys.executable, "-c", code]
 
 
-def _alive(pid: int) -> bool:
+_HAS_PROC = Path("/proc/self/stat").exists()
+#: The ways this OS can read a process state: /proc (Linux), /bin/ps (macOS and
+#: Linux), or the Win32 process object (Windows has neither).
+PROBES: tuple[str, ...] = (
+    ("win32",)
+    if os.name == "nt"
+    else tuple(p for p, ok in (("proc", _HAS_PROC), ("ps", os.path.exists("/bin/ps"))) if ok)
+)
+_STILL_ACTIVE = 259  # GetExitCodeProcess while the process runs
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _win32_state(pid: int) -> str | None:
+    """State "R" while running, "Z" once exited but still held open, else None.
+
+    ``os.kill(pid, 0)`` can't probe on Windows: signal 0 is ``CTRL_C_EVENT``, so it
+    would send Ctrl+C to a console process group instead of checking the pid.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    if not handle:
+        return None
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    if os.name == "nt":
-        return True
+        code = ctypes.c_uint32()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return None
+        return "R" if code.value == _STILL_ACTIVE else "Z"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _state(pid: int, *, probe: str = PROBES[0] if PROBES else "none") -> str | None:
+    """The process state letter(s), or None once the pid is gone.
+
+    Linux reads /proc. macOS has no /proc, so it asks ``/bin/ps -o stat=``;
+    reading /proc there always failed, so every pid looked dead (CON-10/11 #43).
+    Windows asks the process object (:func:`_win32_state`).
+    """
+    if probe == "win32":
+        return _win32_state(pid)
+    if probe == "proc":
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return None
+    out = subprocess.run(  # noqa: S603 - fixed absolute argv, no shell
+        ["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    )
+    return out.stdout.strip() or None
+
+
+def _alive(pid: int, *, probe: str = PROBES[0] if PROBES else "none") -> bool:
+    """Running and not a zombie (a zombie still answers ``kill(pid, 0)``)."""
+    if probe != "win32":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+    state = _state(pid, probe=probe)
+    return state is not None and not state.startswith("Z")
+
+
+def test_alive_tells_running_zombie_and_reaped_apart() -> None:
+    """The helper itself, with every probe this OS has (/proc, /bin/ps, or Win32)."""
+    assert PROBES, "no way to read a process state on this OS"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE
+    )
     try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return False
+        for probe in PROBES:
+            assert _alive(child.pid, probe=probe), probe
+        assert child.stdin is not None
+        child.stdin.close()
+        deadline = time.monotonic() + 5.0  # exited but not yet reaped: a zombie
+        while any(_alive(child.pid, probe=p) for p in PROBES):
+            assert time.monotonic() < deadline, "the exited child still looks alive"
+            time.sleep(0.05)
+        for probe in PROBES:
+            assert _state(child.pid, probe=probe) is not None  # zombie, not gone
+    finally:
+        child.kill()
+        child.wait()
+    for probe in PROBES:
+        assert not _alive(child.pid, probe=probe)
 
 
 def _gone_soon(pid: int) -> bool:

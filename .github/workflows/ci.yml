@@ -178,7 +178,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS legs run in the report-only `test-macos` job below (D-TL-30).
+        # macOS legs run in the blocking `test-macos` job below (D-TL-34).
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
         # On pull_request, Windows runs only 3.11 and 3.15 so the PR queue
@@ -282,22 +282,15 @@ jobs:
         run: python scripts/ci/check_coverage.py coverage.json
 
   test-macos:
-    # Report-only since D-TL-30 (TL decision, fast mode): macos-latest runners
-    # were not being assigned, so these legs are not in the `ci` aggregate's
-    # needs and do not block merges. Same install and test steps as the
-    # non-Windows `test` legs. FOLLOW-UP: move macOS back into `test` (and so
-    # into `ci`) once macOS runners are reliably assigned.
-    # Run on every non-pull_request event (push to main, the nightly
-    # schedule, and workflow_dispatch), not on pull_request, so PR
-    # concurrency is not spent on report-only macOS legs. Because this
-    # job is not in `ci`'s needs, a skipped test-macos on a PR neither
-    # fails nor delays the required aggregate.
-    name: test-macos (report-only) (${{ matrix.python-version }})
-    if: github.event_name != 'pull_request'
+    # Blocking since D-TL-34 (TL decision, owner-activated; supersedes
+    # D-TL-30): every macOS leg runs on every event, pull_request included,
+    # and is in the `ci` aggregate's needs, so a failed, cancelled or skipped
+    # leg fails the required check. Same install and test steps as the
+    # non-Windows `test` legs.
+    name: test-macos (${{ matrix.python-version }})
     needs: [lockfile]
     runs-on: macos-latest
     timeout-minutes: 10
-    continue-on-error: true
     permissions:
       contents: read
     strategy:
@@ -555,13 +548,9 @@ jobs:
       - git-minimum
       # mutation is report-only (D-TL-29, TL decision): it still runs on
       # every workflow event, but is not part of the required aggregate.
-      # test-macos is report-only (D-TL-30, TL decision) until macOS
-      # runners are reliably assigned; restore it to blocking then.
-      # It runs on push to main, the nightly schedule, and
-      # workflow_dispatch, not on pull_request. Leaving it out of needs
-      # means a skipped test-macos on a pull_request does not fail or
-      # delay this aggregate; do not add a skipped-is-ok exception here
-      # unless it is first restored to needs (and then only for test-macos).
+      # test-macos is blocking (D-TL-34, supersedes D-TL-30) and runs on
+      # every event; a skipped test-macos fails this aggregate.
+      - test-macos
       - secret-scan
       - dependency-scan
     runs-on: ubuntu-latest
