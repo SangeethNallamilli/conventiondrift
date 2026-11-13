@@ -379,8 +379,12 @@ def test_the_symlink_helper_fails_under_ci_or_windows(
             monkeypatch.setenv(name, value)
     monkeypatch.setattr(sys, "platform", platform)
     _symlinks_fail(monkeypatch)
-    with pytest.raises(pytest.fail.Exception):
+    # BaseException, not pytest.fail.Exception: a helper that skipped instead
+    # would otherwise escape pytest.raises and turn this case into a skip.
+    with pytest.raises(BaseException) as info:
         symlink_or_skip_locally(tmp_path / "link", tmp_path)
+    assert info.type is pytest.fail.Exception
+    assert not isinstance(info.value, pytest.skip.Exception)
 
 
 def test_the_symlink_helper_skips_only_locally_off_windows(
@@ -390,5 +394,6 @@ def test_the_symlink_helper_skips_only_locally_off_windows(
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.setattr(sys, "platform", "linux")
     _symlinks_fail(monkeypatch)
-    with pytest.raises(pytest.skip.Exception):
+    with pytest.raises(BaseException) as info:
         symlink_or_skip_locally(tmp_path / "link", tmp_path)
+    assert info.type is pytest.skip.Exception

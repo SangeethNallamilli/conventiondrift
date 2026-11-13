@@ -94,7 +94,16 @@ def _wrapper(base: Path) -> Path:
 
 
 def _env(pythonpath: Sequence[Path] = ()) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONSAFEPATH", "PYTHONPATH"}}
+    """This process's environment for a launch, minus the variables the launch
+    sets itself and any test-harness state (mutmut's ``MUTANT_UNDER_TEST`` and
+    ``MUTMUT_*``), so a launched analyzer runs the code as it is, from any folder.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"PYTHONSAFEPATH", "PYTHONPATH", "MUTANT_UNDER_TEST"}
+        and not k.startswith("MUTMUT_")
+    }
     if pythonpath:
         env["PYTHONPATH"] = os.pathsep.join(str(p) for p in pythonpath)
     return env
@@ -266,3 +275,15 @@ def test_pythonpath_reaching_the_repo_root_runs_the_checkers_inline(
     _assert_inline(run)
     assert {m.rsplit("-", 1)[1] for m in _markers(markers)} <= {str(run.pid)}
     assert run.report == _clean_report(base, clean).report
+
+
+def test_the_launch_env_drops_harness_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("MUTANT_UNDER_TEST", "MUTMUT_DEPENDENCY_DEPTH", "PYTHONSAFEPATH"):
+        monkeypatch.setenv(name, "stats")
+    monkeypatch.setenv("CONVENTIONDRIFT_TEST_KEEP", "kept")
+    env = _env([UNIT])
+    assert "MUTANT_UNDER_TEST" not in env
+    assert "MUTMUT_DEPENDENCY_DEPTH" not in env
+    assert "PYTHONSAFEPATH" not in env
+    assert env["CONVENTIONDRIFT_TEST_KEEP"] == "kept"
+    assert env["PYTHONPATH"] == str(UNIT)

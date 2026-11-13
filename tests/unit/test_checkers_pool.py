@@ -6,9 +6,11 @@ import importlib
 import multiprocessing
 import multiprocessing.context
 import os
+import sys
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 from checker_standins import (
@@ -209,26 +211,34 @@ def test_a_system_exit_from_a_checker_is_isolated_too() -> None:
 # --- the process pool (DESIGN §5, §3a) ----------------------------------------------------
 
 
+def _is_current_folder(entry: object, cwd: str) -> bool:
+    if not isinstance(entry, str) or entry in ("", "."):
+        return True
+    return os.path.realpath(entry) == os.path.realpath(cwd)
+
+
 @pytest.fixture
-def outside_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """Run from an empty folder that isn't on ``sys.path``, with ``PYTHONSAFEPATH`` restored.
+def cwd_off_sys_path(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Take the current folder off ``sys.path`` (in this test only), with
+    ``PYTHONSAFEPATH`` restored; yields the current folder.
 
     The isolation pre-check (I-13 C7 ruling 8) runs the checkers inline when the
     current folder is on ``sys.path``, as it is under ``python -m pytest``.
+    The process stays in its folder: spawn workers start there, and a test
+    runner that re-runs its own entry point in them (mutmut) finds its config.
     The pool sets ``PYTHONSAFEPATH``; the monkeypatch undoes that afterwards.
     """
-    work = tmp_path / "cwd"
-    work.mkdir()
-    monkeypatch.chdir(work)
+    cwd = os.getcwd()
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if not _is_current_folder(p, cwd)])
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
-    yield work
+    yield Path(cwd)
 
 
 def _many(n: int) -> list[PyFile]:
     return [py(f"pkg/m{i:03}.py", f"print({i})\nrequests({i})\n") for i in range(n)]
 
 
-@pytest.mark.usefixtures("outside_repo")
+@pytest.mark.usefixtures("cwd_off_sys_path")
 def test_the_pool_gives_the_same_result_as_inline() -> None:
     files = [*_many(130), py("pkg/broken.py", "def (:\n")]
     checkers = reg(PRINT, HTTP, FaultyChecker("raises on one file"))
@@ -244,10 +254,20 @@ def test_the_pool_gives_the_same_result_as_inline() -> None:
     assert len(pooled.sites("logging")) == 130
 
 
-@pytest.mark.usefixtures("outside_repo")
-def test_the_pool_is_never_wider_than_the_batch_count() -> None:
+@pytest.mark.usefixtures("cwd_off_sys_path")
+def test_the_pool_is_never_wider_than_the_batch_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The width the pool is built with, not only the width C7 reports.
+    built: list[int | None] = []
+
+    class Recording(concurrent.futures.ProcessPoolExecutor):
+        def __init__(self, max_workers: int | None = None, **kwargs: Any) -> None:
+            built.append(max_workers)
+            super().__init__(max_workers, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", Recording)
     result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=8)
     assert result.workers == 2
+    assert built == [2]
 
 
 class _Unpicklable(CallChecker):
@@ -256,7 +276,7 @@ class _Unpicklable(CallChecker):
         self.hook: Callable[[], None] = lambda: None
 
 
-@pytest.mark.usefixtures("outside_repo")
+@pytest.mark.usefixtures("cwd_off_sys_path")
 def test_a_broken_pool_fails_closed_as_a_checkers_component_error() -> None:
     with pytest.raises(ComponentError) as info:
         analyze(_many(65), checkers=reg(_Unpicklable()), is_script=never, max_workers=2)
@@ -278,7 +298,7 @@ def test_a_memory_error_on_the_inline_path_is_a_checkers_component_error() -> No
     assert info.value.component == "checkers"
 
 
-@pytest.mark.usefixtures("outside_repo")
+@pytest.mark.usefixtures("cwd_off_sys_path")
 def test_a_memory_error_on_the_pool_path_is_a_checkers_component_error() -> None:
     files = [*_many(64), py("src/huge.py", _MEMORY_ERROR_SRC)]
     with pytest.raises(ComponentError) as info:
@@ -308,7 +328,7 @@ def test_a_keyboard_interrupt_is_re_raised_not_mapped(
         analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=max_workers)
 
 
-@pytest.mark.usefixtures("outside_repo")
+@pytest.mark.usefixtures("cwd_off_sys_path")
 def test_the_pool_uses_the_spawn_start_method(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[object] = []
     real = concurrent.futures.ProcessPoolExecutor
@@ -328,8 +348,9 @@ def test_the_pool_uses_the_spawn_start_method(monkeypatch: pytest.MonkeyPatch) -
 # --- worker isolation (I-13 C7 ruling 8, SR C-1 on #31) ---------------------------------
 
 
-def test_a_pool_run_sets_pythonsafepath_for_its_workers(outside_repo: Path) -> None:
-    records = outside_repo.parent / "records"
+@pytest.mark.usefixtures("cwd_off_sys_path")
+def test_a_pool_run_sets_pythonsafepath_for_its_workers(tmp_path: Path) -> None:
+    records = tmp_path / "records"
     records.mkdir()
     result = analyze(_many(65), checkers=reg(RecordingChecker(str(records))), is_script=never)
     assert result.workers >= 1
@@ -340,8 +361,9 @@ def test_a_pool_run_sets_pythonsafepath_for_its_workers(outside_repo: Path) -> N
     assert os.environ["PYTHONSAFEPATH"] == "1"
 
 
+@pytest.mark.usefixtures("cwd_off_sys_path")
 def test_pythonsafepath_stays_set_when_the_pool_replaces_a_worker_mid_run(
-    outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # max_tasks_per_child=1 makes the pool replace each worker after one batch,
     # so 3 batches on 2 workers need at least one replacement started mid-run.
@@ -349,7 +371,7 @@ def test_pythonsafepath_stays_set_when_the_pool_replaces_a_worker_mid_run(
     monkeypatch.setattr(
         concurrent.futures, "ProcessPoolExecutor", functools.partial(real, max_tasks_per_child=1)
     )
-    records = outside_repo.parent / "records"
+    records = tmp_path / "records"
     records.mkdir()
     checker = RecordingChecker(str(records))
     result = analyze(_many(130), checkers=reg(checker), is_script=never, max_workers=2)
@@ -374,7 +396,7 @@ class _DropsSafePath(concurrent.futures.ProcessPoolExecutor):
 
 
 def test_pythonsafepath_removed_while_the_pool_runs_fails_closed(
-    outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+    cwd_off_sys_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", _DropsSafePath)
     with pytest.raises(ComponentError) as info:
@@ -385,9 +407,9 @@ def test_pythonsafepath_removed_while_the_pool_runs_fails_closed(
 
 @pytest.mark.parametrize("unsafe", ["cwd on sys.path", "empty entry on sys.path"])
 def test_an_unsafe_sys_path_runs_the_checkers_inline(
-    unsafe: str, outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+    unsafe: str, cwd_off_sys_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.syspath_prepend(str(outside_repo) if unsafe == "cwd on sys.path" else "")
+    monkeypatch.syspath_prepend(str(cwd_off_sys_path) if unsafe == "cwd on sys.path" else "")
     result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
     assert result.workers == 0
     assert len(result.sites("logging")) == 65
@@ -396,7 +418,7 @@ def test_an_unsafe_sys_path_runs_the_checkers_inline(
 
 @pytest.mark.parametrize("spelling", ["as given", "with a trailing separator"])
 def test_the_repo_root_on_sys_path_runs_the_checkers_inline(
-    spelling: str, outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    spelling: str, cwd_off_sys_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     analyzed = tmp_path / "analyzed"
     analyzed.mkdir()
@@ -409,7 +431,7 @@ def test_the_repo_root_on_sys_path_runs_the_checkers_inline(
 
 
 def test_without_the_repo_root_the_same_sys_path_uses_the_pool(
-    outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    cwd_off_sys_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Control for the test above: only repo_root makes the folder unsafe.
     analyzed = tmp_path / "analyzed"
@@ -421,7 +443,7 @@ def test_without_the_repo_root_the_same_sys_path_uses_the_pool(
 
 @pytest.mark.parametrize("given", ["the root", "no root"])
 def test_the_worker_backstop_also_refuses_the_repo_root(
-    given: str, outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    given: str, cwd_off_sys_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # PYTHONSAFEPATH=1 gives the workers safe_path, so the only thing the
     # backstop can refuse is the root on sys.path ("no root" is the control).
@@ -442,7 +464,7 @@ def test_the_worker_backstop_also_refuses_the_repo_root(
 
 @pytest.mark.parametrize("value", ["0", "", "true", " 1", "1 "])
 def test_a_pythonsafepath_other_than_1_runs_the_checkers_inline(
-    value: str, outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+    value: str, cwd_off_sys_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("PYTHONSAFEPATH", value)
     result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
@@ -451,11 +473,11 @@ def test_a_pythonsafepath_other_than_1_runs_the_checkers_inline(
 
 
 def test_the_worker_backstop_runs_in_every_worker_and_fails_closed(
-    outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+    cwd_off_sys_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Force the pool past the pre-check with the current folder on sys.path;
     # spawn copies that sys.path into each worker, whose initializer refuses it.
-    monkeypatch.syspath_prepend(str(outside_repo))
+    monkeypatch.syspath_prepend(str(cwd_off_sys_path))
     monkeypatch.setattr("conventiondrift.checkers.pool.pool_allowed", lambda root: True)
     monkeypatch.setenv("PYTHONSAFEPATH", "1")
     with pytest.raises(ComponentError) as info:
