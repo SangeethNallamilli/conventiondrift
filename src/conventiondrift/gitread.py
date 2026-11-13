@@ -612,6 +612,12 @@ _TASKKILL_TIMEOUT_SECONDS = 10.0
 #: (CR2 S1: no kill or close path waits without a bound).
 _REAP_TIMEOUT_SECONDS = 5.0
 _READER_JOIN_SECONDS = 1.0
+#: Windows: longest time spent cancelling a reader's blocked read before the
+#: close is handed to a background thread, and the pause between attempts.
+_CANCEL_READ_SECONDS = 0.5
+_CANCEL_POLL_SECONDS = 0.05
+#: ``OpenThread`` access right that ``CancelSynchronousIo`` needs.
+_THREAD_TERMINATE = 0x0001
 
 
 def _process_group_kwargs() -> dict[str, Any]:
@@ -667,6 +673,48 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
         proc.wait(_REAP_TIMEOUT_SECONDS)
 
 
+def _kernel32() -> Any:
+    """``kernel32`` with handle-sized prototypes for the calls below; Windows only."""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+    kernel32.OpenThread.restype = ctypes.c_void_p
+    kernel32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.CancelSynchronousIo.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return kernel32
+
+
+def _cancel_blocked_read(reader: threading.Thread) -> None:
+    """Windows: make a reader's blocked pipe read fail, waiting a bounded time.
+
+    A read on a synchronous pipe holds the C runtime's lock on the fd, so closing
+    the fd under it waits until a process still holding the pipe's other end
+    writes or exits. ``CancelSynchronousIo`` ends that read with an error, so the
+    reader returns. It is retried, since the reader may be between two reads.
+    Any failure just returns; :func:`_close_when_done` never blocks either way.
+    """
+    try:
+        kernel32 = _kernel32()
+        handle = kernel32.OpenThread(_THREAD_TERMINATE, 0, reader.native_id)
+    except (OSError, AttributeError, TypeError):
+        return
+    if not handle:
+        return
+    try:
+        end = _clock() + _CANCEL_READ_SECONDS
+        while reader.is_alive() and _clock() < end:
+            kernel32.CancelSynchronousIo(handle)
+            reader.join(_CANCEL_POLL_SECONDS)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _close_raw(raw: object) -> None:
+    with contextlib.suppress(OSError, ValueError):
+        cast(io.RawIOBase, raw).close()
+
+
 def _close_when_done(stream: object, reader: threading.Thread) -> None:
     """Close a pipe once its reader is done, or close the raw fd if it is not.
 
@@ -674,18 +722,26 @@ def _close_when_done(stream: object, reader: threading.Thread) -> None:
     process outside git's group still holds the pipe we must not call
     ``stream.close()``. Closing the underlying raw file (CR1 #4) marks the
     wrapper closed without taking that lock, so nothing here blocks and the
-    pipe is not leaked.
+    pipe is not leaked. On Windows closing the raw file still waits for the
+    blocked read, so the read is cancelled first (:func:`_cancel_blocked_read`);
+    if the reader still runs after that, the raw close is left to a daemon
+    thread, which finishes once the holder lets go, and this returns at once.
     """
     reader.join(_READER_JOIN_SECONDS)
     pipe = cast(io.BufferedIOBase, stream)
+    if os.name == "nt" and reader.is_alive():
+        _cancel_blocked_read(reader)
     if not reader.is_alive():
         with contextlib.suppress(OSError):
             pipe.close()
         return
     raw = getattr(pipe, "raw", None)
-    if raw is not None:
-        with contextlib.suppress(OSError, ValueError):
-            raw.close()
+    if raw is None:
+        return
+    if os.name == "nt":
+        threading.Thread(target=_close_raw, args=(raw,), daemon=True).start()
+    else:
+        _close_raw(raw)
 
 
 def _run_bounded(
