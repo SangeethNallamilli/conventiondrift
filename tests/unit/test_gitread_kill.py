@@ -60,7 +60,7 @@ _WINDOWS_EXITED_GIT = pytest.mark.xfail(
         "Windows: _kill_tree runs taskkill /T /PID, which does not kill "
         "grandchildren of a git process that has already exited, so the "
         "timeout path can block on pipes those children still hold "
-        "(CR2 S1 / SR N-4)"
+        "(needs Linear CON-13, Windows tree kill / blocking close; CR2 S1 / SR N-4)"
     ),
     strict=True,
 )
