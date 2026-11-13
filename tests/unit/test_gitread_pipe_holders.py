@@ -13,11 +13,12 @@ grandchild kind separately.
 import ast
 import inspect
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -232,20 +233,56 @@ TRIGGERS: dict[str, tuple[str, Trigger, str]] = {
 }
 
 
-def _killers() -> set[str]:
+# mutmut 3 rewrites gitread in its ``mutants/`` copy: each function's original
+# body becomes ``x_<name>__mutmut_orig`` (methods: ``xǁ<Class>ǁ<name>__mutmut_orig``)
+# next to numbered mutants ``..._mutmut_<n>``. Only while mutmut runs, read the
+# ``orig`` copy under its real name and ignore the numbered mutants; in normal CI
+# every name is taken exactly as written.
+_MUTMUT_NAME = re.compile(r"^x(?:ǁ[^ǁ]+ǁ|_)(?P<name>.+)__mutmut_(?P<which>orig|\d+)$")
+
+
+def _mutmut_running(environ: Mapping[str, str] = os.environ) -> bool:
+    return "MUTANT_UNDER_TEST" in environ and Path(__file__).resolve().parents[2].name == "mutants"
+
+
+def _source_name(name: str, mutmut: bool) -> str | None:
+    """The function name as written in gitread, or None for a numbered mutmut mutant."""
+    match = _MUTMUT_NAME.match(name) if mutmut else None
+    if match is None:
+        return name
+    return match["name"] if match["which"] == "orig" else None
+
+
+def _killers(mutmut: bool | None = None) -> set[str]:
     """Functions in gitread that call ``_kill_tree`` or ``<process>.kill()``."""
+    if mutmut is None:
+        mutmut = _mutmut_running()
     tree = ast.parse(inspect.getsource(gitread))
     found: set[str] = set()
     for fn in ast.walk(tree):
         if isinstance(fn, ast.FunctionDef):
+            name = _source_name(fn.name, mutmut)
+            if name is None:
+                continue
             for node in ast.walk(fn):
                 if isinstance(node, ast.Call):
                     f = node.func
                     if isinstance(f, ast.Name) and f.id == "_kill_tree":
-                        found.add(fn.name)
+                        found.add(name)
                     if isinstance(f, ast.Attribute) and f.attr == "kill":
-                        found.add(fn.name)
+                        found.add(name)
     return found
+
+
+def test_mutmut_names_are_read_only_while_mutmut_runs() -> None:
+    orig = "x__run_bounded__mutmut_orig"
+    assert _source_name(orig, mutmut=False) == orig
+    assert _source_name(orig, mutmut=True) == "_run_bounded"
+    assert _source_name("xǁ_BatchProcessǁkill__mutmut_orig", mutmut=True) == "kill"
+    assert _source_name("xǁGitReaderǁclose__mutmut_4", mutmut=True) is None
+    assert _source_name("x__kill_tree__mutmut_34", mutmut=True) is None
+    assert _source_name("_run_bounded", mutmut=True) == "_run_bounded"
+    assert not _mutmut_running({})
 
 
 def test_triggers_cover_every_kill_path_in_the_code() -> None:
