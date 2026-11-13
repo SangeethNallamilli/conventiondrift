@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 from conventiondrift.components import Components
-from conventiondrift.errors import ComponentError
+from conventiondrift.errors import ComponentError, GitTooOld
 from conventiondrift.model import InternalError
 
 FailOn = Literal["none", "new-stale", "any-stale"]
@@ -79,13 +79,17 @@ def internal_error(exc: BaseException) -> InternalError:
     """The reportable form of a caught exception (I-14 Q6, sanitizing).
 
     Only the component name and the exception class are used; the exception's
-    own message (including ``ComponentError.message``) is never written. A class
-    name that isn't an ASCII identifier becomes ``Exception``; a component that
-    doesn't match the I-14 pattern becomes ``core``.
+    own message (including ``ComponentError.message``) is never written. The one
+    exception is ``GitTooOld``, whose public message is the fixed I-14 text
+    ``"git 2.30 or newer is required"``. A class name that isn't an ASCII
+    identifier becomes ``Exception``; a component that doesn't match the I-14
+    pattern becomes ``core``.
     """
     component = exc.component if isinstance(exc, ComponentError) else "core"
     if not _COMPONENT.fullmatch(component):
         component = "core"
+    if isinstance(exc, GitTooOld):
+        return InternalError(component, "git 2.30 or newer is required")
     name = type(exc).__name__
     if not (name.isascii() and name.isidentifier()):
         name = "Exception"

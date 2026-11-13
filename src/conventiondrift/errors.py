@@ -25,5 +25,33 @@ class ComponentError(Exception):
         self.message = message
 
 
+class GitTooOld(ComponentError):
+    """The git found is older than 2.30, or its version can't be read (I-14, D-TL-18).
+
+    Raised by ``gitread`` before its first other git call; it fails closed like any
+    ``ComponentError("gitread")``. It is the one error with public fixed text: the
+    message is always ``"git 2.30 or newer is required"`` and never the version found.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("gitread", "git 2.30 or newer is required")
+
+
 class GitUnavailable(Exception):
-    """Git or a needed object is unavailable; the run falls back to head-only mode."""
+    """Git is missing or cannot start; the run falls back to head-only mode (I-11 C3).
+
+    It means only that: a missing object, "not a git repository", a
+    ``safe.directory`` refusal, a timeout or any other git failure is a
+    ``ComponentError("gitread")``, never ``GitUnavailable``.
+    """
+
+
+class UnresolvableRevision(Exception):
+    """A user revision could not be resolved to one commit; C1/C2 exit 2 (I-4, I-11 C3).
+
+    Raised only by ``gitread.GitReader.resolve``. The message is fixed text and
+    never contains the revision.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("unresolvable revision")

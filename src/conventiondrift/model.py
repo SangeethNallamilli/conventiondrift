@@ -53,6 +53,28 @@ def _check_sorted(keys: Iterable[Any], what: str) -> None:
             raise ValueError(f"{what} must be sorted")
 
 
+def _check_marker_pairs(pairs: object) -> None:
+    """I-13 ``Policy.markers`` values: ``(line, alone_on_line)`` pairs (SR #32 C-1, L2).
+
+    ``line`` is an int >= 1 (not a bool), ``alone_on_line`` a real bool, and the
+    lines are strictly increasing: sorted, one entry per line. Messages are fixed.
+    """
+    if not isinstance(pairs, tuple):
+        raise ValueError("Policy.markers values must be tuples of pairs")
+    previous = 0
+    for pair in pairs:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise ValueError("Policy.markers entries must be (line, alone_on_line) pairs")
+        line, alone = pair
+        if type(line) is not int or line < 1:
+            raise ValueError("Policy.markers lines must be integers >= 1")
+        if type(alone) is not bool:
+            raise ValueError("Policy.markers alone_on_line must be a bool")
+        if line <= previous:
+            raise ValueError("Policy.markers must be sorted with no duplicate lines")
+        previous = line
+
+
 def _read_only(value: Mapping[Any, Any]) -> Mapping[Any, Any]:
     return MappingProxyType(dict(value))
 
@@ -66,6 +88,10 @@ class RuleMatch:
     specificity: int
 
     def __post_init__(self) -> None:
+        # A wrong type is a TypeError, an invalid value a ValueError (I-10 validity). A plain
+        # set would also pass the checks below but leave the match unhashable (I-13).
+        if not (isinstance(self.preferred, frozenset) and isinstance(self.prohibited, frozenset)):
+            raise TypeError("RuleMatch preferred and prohibited must be frozensets")
         if not (self.preferred | self.prohibited):
             raise ValueError("RuleMatch preferred and prohibited must not both be empty")
         if self.preferred & self.prohibited:
@@ -170,7 +196,8 @@ class Policy:
     max_file_bytes: int
     checkers: Mapping[CheckerId, CheckerPolicy]
     ignores: tuple[IgnoreEntry, ...]
-    markers: Mapping[str, tuple[int, ...]]
+    markers: Mapping[str, tuple[tuple[int, bool], ...]]
+    """File -> sorted ``(line, alone_on_line)`` pairs, from the policy side (I-7, I-13)."""
     paths: tuple[str, ...] | None
     comment: bool
     sarif: bool
@@ -186,6 +213,8 @@ class Policy:
             raise ValueError('CheckerPolicy.script_paths must be () except for "logging"')
         if self.gated != (self.effective_fail_on != "none"):
             raise ValueError('Policy.gated must equal effective_fail_on != "none"')
+        for pairs in self.markers.values():
+            _check_marker_pairs(pairs)
 
 
 @dataclass(frozen=True, slots=True)
