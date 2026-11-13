@@ -772,11 +772,6 @@ def test_real_transport_caps_the_response_size(
 REAL_DEADLINE = 1.5  # the transport's overall deadline for one request, in seconds
 REAL_SLACK = 1.5  # allowed wall-time overrun on a loaded CI runner
 DRIP_EVERY = 0.2  # well under the deadline, so no single read times out
-CLOCK_RATE = 1.03
-"""The transport's clock runs 3 % fast in the real-socket tests (about 45 ms over
-1.5 s). A socket timeout or timer that ends a clock tick early (Windows timers
-can) then still lands past the deadline, so the outcome does not depend on
-timer granularity. The waits themselves are real."""
 
 
 def _tracked_sockets() -> tuple[list[socket.socket], github.SocketFactory]:
@@ -790,14 +785,9 @@ def _tracked_sockets() -> tuple[list[socket.socket], github.SocketFactory]:
     return made, factory
 
 
-def _fast_clock() -> Callable[[], float]:
-    start = time.monotonic()
-    return lambda: start + (time.monotonic() - start) * CLOCK_RATE
-
-
 def _timed_request(server: Server) -> tuple[float, list[socket.socket]]:
     made, factory = _tracked_sockets()
-    transport = HttpClientTransport(clock=_fast_clock(), socket_factory=factory)
+    transport = HttpClientTransport(socket_factory=factory)
     start = time.monotonic()
     with pytest.raises(DeadlineExceeded):
         transport.request("GET", f"{server.base}/", {}, None, REAL_DEADLINE)
@@ -1128,3 +1118,106 @@ def test_the_last_retry_ending_at_or_before_the_deadline(
     )
     assert client.lookup(repo=REPO, pr_number=PR) == expected
     assert transport.script == []
+
+
+# -- a socket timeout that ends a tick before the deadline --------------------------------
+
+
+class EarlySocket(FakeSocket):
+    """Its timeouts end ``early`` seconds before the time set, as coarse OS timers can."""
+
+    def __init__(
+        self, clock: FakeClock, replies: Sequence[Step] = (), *, early: float, **kw: Any
+    ) -> None:
+        super().__init__(clock, replies, **kw)
+        self.early = early
+
+    def _spend(self, delay: float) -> float:
+        if self.timeout is not None and delay > self.timeout:
+            self.clock.now += self.timeout - self.early
+            raise TimeoutError("timed out")
+        return super()._spend(delay)
+
+    def recv_into(self, buffer: Any, nbytes: int = 0, flags: int = 0) -> int:
+        if self.replies and self.timeout is not None and self.replies[0][0] > self.timeout:
+            self.clock.now += self.timeout - self.early
+            raise TimeoutError("timed out")
+        return super().recv_into(buffer, nbytes, flags)
+
+
+EARLY_CASES: dict[str, dict[str, Any]] = {
+    "status line": {"replies": slow_steps(HEADERS, 0.2)},
+    "body": {"replies": [(0.0, BODY_HEAD), *slow_steps(b"[" + b" " * 98 + b"]", 0.2)]},
+    "no reply": {"replies": [(10_000.0, b"x")]},
+    "connect": {"replies": [ok()], "connect_delay": 10_000.0},
+    "handshake": {"replies": [ok()], "handshake_delay": 10_000.0},
+    "upload": {"replies": [ok()], "send_delay": 10_000.0},
+}
+
+
+@pytest.mark.parametrize("early", [0.001, 0.016, 0.049])
+@pytest.mark.parametrize("phase", sorted(EARLY_CASES))
+def test_a_timeout_ending_just_before_the_deadline_is_the_deadline(
+    phase: str, early: float
+) -> None:
+    clock = FakeClock()
+    sock = EarlySocket(clock, early=early, **EARLY_CASES[phase])
+    rig = Rig(clock, [sock])
+    with pytest.raises(DeadlineExceeded):
+        rig.transport.request("POST", "https://api.github.test/x", {}, b"{}", DEADLINE_SECONDS)
+    assert clock.now - START == pytest.approx(DEADLINE_SECONDS - early)
+
+
+@pytest.mark.parametrize("early", [github.TIMER_SLACK_SECONDS + 0.001, 0.5])
+def test_a_timeout_ending_outside_the_slack_is_a_plain_timeout(early: float) -> None:
+    clock = FakeClock()
+    sock = EarlySocket(clock, [(10_000.0, b"x")], early=early)
+    with pytest.raises(TimeoutError) as info:
+        Rig(clock, [sock]).get()
+    assert not isinstance(info.value, DeadlineExceeded)
+
+
+def test_a_timeout_ending_well_before_the_deadline_is_a_plain_timeout() -> None:
+    # The per-operation cap, not the deadline, ended this read.
+    clock = FakeClock()
+    sock = FakeSocket(clock, [(10_000.0, b"x")])
+    with pytest.raises(TimeoutError) as info:
+        Rig(clock, [sock]).get(timeout=25.0)
+    assert not isinstance(info.value, DeadlineExceeded)
+    assert clock.now - START == pytest.approx(REQUEST_TIMEOUT_SECONDS)
+
+
+def test_another_error_just_before_the_deadline_is_not_the_deadline() -> None:
+    clock = FakeClock()
+
+    def reset() -> None:
+        clock.now = START + DEADLINE_SECONDS - 0.001
+        raise ConnectionResetError
+
+    with pytest.raises(ConnectionResetError):
+        Rig(clock, [FakeSocket(clock, [ok()], on_recv=reset)]).get()
+
+
+@pytest.mark.parametrize("op", ["lookup", "publish"])
+def test_the_last_attempt_timing_out_just_before_the_deadline_is_the_deadline_note(op: str) -> None:
+    clock = FakeClock()
+    busy = (0.0, b"HTTP/1.1 500 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    socks = [
+        FakeSocket(clock, [busy]),
+        FakeSocket(clock, [busy]),
+        EarlySocket(clock, [(10_000.0, b"x")], early=0.001),
+    ]
+    client = _client(Rig(clock, socks))
+    if op == "lookup":
+        assert client.lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_DEADLINE)
+    else:
+        out = client.publish(
+            repo=REPO,
+            pr_number=PR,
+            run_head_sha=HEAD,
+            comment=f"{MARKER}\nbody",
+            sarif=None,
+            sarif_commit_sha="c" * 40,
+            sarif_ref="refs/pull/7/merge",
+        )
+        assert out == ("skipped", github.NOTE_DEADLINE)

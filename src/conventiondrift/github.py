@@ -159,6 +159,18 @@ def _time_left(deadline: float, clock: Callable[[], float]) -> float:
     return left
 
 
+TIMER_SLACK_SECONDS: Final = 0.05
+"""A socket timeout that ends this close to the deadline was set by the deadline.
+OS timers and clocks are coarse (about 16 ms on Windows), so such a timeout can
+end a tick before the clock reads the deadline."""
+
+
+def _ran_out(exc: BaseException, deadline: float, clock: Callable[[], float]) -> bool:
+    """True if ``exc`` ended the request because the deadline was reached."""
+    left = deadline - clock()
+    return left <= 0 or (isinstance(exc, TimeoutError) and left < TIMER_SLACK_SECONDS)
+
+
 def _socket_timeout(deadline: float, clock: Callable[[], float]) -> float:
     """The timeout for one socket operation: ``min(cap, time left)``, or raise."""
     return min(REQUEST_TIMEOUT_SECONDS, _time_left(deadline, clock))
@@ -355,7 +367,7 @@ class HttpClientTransport:
             data = _read_body(resp, deadline, self._clock)
             return HttpResponse(resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
         except (OSError, http.client.HTTPException) as exc:
-            if watchdog.fired or self._clock() >= deadline:
+            if watchdog.fired or _ran_out(exc, deadline, self._clock):
                 raise DeadlineExceeded from exc
             raise
         finally:
