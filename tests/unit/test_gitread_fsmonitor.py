@@ -30,7 +30,15 @@ _ENV = {
     "GIT_COMMITTER_EMAIL": "t@example.invalid",
 }
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="the hook is a POSIX shell script")
+
+def _sh_path(path: Path) -> str:
+    """Quote ``path`` for a ``#!/bin/sh`` script, in forward slashes."""
+    return "'" + path.as_posix() + "'"
+
+
+def _write_lf(path: Path, text: str) -> None:
+    """Write ``text`` with LF line ends on every OS (Git for Windows' sh)."""
+    path.write_bytes(text.encode("utf-8"))
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -48,7 +56,7 @@ def hostile(tmp_path: Path) -> tuple[Path, Path, str, str]:
     repo.mkdir()
     sentinel = tmp_path / "sentinel"
     hook = tmp_path / "fsmonitor-hook"
-    hook.write_text(f"#!/bin/sh\necho ran >> '{sentinel}'\nexit 1\n")
+    _write_lf(hook, f"#!/bin/sh\necho ran >> {_sh_path(sentinel)}\nexit 1\n")
     hook.chmod(0o755)
     _git(repo, "init", "-q", "-b", "main")
     (repo / "a.py").write_text("1\n")
@@ -58,7 +66,7 @@ def hostile(tmp_path: Path) -> tuple[Path, Path, str, str]:
     (repo / "a.py").write_text("2\n")
     _git(repo, "commit", "-q", "-am", "head")
     head = _git(repo, "rev-parse", "HEAD")
-    _git(repo, "config", "core.fsmonitor", str(hook))
+    _git(repo, "config", "core.fsmonitor", hook.as_posix())
     assert not sentinel.exists()
     return repo, sentinel, base, head
 

@@ -23,12 +23,17 @@ def _gone(pid: int, wait: float = 10.0) -> bool:
             os.kill(pid, 0)
         except ProcessLookupError:
             return True
-        stat = Path(f"/proc/{pid}/stat")
-        try:
-            if stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                return True
-        except OSError:
+        except PermissionError:
             pass
+        except OSError:
+            return True
+        else:
+            if os.name != "nt":
+                try:
+                    if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                        return True
+                except OSError:
+                    pass
         time.sleep(0.05)
     return False
 
@@ -49,7 +54,6 @@ def _grandchild(tmp_path: Path) -> int:
     return int((tmp_path / "grandchild.pid").read_text())
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups; Windows is stubbed below")
 @pytest.mark.parametrize("parent_exits", [False, True])
 def test_timeout_kills_the_grandchild_too(tmp_path: Path, parent_exits: bool) -> None:
     start = time.monotonic()

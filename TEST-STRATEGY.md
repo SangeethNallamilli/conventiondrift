@@ -1,6 +1,6 @@
 # TEST-STRATEGY.md: conventiondrift v1
 
-**Owner:** Test Engineer · **Status:** working rules, 2026-11-12 (America/New_York).
+**Owner:** Test Engineer · **Status:** working rules, 2026-11-13 (America/New_York).
 The per-AC map is TRACEABILITY.md (team docs; not yet in this repository).
 The historical spec-gate review lives in the team copy of this file.
 
@@ -41,6 +41,8 @@ Never construct a `pathlib.Path` (or a platform-specific `Path` subclass) while 
 ## 6. Windows leg (D-TL-19)
 
 A required `windows-latest` job must run `tests/security`, including the PATH-hijack tests, and be green before T-007 (and later the SR-013 stack) merges. Tests that are meaningful only on Windows must actually run there; a skip under `CI`/`GITHUB_ACTIONS` is a failure of that gate, not a pass.
+
+T-008 behaviour tests that can be set up on Windows run there (sentinels, process-tree kills, `core.symlinks=true`, planted orderfile/graft symlinks). A test may be skipped on an OS only if its precondition cannot be set up there (D-PM-21, AC-N5.2). The platform skip register is TRACEABILITY.md §5.7 in the team docs; after the T-008 variants, the T-008 Windows / old-git skips are only the five legitimate ones listed there, plus the leftover `test_tree_keeps_ntfs_illegal_names` row (colon, newline, and a raw 0xff byte).
 
 ## 7. xfail policy
 

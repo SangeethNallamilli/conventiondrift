@@ -26,8 +26,6 @@ from conventiondrift import gitread
 from conventiondrift.errors import ComponentError
 from conventiondrift.gitread import GitReader
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX groups; Windows is stubbed")
-
 SHA, SHA2 = "a" * 40, "b" * 40
 TIMEOUT = 0.5
 PROMPT = TIMEOUT + 4.0  # the timeout, plus the bounded reader joins and the reap
@@ -41,10 +39,18 @@ KINDS: dict[str, tuple[bool, bool]] = {
 
 def _fake_git(tmp_path: Path, parent_exits: bool, escapes: bool, payload: str) -> list[str]:
     """A git that starts a 20 s grandchild holding stdin/stdout/stderr, then prints."""
+    # On Windows, leaving the group is CREATE_NEW_PROCESS_GROUP (0x200);
+    # start_new_session is POSIX-only.
     code = (
-        "import subprocess, sys, time\n"
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'],"
-        f" start_new_session={escapes})\n"
+        "import os, subprocess, sys, time\n"
+        "kw = {}\n"
+        f"if {escapes}:\n"
+        "    if os.name == 'nt':\n"
+        "        kw['creationflags'] = 0x00000200\n"
+        "    else:\n"
+        "        kw['start_new_session'] = True\n"
+        "child = subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(20)'], **kw)\n"
         f"open({str(tmp_path / 'grandchild.pid')!r}, 'w').write(str(child.pid))\n"
         f"sys.stdout.write({payload!r}); sys.stdout.flush()\n"
         + ("sys.exit(0)\n" if parent_exits else "time.sleep(20)\n")
@@ -57,6 +63,12 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    if os.name == "nt":
+        return True
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
     except OSError:
@@ -185,6 +197,6 @@ def test_a_pipe_holding_grandchild_never_stretches_a_kill(
         pidfile = tmp_path / "grandchild.pid"
         if pidfile.exists():
             try:
-                os.kill(int(pidfile.read_text()), signal.SIGKILL)
-            except ProcessLookupError:
+                os.kill(int(pidfile.read_text()), getattr(signal, "SIGKILL", 9))
+            except (ProcessLookupError, PermissionError, OSError):
                 pass

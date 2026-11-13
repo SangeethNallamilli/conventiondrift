@@ -176,6 +176,23 @@ HOSTILE_CONFIG: tuple[tuple[str, str], ...] = (
 HOSTILE_ATTRIBUTES: tuple[str, ...] = ("*.py -diff", "*.txt diff=evil", "*.md diff=x")
 
 
+def _sh_path(path: Path) -> str:
+    """Quote ``path`` for a ``#!/bin/sh`` script, in forward slashes."""
+    return "'" + path.as_posix() + "'"
+
+
+def _write_lf(path: Path, text: str) -> None:
+    """Write ``text`` with LF line ends on every OS (Git for Windows' sh)."""
+    path.write_bytes(text.encode("utf-8"))
+
+
+def _require_symlinks() -> None:
+    from tests.fixtures.gitrepo import SYMLINK_UNAVAILABLE_REASON, symlinks_available
+
+    if not symlinks_available():
+        pytest.skip(SYMLINK_UNAVAILABLE_REASON)
+
+
 def _make_hostile(
     repo: Path,
     marker: Path,
@@ -183,16 +200,24 @@ def _make_hostile(
     attributes: tuple[str, ...] = HOSTILE_ATTRIBUTES,
 ) -> None:
     gpg = repo.parent / "fake-gpg"
-    gpg.write_text(f"#!/bin/sh\necho ran >> '{marker}'\nexit 1\n")
+    _write_lf(gpg, f"#!/bin/sh\necho ran >> {_sh_path(marker)}\nexit 1\n")
     gpg.chmod(0o755)
     textconv_marker = marker.parent / "textconv-ran"
     textconv = repo.parent / "fake-textconv"
-    textconv.write_text(f"#!/bin/sh\necho ran >> '{textconv_marker}'\necho TEXTCONV\ncat \"$1\"\n")
+    _write_lf(
+        textconv,
+        f'#!/bin/sh\necho ran >> {_sh_path(textconv_marker)}\necho TEXTCONV\ncat "$1"\n',
+    )
     textconv.chmod(0o755)
     order = repo.parent / "order.txt"
-    order.write_text("z.py\nnotes.txt\nsub\n")
+    _write_lf(order, "z.py\nnotes.txt\nsub\n")
     for key, value in config:
-        _git(repo, "config", key, value.format(gpg=gpg, order=order, textconv=textconv))
+        _git(
+            repo,
+            "config",
+            key,
+            value.format(gpg=gpg.as_posix(), order=order.as_posix(), textconv=textconv.as_posix()),
+        )
     if attributes:
         _write(repo, ".gitattributes", "".join(line + "\n" for line in attributes))
 
@@ -209,10 +234,6 @@ def _outputs(repo: Path, root: str, head: str) -> tuple[bytes, Any, Any]:
         reader.close()
 
 
-_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="the fake gpg is a POSIX shell script")
-
-
-@_POSIX_ONLY
 def test_hostile_repo_config_does_not_change_any_output(
     history: tuple[Path, str, str, Path],
 ) -> None:
@@ -238,7 +259,6 @@ def test_hostile_repo_config_does_not_change_any_output(
     assert everything.index(b"a/a.py") < everything.index(b"a/z.py")  # not orderFile's
 
 
-@_POSIX_ONLY
 def test_control_hostile_config_changes_plain_git(history: tuple[Path, str, str, Path]) -> None:
     """Without the pins, the same hostile files do change git's output and run gpg."""
     repo, root, head, marker = history
@@ -256,7 +276,6 @@ def test_control_hostile_config_changes_plain_git(history: tuple[Path, str, str,
     assert marker.exists()
 
 
-@_POSIX_ONLY
 def test_hostile_funcname_text_is_the_only_difference(
     history: tuple[Path, str, str, Path],
 ) -> None:
@@ -321,8 +340,8 @@ def test_no_placeholder_means_no_orderfile(tmp_path: Path) -> None:
     assert os.listdir(tmp_path) == []
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks need a POSIX filesystem")
 def test_a_planted_orderfile_is_refused_not_reused(tmp_path: Path) -> None:
+    _require_symlinks()
     target = tmp_path / "target"
     target.write_text("keep")
     home = tmp_path / "home"
@@ -470,7 +489,6 @@ def _drop(monkeypatch: pytest.MonkeyPatch, *pins: str) -> None:
         monkeypatch.setattr(gitread, name, kept)
 
 
-@_POSIX_ONLY
 @pytest.mark.parametrize("pin", sorted(PIN_DEFEATS))
 def test_dropping_any_one_pin_breaks_the_comparison(
     history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch, pin: str
@@ -550,7 +568,6 @@ def test_each_backstop_pin_is_present_where_i14_lists_it(
         assert present == (sub in BACKSTOP_CALLS[pin]), (pin, sub)
 
 
-@_POSIX_ONLY
 def test_dropping_both_signature_guards_runs_gpg(
     history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -561,7 +578,6 @@ def test_dropping_both_signature_guards_runs_gpg(
     assert marker.exists()
 
 
-@_POSIX_ONLY
 @pytest.mark.parametrize(
     ("config", "attributes"),
     [((item,), ()) for item in HOSTILE_CONFIG] + [((), (line,)) for line in HOSTILE_ATTRIBUTES],
@@ -623,6 +639,46 @@ def test_hostile_log_diff_merges_keeps_first_parent_diff(
     assert first.count(b"diff --git") == 1
 
 
+def test_log_diff_merges_pin_is_safe_on_the_supported_minimum(
+    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CR1 floor: git 2.30 accepts ``-c log.diffMerges=first-parent`` (no error).
+
+    Merge patches are byte-identical with and without that pin on git 2.30,
+    and stay byte-identical with a planted hostile ``log.diffMerges``. The
+    four 2.31+ defeat tests stay version-gated; this is the 2.30 coverage
+    those skips must not be read as dropping.
+    """
+    repo, _, head, _ = history
+    pin = "log.diffMerges=first-parent"
+    assert pin in gitread.HARDENING_CONFIG
+    with_pin = b"".join(GitReader(repo).patches(None, head))
+    first = with_pin.split(b"\x00")[1]  # newest first: the merge
+    assert first.startswith(head.encode() + b"\n")
+    assert b"+from_the_side = 1\n" in first
+
+    with monkeypatch.context() as mp:
+        _drop(mp, pin)
+        without_pin = b"".join(GitReader(repo).patches(None, head))
+    if _git_version() < (2, 31):
+        assert without_pin == with_pin
+
+    for value in ("off", "separate", "combined", "remerge"):
+        _git(repo, "config", "log.diffMerges", value)
+        hostile = b"".join(GitReader(repo).patches(None, head))
+        assert hostile == with_pin
+
+    # git itself must not error on the key, even when 2.30 does not know it
+    out = _REAL_RUN(
+        [_GIT, "-c", pin, "log", "-1", "--format=%H", "--end-of-options", head],
+        cwd=repo,
+        env=dict(_ENV, HOME=str(repo)),
+        capture_output=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == head.encode()
+
+
 def test_hostile_grafts_do_not_reparent_history(history: tuple[Path, str, str, Path]) -> None:
     repo, root, head, _ = history
     clean_chain = GitReader(repo).first_parent_chain(head, 10)
@@ -647,8 +703,8 @@ def test_graft_file_is_a_fresh_empty_0600_file_in_home(tmp_path: Path) -> None:
     assert gitread._graft_file(str(tmp_path)) == str(path)  # same home: reused, not recreated
 
 
-@pytest.mark.skipif(os.name == "nt", reason="symlinks need a POSIX filesystem")
 def test_a_planted_graft_file_is_refused_not_reused(tmp_path: Path) -> None:
+    _require_symlinks()
     target = tmp_path / "target"
     target.write_text("commit-sha parent-sha\n")
     home = tmp_path / "home"
