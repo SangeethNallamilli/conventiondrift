@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import typing
 from pathlib import Path
 
 import pytest
@@ -179,8 +180,9 @@ def test_hard_exclude_regexes_and_check_are_linear(text: str) -> None:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     (tmp_path / ".git").mkdir()
-    (tmp_path / ".git" / "config").write_text("[core]\n\tfsmonitor = evil\n")
-    (tmp_path / "AGENTS.md").write_text("- Use httpx\n")
+    # Bytes, not text: write_text would write CRLF on Windows (PR #23 windows-latest).
+    (tmp_path / ".git" / "config").write_bytes(b"[core]\n\tfsmonitor = evil\n")
+    (tmp_path / "AGENTS.md").write_bytes(b"- Use httpx\n")
     return tmp_path
 
 
@@ -238,7 +240,7 @@ def test_check_uses_only_the_relative_path_not_the_root(tmp_path: Path) -> None:
     # A checkout that itself lives under ".git" or "node_modules" is still read.
     root = tmp_path / "node_modules" / ".GIT" / "repo"
     root.mkdir(parents=True)
-    (root / "AGENTS.md").write_text("- Use httpx\n")
+    (root / "AGENTS.md").write_bytes(b"- Use httpx\n")
     assert read_unless_hard_excluded(root, "AGENTS.md", "instruction", origin="tree")
     assert read_unless_hard_excluded(str(root), "AGENTS.md", "instruction", origin="input")
 
@@ -257,8 +259,8 @@ def test_paths_entry_note_comes_from_i13_text(repo: Path) -> None:
     relpath = ".git/config"
     got = read_unless_hard_excluded(repo, relpath, "config", origin="input")
     assert isinstance(got, AlwaysExcluded)
-    assert not isinstance(got, SkippedFile)
-    assert not isinstance(got, FileSkipped)
+    # object: mypy proves the classes disjoint, but the test pins it at run time.
+    assert not isinstance(typing.cast(object, got), (SkippedFile, FileSkipped))
     assert got.path == relpath
     # Expected wording is from I-13, not from AlwaysExcluded.note.
     assert got.note == "`" + relpath + "` is always excluded"

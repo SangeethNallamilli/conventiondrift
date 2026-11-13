@@ -15,15 +15,21 @@ I-4 says:
   * On a usage error stdout stays empty, stderr gets the usage line then one line
     `conventiondrift: error: <message>`, and no file is written (`--stats-out` included).
 
-What the T-001 skeleton does not do yet is `xfail(strict=True)` naming the task that
-implements it (T-031 for `check` parsing, T-032 for `--version`), so the xfail turns into a
-failure the moment the behaviour lands and the marker must be removed.
+Strict xfails are already in place. When the named task lands, remove the marker
+so the case becomes a real assertion (leaving it would XPASS and fail the suite):
+
+  * T-032: remove `XFAIL_T032` from `test_cli_contract_version_takes_precedence`
+    (IC-I4.2; `--version` precedence).
+  * T-031: remove `XFAIL_T031` from `test_cli_contract_usage_error_stderr_format`
+    (IC-I4.6; usage-error stderr shape) and from
+    `test_cli_contract_check_committed_repo_exits_0_or_1` (IC-I4.7; positive control).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -64,24 +70,91 @@ def cli(request: pytest.FixtureRequest) -> list[str]:
     return make()
 
 
+_GIT_NAMES = ("git", "git.exe", "git.cmd", "git.bat")
+
+
 def _clean_env(home: Path, *, path: str | None = None) -> dict[str, str]:
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("PYTHON", "GIT_", "GITHUB_", "CONVENTIONDRIFT"))
     }
+    home.mkdir(parents=True, exist_ok=True)
+    cfg = home / "isolated.gitconfig"
+    cfg.write_text("", encoding="utf-8")
     env.update(
         {
             "HOME": str(home),
             "USERPROFILE": str(home),
             "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_GLOBAL": str(cfg),
             "PYTHONUTF8": "1",  # portable, unlike LC_ALL=C.UTF-8
         }
     )
     if path is not None:
         env["PATH"] = path
     return env
+
+
+def _assert_git_unresolvable(path: str) -> None:
+    for name in _GIT_NAMES:
+        found = shutil.which(name, path=path)
+        assert found is None, f"restricted PATH unexpectedly resolves {name} to {found}"
+
+
+def _windows_runtime_path() -> str:
+    """SYSTEMROOT\\System32 plus this Python's dirs, so the exe can load DLLs."""
+    systemroot = Path(os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or r"C:\Windows")
+    dirs = [systemroot / "System32", Path(sys.executable).resolve().parent]
+    base_exe = getattr(sys, "base_executable", None)
+    if base_exe:
+        dirs.append(Path(base_exe).resolve().parent)
+    dirs.extend(
+        [
+            Path(sys.base_prefix),
+            Path(sys.base_prefix) / "DLLs",
+            Path(sys.prefix),
+            Path(sys.prefix) / "DLLs",
+            Path(sys.exec_prefix),
+        ]
+    )
+    parts: list[str] = []
+    seen: set[str] = set()
+    for d in dirs:
+        key = os.path.normcase(os.path.normpath(str(d)))
+        if key not in seen and d.is_dir():
+            seen.add(key)
+            parts.append(str(d))
+    return os.pathsep.join(parts)
+
+
+def _path_without_git(tmp_path: Path) -> str:
+    """A PATH that can start this Python (and Windows system DLLs) but cannot resolve git."""
+    if os.name == "nt":
+        path = _windows_runtime_path()
+    else:
+        empty = tmp_path / "empty-bin"
+        empty.mkdir(exist_ok=True)
+        path = str(empty)
+    _assert_git_unresolvable(path)
+    return path
+
+
+def _install_git_sentinel(directory: Path) -> Path:
+    """Fake git that records being invoked. Returns the marker path."""
+    marker = directory / "git-was-called"
+    if os.name == "nt":
+        script = f'@echo called>>"{marker}"\r\n@exit /b 1\r\n'
+        (directory / "git.cmd").write_text(script, encoding="ascii")
+        (directory / "git.bat").write_text(script, encoding="ascii")
+        # A git.exe next to the scripts, so a Windows lookup of "git" or
+        # "git.exe" cannot slip past the sentinel (PATHEXT prefers .exe).
+        (directory / "git.exe").write_bytes(b"")
+    else:
+        git_stub = directory / "git"
+        git_stub.write_text(f'#!/bin/sh\necho called >> "{marker}"\nexit 1\n', encoding="utf-8")
+        git_stub.chmod(0o755)
+    return marker
 
 
 @pytest.fixture
@@ -126,12 +199,22 @@ def test_cli_contract_version(cli: list[str], workdir: Path) -> None:
 
 
 def test_cli_contract_version_reads_no_git(cli: list[str], tmp_path: Path) -> None:
-    """I-4: --version reads neither git nor config: no git on PATH, cwd not a repo."""
-    empty_bin = tmp_path / "empty-bin"
-    empty_bin.mkdir()
+    """I-4: --version reads neither git nor config: no git on PATH, cwd not a repo.
+
+    The restricted PATH cannot resolve git (asserted). On Windows it still
+    includes SYSTEMROOT\\System32 and the Python directories so the exe can
+    start. A sentinel fake git is then prepended; if --version invoked git,
+    the marker would appear and the test would fail.
+    """
+    restricted = _path_without_git(tmp_path)
+    sentinel_dir = tmp_path / "git-sentinel"
+    sentinel_dir.mkdir()
+    marker = _install_git_sentinel(sentinel_dir)
+    path = os.pathsep.join([str(sentinel_dir), restricted]) if restricted else str(sentinel_dir)
     cwd = tmp_path / "not-a-repo"
     cwd.mkdir()
-    _assert_version_output(_run(cli, ["--version"], cwd, path=str(empty_bin)))
+    _assert_version_output(_run(cli, ["--version"], cwd, path=path))
+    assert not marker.exists(), "I-4: --version must not invoke git"
 
 
 VERSION_PRECEDENCE = {

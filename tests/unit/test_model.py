@@ -1,11 +1,14 @@
 """Unit tests for the boundary types in conventiondrift.model (T-005; I-10, I-11, I-13)."""
 
 import dataclasses
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Literal, get_args, get_type_hints
+from typing import Any, Literal, TypeVar, get_args, get_type_hints
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 from conventiondrift import model
 from conventiondrift.model import (
@@ -74,7 +77,7 @@ POLICY = Policy(
         {cid: LOGGING if cid == "logging" else CheckerPolicy(True, ()) for cid in CHECKER_IDS}
     ),
     ignores=(IgnoreEntry(file="AGENTS.md", line=9, text=None),),
-    markers=MappingProxyType({"AGENTS.md": (4,)}),
+    markers=MappingProxyType({"AGENTS.md": ((4, True),)}),
     paths=None,
     comment=True,
     sarif=True,
@@ -464,14 +467,33 @@ def test_missing_field_is_rejected() -> None:
 
 def test_policy_wraps_mappings_in_read_only_copies() -> None:
     checkers = {cid: CheckerPolicy(enabled=True, script_paths=()) for cid in CHECKER_IDS}
-    markers = {"AGENTS.md": (4,)}
+    markers = {"AGENTS.md": ((4, False),)}
     policy = dataclasses.replace(POLICY, checkers=checkers, markers=markers)
     assert isinstance(policy.checkers, MappingProxyType)
     assert isinstance(policy.markers, MappingProxyType)
     checkers.clear()
-    markers["CLAUDE.md"] = (1,)
+    markers["CLAUDE.md"] = ((1, True),)
     assert set(policy.checkers) == set(CHECKER_IDS)
-    assert dict(policy.markers) == {"AGENTS.md": (4,)}
+    assert dict(policy.markers) == {"AGENTS.md": ((4, False),)}
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [(), ((4, True),), ((1, False), (2, True), (9, False))],
+)
+def test_policy_accepts_sorted_marker_pairs(pairs: tuple[tuple[int, bool], ...]) -> None:
+    policy = dataclasses.replace(POLICY, markers={"AGENTS.md": pairs})
+    assert policy.markers["AGENTS.md"] == pairs
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [((9, False), (2, True)), ((1, False), (3, True), (2, False))],
+)
+def test_policy_rejects_unsorted_marker_pairs(pairs: tuple[tuple[int, bool], ...]) -> None:
+    # I-13: each file's markers are sorted (line, alone_on_line) pairs.
+    with pytest.raises(ValueError, match=r"Policy\.markers must be sorted"):
+        dataclasses.replace(POLICY, markers={"CLAUDE.md": ((1, True),), "AGENTS.md": pairs})
 
 
 @pytest.mark.parametrize("missing", CHECKER_IDS)
@@ -648,3 +670,225 @@ def test_rule_accepts_scope_dir_without_edge_slashes(scope_dir: str) -> None:
 def test_rule_rejects_scope_dir_with_edge_slash(scope_dir: str) -> None:
     with pytest.raises(ValueError, match="leading or trailing slash"):
         dataclasses.replace(RULE, scope_dir=scope_dir)
+
+
+# --- I-10 RuleMatch validity (CR2 B1 on #25) ----------------------------------------
+
+
+def test_rule_match_rejects_empty_preferred_and_prohibited() -> None:
+    with pytest.raises(ValueError, match="must not both be empty"):
+        RuleMatch(preferred=frozenset(), prohibited=frozenset(), specificity=1)
+
+
+@pytest.mark.parametrize(
+    ("preferred", "prohibited"),
+    [
+        (frozenset({"httpx"}), frozenset({"httpx"})),
+        (frozenset({"httpx", "requests", "urllib"}), frozenset({"requests", "urllib", "aiohttp"})),
+    ],
+)
+def test_rule_match_rejects_overlapping_preferred_and_prohibited(
+    preferred: frozenset[str], prohibited: frozenset[str]
+) -> None:
+    with pytest.raises(ValueError, match="must be disjoint"):
+        RuleMatch(preferred=preferred, prohibited=prohibited, specificity=1)
+
+
+def test_rule_match_accepts_only_preferred() -> None:
+    match = RuleMatch(preferred=frozenset({"httpx"}), prohibited=frozenset(), specificity=1)
+    assert match.preferred == frozenset({"httpx"})
+    assert match.prohibited == frozenset()
+
+
+def test_rule_match_accepts_only_prohibited() -> None:
+    match = RuleMatch(preferred=frozenset(), prohibited=frozenset({"print"}), specificity=1)
+    assert match.preferred == frozenset()
+    assert match.prohibited == frozenset({"print"})
+
+
+def test_rule_match_accepts_disjoint_nonempty_sets() -> None:
+    match = RuleMatch(
+        preferred=frozenset({"httpx"}), prohibited=frozenset({"requests"}), specificity=2
+    )
+    assert match == MATCH
+
+
+def test_rule_match_error_does_not_echo_option_values() -> None:
+    hostile = "untrusted-option<SECRET>"
+    with pytest.raises(ValueError) as excinfo:
+        RuleMatch(preferred=frozenset({hostile}), prohibited=frozenset({hostile}), specificity=0)
+    assert hostile not in str(excinfo.value)
+
+
+# D-TL-25: the two I-10 invalid classes. This oracle restates the I-10 rule
+# element by element ("at least one option named"; "no option both preferred
+# and prohibited") instead of reusing __post_init__'s set operations, so a bug
+# in those operations cannot also hide in the expected answer.
+def _rule_match_invalid_class(preferred: frozenset[str], prohibited: frozenset[str]) -> str | None:
+    if len(preferred) == 0 and len(prohibited) == 0:
+        return "empty_union"
+    for option in sorted(preferred):
+        if option in prohibited:
+            return "overlap"
+    return None
+
+
+_RULEMATCH_INVALID_CLASSES = frozenset({"empty_union", "overlap"})
+_RULEMATCH_INVALID_MATCH = {
+    "empty_union": "must not both be empty",
+    "overlap": "must be disjoint",
+}
+
+# replace() a valid MATCH (preferred={httpx}, prohibited={requests}) into each class.
+_REPLACE_INVALID_CASES: tuple[tuple[str, frozenset[str], frozenset[str]], ...] = (
+    ("empty_union", frozenset(), frozenset()),
+    ("overlap", MATCH.preferred, frozenset({"httpx"})),
+)
+
+# Explicit property inputs so both invalid classes are always drawn, plus valid cases.
+_PROPERTY_EXAMPLES: tuple[tuple[frozenset[str], frozenset[str], int], ...] = (
+    (frozenset(), frozenset(), 0),
+    (frozenset({"a"}), frozenset({"a"}), 1),
+    (frozenset({"a", "b"}), frozenset({"b", "c"}), 2),
+    (frozenset({"a"}), frozenset(), 1),
+    (frozenset(), frozenset({"b"}), 1),
+    (frozenset({"a"}), frozenset({"b"}), 2),
+)
+
+_F = TypeVar("_F", bound=Callable[..., None])
+
+
+def _with_property_examples(test: _F) -> _F:
+    """Attach every ``_PROPERTY_EXAMPLES`` entry as a Hypothesis ``@example`` (one source)."""
+    for preferred, prohibited, specificity in _PROPERTY_EXAMPLES:
+        test = example(preferred=preferred, prohibited=prohibited, specificity=specificity)(test)
+    return test
+
+
+_OPTION_SETS = st.frozensets(st.sampled_from(("a", "b", "c", "d")), max_size=4)
+
+
+def test_rule_match_replace_cases_cover_invalid_classes() -> None:
+    covered = set()
+    for invalid_class, preferred, prohibited in _REPLACE_INVALID_CASES:
+        assert _rule_match_invalid_class(preferred, prohibited) == invalid_class
+        covered.add(invalid_class)
+    assert covered == _RULEMATCH_INVALID_CLASSES
+
+
+@pytest.mark.parametrize(("invalid_class", "preferred", "prohibited"), _REPLACE_INVALID_CASES)
+def test_rule_match_replace_rejects_invalid_state(
+    invalid_class: str, preferred: frozenset[str], prohibited: frozenset[str]
+) -> None:
+    with pytest.raises(ValueError, match=_RULEMATCH_INVALID_MATCH[invalid_class]):
+        dataclasses.replace(MATCH, preferred=preferred, prohibited=prohibited)
+
+
+def test_rule_match_property_examples_cover_invalid_classes() -> None:
+    covered = {
+        cls
+        for preferred, prohibited, _ in _PROPERTY_EXAMPLES
+        if (cls := _rule_match_invalid_class(preferred, prohibited)) is not None
+    }
+    assert covered == _RULEMATCH_INVALID_CLASSES
+
+
+@given(
+    preferred=_OPTION_SETS,
+    prohibited=_OPTION_SETS,
+    specificity=st.integers(min_value=-100, max_value=100),
+)
+@_with_property_examples
+@settings(max_examples=80, deadline=None, derandomize=True)
+def test_rule_match_constructs_iff_union_nonempty_and_disjoint(
+    preferred: frozenset[str], prohibited: frozenset[str], specificity: int
+) -> None:
+    invalid_class = _rule_match_invalid_class(preferred, prohibited)
+    if invalid_class is None:
+        match = RuleMatch(preferred=preferred, prohibited=prohibited, specificity=specificity)
+        assert match.preferred == preferred
+        assert match.prohibited == prohibited
+        assert match.specificity == specificity
+    else:
+        assert invalid_class in _RULEMATCH_INVALID_CLASSES
+        with pytest.raises(ValueError, match=_RULEMATCH_INVALID_MATCH[invalid_class]):
+            RuleMatch(preferred=preferred, prohibited=prohibited, specificity=specificity)
+
+
+# CR2 #27 F1: a wrong argument type is a TypeError, whichever field it is in and whatever
+# the other field holds; only the two I-10 value conditions are ValueError.
+_NOT_FROZENSETS: tuple[Any, ...] = (None, [], ["a"], set(), {"a"}, (), ("a",), "a", {"a": 1})
+
+
+@pytest.mark.parametrize("bad", _NOT_FROZENSETS)
+@pytest.mark.parametrize("other", [frozenset(), frozenset({"b"})])
+@pytest.mark.parametrize("field", ["preferred", "prohibited"])
+def test_rule_match_rejects_non_frozensets_with_type_error(
+    field: str, other: Any, bad: Any
+) -> None:
+    kwargs: dict[str, Any] = {"preferred": other, "prohibited": other, "specificity": 1}
+    kwargs[field] = bad
+    with pytest.raises(TypeError, match="must be frozensets"):
+        RuleMatch(**kwargs)
+    with pytest.raises(TypeError, match="must be frozensets"):
+        dataclasses.replace(MATCH, **{field: bad})
+
+
+def test_rule_match_type_error_does_not_echo_values() -> None:
+    hostile = ["untrusted-option<SECRET>"]
+    with pytest.raises(TypeError) as excinfo:
+        RuleMatch(preferred=hostile, prohibited=frozenset(), specificity=0)  # type: ignore[arg-type]
+    assert "SECRET" not in str(excinfo.value)
+
+
+# SR #32 C-1 / L2: each invalid class of Policy.markers pairs, tested on its own. The
+# expected messages restate I-13 ("sorted (line, alone_on_line) pairs") per class.
+_MARKER_INVALID: dict[str, tuple[Any, str]] = {
+    "values not a tuple": ([(1, True)], "values must be tuples of pairs"),
+    "entry not a pair": (((1, True, False),), "must be .line, alone_on_line. pairs"),
+    "entry not a tuple": (([1, True],), "must be .line, alone_on_line. pairs"),
+    "line is a bool": (((True, True),), "lines must be integers >= 1"),
+    "line is zero": (((0, True),), "lines must be integers >= 1"),
+    "line is negative": (((-3, False),), "lines must be integers >= 1"),
+    "line not an int": ((("4", False),), "lines must be integers >= 1"),
+    "line is a float": (((4.0, False),), "lines must be integers >= 1"),
+    "alone is an int": (((4, 1),), "alone_on_line must be a bool"),
+    "alone is None": (((4, None),), "alone_on_line must be a bool"),
+    "unsorted": (((9, False), (2, True)), "must be sorted with no duplicate lines"),
+    "duplicate line": (((2, False), (2, True)), "must be sorted with no duplicate lines"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_MARKER_INVALID))
+def test_policy_rejects_each_invalid_marker_class(name: str) -> None:
+    pairs, message = _MARKER_INVALID[name]
+    markers = {"CLAUDE.md": ((1, True),), "AGENTS.md": pairs}
+    with pytest.raises(ValueError, match=message):
+        dataclasses.replace(POLICY, markers=markers)
+
+
+def test_policy_marker_classes_are_covered() -> None:
+    # D-TL-25: every SR C-1 condition has at least one case above.
+    conditions = {"pair", "line >= 1", "line not bool", "alone bool", "sorted", "unique"}
+    covers = {
+        "pair": {"values not a tuple", "entry not a pair", "entry not a tuple"},
+        "line >= 1": {"line is zero", "line is negative"},
+        "line not bool": {"line is a bool"},
+        "alone bool": {"alone is an int", "alone is None"},
+        "sorted": {"unsorted"},
+        "unique": {"duplicate line"},
+    }
+    assert set(covers) == conditions
+    assert set().union(*covers.values()) <= set(_MARKER_INVALID)
+
+
+def test_policy_accepts_named_tuple_pairs() -> None:
+    # T-013's Marker is a NamedTuple(line, alone); it is a valid pair too.
+    from typing import NamedTuple
+
+    class Marker(NamedTuple):
+        line: int
+        alone: bool
+
+    policy = dataclasses.replace(POLICY, markers={"AGENTS.md": (Marker(3, True),)})
+    assert policy.markers["AGENTS.md"] == ((3, True),)

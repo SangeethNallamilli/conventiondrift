@@ -149,6 +149,12 @@ _FOREIGN_BOMS: Final = (
     codecs.BOM_UTF16_BE,
 )
 _READ_CHUNK: Final = 65_536
+# Windows: the longest name one path segment may have, in UTF-16 code units (NTFS, ReFS,
+# exFAT and FAT all use 255). Longer names never reach the OS there (see _name_too_long).
+_NT_NAME_MAX: Final = 255
+# Windows error ERROR_FILENAME_EXCED_RANGE: the whole path is too long, Windows'
+# counterpart of ENAMETOOLONG. Python maps it to errno ENOENT, so it is checked by winerror.
+_WINERROR_FILENAME_EXCED_RANGE: Final = 206
 
 
 def _has_lone_surrogate(segment: str) -> bool:
@@ -228,6 +234,25 @@ def validate_relpath(value: str, *, origin: PathOrigin) -> str:
     if any(_has_lone_surrogate(p) or _windows_only_form(p, colon=colon) for p in parts):
         raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     return "/".join(parts)
+
+
+def _name_too_long(parts: list[str]) -> bool:
+    """True on Windows if a segment is longer than the OS allows (I-13 ENAMETOOLONG).
+
+    POSIX reports such a name as ENAMETOOLONG. Windows reports it with errors that
+    Python maps to EINVAL or ENOENT, which also mean other things, so the length is
+    checked on the string before any file system call. ``os.name`` is read per
+    call, so tests can patch it.
+    """
+    return os.name == "nt" and any(_utf16_units(p) > _NT_NAME_MAX for p in parts)
+
+
+def _utf16_units(segment: str) -> int:
+    """Length of ``segment`` in UTF-16 code units: code points above U+FFFF count twice.
+
+    Counted, not encoded, so no codec module is loaded (that would be a file open).
+    """
+    return len(segment) + sum(ch > "\uffff" for ch in segment)
 
 
 def size_limit(kind: FileKind, max_file_bytes: int | None = None) -> int:
@@ -311,7 +336,10 @@ def _os_reason(exc: OSError, origin: PathOrigin) -> SkipReason:
         return REASON_SYMLINK
     if code == errno.ENOTDIR:
         return REASON_SPECIAL
-    if code == errno.ENAMETOOLONG:
+    if (
+        code == errno.ENAMETOOLONG
+        or getattr(exc, "winerror", None) == _WINERROR_FILENAME_EXCED_RANGE
+    ):
         return REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE
     return REASON_UNREADABLE  # EACCES, EPERM, EIO, ENOENT (vanished) and every other errno
 
@@ -405,12 +433,16 @@ def _read_worktree_file(
     No ``OSError`` ever escapes (INTERFACES "OS errors in discover/safefs.py"):
     ELOOP/EMLINK/EFTYPE are "symlink", ENOTDIR is "special file", ENAMETOOLONG
     is "unsupported path" for a tree name and "outside repository" for a typed
-    value, and every other errno (EACCES, EPERM, EIO, ENOENT, ...) is
-    "unreadable". The ``FileSkipped`` carries only the fixed reason: no OS
-    message, errno text or host path, and no ``__cause__``/``__context__``.
-    Exceptions that are not ``OSError`` are bugs and propagate.
+    value (on Windows also ERROR_FILENAME_EXCED_RANGE, and a segment over 255
+    UTF-16 code units, checked before any file system call), and every other
+    errno (EACCES, EPERM, EIO, ENOENT, ...) is "unreadable". The ``FileSkipped``
+    carries only the fixed reason: no OS message, errno text or host path,
+    and no ``__cause__``/``__context__``. Exceptions that are not ``OSError`` are
+    bugs and propagate.
     """
     parts = validate_relpath(relpath, origin=origin).split("/")
+    if _name_too_long(parts):
+        raise FileSkipped(REASON_UNSUPPORTED if origin == "tree" else REASON_OUTSIDE)
     limit = size_limit(kind, max_file_bytes)
     try:
         return _read(root, parts, limit)
@@ -555,6 +587,8 @@ def read_unless_hard_excluded(
     repo-relative path is checked, never ``root``.
     """
     rel = validate_relpath(relpath, origin=origin)
+    # A hard-excluded `paths:` entry is dropped, not a SkippedFile; the caller adds
+    # AlwaysExcluded.note to the summary (I-13 scan-walk ruling 1).
     if has_hard_excluded_component(rel):
         return AlwaysExcluded(rel)
     return _read_worktree_file(root, rel, kind, max_file_bytes=max_file_bytes, origin=origin)
@@ -618,6 +652,8 @@ class _Walk:
         self.spent = False
 
     def skip(self, parts: list[str], reason: SkipReason) -> None:
+        # Only a root over the entry cap is reported as "."; an unlistable root raises
+        # ComponentError("discover") in _root_or_skip (I-13 scan-walk ruling 2).
         path = "/".join(parts) or "."
         if any(_has_lone_surrogate(part) for part in parts):
             path = _escape_unsupported_path(path)
@@ -693,6 +729,8 @@ class _Walk:
         if is_hard_excluded(name):
             return  # I-5: never lstat-ed, listed, entered or reported
         child = [*parts, name]
+        # A name that is not valid UTF-8 (a lone surrogate under surrogateescape) is listed
+        # as is here; I-13 scan-walk ruling 3 makes it "unsupported path" in the follow-up.
         try:
             validate_relpath(name, origin="tree")
             if isinstance(handle, int):

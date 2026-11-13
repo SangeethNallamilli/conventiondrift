@@ -6,6 +6,8 @@ from __future__ import annotations
 import errno
 import os
 import socket
+import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,10 +36,20 @@ def make(root: Path, *files: str) -> None:
 
 
 def symlink(target: Path, link: Path, *, is_dir: bool = False) -> None:
+    """Create ``link`` -> ``target``.
+
+    Skip only on a local non-Windows machine without CI, where symlink support may
+    be missing. Under CI, GitHub Actions, or on Windows, a failure is a hard fail so
+    a CI run cannot hide these tests in the skipped count (as in #40's
+    ``_symlink_or_skip``).
+    """
     try:
         link.symlink_to(target, target_is_directory=is_dir)
-    except OSError as exc:  # Windows without developer mode
-        pytest.skip(f"symlinks unavailable: {exc.strerror}")
+    except OSError as exc:
+        message = f"failed to create symlink {link} -> {target}: {exc}"
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS") or sys.platform == "win32":
+            pytest.fail(message)
+        pytest.skip(message)
 
 
 def lstat_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -90,15 +102,25 @@ def test_hard_excluded_folders_are_never_entered(
     assert not any(d.is_hard_excluded(os.path.basename(p)) for p in seen)  # not even lstat-ed
 
 
-def test_git_symlink_and_gitlink_file_are_skipped_silently(tmp_path: Path, strategy: str) -> None:
+def test_git_symlinks_are_skipped_silently(tmp_path: Path, strategy: str) -> None:
     outside = tmp_path / "outside"
     make(outside, "config", "x.py")
     repo = tmp_path / "repo"
     make(repo, "a.py")
     symlink(outside, repo / ".git", is_dir=True)
     symlink(outside, repo / "NODE_MODULES", is_dir=True)
+    res = walk_worktree(repo)
+    assert res.files == ("a.py",)
+    assert res.skipped == ()
+
+
+def test_gitlink_file_is_skipped_silently(tmp_path: Path, strategy: str) -> None:
+    outside = tmp_path / "outside"
+    make(outside, "config", "x.py")
+    repo = tmp_path / "repo"
+    make(repo, "a.py")
     (repo / "sub").mkdir()
-    (repo / "sub" / ".git").write_text("gitdir: ../../outside\n")  # submodule gitlink
+    (repo / "sub" / ".git").write_bytes(b"gitdir: ../../outside\n")  # submodule gitlink
     res = walk_worktree(repo)
     assert res.files == ("a.py",)
     assert res.skipped == ()
@@ -250,7 +272,9 @@ def test_folder_swapped_for_a_symlink_after_lstat(
 
     def racing(path: str, *a: object, **k: object) -> os.stat_result:
         st = real(path, *a, **k)  # type: ignore[arg-type]
-        if os.fsdecode(path).endswith("sub") and not (repo / "sub").is_symlink():
+        # Only the saved, unpatched lstat in here: Path.is_symlink goes through os.lstat
+        # on 3.14+, which would re-enter this wrapper (RecursionError).
+        if os.fsdecode(path).endswith("sub") and not stat.S_ISLNK(real(repo / "sub").st_mode):
             (repo / "sub").rename(tmp_path / "moved")
             symlink(outside, repo / "sub", is_dir=True)
         return st
@@ -271,11 +295,13 @@ def test_fallback_rechecks_the_folder_after_listing(
     real = os.scandir
 
     def racing(path: str) -> object:
-        it = real(path)
+        # Swap after the walk took the folder's ids and before it lists: the listing is
+        # of the other folder. Renaming before scandir opens the folder also works on
+        # Windows, which may refuse to rename a folder with an open listing handle.
         if path.endswith("sub"):
             (repo / "sub").rename(tmp_path / "moved")
             (tmp_path / "elsewhere").rename(repo / "sub")  # another real folder
-        return it
+        return real(path)
 
     monkeypatch.setattr(os, "scandir", racing)
     res = walk_worktree(repo)
@@ -357,6 +383,63 @@ def test_junction_is_symlink(
     res = walk_worktree(tmp_path)
     assert res.files == ("a.py",)
     assert res.skipped == (SkippedFile("junction", "symlink"),)
+
+
+def test_reparse_point_attribute_is_symlink(
+    tmp_path: Path, strategy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk's own check reads FILE_ATTRIBUTE_REPARSE_POINT (a simulated Windows lstat)."""
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400, raising=False)
+    make(tmp_path, "a.py", "j/x.py", "r.py")
+    real = os.lstat
+
+    class FakeStat:
+        def __init__(self, st: os.stat_result) -> None:
+            self._st = st
+            self.st_file_attributes = 0x400
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._st, name)
+
+    def fake(path: str, *a: object, **k: object) -> object:
+        st = real(path, *a, **k)  # type: ignore[arg-type]
+        return FakeStat(st) if os.fsdecode(path).endswith(("j", "r.py")) else st
+
+    monkeypatch.setattr(os, "lstat", fake)
+    res = walk_worktree(tmp_path)
+    assert res.files == ("a.py",)
+    assert res.skipped == (SkippedFile("j", "symlink"), SkippedFile("r.py", "symlink"))
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="real Windows behaviour; runs on windows-latest"
+)
+def test_windows_real_junction_is_never_entered(tmp_path: Path) -> None:
+    """A real NTFS junction, inside the repo or out, is "symlink" and never listed."""
+    if sys.platform == "win32":  # mypy checks this block as Windows code
+        import _winapi
+
+        assert not d._USE_DIR_FD, "Windows walks through the by-path fallback"
+        outside = tmp_path / "outside"
+        make(outside, "secret.py")
+        repo = tmp_path / "repo"
+        make(repo, "a.py", "real/x.py")
+        links = [repo / "j_in", repo / "j_out"]
+        _winapi.CreateJunction(str(repo / "real"), str(links[0]))
+        _winapi.CreateJunction(str(outside), str(links[1]))
+        try:
+            assert all(
+                os.lstat(j).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT for j in links
+            )
+            res = walk_worktree(repo)
+        finally:
+            for j in links:
+                os.rmdir(j)  # removes the junction itself, never its target
+        assert res.files == ("a.py", "real/x.py")
+        assert res.skipped == (SkippedFile("j_in", "symlink"), SkippedFile("j_out", "symlink"))
+        assert (outside / "secret.py").exists()
+    else:  # the skipif keeps other platforms out
+        pytest.fail("Windows-only")
 
 
 @pytest.mark.skipif(not POSIX or os.geteuid() == 0, reason="needs POSIX permissions, not root")
