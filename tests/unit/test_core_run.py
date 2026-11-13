@@ -1,6 +1,8 @@
 """Unit tests for run(), the InternalError helper and error-time fail-on (T-006a, I-2, I-14)."""
 
-from collections.abc import Mapping
+import asyncio
+import inspect
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, get_args
 
 import pytest
@@ -9,6 +11,7 @@ from conventiondrift import core
 from conventiondrift.components import Components
 from conventiondrift.core import (
     AnalysisOutcome,
+    FailOn,
     RefusedTriggerOutcome,
     RunContext,
     RunOutcome,
@@ -17,7 +20,7 @@ from conventiondrift.core import (
     internal_error,
     run,
 )
-from conventiondrift.errors import ComponentError, GitUnavailable
+from conventiondrift.errors import ComponentError, GitTooOld, GitUnavailable
 from conventiondrift.model import CheckerId, InternalError
 
 PLANTED = "ghp_FAKE0000planted/src/secret.py contents"
@@ -70,7 +73,25 @@ def test_invalid_components_become_core(component: str) -> None:
     assert internal_error(ComponentError(component, PLANTED)).component == "core"
 
 
-@pytest.mark.parametrize("name", ["Ërror", "Bad Name", "Bad\nName", "1Error", "", "a-b"])
+@pytest.mark.parametrize("component", ["checker:http-client-", "checker:a--b"])
+def test_trailing_and_doubled_suffix_hyphens_are_kept(component: str) -> None:
+    # I-14's suffix class [a-z0-9_-]+ allows these, so they pass through unchanged.
+    assert internal_error(ComponentError(component, PLANTED)).component == component
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Ërror",
+        "Bad Name",
+        "Bad\nName",
+        "1Error",
+        "",
+        "a-b",
+        "Bad\u202eError",  # Cf: right-to-left override (bidi)
+        "Bad\u200bError",  # Cf: zero-width space
+    ],
+)
 def test_class_names_that_are_not_ascii_identifiers_become_exception(name: str) -> None:
     exc = type(name, (Exception,), {})()
     assert internal_error(exc) == InternalError("core", "Exception" + SUFFIX)
@@ -87,6 +108,23 @@ def test_exact_message_text() -> None:
     )
 
 
+def test_git_too_old_uses_the_fixed_public_text() -> None:
+    error = internal_error(GitTooOld())
+    assert error == InternalError("gitread", "git 2.30 or newer is required")
+
+
+def test_component_error_and_git_unavailable_still_withhold_details() -> None:
+    hidden = "git found only in the repository, workspace or current folder"
+    assert internal_error(ComponentError("gitread", hidden)) == InternalError(
+        "gitread", "ComponentError" + SUFFIX
+    )
+    assert hidden not in internal_error(ComponentError("gitread", hidden)).message
+    unavailable = internal_error(GitUnavailable("git executable not found at /home/x/secret"))
+    assert unavailable == InternalError("core", "GitUnavailable" + SUFFIX)
+    assert "git executable not found" not in unavailable.message
+    assert "/home/x/secret" not in unavailable.message
+
+
 @pytest.mark.parametrize(
     ("explicit", "base", "expected"),
     [
@@ -95,13 +133,96 @@ def test_exact_message_text() -> None:
         ("none", "any-stale", "none"),
         (None, "new-stale", "new-stale"),
         ("bogus", "any-stale", "any-stale"),
-        ("NEW-STALE", None, "none"),
+        ("NEW-STALE", None, "new-stale"),  # SR F1: an invalid explicit value fails closed
         ("", None, "none"),
         (None, None, "none"),
     ],
 )
 def test_error_fail_on_order(explicit: str | None, base: Any, expected: str) -> None:
+    # No keyword: config_known_present defaults to False, the pre-D-PM-32 behaviour.
     assert error_fail_on(explicit, base) == expected
+    assert error_fail_on(explicit, base, config_known_present=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("explicit", "base", "expected"),
+    [
+        # (a) an explicit valid value wins even when a config is known to exist.
+        ("none", None, "none"),
+        ("any-stale", None, "any-stale"),
+        ("none", "any-stale", "none"),
+        # the base config's value wins over known-present, including "none".
+        (None, "none", "none"),
+        (None, "any-stale", "any-stale"),
+        ("bogus", "none", "none"),
+        # (b) known present, nothing read: fail closed with the internal gate.
+        (None, None, "new-stale"),
+        ("bogus", None, "new-stale"),
+    ],
+)
+def test_error_fail_on_with_config_known_present(
+    explicit: str | None, base: Any, expected: str
+) -> None:
+    assert error_fail_on(explicit, base, config_known_present=True) == expected
+
+
+INVALID_EXPLICIT = [
+    "bogus",
+    "NEW-STALE",
+    "NONE",
+    "None",
+    "Any-Stale",
+    " none",
+    "none ",
+    "none\n",
+    "none\x00",
+    "n\u043ene",  # "none" with a Cyrillic small o (U+043E)
+    "\uff4e\uff4f\uff4e\uff45",  # fullwidth "none" (U+FF4E U+FF4F U+FF4E U+FF45)
+]
+
+
+def test_invalid_explicit_has_a_case_only_variant_of_every_value() -> None:
+    # D-TL-25: values are matched exactly, with no case folding (I-14 SR F1), so every
+    # valid value needs a case-only look-alike here; this kills a casefold() mutant.
+    valid = set(get_args(FailOn))
+    case_only = {v.casefold() for v in INVALID_EXPLICIT if v not in valid}
+    assert valid <= case_only
+
+
+@pytest.mark.parametrize("explicit", INVALID_EXPLICIT)
+def test_invalid_explicit_fail_on_fails_closed(explicit: str) -> None:
+    # SR F1: with no base value and no known config, an invalid explicit value is new-stale.
+    assert error_fail_on(explicit, None) == "new-stale"
+    assert error_fail_on(explicit, None, config_known_present=False) == "new-stale"
+
+
+@pytest.mark.parametrize("explicit", INVALID_EXPLICIT)
+def test_invalid_explicit_fail_on_exits_3_through_run(
+    monkeypatch: pytest.MonkeyPatch, explicit: str
+) -> None:
+    pipeline = _Recorder(RuntimeError(), explicit_fail_on=explicit)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="cli") == 3
+    assert pipeline.context is not None
+    assert pipeline.context.internal_errors == (InternalError("core", "RuntimeError" + SUFFIX),)
+
+
+def test_empty_explicit_fail_on_still_counts_as_unset() -> None:
+    assert error_fail_on("", None) == "none"
+    assert error_fail_on("", None, config_known_present=True) == "new-stale"
+
+
+@pytest.mark.parametrize("base", ["none", "new-stale", "any-stale"])
+@pytest.mark.parametrize("explicit", ["bogus", "none ", "n\u043ene"])
+def test_valid_base_value_beats_an_invalid_explicit_value(explicit: str, base: Any) -> None:
+    assert error_fail_on(explicit, base) == base
+
+
+def test_config_known_present_is_keyword_only_and_off_by_default() -> None:
+    param = inspect.signature(error_fail_on).parameters["config_known_present"]
+    assert (param.kind, param.default) == (inspect.Parameter.KEYWORD_ONLY, False)
+    with pytest.raises(TypeError):
+        error_fail_on(None, None, True)  # type: ignore[call-arg]
 
 
 class _Recorder:
@@ -193,7 +314,7 @@ def test_run_requires_entry() -> None:
         ({"explicit_fail_on": "none", "base_fail_on": "any-stale"}, 0),
         ({"base_fail_on": "any-stale"}, 3),
         ({"explicit_fail_on": "invalid", "base_fail_on": "new-stale"}, 3),
-        ({"explicit_fail_on": "invalid"}, 0),
+        ({"explicit_fail_on": "invalid"}, 3),  # SR F1
     ],
 )
 def test_run_reports_a_raising_pipeline_with_the_fail_on_known_so_far(
@@ -251,6 +372,36 @@ def test_component_exit_under_any_stale_fails_closed_and_withholds_its_argument(
         assert planted not in err
 
 
+def test_run_git_too_old_debug_data_is_never_shown(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    version = "git version 2.29.0"
+    host_path = "/home/x/secret"
+    planted = f"{version} at {host_path}"
+    try:
+        raise RuntimeError(planted)
+    except RuntimeError as cause:
+        exc = GitTooOld()
+        exc.__cause__ = cause
+        exc.__context__ = cause
+        exc.add_note(planted)
+        exc.found_version = version  # type: ignore[attr-defined]
+        exc.host_path = host_path  # type: ignore[attr-defined]
+
+    pipeline = _Recorder(exc, explicit_fail_on="any-stale")
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="cli") == 3
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    assert error == InternalError("gitread", "git 2.30 or newer is required")
+    out, err = capsys.readouterr()
+    for part in (version, host_path, planted):
+        assert part not in error.message
+        assert part not in error.component
+        assert part not in out
+        assert part not in err
+
+
 def test_run_keeps_internal_errors_recorded_before_a_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -265,6 +416,48 @@ def test_run_keeps_internal_errors_recorded_before_a_raise(
         earlier,
         InternalError("render", "ComponentError" + SUFFIX),
     )
+
+
+GHP_FAKE = "ghp_FAKE0123456789"
+HOST_PATH = "/home/runner/secret/x"
+
+
+class Boom(BaseException):
+    """A bare BaseException subclass a component might raise."""
+
+
+Bóom = type("Bóom", (BaseException,), {})
+
+
+@pytest.mark.parametrize(
+    ("make", "name"),
+    [
+        (lambda: asyncio.CancelledError(GHP_FAKE, HOST_PATH), "CancelledError"),
+        (lambda: Boom(GHP_FAKE, HOST_PATH), "Boom"),
+        (lambda: Bóom(GHP_FAKE, HOST_PATH), "Exception"),
+    ],
+    ids=["CancelledError", "Boom", "non-ascii-name"],
+)
+@pytest.mark.parametrize(("fail_on", "expected"), [("none", 0), ("new-stale", 3), ("any-stale", 3)])
+def test_run_turns_any_base_exception_into_an_internal_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    make: Callable[[], BaseException],
+    name: str,
+    fail_on: str,
+    expected: int,
+) -> None:
+    # SR F3: every BaseException except KeyboardInterrupt is caught and fails closed.
+    pipeline = _Recorder(make(), explicit_fail_on=fail_on)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="action") == expected
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    assert error == InternalError("core", name + SUFFIX)
+    out, err = capsys.readouterr()
+    for planted in (GHP_FAKE, HOST_PATH):
+        for text in (error.component, error.message, out, err):
+            assert planted not in text
 
 
 def test_run_lets_keyboard_interrupt_propagate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -294,8 +487,50 @@ def test_unwired_pipeline_is_an_internal_error(monkeypatch: pytest.MonkeyPatch) 
 
 def test_run_context_defaults() -> None:
     context = RunContext()
-    assert (context.explicit_fail_on, context.base_fail_on, context.internal_errors) == (
-        None,
-        None,
-        (),
-    )
+    assert (
+        context.explicit_fail_on,
+        context.base_fail_on,
+        context.config_known_present,
+        context.internal_errors,
+    ) == (None, None, False, ())
+
+
+@pytest.mark.parametrize(
+    ("context", "expected"),
+    [
+        ({"config_known_present": True}, 3),
+        ({"config_known_present": False}, 0),
+        ({}, 0),
+        ({"config_known_present": True, "explicit_fail_on": "none"}, 0),
+        ({"config_known_present": True, "base_fail_on": "none"}, 0),
+        ({"config_known_present": True, "base_fail_on": "any-stale"}, 3),
+    ],
+)
+def test_run_uses_config_known_present_for_an_early_crash(
+    monkeypatch: pytest.MonkeyPatch, context: dict[str, Any], expected: int
+) -> None:
+    pipeline = _Recorder(RuntimeError(PLANTED), **context)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="action") == expected
+    assert pipeline.context is not None
+    # The internal error is recorded either way, so exit 0 still writes the section.
+    assert pipeline.context.internal_errors == (InternalError("core", "RuntimeError" + SUFFIX),)
+
+
+@pytest.mark.parametrize("entry", ["action", "cli"])
+def test_internal_gate_is_not_presented_as_a_configured_fail_on(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entry: Literal["action", "cli"],
+) -> None:
+    # D-PM-32 case (b): "new-stale" is an internal gate only. Nothing in src renders a
+    # fail-on or policy source yet; the renderer task owns the summary wording.
+    pipeline = _Recorder(RuntimeError(), config_known_present=True)
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry=entry) == 3
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    out, err = capsys.readouterr()
+    for text in (error.component, error.message, out, err):
+        assert "fail-on" not in text
+        assert "new-stale" not in text

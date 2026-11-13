@@ -225,10 +225,18 @@ def run_check(repo: Path, head_ref: str, outdir: Path, n: int, fmt: str = "json"
     return Run(wall, proc.returncode, stats, report, proc.stderr)
 
 
+SKELETON_MARKER = "not implemented yet"  # T-001 cli.py stderr; T-031/T-033 replace this
+
+
 def not_implemented_reason(run: Run) -> str | None:
-    """A first run that exits 2 without writing stats means `check`/`--stats-out` don't exist
-    yet (T-031, T-033). Under CD_BENCH_REQUIRE=1 (the CI benchmark job) that is a failure."""
-    if run.exit_code == 2 and not run.stats:
+    """Return a reason only for the T-001 skeleton (`check`/`--stats-out` not built yet).
+
+    The skeleton exits 2, writes no stats, and prints `not implemented yet` on stderr.
+    A later regression that also exits 2 without stats (for example a usage error) is
+    *not* treated as the skeleton, so AC-E.12 fails instead of being skipped or xfails.
+    Under CD_BENCH_REQUIRE=1 (the CI benchmark job) a skeleton result is a failure.
+    """
+    if run.exit_code == 2 and not run.stats and SKELETON_MARKER in run.stderr:
         return (
             "`conventiondrift check --stats-out` is not implemented yet (T-031/T-033); "
             f"stderr: {run.stderr.strip()[:200]}"
@@ -255,7 +263,9 @@ def probe_cli(workdir: Path) -> str | None:
         }
     )
     if not (repo / ".git").exists():
-        for args in (["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "p"]):
+        from fixtures.gitrepo import init_with_branch
+
+        def _git(*args: str) -> None:
             subprocess.run(  # noqa: S603 - argv list, no shell
                 ["git", *args],  # noqa: S607 - git from PATH by design
                 cwd=repo,
@@ -263,6 +273,9 @@ def probe_cli(workdir: Path) -> str | None:
                 check=True,
                 capture_output=True,
             )
+
+        init_with_branch(_git, "main")
+        _git("commit", "-q", "--allow-empty", "-m", "p")
     return not_implemented_reason(run_check(repo, "main", workdir / "probe-out", 0))
 
 
