@@ -20,6 +20,7 @@ from conventiondrift.gitread import GitReader
 
 _REAL_RUN = subprocess.run
 _GIT = shutil.which("git") or "git"
+_TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 _ENV = {
     "PATH": os.environ.get("PATH", ""),
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -44,7 +45,11 @@ def _write_lf(path: Path, text: str) -> None:
 def _git(repo: Path, *args: str) -> str:
     """Test helper only: plain git, with no hardening."""
     out = _REAL_RUN(
-        [_GIT, *args], cwd=repo, env=dict(_ENV, HOME=str(repo)), check=True, capture_output=True
+        [_GIT, *_TEST_GIT_FLAGS, *args],
+        cwd=repo,
+        env=dict(_ENV, HOME=str(repo)),
+        check=True,
+        capture_output=True,
     )
     return out.stdout.decode().strip()
 
@@ -59,11 +64,11 @@ def hostile(tmp_path: Path) -> tuple[Path, Path, str, str]:
     _write_lf(hook, f"#!/bin/sh\necho ran >> {_sh_path(sentinel)}\nexit 1\n")
     hook.chmod(0o755)
     _git(repo, "init", "-q", "-b", "main")
-    (repo / "a.py").write_text("1\n")
+    _write_lf(repo / "a.py", "1\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     base = _git(repo, "rev-parse", "HEAD")
-    (repo / "a.py").write_text("2\n")
+    _write_lf(repo / "a.py", "2\n")
     _git(repo, "commit", "-q", "-am", "head")
     head = _git(repo, "rev-parse", "HEAD")
     _git(repo, "config", "core.fsmonitor", hook.as_posix())

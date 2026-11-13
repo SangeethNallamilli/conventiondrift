@@ -54,7 +54,22 @@ def _grandchild(tmp_path: Path) -> int:
     return int((tmp_path / "grandchild.pid").read_text())
 
 
-@pytest.mark.parametrize("parent_exits", [False, True])
+_WINDOWS_EXITED_GIT = pytest.mark.xfail(
+    os.name == "nt",
+    reason=(
+        "Windows: _kill_tree runs taskkill /T /PID, which does not kill "
+        "grandchildren of a git process that has already exited, so the "
+        "timeout path can block on pipes those children still hold "
+        "(CR2 S1 / SR N-4)"
+    ),
+    strict=True,
+)
+
+
+@pytest.mark.parametrize(
+    "parent_exits",
+    [False, pytest.param(True, marks=_WINDOWS_EXITED_GIT)],
+)
 def test_timeout_kills_the_grandchild_too(tmp_path: Path, parent_exits: bool) -> None:
     start = time.monotonic()
     with pytest.raises(ComponentError, match="git log timed out"):

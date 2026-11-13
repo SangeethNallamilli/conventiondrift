@@ -25,6 +25,7 @@ from conventiondrift.gitread import GitReader
 
 _REAL_RUN = subprocess.run
 _GIT = shutil.which("git") or "git"
+_TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 _ENV = {
     "PATH": os.environ.get("PATH", ""),
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -44,7 +45,9 @@ def _git(repo: Path, *args: str, date: str | None = None) -> str:
     env = dict(_ENV, HOME=str(repo))
     if date is not None:
         env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = date
-    out = _REAL_RUN([_GIT, *args], cwd=repo, env=env, check=True, capture_output=True)
+    out = _REAL_RUN(
+        [_GIT, *_TEST_GIT_FLAGS, *args], cwd=repo, env=env, check=True, capture_output=True
+    )
     return out.stdout.decode().strip()
 
 
@@ -215,7 +218,7 @@ def test_tree_keeps_symlinks_odd_names_and_gitlinks(repo: Path) -> None:
     _require_symlinks()
     _git(repo, "config", "core.symlinks", "true")
     os.symlink("target", repo / "link")
-    _write(repo, "sp ace\tand.py", "")  # space and tab; a newline is NTFS-illegal
+    _write(repo, "sp ace.py", "")  # space; tab is rejected by Win32 (Invalid argument)
     _write(repo, "caf\xe9.py", "")
     _git(repo, "add", "-A")
     _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{SHA},sub")
@@ -223,14 +226,14 @@ def test_tree_keeps_symlinks_odd_names_and_gitlinks(repo: Path) -> None:
     entries = {e[3]: e for e in GitReader(repo).tree(_git(repo, "rev-parse", "HEAD"))}
     assert entries["link"][0] == "120000" and entries["link"][2] == 6
     assert entries["sub"] == ("160000", SHA, None, "sub")
-    assert "sp ace\tand.py" in entries
+    assert "sp ace.py" in entries
     assert "caf\xe9.py" in entries
 
 
 @pytest.mark.skipif(
     os.name == "nt",
     reason=(
-        "NTFS forbids :, newline, and a raw 0xff byte in file names, "
+        "NTFS/Win32 forbids :, tab, newline, and a raw 0xff byte in file names, "
         "so the fixture can't be checked out"
     ),
 )

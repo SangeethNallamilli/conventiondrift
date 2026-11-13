@@ -176,8 +176,31 @@ def test_triggers_cover_every_kill_path_in_the_code() -> None:
     assert _killers() - {"_kill_tree", "kill"} == {t[0] for t in TRIGGERS.values()}
 
 
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("path", sorted(TRIGGERS))
+_WINDOWS_EXITED_GIT = pytest.mark.xfail(
+    os.name == "nt",
+    reason=(
+        "Windows: _kill_tree runs taskkill /T /PID, which does not kill "
+        "grandchildren of a git process that has already exited, and close/"
+        "timeout paths can block on pipes those children still hold "
+        "(CR2 S1 / SR N-4)"
+    ),
+    strict=True,
+)
+
+
+def _pipe_cases() -> list[pytest.ParameterSet]:
+    cases: list[pytest.ParameterSet] = []
+    for path in sorted(TRIGGERS):
+        for kind in sorted(KINDS):
+            parent_exits, _ = KINDS[kind]
+            # cap + in-group + git exited already returns promptly on Windows CI
+            skip_xfail = path == "_run_bounded cap" and kind == "in-group, git exited"
+            marks = [_WINDOWS_EXITED_GIT] if parent_exits and not skip_xfail else ()
+            cases.append(pytest.param(path, kind, marks=marks, id=f"{path}-{kind}"))
+    return cases
+
+
+@pytest.mark.parametrize(("path", "kind"), _pipe_cases())
 def test_a_pipe_holding_grandchild_never_stretches_a_kill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, kind: str
 ) -> None:

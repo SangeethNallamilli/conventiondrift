@@ -13,7 +13,9 @@ import re
 import shutil
 import stat
 import subprocess
-from collections.abc import Callable
+import sys
+import tempfile
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,8 @@ from conventiondrift.gitread import GitReader
 
 _REAL_RUN = subprocess.run
 _GIT = shutil.which("git") or "git"
+_TEMP_VARS = ("TEMP", "TMP", "TMPDIR")
+_TEST_GIT_FLAGS = ("-c", "core.autocrlf=false")
 _ENV = {
     "PATH": os.environ.get("PATH", ""),
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -41,10 +45,19 @@ SHA2 = "cd" * 20
 _HUNK = re.compile(rb"(@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@).*")
 
 
+@pytest.fixture(autouse=True)
+def _fixture_git_temp(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Git for Windows has no /tmp: textconv and signature checks need TEMP."""
+    with tempfile.TemporaryDirectory(prefix="conventiondrift-git-temp-") as folder:
+        for name in _TEMP_VARS:
+            monkeypatch.setitem(_ENV, name, folder)
+        yield
+
+
 def _git(repo: Path, *args: str, stdin: bytes | None = None) -> bytes:
     """Test helper only: plain git, no hardening."""
     out = _REAL_RUN(
-        [_GIT, *args],
+        [_GIT, *_TEST_GIT_FLAGS, *args],
         cwd=repo,
         env=dict(_ENV, HOME=str(repo)),
         check=True,
@@ -186,11 +199,64 @@ def _write_lf(path: Path, text: str) -> None:
     path.write_bytes(text.encode("utf-8"))
 
 
+def _config_path(path: Path) -> str:
+    """``path`` as a git config value: forward slashes, so Windows has no ``\\U``."""
+    return path.as_posix()
+
+
 def _require_symlinks() -> None:
     from tests.fixtures.gitrepo import SYMLINK_UNAVAILABLE_REASON, symlinks_available
 
     if not symlinks_available():
         pytest.skip(SYMLINK_UNAVAILABLE_REASON)
+
+
+def _gpg_program(tmp_path: Path, marker: Path) -> Path:
+    """An LF ``#!/bin/sh`` gpg.program (git starts this without a shell)."""
+    program = tmp_path / "fake-gpg.sh"
+    _write_lf(program, f"#!/bin/sh\necho ran >> {_sh_path(marker)}\nexit 1\n")
+    program.chmod(0o755)
+    return program
+
+
+def _textconv_command(tmp_path: Path, marker: Path) -> str:
+    """A Python textconv driver: writes ``marker``, prints TEXTCONV, echoes its input."""
+    script = tmp_path / "fake-textconv.py"
+    _write_lf(
+        script,
+        "import pathlib, sys\n"
+        f"pathlib.Path({marker.as_posix()!r}).write_text('ran\\n')\n"
+        "sys.stdout.buffer.write(b'TEXTCONV\\n')\n"
+        "try:\n"
+        "    sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())\n"
+        "except (IndexError, OSError):\n"
+        "    pass\n",
+    )
+    python = Path(sys.executable).as_posix()
+    return f'"{python}" "{script.as_posix()}"'
+
+
+@pytest.fixture
+def git_temp_in_private_home(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Give gitread's git a temp dir so a planted gpg/textconv CAN run on Windows.
+
+    Production's env carries no TEMP/TMP/TMPDIR, so on Windows git cannot create
+    the temp file those programs need. A load-bearing drop-the-pin test must
+    show the pin, not a missing temp dir, is what stops them (same as #40).
+    """
+    real = gitread._environment
+    handed_out: list[str] = []
+
+    def with_temp(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
+        env = real(home, search_path, repo_dir)
+        folder = os.path.join(home, "tmp")
+        os.makedirs(folder, exist_ok=True)
+        handed_out.append(folder)
+        env.update(dict.fromkeys(_TEMP_VARS, folder))
+        return env
+
+    monkeypatch.setattr(gitread, "_environment", with_temp)
+    return handed_out
 
 
 def _make_hostile(
@@ -199,16 +265,9 @@ def _make_hostile(
     config: tuple[tuple[str, str], ...] = HOSTILE_CONFIG,
     attributes: tuple[str, ...] = HOSTILE_ATTRIBUTES,
 ) -> None:
-    gpg = repo.parent / "fake-gpg"
-    _write_lf(gpg, f"#!/bin/sh\necho ran >> {_sh_path(marker)}\nexit 1\n")
-    gpg.chmod(0o755)
+    gpg = _gpg_program(repo.parent, marker)
     textconv_marker = marker.parent / "textconv-ran"
-    textconv = repo.parent / "fake-textconv"
-    _write_lf(
-        textconv,
-        f'#!/bin/sh\necho ran >> {_sh_path(textconv_marker)}\necho TEXTCONV\ncat "$1"\n',
-    )
-    textconv.chmod(0o755)
+    textconv = _textconv_command(repo.parent, textconv_marker)
     order = repo.parent / "order.txt"
     _write_lf(order, "z.py\nnotes.txt\nsub\n")
     for key, value in config:
@@ -216,7 +275,7 @@ def _make_hostile(
             repo,
             "config",
             key,
-            value.format(gpg=gpg.as_posix(), order=order.as_posix(), textconv=textconv.as_posix()),
+            value.format(gpg=_config_path(gpg), order=_config_path(order), textconv=textconv),
         )
     if attributes:
         _write(repo, ".gitattributes", "".join(line + "\n" for line in attributes))
@@ -491,7 +550,10 @@ def _drop(monkeypatch: pytest.MonkeyPatch, *pins: str) -> None:
 
 @pytest.mark.parametrize("pin", sorted(PIN_DEFEATS))
 def test_dropping_any_one_pin_breaks_the_comparison(
-    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch, pin: str
+    history: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    pin: str,
+    git_temp_in_private_home: list[str],
 ) -> None:
     repo, root, head, marker = history
     _drop(monkeypatch, pin)
@@ -569,7 +631,9 @@ def test_each_backstop_pin_is_present_where_i14_lists_it(
 
 
 def test_dropping_both_signature_guards_runs_gpg(
-    history: tuple[Path, str, str, Path], monkeypatch: pytest.MonkeyPatch
+    history: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    git_temp_in_private_home: list[str],
 ) -> None:
     repo, _, head, marker = history
     _drop(monkeypatch, *PIN_PAIRED)
