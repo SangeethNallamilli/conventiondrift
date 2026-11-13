@@ -8,8 +8,9 @@ child's ``sys.path``, so files planted in an analyzed repo (``struct.py``,
 
 * **Parent pre-check** (``pool_allowed``), before any process exists: the pool
   runs only when ``sys.flags.isolated or sys.flags.safe_path``, or when the
-  environment is honoured (no ``-E``), ``PYTHONSAFEPATH`` is set for every child,
-  and no ``sys.path`` entry is ``""``, the current folder or the analyzed root
+  environment is honoured (no ``-E``), ``PYTHONSAFEPATH`` is unset or exactly
+  ``"1"`` and is then set for every child, and no ``sys.path`` entry is ``""``,
+  ``"."``, the current folder or the analyzed root (compared by ``path_key``)
   (spawn copies the parent's ``sys.path`` into each child). Otherwise C7 runs
   the checkers inline.
 * **Worker backstop** (``worker_backstop``), the pool initializer, which runs
@@ -52,23 +53,36 @@ class Flags(Protocol):
     def ignore_environment(self) -> int: ...
 
 
-def _key(path: str) -> str:
-    return os.path.normcase(os.path.realpath(path))
+CURRENT_FOLDER_SPELLINGS = ("", os.curdir)
+"""``sys.path`` entries that always mean the current folder (SR condition (a))."""
+
+
+def _strip_separators(path: str) -> str:
+    """``path`` without trailing separators, except a root's own separator."""
+    drive, rest = os.path.splitdrive(path)
+    stripped = rest.rstrip(os.sep + (os.altsep or ""))
+    return drive + (stripped or rest[:1])
+
+
+def path_key(path: str) -> str:
+    """The form two folders are compared in: realpath, then trailing separators
+    stripped, then ``normcase`` (I-13 C7 ruling 8, SR condition (a))."""
+    return os.path.normcase(_strip_separators(os.path.realpath(path)))
 
 
 def unsafe_path_entries(entries: Iterable[object], cwd: str, root: str | None) -> bool:
-    """Whether any entry is ``""``, the current folder or the analyzed root.
+    """Whether any entry is ``""``, ``"."``, the current folder or the analyzed root.
 
-    Entries are compared as resolved, case-normalized paths, so ``"."``, a
-    relative path or a symlink to the folder counts too. An entry that isn't a
-    ``str`` or can't be resolved counts as unsafe (fail closed).
+    Entries are compared by ``path_key``, so a relative path or a symlink to
+    either folder counts too. An entry that isn't a ``str`` or can't be
+    resolved counts as unsafe (fail closed).
     """
-    banned = {_key(cwd)} if root is None else {_key(cwd), _key(root)}
+    banned = {path_key(cwd)} if root is None else {path_key(cwd), path_key(root)}
     for entry in entries:
-        if not isinstance(entry, str) or entry == "":
+        if not isinstance(entry, str) or entry in CURRENT_FOLDER_SPELLINGS:
             return True
         try:
-            if _key(entry) in banned:
+            if path_key(entry) in banned:
                 return True
         except (OSError, ValueError):
             return True
@@ -87,19 +101,23 @@ def pool_allowed(
 
     With ``-I`` or ``-P`` (``isolated``/``safe_path``) children inherit the flag,
     so the pool is allowed and ``environ`` is left alone. Otherwise the pool is
-    allowed only when ``-E`` is off (children would ignore ``PYTHONSAFEPATH``)
-    and no ``path`` entry is unsafe (see ``unsafe_path_entries``); then
-    ``PYTHONSAFEPATH=1`` is set in ``environ`` and stays set afterwards. Any other
-    case returns ``False`` and C7 runs inline.
+    allowed only when ``-E`` is off (children would ignore ``PYTHONSAFEPATH``),
+    ``PYTHONSAFEPATH`` is unset or exactly ``"1"`` (any other value, empty
+    included, counts as unsafe), and no ``path`` entry is unsafe (see
+    ``unsafe_path_entries``); then ``PYTHONSAFEPATH=1`` is set in ``environ`` and
+    stays set afterwards. Any other case returns ``False`` and C7 runs inline.
     """
     if flags.isolated or flags.safe_path:
         return True
     if flags.ignore_environment:
         return False
+    env = os.environ if environ is None else environ
+    if env.get(SAFE_PATH_VAR, SAFE_PATH_VALUE) != SAFE_PATH_VALUE:
+        return False
     entries = sys.path if path is None else path
     if unsafe_path_entries(entries, os.getcwd() if cwd is None else cwd, root):
         return False
-    (os.environ if environ is None else environ)[SAFE_PATH_VAR] = SAFE_PATH_VALUE
+    env[SAFE_PATH_VAR] = SAFE_PATH_VALUE
     return True
 
 

@@ -117,12 +117,16 @@ class Launch:
         return {r["pid"] for r in self.records} - {self.pid}
 
 
-def _launch(argv: list[str], repo: Path, records: Path, env: dict[str, str]) -> Launch:
+def _launch(
+    argv: list[str], repo: Path, records: Path, env: dict[str, str], *, cwd: Path | None = None
+) -> Launch:
+    """Run the driver on ``repo``, from ``repo`` unless ``cwd`` is given."""
     markers = records.parent / "markers"
     records.mkdir()
+    extra = [] if cwd is None else [str(repo)]
     done = subprocess.run(  # noqa: S603 -- fixed argv: this interpreter and test files
-        [*argv, str(records)],
-        cwd=repo,
+        [*argv, str(records), *extra],
+        cwd=repo if cwd is None else cwd,
         env=env,
         capture_output=True,
         text=True,
@@ -224,3 +228,28 @@ def test_python_dash_m_conventiondrift_from_the_repo_imports_no_repo_module(
     )
     assert done.returncode == 0, done.stderr
     assert _markers(markers) == []
+
+
+@pytest.mark.parametrize("reach", ["symlink", "relative path"])
+def test_pythonpath_reaching_the_repo_root_runs_the_checkers_inline(
+    reach: str, setup: tuple[Path, Path, Path, Path]
+) -> None:
+    # Launched from another folder, so only the repo_root rule (realpath of the
+    # root and of each sys.path entry) can see that PYTHONPATH names the repo.
+    # The launcher itself imports the planted modules (PYTHONPATH says so, and
+    # C7 can't change that), so only markers from other processes count.
+    base, markers, hostile, clean = setup
+    elsewhere = base / "elsewhere"
+    elsewhere.mkdir()
+    if reach == "symlink":
+        entry = base / "repo-link"
+        entry.symlink_to(hostile, target_is_directory=True)
+        pythonpath = str(entry)
+    else:
+        pythonpath = os.path.join(os.pardir, hostile.name)
+    env = dict(_env(), PYTHONPATH=pythonpath)
+    script = str(_wrapper(base))
+    run = _launch([sys.executable, script], hostile, base / "rec-pp", env, cwd=elsewhere)
+    _assert_inline(run)
+    assert {m.rsplit("-", 1)[1] for m in _markers(markers)} <= {str(run.pid)}
+    assert run.report == _clean_report(base, clean).report

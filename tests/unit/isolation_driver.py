@@ -7,7 +7,8 @@ console-script wrapper (with and without ``-I`` or ``-E``) and as
 two stand-in checkers and ``max_workers=2``, and prints one JSON object: the
 report, the worker count (0 means the batches ran inline) and its own pid.
 
-Usage: ``isolation_driver <record dir>``.
+Usage: ``isolation_driver <record dir> [<repo dir>]``. The repo defaults to the
+current folder; it is passed to ``analyze`` as ``repo_root``, as T-028 does.
 """
 
 import json
@@ -27,7 +28,7 @@ def _never(path: str) -> bool:
 
 def main() -> int:
     record_dir = sys.argv[1]
-    here = Path.cwd()
+    here = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.cwd()
     files = [
         PyFile(p.relative_to(here).as_posix(), p.read_bytes())
         for p in sorted((here / "pkg").rglob("*.py"))
@@ -36,7 +37,7 @@ def main() -> int:
         "logging": RecordingChecker(record_dir),
         "http-client": CallChecker("http-client", frozenset({"requests"})),
     }
-    result = analyze(files, checkers=checkers, is_script=_never, max_workers=2)
+    result = analyze(files, checkers=checkers, is_script=_never, max_workers=2, repo_root=str(here))
     report = {
         "sites": {
             cid: [[s.file, s.line, s.col, s.option] for s in result.sites(cid)]

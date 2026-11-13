@@ -80,9 +80,9 @@ def _run_batches(
     """Run the batches inline (one batch, ``max_workers=1``, or the isolation
     pre-check refuses the pool) or in a spawn pool.
 
-    ``root`` is the analyzed repo root for the isolation checks; ``analyze``
-    passes ``None`` until I-11 carries one (only ``""`` and the current folder
-    are compared then). Returns the outcomes in batch order and the number of
+    ``root`` is the analyzed repo root for the isolation checks (``analyze``'s
+    ``repo_root``; with ``None`` only ``""``, ``"."`` and the current folder are
+    compared). Returns the outcomes in batch order and the number of
     pool workers (0 inline).
     """
     if max_workers is not None and max_workers < 1:
@@ -191,6 +191,7 @@ def analyze(
     entry_points: frozenset[str] = frozenset(),
     manifests: Sequence[ManifestFile] = (),
     max_workers: int | None = None,
+    repo_root: str | None = None,
 ) -> Analysis:
     """Run every checker over one side's files (I-11 C7).
 
@@ -198,7 +199,9 @@ def analyze(
     enabled ones). ``is_script(path)`` says whether a path matches the effective
     logging ``script-paths`` (I-6, B2); a path in ``entry_points`` (console
     scripts, A-4) is a script too. ``max_workers=None`` sizes the pool to the
-    CPU count; ``1`` runs inline. Paths must be unique.
+    CPU count; ``1`` runs inline. Paths must be unique. ``repo_root`` is the
+    absolute analyzed root (T-028 always passes it): the isolation pre-check
+    and every worker's check also refuse it on ``sys.path`` (I-13 C7 ruling 8).
 
     Raises ``ValueError`` for a malformed registry or duplicate paths (caller
     bugs) and ``ComponentError("checkers")`` if the pool itself breaks.
@@ -211,7 +214,7 @@ def analyze(
         FileJob(f.path, f.data, is_test_file(f.path), f.path in entry_points or is_script(f.path))
         for f in sorted(py_files, key=lambda f: f.path.encode("utf-8", "surrogateescape"))
     ]
-    outcomes, workers = _run_batches(ordered, batches(jobs), max_workers)
+    outcomes, workers = _run_batches(ordered, batches(jobs), max_workers, repo_root)
 
     failed: dict[str, str] = {}
     for outcome in outcomes:

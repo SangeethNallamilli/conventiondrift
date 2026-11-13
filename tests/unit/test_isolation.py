@@ -16,9 +16,11 @@ from conventiondrift import isolation
 from conventiondrift.errors import ComponentError
 from conventiondrift.isolation import (
     BACKSTOP_MESSAGE,
+    CURRENT_FOLDER_SPELLINGS,
     SAFE_PATH_VALUE,
     SAFE_PATH_VAR,
     check_worker,
+    path_key,
     pool_allowed,
     safe_path_still_set,
     unsafe_path_entries,
@@ -137,6 +139,70 @@ def test_without_a_root_only_empty_and_cwd_are_compared(dirs: tuple[str, str, st
     cwd, root, site = dirs
     assert unsafe_path_entries([site, root], cwd, None) is False
     assert unsafe_path_entries([site, cwd], cwd, None) is True
+
+
+@pytest.mark.parametrize("value", ["0", "", "true", "yes", " 1", "1 ", "01"])
+def test_the_pre_check_counts_pythonsafepath_only_when_it_is_exactly_1(
+    value: str, dirs: tuple[str, str, str]
+) -> None:
+    cwd, root, site = dirs
+    env = {"PYTHONSAFEPATH": value}
+    assert pool_allowed(root, flags=PLAIN, environ=env, path=[site], cwd=cwd) is False
+    assert env == {"PYTHONSAFEPATH": value}
+
+
+def test_the_pre_check_keeps_an_existing_pythonsafepath_of_1(dirs: tuple[str, str, str]) -> None:
+    cwd, root, site = dirs
+    env = {"PYTHONSAFEPATH": "1"}
+    assert pool_allowed(root, flags=PLAIN, environ=env, path=[site], cwd=cwd) is True
+    assert env == {"PYTHONSAFEPATH": "1"}
+
+
+def test_the_current_folder_spellings() -> None:
+    assert CURRENT_FOLDER_SPELLINGS == ("", ".")
+
+
+def test_dot_counts_as_the_current_folder_without_resolving_it(
+    dirs: tuple[str, str, str],
+) -> None:
+    # The cwd passed in is not the process's real folder, so only the
+    # spelling rule (not realpath) can catch ".".
+    cwd, root, site = dirs
+    assert unsafe_path_entries([site, "."], cwd, root) is True
+
+
+@pytest.mark.parametrize("which", ["entry", "root"])
+def test_trailing_separators_do_not_hide_the_root(which: str, dirs: tuple[str, str, str]) -> None:
+    cwd, root, site = dirs
+    slashed = root + os.sep + os.sep
+    entry, given = (slashed, root) if which == "entry" else (root, slashed)
+    assert unsafe_path_entries([site, entry], cwd, given) is True
+
+
+def test_the_path_key_strips_trailing_separators_but_keeps_a_root(tmp_path: Path) -> None:
+    folder = str(tmp_path)
+    fs_root = os.path.abspath(os.sep)
+    assert (
+        path_key(folder + os.sep) == path_key(folder) == os.path.normcase(os.path.realpath(folder))
+    )
+    assert path_key(fs_root) == os.path.normcase(fs_root)
+    assert path_key(fs_root).endswith(os.sep)
+
+
+def test_the_path_key_is_case_normalized(tmp_path: Path) -> None:
+    folder = os.path.realpath(tmp_path)
+    assert path_key(folder) == os.path.normcase(folder)
+
+
+def test_the_root_is_compared_through_a_symlink(tmp_path: Path) -> None:
+    real = tmp_path / "repo"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    assert unsafe_path_entries([str(link)], str(cwd), str(real)) is True
+    assert unsafe_path_entries([str(real)], str(cwd), str(link)) is True
 
 
 # --- PYTHONSAFEPATH for the pool's lifetime ------------------------------------------------

@@ -384,6 +384,55 @@ def test_an_unsafe_sys_path_runs_the_checkers_inline(
     assert "PYTHONSAFEPATH" not in os.environ
 
 
+@pytest.mark.parametrize("spelling", ["as given", "with a trailing separator"])
+def test_the_repo_root_on_sys_path_runs_the_checkers_inline(
+    spelling: str, outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    analyzed = tmp_path / "analyzed"
+    analyzed.mkdir()
+    monkeypatch.syspath_prepend(str(analyzed))
+    root = str(analyzed) + (os.sep if spelling == "with a trailing separator" else "")
+    result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2, repo_root=root)
+    assert result.workers == 0
+    assert len(result.sites("logging")) == 65
+    assert "PYTHONSAFEPATH" not in os.environ
+
+
+def test_without_the_repo_root_the_same_sys_path_uses_the_pool(
+    outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control for the test above: only repo_root makes the folder unsafe.
+    analyzed = tmp_path / "analyzed"
+    analyzed.mkdir()
+    monkeypatch.syspath_prepend(str(analyzed))
+    result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert result.workers == 2
+
+
+def test_the_worker_backstop_also_refuses_the_repo_root(
+    outside_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    analyzed = tmp_path / "analyzed"
+    analyzed.mkdir()
+    monkeypatch.syspath_prepend(str(analyzed))
+    monkeypatch.setattr("conventiondrift.checkers.pool.pool_allowed", lambda root: True)
+    with pytest.raises(ComponentError) as info:
+        analyze(
+            _many(65), checkers=reg(PRINT), is_script=never, max_workers=2, repo_root=str(analyzed)
+        )
+    assert info.value.message == "process pool failed: BrokenProcessPool"
+
+
+@pytest.mark.parametrize("value", ["0", "", "true", " 1", "1 "])
+def test_a_pythonsafepath_other_than_1_runs_the_checkers_inline(
+    value: str, outside_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTHONSAFEPATH", value)
+    result = analyze(_many(65), checkers=reg(PRINT), is_script=never, max_workers=2)
+    assert result.workers == 0
+    assert os.environ["PYTHONSAFEPATH"] == value
+
+
 def test_the_worker_backstop_runs_in_every_worker_and_fails_closed(
     outside_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
