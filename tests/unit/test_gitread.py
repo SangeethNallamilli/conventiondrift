@@ -272,6 +272,9 @@ HARDENING = [
     "-c", "core.pager=cat",
     "-c", "protocol.allow=never",
     "-c", "log.showSignature=false",
+    "-c", "core.quotePath=true",
+    "-c", "i18n.logOutputEncoding=UTF-8",
+    "-c", "log.diffMerges=first-parent",
     "-c", "safe.bareRepository=explicit",
 ]  # fmt: skip
 
@@ -356,10 +359,12 @@ def test_environment_is_fixed_and_nothing_else_leaks(
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_CEILING_DIRECTORIES": os.path.dirname(os.path.realpath(repo)),
         "HOME": env["HOME"],
+        "GIT_GRAFT_FILE": env["GIT_GRAFT_FILE"],
         **windows_only,
     }
     assert env["HOME"] != str(repo)
-    assert spy[0]["home_listing"] == []
+    assert env["GIT_GRAFT_FILE"] == str(Path(env["HOME"]) / "conventiondrift-grafts")
+    assert spy[0]["home_listing"] == ["conventiondrift-grafts"]
     assert not os.path.exists(env["HOME"])  # removed after the call
 
 
@@ -1711,6 +1716,32 @@ def test_windows_rooted_entry_without_a_drive_is_dropped(
     assert len(dropped) == 3
 
 
+def _rooted_is_absolute(path: str) -> bool:
+    """Python 3.11's ``ntpath.isabs`` rule: a rooted path counts even without a drive."""
+    return ntpath.splitdrive(path)[1][:1] in ("\\", "/")
+
+
+def test_rooted_entries_are_dropped_even_where_isabs_accepts_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _split_path must use _is_absolute_entry, not os.path.isabs: pin the 3.11
+    # isabs rule on every Python so the two differ for a drive-less rooted entry.
+    real_isabs = ntpath.isabs
+    monkeypatch.setenv("PATH", "\\tools;/usr/bin;C:\\tools")
+    with _simulated_windows(monkeypatch, cwd="D:\\work"):
+        monkeypatch.setattr(ntpath, "isabs", _rooted_is_absolute)
+        try:
+            isabs = [ntpath.isabs(e) for e in ("\\tools", "/usr/bin", "C:\\tools")]
+            absolute = [gitread._is_absolute_entry(e) for e in ("\\tools", "/usr/bin", "C:\\tools")]
+            kept, dropped = gitread._split_path([])  # no untrusted folder to catch them
+        finally:
+            monkeypatch.setattr(ntpath, "isabs", real_isabs)
+    assert isabs == [True, True, True]
+    assert absolute == [False, False, True]
+    assert kept == ["C:\\tools"]  # both rooted entries are dropped, never kept
+    assert len(dropped) == 2
+
+
 # --- I-14 / D-TL-18: version check ---------------------------------------------
 
 
@@ -1850,10 +1881,12 @@ def test_version_check_runs_once_first_with_fixed_env_and_no_flags(
     assert all(a[0] == argvs[0][0] for a in argvs)  # the same resolved git every time
     version_kwargs = seen[0][1]
     # I-11 C3: SYSTEMROOT too, only when os.name == "nt" (every Windows host sets it).
-    expected = {*gitread.FIXED_ENV, "PATH", "HOME", "GIT_CEILING_DIRECTORIES"}
+    expected = {*gitread.FIXED_ENV, "PATH", "HOME", "GIT_CEILING_DIRECTORIES", "GIT_GRAFT_FILE"}
     if os.name == "nt":
         expected.add("SYSTEMROOT")
     assert set(version_kwargs["env"]) == expected
+    graft = version_kwargs["env"]["GIT_GRAFT_FILE"]
+    assert graft == str(Path(version_kwargs["env"]["HOME"]) / "conventiondrift-grafts")
     assert version_kwargs["timeout"] == gitread.GIT_TIMEOUT_SECONDS
     assert version_kwargs["max_stdout"] == gitread.SMALL_OUTPUT_MAX_BYTES
 

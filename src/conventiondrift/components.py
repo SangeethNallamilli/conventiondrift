@@ -5,7 +5,7 @@ bundle that tests pass to ``core.run``. Every field left as ``None`` means
 "use the production default"; T-028 wires the defaults.
 """
 
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,13 +37,22 @@ class GitReaderProtocol(Protocol):
 
     def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]: ...
 
-    def patches(self, from_sha: str, to_sha: str) -> Iterator[bytes]: ...
+    def patches(self, from_sha: str | None, to_sha: str) -> Generator[bytes, None, None]:
+        """Newest commit first, chunks of at most 1 MiB; C8 enforces the byte cap (I-14 item 9).
+
+        A generator, so C8 can ``.close()`` it at its cap without a cast.
+        """
+        ...
 
     def tree(self, sha: str) -> Sequence[TreeEntry]: ...
 
     def blob(self, oid: str, max_bytes: int) -> bytes: ...
 
     def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]: ...
+
+    def close(self) -> None:
+        """Kill and reap the long-lived cat-file processes; idempotent (I-14 item 9)."""
+        ...
 
 
 class Extractor(Protocol):

@@ -30,28 +30,36 @@ each reader runs ``git --version`` and anything older or unparsable raises
 ``GitTooOld`` (I-14), failing closed.
 
 Part 1 (T-007): the runner, ``resolve``, ``is_shallow``, ``has_object``,
-``merge_base`` and ``commit_date``. ``tree``, ``blob``, ``changed_files``,
-``first_parent_chain`` and ``patches`` are T-008; they reuse :meth:`_command`
-and :func:`_environment` (``blob`` needs a streamed ``cat-file --batch``, so it
-can check the header size before reading the body).
+``merge_base`` and ``commit_date``. Part 2 (T-008): ``tree``, ``blob``,
+``changed_files``, ``first_parent_chain`` and ``patches``, through the same
+bounded runner, each with its own stdout cap. ``blob`` reads the
+``cat-file --batch-check`` header first, so an oversized body is never read.
+Signatures follow INTERFACES I-14 ``GitReaderProtocol``.
 """
 
+import contextlib
 import io
 import ntpath
 import os
+import queue
 import re
+import signal
+import stat
 import string
 import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
+from conventiondrift.components import ChangedFile, TreeEntry
 from conventiondrift.errors import (
     ComponentError,
+    FileSkipped,
     GitTooOld,
     GitUnavailable,
     UnresolvableRevision,
@@ -94,6 +102,13 @@ HARDENING_CONFIG: tuple[str, ...] = (
     "core.pager=cat",
     "protocol.allow=never",
     "log.showSignature=false",
+    # I-14 item 9 diff-config pins: C-quoted paths and UTF-8 output, whatever the repo says.
+    "core.quotePath=true",
+    "i18n.logOutputEncoding=UTF-8",
+    # I-14 item 9 / SR #29 M-1: keep first-parent merge diffs under -m.
+    # git >= 2.31 honours repo log.diffMerges; 2.30 ignores the unknown key
+    # and already defaults to this.
+    "log.diffMerges=first-parent",
     # SR-014 low: never discover a bare repository implicitly (git >= 2.38; older
     # git ignores the unknown key, and the run is then as before).
     "safe.bareRepository=explicit",
@@ -118,23 +133,71 @@ FIXED_ENV: dict[str, str] = {
 
 #: R2.6 (DESIGN §10 S4): at most 10,000 first-parent commits walked.
 MAX_COUNT_CAP: int = 10_000
+#: The monotonic clock every gitread deadline uses (a test seam, like ``_start_batch``).
+_clock = time.monotonic
+#: Largest chunk ``patches`` yields (I-14 item 9). C8 counts patch bytes, not C3.
+PATCH_CHUNK_BYTES: int = 1024 * 1024
+#: Most stdout chunks held between a long-lived git and its reader (back-pressure).
+_QUEUE_CHUNKS = 16
+#: Stdout cap for the ``ls-tree`` and ``diff-tree`` listings (I-14 bounds; T-008).
+#: About 500,000 entries at 128 bytes each, well past R2.6's 100,000 ``.py`` files.
+LISTING_MAX_BYTES: int = 64 * 1024 * 1024
 _MAX_COUNT_RE = re.compile(r"--max-count=([1-9][0-9]*)", re.ASCII)
 #: SR-014 low: these must carry exactly one ``--max-count=N`` with 1 <= N <= the cap.
 _MAX_COUNT_SUBCOMMANDS: frozenset[str] = frozenset({"rev-list", "log"})
+
+#: Placeholder for ``-O<orderfile>`` (I-14 item 9): replaced, after the allowlist
+#: check, by ``-O`` plus the absolute path of an empty file gitread creates in the
+#: call's private ``HOME`` (:func:`_with_orderfile`). Never chosen by config or env.
+ORDERFILE_ARG = "-O<orderfile>"
+_ORDERFILE_NAME = "conventiondrift-orderfile"
+#: Empty file that ``GIT_GRAFT_FILE`` points at (I-14 item 9 / SR #29 L-6), so
+#: ``.git/info/grafts`` is never read. Created in the call's private ``HOME``.
+_GRAFTFILE_NAME = "conventiondrift-grafts"
+#: I-14 item 9 pins shared by ``patches`` and ``changed_files``: fixed rename
+#: threshold and limit, no ``diff.relative``, and an empty order file.
+_DIFF_PINS: frozenset[str] = frozenset({"-M50%", "-l1000", "--no-relative", ORDERFILE_ARG})
 
 #: SR-014 low: the options each subcommand may take, before ``--end-of-options``.
 #: Everything after ``--end-of-options`` is an operand (validated by the caller).
 #: T-008 extends this for its operations; anything not listed is refused.
 OPTION_ALLOWLIST: dict[str, frozenset[str]] = {
     "rev-parse": frozenset({"--verify", "--is-shallow-repository"}),
-    "cat-file": frozenset({"-e"}),
+    # T-008 blob: object ids go on stdin, never on the command line (DESIGN §3).
+    "cat-file": frozenset({"-e", "--batch-check", "--batch"}),
     "merge-base": frozenset(),
-    "log": frozenset({"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}),
-    "rev-list": frozenset({"--first-parent"}),
+    "log": frozenset(
+        {"--no-walk", "--format=%cI", "--first-parent", "-p", "-U0"}
+        # T-008 patches: merge diffs against the first parent (F-1), root diff, a
+        # commit marker with no message, and the I-14 item 9 diff-config pins.
+        | {"-m", "--root", "--format=%x00%H", "--no-show-signature"}
+        | _DIFF_PINS
+        | {"--text", "--src-prefix=a/", "--dst-prefix=b/", "--diff-algorithm=myers"}
+        | {"--no-indent-heuristic", "--inter-hunk-context=0", "--submodule=short"}
+        | {"--full-index"}
+    ),
+    "rev-list": frozenset({"--first-parent", "--timestamp"}),
     "ls-tree": frozenset({"-r", "-l", "-z", "--full-tree"}),
-    "diff-tree": frozenset({"-r", "-z", "-M", "-p", "--no-commit-id"}),
+    "diff-tree": frozenset(
+        {"-r", "-z", "-M", "-p", "--no-commit-id", "--name-status"} | _DIFF_PINS
+    ),
     "show": frozenset(),
 }
+
+
+#: I-14 item 9 option sets ("Argv and stream details": the order is free, and
+#: ``--end-of-options`` and the revisions come last). ``_command`` adds
+#: ``--no-ext-diff --no-textconv --no-color`` (DESIGN §3) in front.
+_PATCHES_ARGS: tuple[str, ...] = (
+    "--first-parent", f"--max-count={MAX_COUNT_CAP}", "-m", "--root", "-p", "-U0", "--text",
+    "--src-prefix=a/", "--dst-prefix=b/", "-M50%", "-l1000", "--full-index",
+    "--diff-algorithm=myers", "--no-indent-heuristic", "--inter-hunk-context=0",
+    "--no-relative", "--submodule=short", "--no-show-signature", ORDERFILE_ARG,
+    "--format=%x00%H",
+)  # fmt: skip
+_CHANGED_FILES_ARGS: tuple[str, ...] = (
+    "-r", "-z", "--name-status", "-M50%", "-l1000", "--no-relative", ORDERFILE_ARG,
+)  # fmt: skip
 
 
 def _check_options(subcommand: str, args: Sequence[str]) -> None:
@@ -403,6 +466,106 @@ def _environment(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
     return env
 
 
+# T-008 output formats. Object ids are 40 or 64 lowercase hex (I-11 C3).
+_OID = rb"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+# ls-tree -r -l -z: "<mode> <type> <oid> <padded size or ->\t<path>"; -r lists no trees.
+_TREE_RECORD = re.compile(
+    rb"([0-7]{6}) (blob|commit) (" + _OID + rb") +(-|[0-9]{1,20})\t(.+)", re.S
+)
+# cat-file --batch-check / --batch header: "<oid> <type> <size>\n".
+_BATCH_HEADER = re.compile(rb"(" + _OID + rb") ([a-z]{1,8}) ([0-9]{1,20})\n")
+# rev-list --timestamp: "<committer epoch seconds> <sha>".
+_CHAIN_LINE = re.compile(rb"(-?[0-9]{1,20}) (" + _OID + rb")")
+_CHAIN_LINE_MAX = 1 + 20 + 1 + 64 + 1
+# diff-tree --name-status -z: a status letter (with a score for R and C), then paths.
+_STATUS = re.compile(rb"([ADMT])|([RC])[0-9]{1,3}")
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _bad_output() -> ComponentError:
+    return ComponentError(_COMPONENT, "unexpected git output")
+
+
+def _nul_records(data: bytes) -> list[bytes]:
+    """Split ``-z`` output; it must be empty or end in NUL, with no empty record."""
+    if not data:
+        return []
+    records = data.split(b"\0")
+    if records.pop() != b"" or b"" in records:
+        raise _bad_output()
+    return records
+
+
+def _empty_home_file(home: str, name: str, what: str) -> str:
+    """Create an empty 0600 file in ``home``. A path that already exists is refused.
+
+    Uses ``O_CREAT | O_EXCL`` (and ``O_NOFOLLOW`` where it exists), so a planted
+    symlink or other file is not followed or reused.
+    """
+    path = os.path.join(os.path.abspath(home), name)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        os.close(os.open(path, flags, 0o600))
+    except OSError as exc:
+        raise ComponentError(_COMPONENT, f"{what} could not be created") from exc
+    return path
+
+
+def _with_orderfile(argv: list[str], home: str) -> list[str]:
+    """``argv`` with :data:`ORDERFILE_ARG` replaced by ``-O<home>/<fixed name>``.
+
+    The file is created empty with ``O_CREAT | O_EXCL`` (and ``O_NOFOLLOW`` where it
+    exists), mode 0600, inside the call's fresh private ``HOME``; a file already
+    there is refused rather than reused. Without the placeholder, ``argv`` is
+    returned unchanged and nothing is created.
+    """
+    if ORDERFILE_ARG not in argv:
+        return argv
+    path = _empty_home_file(home, _ORDERFILE_NAME, "order file")
+    return ["-O" + path if arg == ORDERFILE_ARG else arg for arg in argv]
+
+
+def _graft_file(home: str) -> str:
+    """Absolute path of the empty ``GIT_GRAFT_FILE`` in ``home``.
+
+    Created the same way as the order file. A second call on the same ``home``
+    (the version check, then the real call, or the two ``cat-file`` processes)
+    reuses the existing file only when it is still a regular empty file.
+    """
+    path = os.path.join(os.path.abspath(home), _GRAFTFILE_NAME)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        os.close(os.open(path, flags, 0o600))
+        return path
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ComponentError(_COMPONENT, "graft file could not be created") from exc
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise ComponentError(_COMPONENT, "graft file could not be created") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_size != 0:
+        raise ComponentError(_COMPONENT, "graft file could not be created")
+    return path
+
+
+def _call_env(home: str, search_path: str, repo_dir: Path) -> dict[str, str]:
+    """:func:`_environment` plus ``GIT_GRAFT_FILE`` pointing at an empty 0600 file."""
+    env = _environment(home, search_path, repo_dir)
+    env["GIT_GRAFT_FILE"] = _graft_file(home)
+    return env
+
+
+def _path(raw: bytes) -> str:
+    """A repo path from git's raw bytes: UTF-8, with ``surrogateescape`` for the rest.
+
+    Lossless and never fails the run on one odd name; any lone surrogate left in
+    the text is shown as ``U+XXXX`` by ``render/escape.py`` (category Cs, I-14).
+    """
+    return raw.decode("utf-8", "surrogateescape")
+
+
 @dataclass(frozen=True)
 class _Output:
     returncode: int
@@ -441,6 +604,90 @@ def _drain(
         return
 
 
+#: Windows ``CREATE_NEW_PROCESS_GROUP`` (the constant exists only on Windows Pythons).
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+#: Wall-clock limit for ``taskkill`` itself, in seconds.
+_TASKKILL_TIMEOUT_SECONDS = 10.0
+#: Longest wait to reap git after the kill, and for each reader thread to finish
+#: (CR2 S1: no kill or close path waits without a bound).
+_REAP_TIMEOUT_SECONDS = 5.0
+_READER_JOIN_SECONDS = 1.0
+
+
+def _process_group_kwargs() -> dict[str, Any]:
+    """Popen options that put git and everything it starts in one killable group (SR N-4).
+
+    POSIX: a new session, so its process group id is git's pid. Windows: a new
+    process group, so ``taskkill /T`` can end the ``git.exe`` launcher's children.
+    """
+    if os.name == "nt":
+        return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _system32() -> str:
+    """The absolute Windows system folder, from the OS, never from ``PATH`` or env."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(260)
+    length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, 260)  # type: ignore[attr-defined,unused-ignore]
+    if not 0 < length < 260:
+        raise OSError("system directory not found")
+    return buffer.value
+
+
+def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill git and every process it started, then reap git (SR N-4).
+
+    POSIX: ``SIGKILL`` to git's process group (its own session, see
+    :func:`_process_group_kwargs`); this also reaches a grandchild that outlived
+    git. Windows: ``<System32>\\taskkill.exe /T /F /PID <pid>`` by absolute path,
+    never looked up on ``PATH``. Either way ``proc.kill()`` follows as a fallback,
+    and git is reaped, waiting at most :data:`_REAP_TIMEOUT_SECONDS`. Every kill
+    path calls this, also when git itself has already exited (CR2 S1), because a
+    grandchild may still hold its pipes.
+    """
+    if os.name == "nt":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(  # noqa: S603 (absolute System32 path, fixed argv, no shell)
+                [os.path.join(_system32(), "taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                timeout=_TASKKILL_TIMEOUT_SECONDS,
+                check=False,
+            )
+    else:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(_REAP_TIMEOUT_SECONDS)
+
+
+def _close_when_done(stream: object, reader: threading.Thread) -> None:
+    """Close a pipe once its reader is done, or close the raw fd if it is not.
+
+    Closing a buffered pipe waits on the lock a blocked reader holds, so while a
+    process outside git's group still holds the pipe we must not call
+    ``stream.close()``. Closing the underlying raw file (CR1 #4) marks the
+    wrapper closed without taking that lock, so nothing here blocks and the
+    pipe is not leaked.
+    """
+    reader.join(_READER_JOIN_SECONDS)
+    pipe = cast(io.BufferedIOBase, stream)
+    if not reader.is_alive():
+        with contextlib.suppress(OSError):
+            pipe.close()
+        return
+    raw = getattr(pipe, "raw", None)
+    if raw is not None:
+        with contextlib.suppress(OSError, ValueError):
+            raw.close()
+
+
 def _run_bounded(
     argv: Sequence[str],
     *,
@@ -453,11 +700,11 @@ def _run_bounded(
     """Run ``argv`` with a wall-clock timeout and a stdout cap (SR-014).
 
     stdout is read in chunks and capped at ``max_stdout + 1`` bytes; past the cap,
-    or past ``timeout`` seconds, the process is killed and a fixed-text
-    ``ComponentError("gitread")`` naming only ``label`` is raised. stderr is drained
-    in chunks and discarded, never held whole and never put in a message. stdin is
-    ``DEVNULL``. A process that can't start raises ``GitUnavailable``. Reusable by
-    T-008 with its own cap (for example R2.6's patch-byte cap).
+    or past ``timeout`` seconds, git and every process it started are killed
+    (:func:`_kill_tree`) and a fixed-text ``ComponentError("gitread")`` naming only
+    ``label`` is raised. stderr is drained in chunks and discarded, never held
+    whole and never put in a message. stdin is ``DEVNULL``. A process that can't
+    start raises ``GitUnavailable``.
     """
     try:
         proc = subprocess.Popen(  # noqa: S603 (argv list, resolved git, no shell)
@@ -468,6 +715,7 @@ def _run_bounded(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
+            **_process_group_kwargs(),
         )
     except OSError as exc:
         raise GitUnavailable("git could not be started") from exc
@@ -480,11 +728,11 @@ def _run_bounded(
     ]
     for reader in readers:
         reader.start()
-    deadline = time.monotonic() + timeout
+    deadline = _clock() + timeout
     failure: str | None = None
     try:
         for reader in readers:
-            reader.join(max(0.0, deadline - time.monotonic()))
+            reader.join(max(0.0, deadline - _clock()))
             if over.is_set():
                 failure = "output too large"
                 break
@@ -493,21 +741,161 @@ def _run_bounded(
                 break
         if failure is None:
             try:
-                returncode = proc.wait(max(0.0, deadline - time.monotonic()))
+                returncode = proc.wait(max(0.0, deadline - _clock()))
             except subprocess.TimeoutExpired:
                 failure = "timed out"
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        for reader in readers:
-            reader.join(1.0)
-        proc.stdout.close()
-        proc.stderr.close()
+        if failure is not None or proc.poll() is None:
+            _kill_tree(proc)
+        _close_when_done(proc.stdout, readers[0])
+        _close_when_done(proc.stderr, readers[1])
     if failure is not None:
         # Fixed text: never the argv (which may hold a REV), stdout or stderr.
         raise ComponentError(_COMPONENT, f"git {label} {failure}")
     return _Output(returncode, b"".join(chunks))
+
+
+class _BatchProcess:
+    """A long-lived git with piped stdin and stdout, read with per-request deadlines.
+
+    Started only by :func:`_start_batch` (I-14 item 9). A pump thread moves stdout
+    into a bounded queue, so a slow reader stops git instead of buffering its
+    output; stderr is drained and discarded. Every read waits at most until its
+    ``deadline`` (``_clock()``); past it, or on a short read, a fixed-text
+    ``ComponentError("gitread")`` is raised and the caller kills the process.
+    """
+
+    def __init__(self, proc: "subprocess.Popen[bytes]", label: str) -> None:
+        self._proc = proc
+        self._label = label
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=_QUEUE_CHUNKS)
+        self._buffer = bytearray()
+        self._eof = False
+        self._stop = threading.Event()
+        self._threads = [
+            threading.Thread(target=self._pump, daemon=True),
+            threading.Thread(target=_drain, args=(proc.stderr, -1, [], threading.Event())),
+        ]
+        for thread in self._threads:
+            thread.daemon = True
+            thread.start()
+
+    def _pump(self) -> None:
+        stdout = cast(io.BufferedIOBase, self._proc.stdout)  # a pipe (_start_batch)
+        with contextlib.suppress(OSError, ValueError):
+            while chunk := stdout.read1(_CHUNK_BYTES):
+                if not self._put(chunk):
+                    return
+        self._put(b"")  # end of output
+
+    def _put(self, chunk: bytes) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(chunk, timeout=0.05)
+            except queue.Full:
+                continue
+            return True
+        return False
+
+    def _error(self, what: str) -> ComponentError:
+        return ComponentError(_COMPONENT, f"git {self._label} {what}")
+
+    def send(self, data: bytes) -> None:
+        """Write one request; a git that already exited is a ``ComponentError``."""
+        stdin = cast(io.BufferedIOBase, self._proc.stdin)  # a pipe (_start_batch)
+        try:
+            stdin.write(data)
+            stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise self._error("stopped") from exc
+
+    def close_stdin(self) -> None:
+        with contextlib.suppress(OSError):
+            cast(io.BufferedIOBase, self._proc.stdin).close()
+
+    def _fill(self, deadline: float) -> bool:
+        """Wait for the next stdout chunk; False at end of output."""
+        if self._eof:
+            return False
+        try:
+            chunk = self._queue.get(timeout=max(0.0, deadline - _clock()))
+        except queue.Empty:
+            raise self._error("timed out") from None
+        if not chunk:
+            self._eof = True
+            return False
+        self._buffer += chunk
+        return True
+
+    def read_line(self, limit: int, deadline: float) -> bytes:
+        """One ``\\n``-terminated line of at most ``limit`` bytes."""
+        while (end := self._buffer.find(b"\n", 0, limit)) < 0:
+            if len(self._buffer) >= limit or not self._fill(deadline):
+                raise _bad_output()
+        line = bytes(self._buffer[: end + 1])
+        del self._buffer[: end + 1]
+        return line
+
+    def read_exact(self, size: int, deadline: float) -> bytes:
+        """Exactly ``size`` bytes; output that ends sooner is a short read."""
+        while len(self._buffer) < size:
+            if not self._fill(deadline):
+                raise _bad_output()
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def read_some(self, limit: int, deadline: float) -> bytes:
+        """Up to ``limit`` bytes as soon as any are there; ``b""`` at end of output."""
+        if not self._buffer and not self._fill(deadline):
+            return b""
+        data = bytes(self._buffer[:limit])
+        del self._buffer[:limit]
+        return data
+
+    def wait(self, deadline: float) -> int:
+        """git's exit code, waiting at most until ``deadline``."""
+        try:
+            return self._proc.wait(max(0.0, deadline - _clock()))
+        except subprocess.TimeoutExpired:
+            raise self._error("timed out") from None
+
+    def kill(self) -> None:
+        """Kill git's process tree (N-4, CR2 S1), reap it and stop the threads.
+
+        The group is killed even when git has exited, since a grandchild may hold
+        the pipes; no step waits without a bound.
+        """
+        self._stop.set()
+        _kill_tree(self._proc)
+        self.close_stdin()
+        _close_when_done(self._proc.stdout, self._threads[0])
+        _close_when_done(self._proc.stderr, self._threads[1])
+
+
+def _start_batch(
+    argv: Sequence[str], *, cwd: Path, env: dict[str, str], label: str
+) -> _BatchProcess:
+    """Start a long-lived git (I-14 items 8 and 9) in its own process group.
+
+    The same argv rules, environment and git as :func:`_run_bounded` (the caller
+    builds ``argv`` with :meth:`GitReader._command`), with piped stdin and stdout.
+    A process that can't start raises ``GitUnavailable``.
+    """
+    try:
+        proc = subprocess.Popen(  # noqa: S603 (argv list, resolved git, no shell)
+            list(argv),
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            **_process_group_kwargs(),
+        )
+    except OSError as exc:
+        raise GitUnavailable("git could not be started") from exc
+    return _BatchProcess(proc, label)
 
 
 class GitReader:
@@ -523,6 +911,12 @@ class GitReader:
         self._repo_dir = Path(repo_dir)
         self._git: _ResolvedGit | None = None
         self._version_ok = False
+        # T-008 blob: one long-lived cat-file per mode, started lazily (I-14 item 9).
+        self._batch_check: _BatchProcess | None = None
+        self._batch: _BatchProcess | None = None
+        self._batch_home: tempfile.TemporaryDirectory[str] | None = None
+        # Set once a cat-file request fails (I-14 item 9): no restart afterwards.
+        self._batch_failed = False
 
     def _resolved_git(self) -> _ResolvedGit:
         """Git, resolved once per reader and cached (I-14 step 1)."""
@@ -560,7 +954,7 @@ class GitReader:
         out = _run_bounded(
             [git.path, "--version"],
             cwd=self._repo_dir,
-            env=_environment(home, git.search_path, self._repo_dir),
+            env=_call_env(home, git.search_path, self._repo_dir),
             label="--version",
             max_stdout=SMALL_OUTPUT_MAX_BYTES,
             timeout=GIT_TIMEOUT_SECONDS,
@@ -589,13 +983,58 @@ class GitReader:
             if not self._version_ok:
                 self._check_version(home)
             return _run_bounded(
-                argv,
+                _with_orderfile(argv, home),
                 cwd=self._repo_dir,
-                env=_environment(home, git.search_path, self._repo_dir),
+                env=_call_env(home, git.search_path, self._repo_dir),
                 label=subcommand,
                 max_stdout=max_stdout,
                 timeout=GIT_TIMEOUT_SECONDS,
             )
+
+    def _start(self, argv: list[str], home: str, label: str) -> _BatchProcess:
+        """Start a long-lived git through :func:`_start_batch`, after the version check."""
+        if not self._repo_dir.is_dir():
+            raise ComponentError(_COMPONENT, "repository directory not found")
+        if not self._version_ok:
+            self._check_version(home)
+        env = _call_env(home, self._resolved_git().search_path, self._repo_dir)
+        argv = _with_orderfile(argv, home)
+        return _start_batch(argv, cwd=self._repo_dir, env=env, label=label)
+
+    def _batch_process(self, mode: str) -> _BatchProcess:
+        """The reader's ``cat-file --batch-check`` or ``--batch`` process, started once."""
+        current = self._batch_check if mode == "--batch-check" else self._batch
+        if current is not None:
+            return current
+        argv = self._command("cat-file", [mode])
+        if self._batch_home is None:
+            self._batch_home = tempfile.TemporaryDirectory(prefix="conventiondrift-home-")
+        started = self._start(argv, self._batch_home.name, "cat-file")
+        if mode == "--batch-check":
+            self._batch_check = started
+        else:
+            self._batch = started
+        return started
+
+    def close(self) -> None:
+        """Kill and reap both long-lived ``cat-file`` processes (I-14 item 9).
+
+        Idempotent, and safe when they were never started. T-028 calls it in a
+        ``finally``. A later ``blob`` call starts new processes, unless a failed
+        request stopped them (then it raises, I-14 item 9).
+        """
+        for process in (self._batch_check, self._batch):
+            if process is not None:
+                process.kill()
+        self._batch_check = self._batch = None
+        if self._batch_home is not None:
+            self._batch_home.cleanup()
+            self._batch_home = None
+
+    def _stop_batch(self) -> None:
+        """A cat-file request failed: kill both processes, and never restart them."""
+        self._batch_failed = True
+        self.close()
 
     def _fail(self, subcommand: str, out: _Output) -> ComponentError:
         # Fixed text: never stderr, never a revision or path from input (DESIGN §4).
@@ -663,3 +1102,184 @@ class GitReader:
         if when.tzinfo is None:
             raise ComponentError(_COMPONENT, "unexpected git output")
         return when.astimezone(UTC)
+
+    # -- part 2 (T-008) -------------------------------------------------------
+
+    def tree(self, sha: str) -> Sequence[TreeEntry]:
+        """Every file of a commit's tree with its size, before any content is read.
+
+        ``ls-tree -r -l -z --full-tree``, capped at :data:`LISTING_MAX_BYTES`. The
+        size is ``None`` only for gitlinks (submodules, I-14 ``TreeEntry``).
+        """
+        out = self._run(
+            "ls-tree",
+            ["-r", "-l", "-z", "--full-tree", "--end-of-options", _require_sha(sha)],
+            max_stdout=LISTING_MAX_BYTES,
+        )
+        if out.returncode != 0:
+            raise self._fail("ls-tree", out)
+        entries: list[TreeEntry] = []
+        for record in _nul_records(out.stdout):
+            m = _TREE_RECORD.fullmatch(record)
+            if m is None or (m[2] == b"commit") != (m[4] == b"-"):
+                raise _bad_output()
+            size = None if m[4] == b"-" else int(m[4])
+            entries.append((m[1].decode("ascii"), m[3].decode("ascii"), size, _path(m[5])))
+        return entries
+
+    def blob(self, oid: str, max_bytes: int) -> bytes:
+        """A blob's bytes, by object id on ``cat-file`` stdin (DESIGN §3, I-14 item 9).
+
+        The reader's long-lived ``--batch-check`` gives the header first (capped at
+        :data:`SMALL_OUTPUT_MAX_BYTES`); a blob over ``max_bytes`` raises
+        ``FileSkipped("size limit")`` and ``--batch`` is never asked for it (R2.3).
+        Otherwise ``--batch`` gives the same header, then exactly the body and its
+        trailing LF. Each request waits at most :data:`GIT_TIMEOUT_SECONDS`.
+
+        I-14 item 9: a well-formed ``<oid> missing`` reply (and a non-blob) raises
+        ``ComponentError("gitread")`` and leaves both processes running and in step.
+        A timeout, short read, malformed header or oid mismatch kills both and
+        raises ``ComponentError("gitread")``; every later call then raises too,
+        without starting new processes.
+        """
+        request = _require_sha(oid).encode("ascii") + b"\n"
+        if max_bytes < 0:
+            raise ComponentError(_COMPONENT, "invalid size limit")
+        if self._batch_failed:
+            raise ComponentError(_COMPONENT, "git cat-file stopped after an error")
+        try:
+            check = self._batch_process("--batch-check")
+            check.send(request)
+            header = check.read_line(SMALL_OUTPUT_MAX_BYTES, _clock() + GIT_TIMEOUT_SECONDS)
+            m = _BATCH_HEADER.fullmatch(header)
+            missing = header == request[:-1] + b" missing\n"
+            if not missing and (m is None or m[1] + b"\n" != request):
+                raise _bad_output()
+        except ComponentError:
+            self._stop_batch()
+            raise
+        if m is None:  # "<oid> missing": the protocol is still in step
+            raise ComponentError(_COMPONENT, "object not found")
+        if m[2] != b"blob":
+            raise ComponentError(_COMPONENT, "object is not a blob")
+        size = int(m[3])
+        if size > max_bytes:
+            raise FileSkipped("size limit")
+        try:
+            batch = self._batch_process("--batch")
+            batch.send(request)
+            deadline = _clock() + GIT_TIMEOUT_SECONDS
+            if batch.read_line(SMALL_OUTPUT_MAX_BYTES, deadline) != header:
+                raise _bad_output()
+            body = batch.read_exact(size + 1, deadline)
+            if not body.endswith(b"\n"):
+                raise _bad_output()
+        except ComponentError:
+            self._stop_batch()
+            raise
+        return body[:-1]
+
+    def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]:
+        """Files changed from ``base`` to ``head``, renames detected (-M, ADR-0004).
+
+        ``diff-tree`` with :data:`_CHANGED_FILES_ARGS` (I-14 item 9: the same rename
+        pins as ``patches``), capped at :data:`LISTING_MAX_BYTES`.
+        Each entry is (status letter without the score, old path, new path) with
+        the old path set only for R and C (I-14 item 9): a deleted file is
+        ``("D", None, deleted_path)``. Paths are in git's order.
+        """
+        args = [*_CHANGED_FILES_ARGS, "--end-of-options"]
+        out = self._run(
+            "diff-tree",
+            [*args, _require_sha(base), _require_sha(head)],
+            max_stdout=LISTING_MAX_BYTES,
+        )
+        if out.returncode != 0:
+            raise self._fail("diff-tree", out)
+        records = _nul_records(out.stdout)
+        changes: list[ChangedFile] = []
+        i = 0
+        while i < len(records):
+            m = _STATUS.fullmatch(records[i])
+            count = 2 if m is not None and m[2] is not None else 1
+            paths = records[i + 1 : i + 1 + count]
+            if m is None or len(paths) != count:
+                raise _bad_output()
+            status = (m[1] or m[2]).decode("ascii")
+            old = _path(paths[0]) if count == 2 else None
+            changes.append((status, old, _path(paths[-1])))
+            i += 1 + count
+        return changes
+
+    def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]:
+        """``sha`` and its first-parent ancestors, newest first, at most ``limit``.
+
+        ``rev-list --first-parent --max-count=<limit> --timestamp``. Each entry is
+        (commit SHA, committer date as a timezone-aware UTC datetime, like
+        :meth:`commit_date`). ``limit`` must be 1 to the R2.6 cap
+        (:data:`MAX_COUNT_CAP`); anything else is a caller bug and is refused.
+        """
+        _require_sha(sha)
+        if not 1 <= limit <= MAX_COUNT_CAP:
+            raise ComponentError(_COMPONENT, "first-parent limit outside the R2.6 cap")
+        out = self._run(
+            "rev-list",
+            ["--first-parent", f"--max-count={limit}", "--timestamp", "--end-of-options", sha],
+            max_stdout=limit * _CHAIN_LINE_MAX,
+        )
+        if out.returncode != 0:
+            raise self._fail("rev-list", out)
+        lines = out.stdout.split(b"\n")
+        if lines.pop() != b"" or not lines or len(lines) > limit:
+            raise _bad_output()
+        chain: list[tuple[str, datetime]] = []
+        for line in lines:
+            m = _CHAIN_LINE.fullmatch(line)
+            if m is None:
+                raise _bad_output()
+            try:
+                when = _EPOCH + timedelta(seconds=int(m[1]))
+            except OverflowError as exc:
+                raise _bad_output() from exc
+            chain.append((m[2].decode("ascii"), when))
+        return chain
+
+    def patches(self, from_sha: str | None, to_sha: str) -> Generator[bytes, None, None]:
+        """Raw first-parent patch text for ``from_sha..to_sha``, newest commit first.
+
+        I-14 item 9: ``log`` with :data:`_PATCHES_ARGS` (the diff-config pins,
+        ``--no-show-signature``, ``--max-count=10000`` and an empty ``-O`` order file),
+        the DESIGN §3 ``--no-ext-diff --no-textconv --no-color``, then
+        ``--end-of-options <to_sha> [^<from_sha>]``. ``from_sha`` is excluded, and
+        ``None`` means back to the root. Merges diff against their first parent.
+        Each commit starts with ``\\x00<sha>\\n``; commit messages are never printed.
+
+        The result is a generator of raw stdout chunks of at most
+        :data:`PATCH_CHUNK_BYTES`; git starts on the first ``next()``. C3 doesn't
+        count patch bytes: C8 stops at its R2.6 cap and calls ``close()``, and the
+        generator's ``finally`` kills git's process tree and reaps it. The whole
+        stream, from spawn to git's exit, has one :data:`GIT_TIMEOUT_SECONDS`
+        deadline (I-14 item 9); running out, or a non-zero exit, kills git's tree
+        and raises ``ComponentError("gitread")``.
+        """
+        revs = [_require_sha(to_sha)]
+        if from_sha is not None:
+            revs.append("^" + _require_sha(from_sha))
+        argv = self._command("log", [*_PATCHES_ARGS, "--end-of-options", *revs])
+        return self._stream_patches(argv)
+
+    def _stream_patches(self, argv: list[str]) -> Generator[bytes, None, None]:
+        with tempfile.TemporaryDirectory(prefix="conventiondrift-home-") as home:
+            process = self._start(argv, home, "log")
+            # I-14 item 9: ONE deadline from spawn to exit; every chunk wait and the
+            # exit wait use what is left of it (time spent in C8 counts too).
+            deadline = _clock() + GIT_TIMEOUT_SECONDS
+            try:
+                process.close_stdin()
+                while chunk := process.read_some(PATCH_CHUNK_BYTES, deadline):
+                    yield chunk
+                code = process.wait(deadline)
+                if code != 0:
+                    raise ComponentError(_COMPONENT, f"git log failed (exit {code})")
+            finally:
+                process.kill()
