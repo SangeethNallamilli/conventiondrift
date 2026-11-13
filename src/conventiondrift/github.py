@@ -37,13 +37,16 @@ network connection. The rules it follows:
 import base64
 import gzip
 import http.client
+import io
 import json
 import re
+import socket
 import ssl
+import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 from urllib.parse import urljoin, urlsplit
 
 from conventiondrift.components import GitHubClient, PublishOutcome
@@ -118,7 +121,12 @@ class HttpResponse:
 
 
 class Transport(Protocol):
-    """Sends one HTTP request and never follows redirects. Tests inject fakes."""
+    """Sends one HTTP request and never follows redirects. Tests inject fakes.
+
+    ``timeout`` is the absolute budget for the whole request (DNS, connect,
+    TLS handshake, send, status line, headers and body), not a per-recv idle
+    timeout. Running out raises ``DeadlineExceeded``.
+    """
 
     def request(
         self,
@@ -134,8 +142,180 @@ class ResponseTooLarge(Exception):
     """A response body was over ``MAX_RESPONSE_BYTES``."""
 
 
+class DeadlineExceeded(Exception):
+    """A request did not finish before its absolute deadline (ruling 3)."""
+
+
+IO_CHUNK_BYTES: Final = 16 * 1024
+"""Largest single send; the deadline is re-checked before each one."""
+READ_CHUNK_BYTES: Final = 64 * 1024
+"""Largest body read; the deadline is re-checked before each one."""
+
+
+def _time_left(deadline: float, clock: Callable[[], float]) -> float:
+    left = deadline - clock()
+    if left <= 0:
+        raise DeadlineExceeded
+    return left
+
+
+def _socket_timeout(deadline: float, clock: Callable[[], float]) -> float:
+    """The timeout for one socket operation: ``min(cap, time left)``, or raise."""
+    return min(REQUEST_TIMEOUT_SECONDS, _time_left(deadline, clock))
+
+
+class _Shuttable(Protocol):
+    def shutdown(self, how: int, /) -> None: ...
+
+
+class _Timer(Protocol):
+    """The part of ``threading.Timer`` the watchdog uses (tests inject a fake)."""
+
+    daemon: bool
+
+    def start(self) -> None: ...
+
+    def cancel(self) -> None: ...
+
+    def join(self, timeout: float | None = None) -> None: ...
+
+
+TimerFactory = Callable[[float, Callable[[], None]], _Timer]
+
+
+class _Watchdog:
+    """Shuts a socket down at an absolute deadline.
+
+    Defence in depth for a blocking call that might not honour its own
+    timeout across several reads (the TLS handshake, ``http.client``
+    status-line and header parsing): it then fails at once instead of running
+    past the deadline. ``stop`` cancels and joins the timer thread, so no
+    thread outlives the request.
+    """
+
+    def __init__(self, seconds: float, timer: TimerFactory = threading.Timer) -> None:
+        self._lock = threading.Lock()
+        self._sock: socket.socket | None = None
+        self._started = False
+        self.fired = False
+        self._timer = timer(max(seconds, 0.0), self._fire)
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+        self._started = True
+
+    def watch(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._sock = sock
+            if self.fired:
+                _shutdown(sock)
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired = True
+            if self._sock is not None:
+                _shutdown(self._sock)
+
+    def stop(self) -> None:
+        self._timer.cancel()
+        if self._started:
+            self._timer.join()
+
+
+def _shutdown(sock: _Shuttable) -> None:
+    try:
+        if isinstance(sock, socket.socket):
+            # The plain-socket method, so an SSLSocket is cut at the TCP level
+            # from this thread without touching its SSL object.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        else:
+            sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class _DeadlineSocket:
+    """What ``http.client`` sees as its socket: every recv and send is bounded.
+
+    Before each operation the timeout is set to ``min(cap, time left)``, and an
+    operation is never started once the deadline has passed. Sends go out in
+    ``IO_CHUNK_BYTES`` pieces, so a slowly reading server cannot stretch one.
+    """
+
+    def __init__(self, sock: socket.socket, deadline: float, clock: Callable[[], float]) -> None:
+        self._sock = sock
+        self._deadline = deadline
+        self._clock = clock
+
+    def _arm(self) -> None:
+        self._sock.settimeout(_socket_timeout(self._deadline, self._clock))
+
+    def recv_into(self, buffer: memoryview | bytearray, nbytes: int = 0, flags: int = 0) -> int:
+        self._arm()
+        return self._sock.recv_into(buffer, nbytes, flags)
+
+    def sendall(self, data: bytes | bytearray | memoryview) -> None:
+        view = memoryview(data).cast("B")
+        while view:
+            self._arm()
+            sent = self._sock.send(view[:IO_CHUNK_BYTES])
+            view = view[sent:]
+
+    def makefile(self, mode: str = "rb", *args: object, **kwargs: object) -> io.BufferedReader:
+        return io.BufferedReader(socket.SocketIO(self, "rb"))  # type: ignore[arg-type]
+
+    def _decref_socketios(self) -> None:
+        pass  # the real socket is closed by the transport, never by the reader
+
+    def fileno(self) -> int:
+        return self._sock.fileno()
+
+    def close(self) -> None:
+        # http.client closes its socket as soon as it has the headers of a
+        # "Connection: close" response, while the body is still to be read.
+        # The transport closes the real socket itself, on every path.
+        pass
+
+
+AddrInfo = tuple[socket.AddressFamily, socket.SocketKind, int, str, Any]
+"""One ``socket.getaddrinfo`` entry."""
+Resolver = Callable[..., Sequence[AddrInfo]]
+SocketFactory = Callable[[socket.AddressFamily, socket.SocketKind, int], socket.socket]
+
+
 class HttpClientTransport:
-    """The production transport on stdlib ``http.client``; it never follows redirects."""
+    """The production transport on stdlib ``http.client``; it never follows redirects.
+
+    One absolute deadline (``timeout`` seconds from the start) covers the whole
+    request (ruling 3):
+
+    - **DNS:** an IP literal is parsed in place. A name is resolved in a helper
+      thread that is waited on only until the deadline; stdlib cannot cancel
+      ``getaddrinfo``, so a stuck resolver's thread finishes on its own later.
+    - **connect and TLS handshake:** each runs with ``min(cap, time left)``.
+    - **send, status line, headers, body:** every recv and send goes through
+      ``_DeadlineSocket``; the body is read in ``READ_CHUNK_BYTES`` pieces
+      (chunked transfer encoding included) with the deadline re-checked before
+      each, and a response that completes after the deadline is refused.
+    - **watchdog:** from connect until the headers are parsed, a timer shuts
+      the socket down at the deadline. It is cancelled and joined on every path.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        resolver: Resolver = socket.getaddrinfo,
+        ssl_context: Callable[[], ssl.SSLContext] = ssl.create_default_context,
+        socket_factory: SocketFactory = socket.socket,
+        timer: TimerFactory = threading.Timer,
+    ) -> None:
+        self._clock = clock
+        self._resolver = resolver
+        self._ssl_context = ssl_context
+        self._socket_factory = socket_factory
+        self._timer = timer
 
     def request(
         self,
@@ -145,27 +325,129 @@ class HttpClientTransport:
         body: bytes | None,
         timeout: float,
     ) -> HttpResponse:
+        deadline = self._clock() + timeout
         parts = urlsplit(url)
         host = parts.hostname or ""
+        https = parts.scheme == "https"
+        port = parts.port or (443 if https else 80)
         target = parts.path or "/"
         if parts.query:
             target += "?" + parts.query
-        conn: http.client.HTTPConnection
-        if parts.scheme == "https":
-            conn = http.client.HTTPSConnection(
-                host, parts.port, timeout=timeout, context=ssl.create_default_context()
-            )
-        else:
-            conn = http.client.HTTPConnection(host, parts.port, timeout=timeout)
+        addresses = self._resolve(host, port, deadline)
+        watchdog = _Watchdog(_time_left(deadline, self._clock), self._timer)
+        sock: socket.socket | None = None
+        conn: http.client.HTTPConnection | None = None
+        resp: http.client.HTTPResponse | None = None
         try:
+            watchdog.start()
+            sock = self._connect(addresses, deadline, watchdog)
+            if https:
+                sock = self._handshake(sock, host, deadline, watchdog)
+            conn = http.client.HTTPConnection(host, port)
+            if https:
+                conn.default_port = 443  # Host header without ":443"
+            conn.sock = _DeadlineSocket(sock, deadline, self._clock)
             conn.request(method, target, body=body, headers=dict(headers))
             resp = conn.getresponse()
-            data = resp.read(MAX_RESPONSE_BYTES + 1)
-            if len(data) > MAX_RESPONSE_BYTES:
-                raise ResponseTooLarge
+            watchdog.stop()
+            if watchdog.fired:
+                raise DeadlineExceeded
+            data = _read_body(resp, deadline, self._clock)
             return HttpResponse(resp.status, {k.lower(): v for k, v in resp.getheaders()}, data)
+        except (OSError, http.client.HTTPException) as exc:
+            if watchdog.fired or self._clock() >= deadline:
+                raise DeadlineExceeded from exc
+            raise
         finally:
-            conn.close()
+            watchdog.stop()
+            if resp is not None:
+                resp.close()
+            if conn is not None:
+                conn.close()
+            if sock is not None:
+                sock.close()
+
+    def _resolve(self, host: str, port: int, deadline: float) -> Sequence[AddrInfo]:
+        try:
+            return self._resolver(host, port, 0, socket.SOCK_STREAM, 0, socket.AI_NUMERICHOST)
+        except socket.gaierror:
+            pass  # a name, not an IP literal
+        box: list[Sequence[AddrInfo] | BaseException] = []
+
+        def work() -> None:
+            try:
+                box.append(self._resolver(host, port, 0, socket.SOCK_STREAM))
+            except BaseException as exc:  # noqa: BLE001 -- handed back to the caller
+                box.append(exc)
+
+        helper = threading.Thread(target=work, name="conventiondrift-dns", daemon=True)
+        helper.start()
+        helper.join(_time_left(deadline, self._clock))
+        if not box:
+            raise DeadlineExceeded
+        result = box[0]
+        if isinstance(result, BaseException):
+            raise OSError("name resolution failed") from result
+        _time_left(deadline, self._clock)  # resolved, but after the deadline: late
+        return result
+
+    def _connect(
+        self, addresses: Sequence[AddrInfo], deadline: float, watchdog: _Watchdog
+    ) -> socket.socket:
+        last: OSError = OSError("no address")
+        for family, kind, proto, _canon, address in addresses:
+            sock = self._socket_factory(family, kind, proto)
+            watchdog.watch(sock)
+            try:
+                sock.settimeout(_socket_timeout(deadline, self._clock))
+                sock.connect(address)
+            except OSError as exc:
+                sock.close()
+                last = exc
+                continue
+            except BaseException:
+                sock.close()
+                raise
+            return sock
+        raise last
+
+    def _handshake(
+        self, sock: socket.socket, host: str, deadline: float, watchdog: _Watchdog
+    ) -> socket.socket:
+        try:
+            tls = self._ssl_context().wrap_socket(
+                sock, server_hostname=host, do_handshake_on_connect=False
+            )
+        except BaseException:
+            sock.close()
+            raise
+        watchdog.watch(tls)
+        try:
+            tls.settimeout(_socket_timeout(deadline, self._clock))
+            tls.do_handshake()
+        except BaseException:
+            tls.close()
+            raise
+        return tls
+
+
+def _read_body(
+    resp: http.client.HTTPResponse, deadline: float, clock: Callable[[], float]
+) -> bytes:
+    """Read the whole body in bounded pieces, re-checking the deadline before each."""
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        _time_left(deadline, clock)
+        piece = resp.read(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
+        if not piece:
+            break
+        chunks.append(piece)
+        size += len(piece)
+        if size > MAX_RESPONSE_BYTES:
+            raise ResponseTooLarge
+    _time_left(deadline, clock)  # finished, but after the deadline: late, never a result
+    return b"".join(chunks)
 
 
 def _origin(url: str) -> tuple[str, str, int] | None:
@@ -354,7 +636,15 @@ class GitHubApiClient:
                     body,
                     min(REQUEST_TIMEOUT_SECONDS, left),
                 )
+            except DeadlineExceeded:
+                self._expired = True
+                return None
             except Exception:  # noqa: BLE001 -- §4: any transport failure is a note, never a crash
+                if self._time_left() <= 0:
+                    self._expired = True
+                return None
+            if self._time_left() <= 0:
+                self._expired = True  # it completed after the deadline: late, not a result
                 return None
             if resp.status not in REDIRECT_STATUSES or method != "GET":
                 return resp

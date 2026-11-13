@@ -7,11 +7,10 @@ fakes. Expected results are written by hand from I-3, DESIGN §4 and PLAN T-027.
 
 import base64
 import gzip
-import http.client
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -616,14 +615,66 @@ def test_lookup_out_of_time_returns_not_found_with_a_note() -> None:
 
 def test_deadline_is_per_call() -> None:
     clock = Clock()
-    api = FakeGitHub(hooks=[_ticking(clock, 0.6)])
+    api = FakeGitHub(hooks=[_ticking(clock, 0.55)])
     client = make(api, clock)
-    assert client.lookup(repo=REPO, pr_number=PR) == (False, None)  # 0 s to 0.6 s
-    # publish starts a fresh 3 s at 0.6 s, so its 5th request still starts at 3.0 s.
+    assert client.lookup(repo=REPO, pr_number=PR) == (False, None)  # 0 s to 0.55 s
+    # publish starts a fresh 3 s at 0.55 s, so its 5th request may end at 3.3 s.
     assert publish(client) == ("posted", None)
     assert len(api.requests) == 6
     assert api.requests[1].timeout == pytest.approx(github.DEADLINE_SECONDS)
-    assert api.requests[5].timeout == pytest.approx(0.6)
+    assert api.requests[5].timeout == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("call", ["lookup", "publish"])
+@pytest.mark.parametrize("late_by", [0.0, 0.01, 5.0])
+def test_request_finishing_after_the_deadline_is_late(late_by: float, call: str) -> None:
+    # A response that arrives at or after the deadline is never a normal result.
+    clock = Clock()
+
+    def late(req: Req) -> HttpResponse | None:
+        clock.now = github.DEADLINE_SECONDS + late_by
+        return None  # the fake API then answers normally
+
+    api = FakeGitHub(comments=[bot_comment(5)], hooks=[late])
+    client = make(api, clock)
+    if call == "lookup":
+        assert client.lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_DEADLINE)
+    else:
+        assert publish(client) == ("skipped", github.NOTE_DEADLINE)
+        assert api.writes() == []
+    assert len(api.requests) == 1
+
+
+def test_request_finishing_just_before_the_deadline_is_not_late() -> None:
+    clock = Clock()
+
+    def nearly(req: Req) -> HttpResponse | None:
+        clock.now = github.DEADLINE_SECONDS - 0.01
+        return None
+
+    api = FakeGitHub(comments=[bot_comment(5)], hooks=[nearly])
+    assert make(api, clock).lookup(repo=REPO, pr_number=PR) == (True, None)
+
+
+def test_transport_deadline_error_is_the_deadline_note() -> None:
+    def expired(req: Req) -> HttpResponse:
+        raise github.DeadlineExceeded
+
+    api = FakeGitHub(hooks=[expired])
+    assert make(api).lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_DEADLINE)
+    assert publish(make(FakeGitHub(hooks=[expired]))) == ("skipped", github.NOTE_DEADLINE)
+    assert len(api.requests) == 1  # never retried
+
+
+def test_transport_error_at_the_deadline_is_the_deadline_note() -> None:
+    clock = Clock()
+
+    def reset(req: Req) -> HttpResponse:
+        clock.now = github.DEADLINE_SECONDS
+        raise ConnectionResetError
+
+    api = FakeGitHub(hooks=[reset])
+    assert make(api, clock).lookup(repo=REPO, pr_number=PR) == (False, github.NOTE_DEADLINE)
 
 
 def test_lookup_never_raises() -> None:
@@ -1221,82 +1272,7 @@ def test_client_satisfies_protocol() -> None:
     assert Components(github_client=factory).github_client is GitHubApiClient
 
 
-# -- the stdlib transport (no network: http.client is patched) ------------------------------
-
-
-class _FakeResp:
-    def __init__(self, status: int, body: bytes) -> None:
-        self.status = status
-        self._body = body
-
-    def read(self, n: int) -> bytes:
-        return self._body[:n]
-
-    def getheaders(self) -> list[tuple[str, str]]:
-        return [("Content-Type", "application/json"), ("Location", "x")]
-
-
-class _FakeConn:
-    made: ClassVar[list["_FakeConn"]] = []
-    body = b"{}"
-
-    def __init__(
-        self, host: str, port: int | None, *, timeout: float, context: object = None
-    ) -> None:
-        self.args = (host, port, timeout, context)
-        self.sent: tuple[str, str, bytes | None, dict[str, str]] | None = None
-        self.closed = False
-        _FakeConn.made.append(self)
-
-    def request(
-        self,
-        method: str,
-        target: str,
-        body: bytes | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self.sent = (method, target, body, headers or {})
-
-    def getresponse(self) -> _FakeResp:
-        return _FakeResp(200, _FakeConn.body)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-@pytest.fixture
-def fake_conn(monkeypatch: pytest.MonkeyPatch) -> type[_FakeConn]:
-    _FakeConn.made = []
-    _FakeConn.body = b"{}"
-    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeConn)
-    monkeypatch.setattr(http.client, "HTTPConnection", _FakeConn)
-    return _FakeConn
-
-
-def test_transport_https_request(fake_conn: type[_FakeConn]) -> None:
-    resp = HttpClientTransport().request(
-        "GET", "https://api.github.test/a/b?x=1", {"H": "v"}, None, 4.0
-    )
-    assert resp == HttpResponse(200, {"content-type": "application/json", "location": "x"}, b"{}")
-    conn = fake_conn.made[0]
-    assert conn.args[0:3] == ("api.github.test", None, 4.0)
-    assert conn.args[3] is not None  # an ssl context
-    assert conn.sent == ("GET", "/a/b?x=1", None, {"H": "v"})
-    assert conn.closed
-
-
-def test_transport_http_for_seam(fake_conn: type[_FakeConn]) -> None:
-    HttpClientTransport().request("POST", "http://127.0.0.1:9", {}, b"x", 1.0)
-    conn = fake_conn.made[0]
-    assert conn.args == ("127.0.0.1", 9, 1.0, None)
-    assert conn.sent == ("POST", "/", b"x", {})
-
-
-def test_transport_caps_response_size(fake_conn: type[_FakeConn]) -> None:
-    fake_conn.body = b"x" * (github.MAX_RESPONSE_BYTES + 1)
-    with pytest.raises(github.ResponseTooLarge):
-        HttpClientTransport().request("GET", "https://api.github.test/", {}, None, 1.0)
-    assert fake_conn.made[0].closed
+# -- the stdlib transport (real-socket tests live in test_github_transport.py) -------------
 
 
 def test_default_transport_is_stdlib() -> None:
