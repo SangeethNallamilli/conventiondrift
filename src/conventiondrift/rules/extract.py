@@ -173,7 +173,7 @@ def _front_matter_end(path: str, lines: Sequence[str]) -> int:
     for index in range(1, len(lines)):
         if lines[index].strip() == "---":
             return index + 1
-    # QUESTION(T-013-1): an unclosed "---" block is read as no front matter,
+    # I-13 C6 ruling (T-013-1): an unclosed "---" block is read as no front matter,
     # as CommonMark renders it (a thematic break), so the file's rules are kept.
     return 0
 
@@ -294,9 +294,8 @@ def recognize(normalized_text: str) -> str | None:
 
     Shapes are matched at the start of the sentence, where an imperative is.
     """
-    # QUESTION(T-013-2): DESIGN §7 says a rule "has an imperative pattern" but
-    # does not say where. Anchoring at the sentence start is the conservative
-    # reading (prose such as "We use Django" is not a rule); AC-F2.3-F2.5 hold.
+    # I-13 C6 ruling (T-013-2): shapes match only at the start of a sentence,
+    # so prose such as "We use Django" is not a rule; AC-F2.3-F2.5 hold.
     for shape in SHAPES:
         if shape.pattern.match(normalized_text):
             return shape.name

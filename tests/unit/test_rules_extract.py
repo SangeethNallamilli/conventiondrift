@@ -125,7 +125,7 @@ def test_each_shape_rejects_incomplete_sentences(shape: ex.Shape) -> None:
 
 @pytest.mark.parametrize("shape", ex.SHAPES, ids=lambda s: s.name)
 def test_each_shape_is_anchored_at_sentence_start(shape: ex.Shape) -> None:
-    # A shape later in a prose sentence is not an imperative (QUESTION T-013-2).
+    # A shape later in a prose sentence is not an imperative (I-13 C6 ruling T-013-2).
     for sentence in POSITIVES[shape.name]:
         prose = "our team says " + normalize(sentence).replace(",", "")
         assert shape.pattern.search(prose) is None, prose
@@ -341,7 +341,7 @@ def test_front_matter_must_start_on_line_1() -> None:
 
 
 def test_unclosed_mdc_front_matter_is_not_front_matter() -> None:
-    # QUESTION(T-013-1): read as CommonMark does, so the rule is kept.
+    # I-13 C6 ruling (T-013-1): read as CommonMark does, so the rule is kept.
     assert _rules("---\nUse a.\n", "x.mdc") == [(2, "Use a.")]
 
 
