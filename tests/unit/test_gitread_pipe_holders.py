@@ -14,6 +14,7 @@ import ast
 import inspect
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -52,15 +53,59 @@ def _fake_git(tmp_path: Path, parent_exits: bool, escapes: bool, payload: str) -
     return [sys.executable, "-c", code]
 
 
-def _alive(pid: int) -> bool:
+_HAS_PROC = Path("/proc/self/stat").exists()
+
+
+def _state(pid: int, *, use_proc: bool = _HAS_PROC) -> str | None:
+    """The process state letter(s), or None once the pid is gone.
+
+    Linux reads /proc. macOS has no /proc, so it asks ``/bin/ps -o stat=``;
+    reading /proc there always failed, so every pid looked dead (CON-10/11 #43).
+    """
+    if use_proc:
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return None
+    out = subprocess.run(  # noqa: S603 - fixed absolute argv, no shell
+        ["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    )
+    return out.stdout.strip() or None
+
+
+def _alive(pid: int, *, use_proc: bool = _HAS_PROC) -> bool:
+    """Running and not a zombie (a zombie still answers ``kill(pid, 0)``)."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    state = _state(pid, use_proc=use_proc)
+    return state is not None and not state.startswith("Z")
+
+
+def test_alive_tells_running_zombie_and_reaped_apart() -> None:
+    """The helper itself, with every probe this OS has (/proc and/or /bin/ps)."""
+    probes = [use for use, ok in ((True, _HAS_PROC), (False, os.path.exists("/bin/ps"))) if ok]
+    assert probes, "no way to read a process state on this OS"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE
+    )
     try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return False
+        for use_proc in probes:
+            assert _alive(child.pid, use_proc=use_proc), use_proc
+        assert child.stdin is not None
+        child.stdin.close()
+        deadline = time.monotonic() + 5.0  # exited but not yet reaped: a zombie
+        while any(_alive(child.pid, use_proc=u) for u in probes):
+            assert time.monotonic() < deadline, "the exited child still looks alive"
+            time.sleep(0.05)
+        for use_proc in probes:
+            assert _state(child.pid, use_proc=use_proc) is not None  # zombie, not gone
+    finally:
+        child.kill()
+        child.wait()
+    for use_proc in probes:
+        assert not _alive(child.pid, use_proc=use_proc)
 
 
 def _gone_soon(pid: int) -> bool:
