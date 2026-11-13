@@ -11,6 +11,7 @@ from conventiondrift import core
 from conventiondrift.components import Components
 from conventiondrift.core import (
     AnalysisOutcome,
+    FailOn,
     RefusedTriggerOutcome,
     RunContext,
     RunOutcome,
@@ -19,7 +20,7 @@ from conventiondrift.core import (
     internal_error,
     run,
 )
-from conventiondrift.errors import ComponentError, GitUnavailable
+from conventiondrift.errors import ComponentError, GitTooOld, GitUnavailable
 from conventiondrift.model import CheckerId, InternalError
 
 PLANTED = "ghp_FAKE0000planted/src/secret.py contents"
@@ -107,6 +108,23 @@ def test_exact_message_text() -> None:
     )
 
 
+def test_git_too_old_uses_the_fixed_public_text() -> None:
+    error = internal_error(GitTooOld())
+    assert error == InternalError("gitread", "git 2.30 or newer is required")
+
+
+def test_component_error_and_git_unavailable_still_withhold_details() -> None:
+    hidden = "git found only in the repository, workspace or current folder"
+    assert internal_error(ComponentError("gitread", hidden)) == InternalError(
+        "gitread", "ComponentError" + SUFFIX
+    )
+    assert hidden not in internal_error(ComponentError("gitread", hidden)).message
+    unavailable = internal_error(GitUnavailable("git executable not found at /home/x/secret"))
+    assert unavailable == InternalError("core", "GitUnavailable" + SUFFIX)
+    assert "git executable not found" not in unavailable.message
+    assert "/home/x/secret" not in unavailable.message
+
+
 @pytest.mark.parametrize(
     ("explicit", "base", "expected"),
     [
@@ -151,6 +169,9 @@ def test_error_fail_on_with_config_known_present(
 INVALID_EXPLICIT = [
     "bogus",
     "NEW-STALE",
+    "NONE",
+    "None",
+    "Any-Stale",
     " none",
     "none ",
     "none\n",
@@ -158,6 +179,14 @@ INVALID_EXPLICIT = [
     "n\u043ene",  # "none" with a Cyrillic small o (U+043E)
     "\uff4e\uff4f\uff4e\uff45",  # fullwidth "none" (U+FF4E U+FF4F U+FF4E U+FF45)
 ]
+
+
+def test_invalid_explicit_has_a_case_only_variant_of_every_value() -> None:
+    # D-TL-25: values are matched exactly, with no case folding (I-14 SR F1), so every
+    # valid value needs a case-only look-alike here; this kills a casefold() mutant.
+    valid = set(get_args(FailOn))
+    case_only = {v.casefold() for v in INVALID_EXPLICIT if v not in valid}
+    assert valid <= case_only
 
 
 @pytest.mark.parametrize("explicit", INVALID_EXPLICIT)
@@ -341,6 +370,36 @@ def test_component_exit_under_any_stale_fails_closed_and_withholds_its_argument(
         assert planted not in error.component
         assert planted not in out
         assert planted not in err
+
+
+def test_run_git_too_old_debug_data_is_never_shown(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    version = "git version 2.29.0"
+    host_path = "/home/x/secret"
+    planted = f"{version} at {host_path}"
+    try:
+        raise RuntimeError(planted)
+    except RuntimeError as cause:
+        exc = GitTooOld()
+        exc.__cause__ = cause
+        exc.__context__ = cause
+        exc.add_note(planted)
+        exc.found_version = version  # type: ignore[attr-defined]
+        exc.host_path = host_path  # type: ignore[attr-defined]
+
+    pipeline = _Recorder(exc, explicit_fail_on="any-stale")
+    monkeypatch.setattr(core, "_pipeline", pipeline)
+    assert run([], {}, entry="cli") == 3
+    assert pipeline.context is not None
+    (error,) = pipeline.context.internal_errors
+    assert error == InternalError("gitread", "git 2.30 or newer is required")
+    out, err = capsys.readouterr()
+    for part in (version, host_path, planted):
+        assert part not in error.message
+        assert part not in error.component
+        assert part not in out
+        assert part not in err
 
 
 def test_run_keeps_internal_errors_recorded_before_a_raise(
