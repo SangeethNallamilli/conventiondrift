@@ -13,6 +13,11 @@ entries) turns an untrusted repo-relative path into bytes or text:
   PEP 263 for ``.py`` (AC-E.15, AC-E.16).
 * :func:`entry_kind` - classify an ``lstat`` result so walks skip FIFOs,
   sockets and devices without opening them (DESIGN §12 A-3 #2).
+* :func:`is_hard_excluded` - the I-5 hard-exclusion name check for ``.git`` and
+  ``node_modules`` (SC-2.43, SR N4), applied to repo-relative components only;
+  :func:`read_unless_hard_excluded` applies it before a named read (T-010b).
+* :func:`walk_worktree` - the scan-mode working-tree walk: no symlinks followed,
+  hard-excluded names never listed or entered, walk caps (DESIGN §12 A-3 #1-#3).
 
 Every problem with a file is a normal outcome: :class:`FileSkipped` with one
 of the I-9 ``skipped_files`` reasons. Nothing here runs git.
@@ -27,14 +32,16 @@ import os
 import re
 import stat
 import tokenize
+from dataclasses import dataclass
 from typing import Final, Literal
 
 from conventiondrift.errors import FileSkipped
-from conventiondrift.model import SkipReason
+from conventiondrift.model import SkippedFile, SkipReason
 
 __all__ = [
     "CONFIG_MAX_BYTES",
     "FILE_MAX_BYTES",
+    "HARD_EXCLUDE_IGNORABLE",
     "REASON_BINARY",
     "REASON_NOT_DECODABLE",
     "REASON_OUTSIDE",
@@ -43,16 +50,24 @@ __all__ = [
     "REASON_SYMLINK",
     "REASON_UNREADABLE",
     "REASON_UNSUPPORTED",
+    "REASON_WALK_LIMIT",
     "REGEXES",
+    "WALK_MAX_DEPTH",
+    "WALK_MAX_ENTRIES",
     "EntryKind",
     "FileKind",
     "PathOrigin",
+    "WalkResult",
     "check_size",
     "decode_text",
     "entry_kind",
+    "has_hard_excluded_component",
+    "is_hard_excluded",
+    "read_unless_hard_excluded",
     "read_worktree_file",
     "size_limit",
     "validate_relpath",
+    "walk_worktree",
 ]
 
 FileKind = Literal["instruction", "python", "manifest", "lockfile", "config"]
@@ -78,6 +93,13 @@ REASON_SPECIAL: Final = "special file"
 REASON_UNSUPPORTED: Final = "unsupported path"
 # Permission denied, I/O error, a file that vanished after listing, any other OS error (I-13).
 REASON_UNREADABLE: Final = "unreadable"
+# A folder the walk did not list because of a DESIGN §12 A-3 #3 cap (I-13).
+REASON_WALK_LIMIT: Final = "walk limit"
+
+# DESIGN §12 A-3 #3: the scan-mode walk lists at most this many entries in total and
+# enters folders at most this many components deep. Read per call, so tests can patch them.
+WALK_MAX_ENTRIES = 500_000
+WALK_MAX_DEPTH = 64
 
 # Windows reserved device names (D-PM-28 #5, SR-012 F5, SR N2 / I-13): the Python 3.13
 # ``ntpath`` set, superscript digits and console names included. A segment whose part
@@ -88,10 +110,33 @@ _DEVICE_NAMES: Final = frozenset(
     + [f"COM{c}" for c in "123456789\u00b9\u00b2\u00b3"]
     + [f"LPT{c}" for c in "123456789\u00b9\u00b2\u00b3"]
 )
+# INTERFACES I-5 "Hard-exclusion name check" step 1: code points dropped before the
+# name is compared (a superset of git's HFS+-ignorable set). Design-controlled.
+HARD_EXCLUDE_IGNORABLE: Final = frozenset(
+    map(
+        chr,
+        [
+            0x00AD,
+            0x034F,
+            *range(0x180B, 0x180F),
+            *range(0x200B, 0x2010),
+            *range(0x202A, 0x202F),
+            *range(0x2060, 0x2070),
+            *range(0xFE00, 0xFE10),
+            0xFEFF,
+        ],
+    )
+)
+_DROP_IGNORABLE: Final = str.maketrans(dict.fromkeys(HARD_EXCLUDE_IGNORABLE))
+_HARD_EXCLUDED_NAMES: Final = frozenset([".git", "node_modules"])
+# I-5 step 4: NTFS 8.3 short names, always applied with fullmatch (never ``$``, which
+# also matches before a trailing newline). Both patterns are linear: no nested repeats.
+_GIT_SHORT_NAME: Final = re.compile(r"(?:git|gi[0-9a-f]{4})~[1-9][0-9]*")
+_NODE_MODULES_SHORT_NAME: Final = re.compile(r"(?:node_m|no[0-9a-f]{4})~[1-9][0-9]*")
 # SECURITY-RULES R2.5: every regex this module applies to repo text is listed here
-# and gets a ReDoS unit test. There are none today: path checks are plain string
-# operations. A test fails if a compiled pattern appears in the module but not here.
-REGEXES: Final[tuple[re.Pattern[str], ...]] = ()
+# and gets a ReDoS unit test. A test fails if a compiled pattern appears in the
+# module but not here.
+REGEXES: Final[tuple[re.Pattern[str], ...]] = (_GIT_SHORT_NAME, _NODE_MODULES_SHORT_NAME)
 # BOMs that mean "this is not UTF-8 text" (UTF-32 first: its LE BOM starts with UTF-16's).
 _FOREIGN_BOMS: Final = (
     codecs.BOM_UTF32_LE,
@@ -468,3 +513,192 @@ def decode_text(data: bytes, kind: FileKind) -> str:
         # hostile cookie such as ``# coding: undefined`` raises (R2.4, SR-012 F1).
         pass
     raise FileSkipped(REASON_NOT_DECODABLE) from None
+
+
+def is_hard_excluded(component: str) -> bool:
+    """True if one repo-relative path component is ``.git`` or ``node_modules`` (I-5).
+
+    The INTERFACES I-5 steps, in order: drop :data:`HARD_EXCLUDE_IGNORABLE`
+    code points, strip trailing dots and spaces, ``str.casefold()``, then compare
+    with ``.git`` and ``node_modules`` or fully match their 8.3 short names
+    (``GIT~1``, ``GI1A2B~1``, ``NODE_M~1``). Name only, whatever the entry's type,
+    so a ``.git`` gitlink file or symlink is excluded too. Never pass the
+    checkout's own absolute path, or a parent of it, to this check.
+    """
+    name = component.translate(_DROP_IGNORABLE).rstrip(". ").casefold()
+    return (
+        name in _HARD_EXCLUDED_NAMES
+        or _GIT_SHORT_NAME.fullmatch(name) is not None
+        or _NODE_MODULES_SHORT_NAME.fullmatch(name) is not None
+    )
+
+
+def has_hard_excluded_component(relpath: str) -> bool:
+    """True if any ``/``-separated component of a repo-relative path is hard-excluded."""
+    return any(is_hard_excluded(part) for part in relpath.split("/"))
+
+
+def read_unless_hard_excluded(
+    root: str | os.PathLike[str],
+    relpath: str,
+    kind: FileKind,
+    *,
+    max_file_bytes: int | None = None,
+    origin: PathOrigin,
+) -> bytes | None:
+    """:func:`read_worktree_file`, or ``None`` without touching the filesystem if any
+    component of the validated ``relpath`` is hard-excluded (I-5, SR N4).
+
+    For named reads such as a config ``paths:`` entry. The path is validated first,
+    so traversal and Windows-only forms keep their I-13 reasons; only the
+    repo-relative path is checked, never ``root``.
+    """
+    rel = validate_relpath(relpath, origin=origin)
+    # A hard-excluded `paths:` entry is dropped, not a SkippedFile. I-13 scan-walk
+    # ruling 1 adds a summary note for it; that note comes in the T-010b follow-up.
+    if has_hard_excluded_component(rel):
+        return None
+    return read_worktree_file(root, rel, kind, max_file_bytes=max_file_bytes, origin=origin)
+
+
+@dataclass(frozen=True, slots=True)
+class WalkResult:
+    """What :func:`walk_worktree` found. Paths are repo-relative POSIX strings."""
+
+    files: tuple[str, ...]  # regular files, sorted by path bytes (DESIGN §12 A-5)
+    skipped: tuple[SkippedFile, ...]  # symlinks, special files, bad names, walk limits
+    entries: int  # names listed, for the I-12 ``scan_walk_entries`` counter
+
+
+def walk_worktree(root: str | os.PathLike[str]) -> WalkResult:
+    """List every regular file under ``root`` for scan mode (DESIGN §12 A-3).
+
+    * Hard-excluded names (I-5) are dropped by name before they are ``lstat``-ed,
+      listed or entered, and are not reported. ``root`` itself is never checked.
+    * Symlinks (and Windows junctions) are never followed: "symlink". FIFOs,
+      sockets and devices are judged by ``lstat`` and never opened: "special
+      file". Tree names Windows can't hold: "unsupported path" (I-13).
+    * Folders are opened with ``O_NOFOLLOW`` relative to their parent's handle;
+      the Windows fallback re-checks every folder of the path after listing.
+    * A folder deeper than :data:`WALK_MAX_DEPTH`, or one whose listing would take
+      the total past :data:`WALK_MAX_ENTRIES`, is "walk limit", and so is every
+      folder reached after the total is spent. Folders are walked in sorted name
+      order, so the result is the same for the same tree.
+    * No ``OSError`` escapes: it becomes a fixed reason, as for reads. A root that
+      can't be listed is reported with the path ``"."``.
+
+    Effective excludes and ``.gitignore`` are not applied here; callers filter.
+    """
+    walk = _Walk(os.path.realpath(root))
+    walk.folder([], None)
+    return WalkResult(
+        tuple(sorted(walk.files, key=os.fsencode)),
+        tuple(sorted(walk.skipped, key=lambda s: os.fsencode(s.path))),
+        walk.entries,
+    )
+
+
+def _skip_reason(exc: FileSkipped | OSError) -> SkipReason:
+    return exc.reason if isinstance(exc, FileSkipped) else _os_reason(exc, "tree")
+
+
+class _Walk:
+    def __init__(self, root_real: str) -> None:
+        self.root = root_real
+        self.files: list[str] = []
+        self.skipped: list[SkippedFile] = []
+        self.entries = 0
+        self.spent = False
+
+    def skip(self, parts: list[str], reason: SkipReason) -> None:
+        # The root is reported as ".". I-13 scan-walk ruling 2 makes an unlistable root
+        # a ComponentError("discover") in the T-010b follow-up; a root over the cap stays ".".
+        self.skipped.append(SkippedFile("/".join(parts) or ".", reason))
+
+    def folder(self, parts: list[str], parent_fd: int | None) -> None:
+        if self.spent:
+            self.skip(parts, REASON_WALK_LIMIT)
+            return
+        try:
+            handle = self.open(parts, parent_fd)
+        except (FileSkipped, OSError) as exc:
+            self.skip(parts, _skip_reason(exc))
+            return
+        try:
+            self.visit(handle, parts)
+        finally:
+            if isinstance(handle, int):
+                os.close(handle)
+
+    def open(self, parts: list[str], parent_fd: int | None) -> int | str:
+        """A no-follow handle on the folder, or its path on the Windows fallback."""
+        if not _USE_DIR_FD:
+            return os.path.join(self.root, *parts)
+        if parent_fd is None:
+            return os.open(self.root, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
+        return _open_subdir(parts[-1], parent_fd)
+
+    def visit(self, handle: int | str, parts: list[str]) -> None:
+        try:
+            names = self.listing(handle, parts)
+        except (FileSkipped, OSError) as exc:
+            self.skip(parts, _skip_reason(exc))
+            return
+        if names is None:
+            self.spent = True
+            self.skip(parts, REASON_WALK_LIMIT)
+            return
+        for name in sorted(names, key=os.fsencode):
+            self.entry(parts, name, handle)
+
+    def listing(self, handle: int | str, parts: list[str]) -> list[str] | None:
+        """Names in the folder, or ``None`` if they would take the walk past its cap."""
+        budget = WALK_MAX_ENTRIES - self.entries
+        before = None if isinstance(handle, int) else self.folder_ids(parts)
+        names: list[str] = []
+        with os.scandir(handle) as it:
+            for entry in it:
+                if len(names) == budget:
+                    return None
+                names.append(entry.name)
+        if before is not None and self.folder_ids(parts) != before:
+            raise FileSkipped(REASON_SYMLINK)  # swapped while listed (Windows fallback)
+        self.entries += len(names)
+        return names
+
+    def folder_ids(self, parts: list[str]) -> list[tuple[int, int]]:
+        ids: list[tuple[int, int]] = []
+        path = self.root
+        for name in parts:
+            path = os.path.join(path, name)
+            st = os.lstat(path)
+            _reject_link_or_other(st, final=False)
+            ids.append((st.st_dev, st.st_ino))
+        return ids
+
+    def entry(self, parts: list[str], name: str, handle: int | str) -> None:
+        if is_hard_excluded(name):
+            return  # I-5: never lstat-ed, listed, entered or reported
+        child = [*parts, name]
+        # A name that is not valid UTF-8 (a lone surrogate under surrogateescape) is listed
+        # as is here; I-13 scan-walk ruling 3 makes it "unsupported path" in the follow-up.
+        try:
+            validate_relpath(name, origin="tree")
+            if isinstance(handle, int):
+                st = os.lstat(name, dir_fd=handle)
+            else:
+                st = os.lstat(os.path.join(handle, name))
+        except (FileSkipped, OSError) as exc:
+            self.skip(child, _skip_reason(exc))
+            return
+        kind = entry_kind(st.st_mode)
+        if kind == "symlink" or _is_reparse_point(st):
+            self.skip(child, REASON_SYMLINK)
+        elif kind == "file":
+            self.files.append("/".join(child))
+        elif kind == "other":
+            self.skip(child, REASON_SPECIAL)
+        elif len(child) > WALK_MAX_DEPTH:
+            self.skip(child, REASON_WALK_LIMIT)
+        else:
+            self.folder(child, handle if isinstance(handle, int) else None)
