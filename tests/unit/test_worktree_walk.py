@@ -20,6 +20,7 @@ from conventiondrift.errors import ComponentError
 from conventiondrift.model import SkippedFile
 
 POSIX = os.name == "posix"
+_APFS_UNASSIGNED = "\u2065"  # the only HARD_EXCLUDE_IGNORABLE code point unassigned (Cn)
 
 
 @pytest.fixture(params=["dir_fd", "by_path"])
@@ -135,6 +136,13 @@ def test_hard_excluded_folders_are_never_entered(
     assert set(d._HARD_EXCLUDED_NAMES) <= set(names)
     assert all(any(ch in n for n in names) for ch in d.HARD_EXCLUDE_IGNORABLE)
     for i, name in enumerate(names):
+        if sys.platform == "darwin" and _APFS_UNASSIGNED in name:
+            # APFS refuses to create a name with a code point unassigned in Unicode 9.0
+            # (EILSEQ, errno 92), so this folder can't exist in a macOS tree. Pin that.
+            with pytest.raises(OSError) as exc:
+                (tmp_path / name).mkdir()
+            assert exc.value.errno == errno.EILSEQ
+            continue
         (tmp_path / name).mkdir(exist_ok=True)  # case-insensitive FS: same folder, fine
         (tmp_path / name / f"x{i}.py").write_text("x = 1\n")
     make(tmp_path, "src/a.py", "src/.GIT/config", "src/node_modules/m.py", "gitx~1/a.py")
@@ -558,6 +566,11 @@ def test_hard_excluded_names_count_toward_the_entry_cap(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="needs a file system that takes non-UTF-8 names")
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="APFS rejects a file name that is not valid UTF-8 (EILSEQ, errno 92), "
+    "so the b'\\xff.py' precondition can't be created on macOS",
+)
 def test_non_utf8_tree_name_is_unsupported_path(tmp_path: Path, strategy: str) -> None:
     """I-13 ruling 3 / QA F2: a surrogateescape name is SkippedFile with a U+XXXX path."""
     weird = tmp_path / "weird"
