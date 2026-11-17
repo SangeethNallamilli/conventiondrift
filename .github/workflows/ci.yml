@@ -9,6 +9,9 @@ on:
     branches: [main]
   schedule:
     - cron: '17 6 * * *'
+    # Weekly mutation run (owner decision 2026-11-13): Mondays 07:41 UTC.
+    # Only the mutation job keys on this cron; see its `if:`.
+    - cron: '41 7 * * 1'
   workflow_dispatch:
 
 concurrency:
@@ -501,11 +504,14 @@ jobs:
     # Report-only since D-TL-29: not in the `ci` aggregate's needs.
     # Needs SR review: new dependency mutmut==3.8.1, separate hashed lock.
     # GATES.md / D-TL-17: overall ≥80%, critical modules ≥90% when present.
-    # Runs on pull_request and on push to main (same triggers as this workflow).
+    # Runs only on the weekly schedule (owner decision 2026-11-13): a full
+    # run does not fit a per-PR budget. Not on pull_request, push, the
+    # nightly, or workflow_dispatch.
     name: mutation
+    if: github.event_name == 'schedule' && github.event.schedule == '41 7 * * 1'
     needs: [lockfile]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     permissions:
       contents: read
     steps:
@@ -546,8 +552,8 @@ jobs:
       - build
       - vendor-network
       - git-minimum
-      # mutation is report-only (D-TL-29, TL decision): it still runs on
-      # every workflow event, but is not part of the required aggregate.
+      # mutation is report-only (D-TL-29, TL decision) and runs only on
+      # the weekly schedule; it is not part of the required aggregate.
       # test-macos is blocking (D-TL-34, supersedes D-TL-30) and runs on
       # every event; a skipped test-macos fails this aggregate.
       - test-macos

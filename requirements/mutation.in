@@ -3,6 +3,9 @@
 # GATES.md / TEST-STRATEGY.md §2: overall mutation ≥80%; critical modules ≥90%.
 # Thresholds are not lowered.
 mutmut==3.8.1
+# The mutmut baseline collects tests/property/, which imports hypothesis.
+# Same pin as requirements/dev.txt.
+hypothesis==6.170.15
 # Build backend, same pin as pyproject [build-system], required for
 # pip install --no-deps --no-build-isolation -e . in the mutation job.
 setuptools==84.2.1
