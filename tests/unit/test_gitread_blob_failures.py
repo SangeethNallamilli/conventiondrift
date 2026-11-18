@@ -95,8 +95,17 @@ def _fake(monkeypatch: pytest.MonkeyPatch, check: str, batch: str) -> list[Any]:
         return started[-1]
 
     monkeypatch.setattr(gitread, "_start_batch", start)
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
     return started
+
+
+def _short_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make each later request wait at most 0.5 s, so the SLEEP cases fail fast.
+
+    Called only once the warm-up blob has come back, i.e. once both fakes are
+    running: a fake's interpreter start-up on a slow runner (CON-14: macOS took
+    longer than 0.5 s) must not count against a request's deadline.
+    """
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
 
 
 @pytest.fixture
@@ -124,6 +133,7 @@ def test_each_failure_kills_both_processes_and_later_calls_raise_without_restart
     reader = GitReader(repo)
     assert reader.blob(GOOD, 10) == b"abc"  # both processes running
     assert len(started) == 2
+    _short_timeout(monkeypatch)
     with pytest.raises(ComponentError) as info:
         reader.blob(BAD, 10)
     assert (info.value.component, info.value.message) == ("gitread", message)
@@ -144,6 +154,7 @@ def test_a_well_formed_missing_reply_keeps_both_processes(
     started = _fake(monkeypatch, f"{BAD} missing\n", "")
     reader = GitReader(repo)
     assert reader.blob(GOOD, 10) == b"abc"
+    _short_timeout(monkeypatch)
     with pytest.raises(ComponentError) as info:
         reader.blob(BAD, 10)
     assert (info.value.component, info.value.message) == ("gitread", "object not found")
