@@ -44,6 +44,7 @@ from conventiondrift.policy.config import (
     check_ranges,
 )
 from conventiondrift.policy.ignores import markers_by_file
+from conventiondrift.policy.yamlsafe import load_yaml
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",
@@ -52,6 +53,7 @@ __all__ = [
     "PolicySide",
     "build_policy",
     "config_path",
+    "load_yaml",
 ]
 
 Mode = Literal["compare", "head-only", "scan"]
