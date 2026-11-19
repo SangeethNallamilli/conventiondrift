@@ -536,6 +536,14 @@ OUTSIDE = [
     "./",
     "//",
     "a\ud800b",
+    # Windows-only forms that validate_relpath refuses for typed input on every OS (I-13):
+    # device names, a trailing dot or space.
+    "nul.txt",
+    "src/CON",
+    "Com1.py",
+    "docs./a.md",
+    "a.md ",
+    "..a/b..",
 ]
 INSIDE = {
     "AGENTS.md": "AGENTS.md",
@@ -543,7 +551,7 @@ INSIDE = {
     "docs//rules/./x.md": "docs/rules/x.md",
     "legacy/**": "legacy/**",
     "dir/": "dir",
-    "..a/b..": "..a/b..",
+    "..a/..b": "..a/..b",
 }
 
 
