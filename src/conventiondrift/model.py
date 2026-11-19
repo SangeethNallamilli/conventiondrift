@@ -9,12 +9,13 @@ names and value sets follow I-13, which C11 maps one-to-one to the I-9 report.
 """
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from itertools import pairwise
+from heapq import merge
+from itertools import islice, pairwise
 from types import MappingProxyType
-from typing import Any, Literal, cast, get_args
+from typing import Any, Final, Literal, cast, get_args
 
 CheckerId = Literal[
     "logging",
@@ -249,6 +250,118 @@ class Conflict:
         _check_sorted(self.rules, "Conflict.rules")
 
 
+MAX_CONFLICT_WITH: Final = 20
+"""R2.6: the most partner ids ``ConflictIndex.partners`` and ``RuleResult.conflict_with`` hold.
+
+A design constant of C6 (INTERFACES I-13 C6 item 4). It lives here, not in
+``rules/conflicts.py``, because the model types that enforce it cannot import C6.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedRule:
+    """A recognized rule, before checker mapping (T-015)."""
+
+    line: int
+    column: int
+    text: str
+    normalized_text: str
+    shape: str
+    ignored: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FileRules:
+    """Extraction result for one instruction file.
+
+    ``candidates_dropped`` and ``rules_dropped`` count what the R2.6 caps cut,
+    so the caller can list it (DESIGN §10 S4, "skipped and listed").
+    """
+
+    path: str
+    rules: tuple[ExtractedRule, ...]
+    unattached_markers: tuple[int, ...]
+    candidates_dropped: int
+    rules_dropped: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConflictIndex:
+    """Which rules conflict, for every rule and independent of ``MAX_CONFLICTS`` (I-13 C6 item 5).
+
+    A value type: two indexes built from the same rules compare equal. Rules
+    with the same checker match and scope form a *group*; ``ids[g]`` holds the
+    sorted rule ids of group ``g`` and ``adjacent[g]`` the groups it conflicts
+    with. ``incomplete_ids`` holds the rules for which some pair was not
+    evaluated (the R2.6 pair budget ran out, or the scope was too long to
+    compare): their ``total`` is a lower bound (item 6).
+    """
+
+    ids: tuple[tuple[str, ...], ...] = ()
+    adjacent: tuple[tuple[int, ...], ...] = ()
+    incomplete_ids: frozenset[str] = frozenset()
+    _group_of: dict[str, int] = field(init=False, repr=False, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        if len(self.ids) != len(self.adjacent):
+            raise ValueError("ConflictIndex.ids and adjacent must have one entry per group")
+        object.__setattr__(
+            self,
+            "_group_of",
+            {rule_id: g for g, members in enumerate(self.ids) for rule_id in members},
+        )
+
+    def partners(self, rule_id: str) -> tuple[str, ...]:
+        """The first ``MAX_CONFLICT_WITH`` ids ``rule_id`` conflicts with, sorted; () if unknown."""
+        group = self._group_of.get(rule_id)
+        if group is None:
+            return ()
+        # Each group's ids are sorted and no id is in two groups, so a merge is sorted.
+        return tuple(islice(merge(*(self.ids[o] for o in self.adjacent[group])), MAX_CONFLICT_WITH))
+
+    def total(self, rule_id: str) -> int:
+        """How many rules ``rule_id`` conflicts with: exact unless ``is_incomplete``, else at least.
+
+        Never less than ``len(partners(rule_id))``; 0 for an unknown id. A rule is
+        conflicting if and only if this is above 0, whatever either cap cut.
+        """
+        group = self._group_of.get(rule_id)
+        if group is None:
+            return 0
+        return sum(len(self.ids[o]) for o in self.adjacent[group])
+
+    def is_incomplete(self, rule_id: str) -> bool:
+        """Whether some pair involving ``rule_id`` was not evaluated."""
+        return rule_id in self.incomplete_ids
+
+    @property
+    def incomplete(self) -> int:
+        """The number of rules that were not fully checked."""
+        return len(self.incomplete_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class Extraction:
+    """What C6 found (I-11 ``Extractor``, I-13 C6 items 3 and 5).
+
+    ``files`` holds each file's ``extract_file`` result in path order, so the
+    caller can list the R2.6 caps (DESIGN §10 S4). ``conflicts`` lists at most
+    ``MAX_CONFLICTS`` conflicts and ``conflicts_dropped`` counts the rest (it
+    becomes ``ReportCounts.conflicts_unlisted``). ``conflict_lookup`` covers
+    every conflict, whatever the cap cut. ``unattached_markers`` holds
+    ``(repo-relative POSIX path, 1-based line)`` pairs, sorted. ``notes`` holds
+    the sentences C10/C11 must show (the conflict check stopped at its limit).
+    """
+
+    rules: tuple[Rule, ...]
+    conflicts: tuple[Conflict, ...]
+    files: tuple[FileRules, ...]
+    conflicts_dropped: int
+    unattached_markers: tuple[tuple[str, int], ...]
+    conflict_lookup: ConflictIndex
+    notes: tuple[str, ...] = ()
+
+
 class Verdict(StrEnum):
     """The six verdicts; values are the exact I-9 strings (I-13 Q7)."""
 
@@ -332,6 +445,8 @@ class RuleResult:
     base: SideResult | None
     head: SideResult | None
     conflict_with: tuple[str, ...]
+    conflict_with_total: int
+    conflict_incomplete: bool
     case: Case | None
     causing_files: tuple[CausingFile, ...]
     suggestion: Suggestion
@@ -339,6 +454,15 @@ class RuleResult:
     def __post_init__(self) -> None:
         if self.base_rule is None and self.head_rule is None:
             raise ValueError("RuleResult must have at least one of base_rule/head_rule")
+        # I-13 C6 item 7: cheap, and they hold for every constructor.
+        if self.conflict_with_total < 0:
+            raise ValueError("RuleResult.conflict_with_total must not be negative")
+        if len(self.conflict_with) > MAX_CONFLICT_WITH:
+            raise ValueError(f"RuleResult.conflict_with holds at most {MAX_CONFLICT_WITH} ids")
+        if len(self.conflict_with) > self.conflict_with_total:
+            raise ValueError("RuleResult.conflict_with_total must be at least len(conflict_with)")
+        if any(a >= b for a, b in pairwise(self.conflict_with)):
+            raise ValueError("RuleResult.conflict_with must be sorted with no duplicates")
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,10 +497,14 @@ class ReportCounts:
     rules_unchanged: int
     conflicts_unlisted: int = 0
     """Conflicts beyond the C6 listing cap (I-13 "C6 conflict cap and rule ids"); 0 if none."""
+    conflicts_incomplete: int = 0
+    """Rules whose conflicts were not fully checked (I-13 C6 item 6); 0 if none."""
 
     def __post_init__(self) -> None:
         if self.conflicts_unlisted < 0:
             raise ValueError("ReportCounts.conflicts_unlisted must not be negative")
+        if self.conflicts_incomplete < 0:
+            raise ValueError("ReportCounts.conflicts_incomplete must not be negative")
 
 
 @dataclass(frozen=True, slots=True, eq=True)

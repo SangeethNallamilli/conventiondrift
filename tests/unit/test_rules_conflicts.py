@@ -7,7 +7,7 @@ from typing import get_args
 
 import pytest
 
-from conventiondrift.model import CheckerId, Conflict, Rule, RuleMatch
+from conventiondrift.model import MAX_CONFLICT_WITH, CheckerId, Conflict, Rule, RuleMatch
 from conventiondrift.rules.conflicts import (
     MAX_CONFLICTS,
     find_conflicts,
@@ -190,7 +190,7 @@ def test_ignored_rules_still_conflict() -> None:
 def test_no_rules_no_conflicts() -> None:
     result = find_conflicts([])
     assert (result.found, result.unlisted) == ((), 0)
-    assert not result.lookup.is_conflicting("A.md:1")
+    assert result.lookup.total("A.md:1") == 0
 
 
 # --- scope overlap ---------------------------------------------------------------------
@@ -308,13 +308,13 @@ def test_lookup_gives_each_rules_partners_and_status() -> None:
     assert lookup.partners("A.md:1") == ("B.md:1", "C.md:1")
     assert lookup.partners("B.md:1") == ("A.md:1",)
     assert lookup.partners("D.md:1") == ()
-    assert [lookup.is_conflicting(r.id) for r in rules] == [True, True, True, False, False]
+    assert [lookup.total(r.id) > 0 for r in rules] == [True, True, True, False, False]
 
 
 def test_lookup_for_an_unknown_id_is_empty() -> None:
     lookup = find_conflicts([_rule("A.md", 1, REQUESTS), _rule("B.md", 1, HTTPX)]).lookup
     assert lookup.partners("nope") == ()
-    assert not lookup.is_conflicting("nope")
+    assert lookup.total("nope") == 0
 
 
 def test_lookup_covers_every_rule_even_when_the_cap_cuts_the_list() -> None:
@@ -325,12 +325,14 @@ def test_lookup_covers_every_rule_even_when_the_cap_cuts_the_list() -> None:
     assert result.unlisted == side * side - MAX_CONFLICTS
     listed = {i for c in result.found for i in c.rules}
     for rule in rules:
-        assert result.lookup.is_conflicting(rule.id)
-        assert len(result.lookup.partners(rule.id)) == side
+        assert result.lookup.total(rule.id) == side
+        assert len(result.lookup.partners(rule.id)) == MAX_CONFLICT_WITH
     # The cap stops after the first 25 "a" rules (25 * 40 pairs), so "a39" is not listed at all,
-    # yet the lookup still knows its 40 partners.
+    # yet the lookup still knows its partners (the first 20, and a total of 40).
     assert "a39.md:1" not in listed
-    assert result.lookup.partners("a39.md:1") == tuple(f"b{n:02}.md:1" for n in range(side))
+    assert result.lookup.partners("a39.md:1") == tuple(
+        f"b{n:02}.md:1" for n in range(MAX_CONFLICT_WITH)
+    )
 
 
 def test_the_listed_pairs_are_the_first_in_sorted_order_whatever_the_rule_order() -> None:

@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from conventiondrift.checkers.base import Checker
-from conventiondrift.model import InstructionFile, Policy, PyFile, Result, Window
-from conventiondrift.rules.mapping import Extraction
+from conventiondrift.model import Extraction, InstructionFile, Policy, PyFile, Result, Window
 
 Side = Literal["base", "head"]
 TreeEntry = tuple[str, str, int | None, str]

@@ -20,7 +20,8 @@
 4. ``ignored`` is set by an I-7 marker or a config ``ignore`` entry on any of
    the rule's lines; ``disabled`` when the winning checker is off in the
    policy (AC-F3.14); ``scope_dir`` is the file's folder, set by C4.
-5. Conflicts come from ``conflicts.find_conflicts``.
+5. Conflicts come from ``conflicts.find_conflicts`` (bounded, I-13 C6 items 4 and 6); a run that
+   hit its limit adds the "not fully checked" note to ``Extraction.notes``.
 
 Mapping is deterministic: checkers are tried in sorted id order and output is
 in (file, line) order.
@@ -28,25 +29,25 @@ in (file, line) order.
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import NamedTuple
 
 from conventiondrift.checkers.base import Checker
 from conventiondrift.errors import ComponentError
 from conventiondrift.model import (
     CheckerId,
-    Conflict,
+    ExtractedRule,
+    Extraction,
+    FileRules,
     IgnoreEntry,
     InstructionFile,
     Policy,
     Rule,
     RuleMatch,
 )
-from conventiondrift.rules.conflicts import ConflictIndex, find_conflicts
-from conventiondrift.rules.extract import ExtractedRule, FileRules, extract_file, normalize
+from conventiondrift.rules.conflicts import MAX_CONFLICT_PAIRS, find_conflicts, incomplete_note
+from conventiondrift.rules.extract import extract_file, normalize
 
 __all__ = [
-    "Extraction",
     "Mapped",
     "RuleExtractor",
     "extract_rules",
@@ -64,26 +65,6 @@ class Mapped(NamedTuple):
 
 
 UNMAPPED = Mapped(checker=None, match=None)
-
-
-@dataclass(frozen=True, slots=True)
-class Extraction:
-    """What ``extract_rules`` found.
-
-    ``files`` holds each file's ``extract_file`` result in path order, so the
-    caller can list unattached markers and the R2.6 caps (DESIGN §10 S4).
-    ``conflicts`` lists at most ``MAX_CONFLICTS`` conflicts and
-    ``conflicts_dropped`` counts the rest (I-9 ``counts.conflicts_dropped``).
-    ``conflict_lookup`` answers whether a rule is in a conflict and with which
-    rules, whatever the cap cut (``conflict_with``).
-    """
-
-    rules: tuple[Rule, ...]
-    conflicts: tuple[Conflict, ...]
-    files: tuple[FileRules, ...]
-    conflicts_dropped: int
-    unattached_markers: tuple[tuple[str, int], ...]
-    conflict_lookup: ConflictIndex
 
 
 def rule_identity(file: str, normalized_text: str) -> tuple[str, str]:
@@ -200,13 +181,18 @@ def _build(
 
 
 def extract_rules(
-    files: Sequence[InstructionFile], policy: Policy, checkers: Mapping[str, Checker]
+    files: Sequence[InstructionFile],
+    policy: Policy,
+    checkers: Mapping[str, Checker],
+    *,
+    max_conflict_pairs: int = MAX_CONFLICT_PAIRS,
 ) -> Extraction:
     """Instruction files to rules and conflicts (I-11 C6); see the module docstring.
 
     Raises ``ComponentError("rules")`` for a repeated file path or a checker
     missing from the policy, and ``ComponentError("checker:<id>")`` for a
-    broken checker; none of these is ever treated as config.
+    broken checker; none of these is ever treated as config. ``max_conflict_pairs``
+    is the C6 conflict evaluation budget; production uses the default.
     """
     ordered = sorted(files, key=lambda f: f.path)
     if len({f.path for f in ordered}) != len(ordered):
@@ -227,16 +213,17 @@ def extract_rules(
         _build(file, group, policy, checkers, shares_line=starts[(file.path, group[0].line)] > 1)
         for file, group in groups.values()
     ]
-    conflicts = find_conflicts(rules)
+    conflicts = find_conflicts(rules, max_pairs=max_conflict_pairs)
     return Extraction(
         rules=tuple(rules),
         conflicts=conflicts.found,
         files=tuple(results),
         conflicts_dropped=conflicts.unlisted,
         unattached_markers=tuple(
-            (result.path, line) for result in results for line in result.unattached_markers
+            sorted((result.path, line) for result in results for line in result.unattached_markers)
         ),
         conflict_lookup=conflicts.lookup,
+        notes=(incomplete_note(incomplete),) if (incomplete := conflicts.lookup.incomplete) else (),
     )
 
 
