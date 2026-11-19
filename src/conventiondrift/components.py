@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from conventiondrift.checkers.base import Checker
-from conventiondrift.model import Conflict, InstructionFile, Policy, PyFile, Result, Rule, Window
+from conventiondrift.model import InstructionFile, Policy, PyFile, Result, Window
+from conventiondrift.rules.mapping import Extraction
 
 Side = Literal["base", "head"]
 TreeEntry = tuple[str, str, int | None, str]
@@ -56,14 +57,14 @@ class GitReaderProtocol(Protocol):
 
 
 class Extractor(Protocol):
-    """C6, instruction files to rules and conflicts."""
+    """C6, instruction files to the full ``Extraction`` (I-13 C6 item 3)."""
 
     def extract(
         self,
         files: Sequence[InstructionFile],
         policy: Policy,
         checkers: Mapping[str, Checker],
-    ) -> tuple[Sequence[Rule], Sequence[Conflict]]: ...
+    ) -> Extraction: ...
 
 
 class History(Protocol):

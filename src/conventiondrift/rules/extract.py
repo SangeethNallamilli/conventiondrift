@@ -33,7 +33,7 @@ duplicates and conflicts are T-015, not this module.
 import re
 from bisect import bisect_right
 from collections.abc import Collection, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final, NamedTuple
 
 __all__ = [
@@ -122,6 +122,8 @@ class Candidate:
 
     line: int
     text: str
+    column: int = field(default=0, compare=False)
+    """1-based column (in characters of the line as written) of the first character; 0 = unknown."""
 
 
 class Marker(NamedTuple):
@@ -139,6 +141,7 @@ class ExtractedRule:
     """A recognized rule, before checker mapping (T-015)."""
 
     line: int
+    column: int
     text: str
     normalized_text: str
     shape: str
@@ -203,14 +206,37 @@ def _is_break(content: str) -> bool:
     return len(marks) >= 3 and set(marks) <= _BREAK_CHARS and len(set(marks)) == 1
 
 
-def _sentences(block: Sequence[tuple[int, str]]) -> Iterator[Candidate]:
-    """Split one bullet or paragraph into sentences with their start lines."""
+class _Line(NamedTuple):
+    """One line of a bullet or paragraph: ``content`` is what is split into sentences.
+
+    It is ``raw`` with each marker replaced by one space, minus its first ``skip``
+    characters (the bullet).
+    """
+
+    number: int
+    content: str
+    raw: str
+    skip: int
+
+
+def _raw_index(raw: str, index: int) -> int:
+    """Where ``index`` in ``raw`` with each marker replaced by one space is in ``raw`` itself."""
+    shift = 0
+    position = raw.find(MARKER)
+    while position >= 0 and position - shift < index:
+        shift += len(MARKER) - 1
+        position = raw.find(MARKER, position + len(MARKER))
+    return index + shift
+
+
+def _sentences(block: Sequence[_Line]) -> Iterator[Candidate]:
+    """Split one bullet or paragraph into sentences with their start lines and columns."""
     offsets: list[int] = []
     position = 0
-    for _, content in block:
+    for entry in block:
         offsets.append(position)
-        position += len(content) + 1
-    text = "\n".join(content for _, content in block)
+        position += len(entry.content) + 1
+    text = "\n".join(entry.content for entry in block)
     size = len(text)
     index = 0
     while index < size:
@@ -224,8 +250,14 @@ def _sentences(block: Sequence[tuple[int, str]]) -> Iterator[Candidate]:
             index += 1
             if char in _TERMINATORS and (index >= size or text[index].isspace()):
                 break
-        line = block[bisect_right(offsets, start) - 1][0]
-        yield Candidate(line=line, text=" ".join(text[start:index].split()))
+        which = bisect_right(offsets, start) - 1
+        entry = block[which]
+        within = entry.skip + start - offsets[which]
+        yield Candidate(
+            line=entry.number,
+            text=" ".join(text[start:index].split()),
+            column=_raw_index(entry.raw, within) + 1,
+        )
 
 
 def segment(path: str, text: str) -> Iterator[Candidate]:
@@ -238,7 +270,7 @@ def segment(path: str, text: str) -> Iterator[Candidate]:
     """
     lines = _split_lines(text)
     first = _front_matter_end(path, lines)
-    block: list[tuple[int, str]] = []
+    block: list[_Line] = []
     fence: tuple[str, int] | None = None
     for number in range(first + 1, len(lines) + 1):
         raw = lines[number - 1]
@@ -260,9 +292,9 @@ def segment(path: str, text: str) -> Iterator[Candidate]:
         bullet = _BULLET.match(content)
         if bullet is not None:
             yield from _sentences(block)
-            block = [(number, content[bullet.end() :])]
+            block = [_Line(number, content[bullet.end() :], raw, bullet.end())]
             continue
-        block.append((number, content))
+        block.append(_Line(number, content, raw, 0))
     yield from _sentences(block)
 
 
@@ -369,6 +401,7 @@ def extract_file(
     rules = tuple(
         ExtractedRule(
             line=candidate.line,
+            column=candidate.column,
             text=candidate.text,
             normalized_text=normalized,
             shape=shape,

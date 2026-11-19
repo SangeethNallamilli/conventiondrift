@@ -27,15 +27,15 @@ from conventiondrift.components import (
 from conventiondrift.model import (
     CheckerId,
     CheckerPolicy,
-    Conflict,
     InstructionFile,
     Policy,
     ReportCounts,
     Result,
-    Rule,
     Thresholds,
     Window,
 )
+from conventiondrift.rules.conflicts import ConflictIndex
+from conventiondrift.rules.mapping import Extraction
 
 FIELDS = (
     "git_reader",
@@ -144,15 +144,25 @@ def test_components_are_frozen_and_keyword_only() -> None:
         Components(None)  # type: ignore[call-arg]
 
 
+EMPTY_EXTRACTION = Extraction(
+    rules=(),
+    conflicts=(),
+    files=(),
+    conflicts_dropped=0,
+    unattached_markers=(),
+    conflict_lookup=ConflictIndex((), ()),
+)
+
+
 class _Extractor:
     def extract(
         self,
         files: Sequence[InstructionFile],
         policy: Policy,
         checkers: Mapping[str, Checker],
-    ) -> tuple[Sequence[Rule], Sequence[Conflict]]:
+    ) -> Extraction:
         self.seen = (tuple(files), policy, dict(checkers))
-        return ((), ())
+        return EMPTY_EXTRACTION
 
 
 def test_extractor_protocol_is_called_through_components() -> None:
@@ -161,7 +171,7 @@ def test_extractor_protocol_is_called_through_components() -> None:
     assert components.extractor is not None
     files = (InstructionFile(path="AGENTS.md", data=b"x", scope_dir="", via_paths_input=False),)
     policy = _minimal_result().policy
-    assert components.extractor.extract(files, policy, {}) == ((), ())
+    assert components.extractor.extract(files, policy, {}) is EMPTY_EXTRACTION
     assert extractor.seen == (files, policy, {})
 
 
