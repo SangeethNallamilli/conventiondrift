@@ -297,7 +297,10 @@ jobs:
     # non-Windows `test` legs.
     name: test-macos (${{ matrix.python-version }})
     needs: [lockfile]
-    runs-on: macos-latest
+    # Pinned to macos-15 (2026-11-19): macos-latest now resolves to the
+    # macos-26-arm64 pool, which repeatedly failed to assign runners
+    # ("not acquired by Runner of type hosted") on daytime full-matrix runs.
+    runs-on: macos-15
     timeout-minutes: 10
     permissions:
       contents: read
