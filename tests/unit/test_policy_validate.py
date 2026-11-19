@@ -7,6 +7,7 @@ module's constants, and each test asserts it covers them (D-TL-25).
 """
 
 import dataclasses
+from collections.abc import Mapping
 from typing import Any, get_args
 
 import pytest
@@ -337,7 +338,7 @@ def test_history_days_wrong_type(value: object) -> None:
 THRESHOLD_FIELDS = tuple(THRESHOLD_RANGES)
 
 
-def thresholds_doc(values: dict[str, object]) -> dict[str, Any]:
+def thresholds_doc(values: Mapping[str, object]) -> dict[str, Any]:
     """I-6 ``thresholds`` block from ``Thresholds`` field names."""
     block: dict[str, Any] = {}
     for name, value in values.items():
