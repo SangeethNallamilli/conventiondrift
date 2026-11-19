@@ -13,6 +13,7 @@ import pytest
 from tests.fixtures.gitrepo import SYMLINK_UNAVAILABLE_REASON, symlinks_available
 
 import conventiondrift.discover as discover
+from conventiondrift.core import BasePhaseDone
 from conventiondrift.defaults import DEFAULT_EXCLUDES
 from conventiondrift.discover import (
     MAX_INSTRUCTION_FILES,
@@ -28,6 +29,7 @@ from conventiondrift.model import SkippedFile, SkipReason
 
 SHA = "ab" * 20
 PY = b"x = 1\n"
+PHASE = BasePhaseDone(base_config_known=False)
 
 
 class FakeGit:
@@ -58,7 +60,7 @@ def run(
     excludes: Sequence[str] = DEFAULT_EXCLUDES,
     paths: Sequence[str] | None = None,
 ) -> discover.Discovery:
-    return discover_tree(FakeGit(files), SHA, excludes=excludes, paths=paths)
+    return discover_tree(PHASE, FakeGit(files), SHA, excludes=excludes, paths=paths)
 
 
 def names(found: discover.Discovery) -> tuple[list[str], list[str]]:
@@ -112,7 +114,7 @@ def test_discovers_every_pattern_and_no_decoys_sorted_by_path_bytes() -> None:
 
 
 def test_no_instruction_files_and_no_python_are_empty_results() -> None:
-    assert run({"a.py": PY}) == discover.Discovery((), (), (), ())
+    assert run({"a.py": PY}) == discover.Discovery((), (), (), frozenset(), (), ())
     empty = run({"AGENTS.md": b"- Use httpx\n"})
     assert empty.py_files == () and len(empty.instruction_files) == 1
 
@@ -128,7 +130,7 @@ def test_python_files_are_kept_only_inside_an_instruction_scope() -> None:
             "tool.py": PY,
         }
     )
-    found = discover_tree(git, SHA)
+    found = discover_tree(PHASE, git, SHA)
     assert names(found)[1] == ["services/billing/deep/x.py", "services/billing/pay.py"]
     assert "services/web/app.py" not in git.blobs  # out of scope: never read
     root = run({"AGENTS.md": b"r", "a/b.py": PY, "c.py": PY})
@@ -170,7 +172,7 @@ def test_default_excludes_and_hard_excludes_drop_python_silently(path: str) -> N
 
 def test_hard_excludes_survive_a_custom_exclude_set_and_are_never_read() -> None:
     git = FakeGit({"AGENTS.md": b"r", ".git/hooks/x.py": PY, "node_modules/AGENTS.md": b"r"})
-    found = discover_tree(git, SHA, excludes=())
+    found = discover_tree(PHASE, git, SHA, excludes=())
     assert names(found) == (["AGENTS.md"], [])
     assert git.blobs == ["AGENTS.md"]  # SEC-T10: nothing under .git/ or node_modules/ is read
 
@@ -250,7 +252,7 @@ def test_paths_entries_are_deduplicated_and_not_subject_to_excludes() -> None:
 )
 def test_hard_excluded_paths_entry_is_a_note_not_a_skipped_file(entry: str) -> None:
     git = FakeGit({"AGENTS.md": b"r", entry.lstrip("./"): b"r"})
-    found = discover_tree(git, SHA, paths=[entry])
+    found = discover_tree(PHASE, git, SHA, paths=[entry])
     assert found.notes == (AlwaysExcluded(entry).note,)
     assert found.notes == (f"`{entry}` is always excluded",)
     assert found.skipped == () and found.instruction_files == () and git.blobs == []
@@ -262,15 +264,87 @@ def test_hard_excluded_paths_entry_is_a_note_not_a_skipped_file(entry: str) -> N
         ("../x.md", "outside repository"),
         ("/etc/passwd", "outside repository"),
         ("a\\b.md", "outside repository"),
-        ("missing.md", "unreadable"),
     ],
 )
-def test_bad_or_missing_paths_entries_are_skipped_with_a_reason(
-    entry: str, reason: SkipReason
-) -> None:
+def test_bad_paths_entries_are_skipped_with_a_reason(entry: str, reason: SkipReason) -> None:
     found = run({"AGENTS.md": b"r"}, paths=[entry])
     assert found.skipped == (SkippedFile(entry, reason),)
     assert found.instruction_files == ()
+
+
+def test_some_missing_paths_entries_get_a_not_found_note_and_the_rest_run() -> None:
+    files = {"AGENTS.md": b"root", "docs/RULES.md": b"r", "x.py": PY}
+    found = run(files, paths=["gone.md", "docs/RULES.md", "./docs//nope.md"])
+    assert names(found) == (["docs/RULES.md"], ["x.py"])
+    assert found.notes == ("`gone.md` was not found", "`docs/nope.md` was not found")
+    assert found.skipped == ()
+
+
+def test_all_paths_entries_missing_never_fall_back_to_auto_detection() -> None:
+    files = {"AGENTS.md": b"root", "a/CLAUDE.md": b"r", "x.py": PY}
+    git = FakeGit(files)
+    found = discover_tree(PHASE, git, SHA, paths=["gone.md", "other.md"])
+    assert found == discover.Discovery(
+        (), (), (), frozenset(), (), ("`gone.md` was not found", "`other.md` was not found")
+    )
+    assert git.blobs == []  # nothing was read, not even the root AGENTS.md
+
+
+def test_missing_and_hard_excluded_entries_each_get_their_own_note() -> None:
+    found = run({"AGENTS.md": b"r"}, paths=[".git/config", "gone.md"])
+    assert found.notes == ("`.git/config` is always excluded", "`gone.md` was not found")
+
+
+def test_discovery_carries_empty_manifest_and_entry_point_fields_until_t010c() -> None:
+    found = run({"AGENTS.md": b"r", "pyproject.toml": b"[project]\n", "a.py": PY})
+    assert found.manifest_files == () and found.entry_points == frozenset()
+
+
+def test_the_base_phase_token_is_required_and_changes_nothing() -> None:
+    files = {"AGENTS.md": b"r", "a.py": PY}
+    known = discover_tree(BasePhaseDone(base_config_known=True), FakeGit(files), SHA)
+    assert known == run(files)
+    with pytest.raises(TypeError):
+        discover_tree(FakeGit(files), SHA)  # type: ignore[call-arg,arg-type]
+    with pytest.raises(AttributeError):
+        PHASE.base_config_known = True  # type: ignore[misc]  # frozen
+
+
+def test_a_root_tool_folder_file_that_also_matches_a_name_is_one_whole_repo_file() -> None:
+    files = {
+        ".claude/rules/CLAUDE.md": b"r",
+        ".cursor/rules/AGENTS.md": b"r",
+        ".github/instructions/GEMINI.md": b"r",
+        "sub/.claude/rules/CLAUDE.md": b"r",  # not a root tool folder: the name decides
+        "a.py": PY,
+        ".claude/x.py": PY,
+    }
+    found = run(files)
+    assert [(f.path, f.scope_dir) for f in found.instruction_files] == [
+        (".claude/rules/CLAUDE.md", ""),
+        (".cursor/rules/AGENTS.md", ""),
+        (".github/instructions/GEMINI.md", ""),
+        ("sub/.claude/rules/CLAUDE.md", "sub/.claude/rules"),
+    ]
+    assert names(found)[1] == [".claude/x.py", "a.py"]
+    assert len({f.path for f in found.instruction_files}) == len(found.instruction_files)
+
+
+def test_a_non_root_pyvenv_folder_excludes_its_whole_subtree_and_the_root_one_does_not() -> None:
+    files = {
+        "AGENTS.md": b"r",
+        "pyvenv.cfg": b"home = /x\n",  # the repo root: not a venv exclusion
+        "a.py": PY,
+        "tools/env/pyvenv.cfg": b"home = /x\n",
+        "tools/env/bin/x.py": PY,
+        "tools/env/lib/deep/er/y.py": PY,
+        "tools/env/CLAUDE.md": b"r",
+        "tools/other.py": PY,
+        "tools/env2/z.py": PY,  # a sibling with a similar name is untouched
+    }
+    found = run(files)
+    assert names(found) == (["AGENTS.md"], ["a.py", "tools/env2/z.py", "tools/other.py"])
+    assert found.skipped == ()
 
 
 def test_summary_note_text_is_stable_for_the_escaping_layer() -> None:
@@ -296,7 +370,7 @@ def test_symlinks_and_odd_modes_are_reported_only_for_files_that_would_be_analyz
             "sub/mod": ("160000", b""),  # a submodule is ignored
         }
     )
-    found = discover_tree(git, SHA)
+    found = discover_tree(PHASE, git, SHA)
     assert found.skipped == (SkippedFile("link.py", reason), SkippedFile("sub/CLAUDE.md", reason))
     assert git.blobs == ["AGENTS.md"]
 
@@ -312,7 +386,7 @@ def test_oversize_binary_and_undecodable_files_are_skipped_before_or_after_readi
             "bin/AGENTS.md": b"a\x00",
         }
     )
-    found = discover_tree(git, SHA)
+    found = discover_tree(PHASE, git, SHA)
     assert {(s.path, s.reason) for s in found.skipped} == {
         ("big.py", "size limit"),
         ("bin.py", "binary"),
@@ -322,7 +396,7 @@ def test_oversize_binary_and_undecodable_files_are_skipped_before_or_after_readi
     }
     assert "big.py" not in git.blobs  # the tree size is checked before any read
     low = discover_tree(
-        FakeGit({"AGENTS.md": b"r", "a.py": b"x = 1\n" * 10}), SHA, max_file_bytes=16
+        PHASE, FakeGit({"AGENTS.md": b"r", "a.py": b"x = 1\n" * 10}), SHA, max_file_bytes=16
     )
     assert low.skipped == (SkippedFile("a.py", "size limit"),)
 
@@ -332,7 +406,7 @@ def test_a_blob_that_grows_past_the_limit_is_still_skipped() -> None:
         def tree(self, sha: str) -> list[tuple[str, str, int | None, str]]:
             return [(m, o, 1, p) for m, o, _, p in super().tree(sha)]
 
-    found = discover_tree(Lying({"AGENTS.md": b"r", "a.py": b"x" * 2_000_000}), SHA)
+    found = discover_tree(PHASE, Lying({"AGENTS.md": b"r", "a.py": b"x" * 2_000_000}), SHA)
     assert found.skipped == (SkippedFile("a.py", "size limit"),)
 
 
@@ -378,7 +452,7 @@ def test_python_file_cap_keeps_the_first_by_path_and_never_reads_the_rest(
 ) -> None:
     monkeypatch.setattr(discover, "MAX_PY_FILES", 2)
     git = FakeGit({"AGENTS.md": b"r", "c.py": PY, "a.py": PY, "b.py": PY, "d.py": PY})
-    found = discover_tree(git, SHA)
+    found = discover_tree(PHASE, git, SHA)
     assert names(found)[1] == ["a.py", "b.py"]
     assert found.skipped == (
         SkippedFile("c.py", "cap exceeded"),
@@ -399,7 +473,7 @@ def test_a_git_failure_other_than_a_skip_fails_closed() -> None:
             raise ComponentError("gitread", "boom")
 
     with pytest.raises(ComponentError):
-        discover_tree(Broken({"AGENTS.md": b"r"}), SHA)
+        discover_tree(PHASE, Broken({"AGENTS.md": b"r"}), SHA)
 
 
 def test_discovery_is_deterministic_for_any_listing_order() -> None:
@@ -455,7 +529,7 @@ def test_real_repository_through_gitread(tmp_path: Path) -> None:
     _git(repo, "commit", "-q", "-m", "c")
     reader = GitReader(repo)
     try:
-        found = discover_tree(reader, _git(repo, "rev-parse", "HEAD"))
+        found = discover_tree(PHASE, reader, _git(repo, "rev-parse", "HEAD"))
     finally:
         reader.close()
     assert [(f.path, f.scope_dir) for f in found.instruction_files] == [

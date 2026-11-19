@@ -27,10 +27,11 @@ from conventiondrift.discover.safefs import (
     validate_relpath,
 )
 from conventiondrift.errors import FileSkipped
-from conventiondrift.model import InstructionFile, PyFile, SkippedFile, SkipReason
+from conventiondrift.model import InstructionFile, ManifestFile, PyFile, SkippedFile, SkipReason
 
 if TYPE_CHECKING:
     from conventiondrift.components import TreeEntry
+    from conventiondrift.core import BasePhaseDone
 
 __all__ = [
     "MAX_INSTRUCTION_FILES",
@@ -102,8 +103,10 @@ class Discovery:
 
     instruction_files: tuple[InstructionFile, ...]
     py_files: tuple[PyFile, ...]
+    manifest_files: tuple[ManifestFile, ...]  # empty until T-010c (A-4)
+    entry_points: frozenset[str]  # empty until T-010c (A-4)
     skipped: tuple[SkippedFile, ...]
-    notes: tuple[str, ...]  # summary notes, such as "`.git/x` is always excluded" (I-13 ruling 1)
+    notes: tuple[str, ...]  # summary notes: "`x` is always excluded", "`x` was not found"
 
 
 def _sort_key(path: str) -> bytes:
@@ -155,6 +158,7 @@ class _Reader:
 
 
 def discover_tree(
+    phase: BasePhaseDone,
     git: TreeReader,
     sha: str,
     *,
@@ -164,6 +168,8 @@ def discover_tree(
 ) -> Discovery:
     """List instruction files and Python files in scope at commit ``sha`` (DESIGN §10 S6).
 
+    ``phase`` is the SR-015 token: the base config load has already run (I-13 C4 rulings).
+
     * ``excludes`` is the effective glob set (``Policy.excludes``). The hard ``.git/`` and
       ``node_modules/`` exclusions (any component, I-5) and the two content rules, a
       folder holding ``pyvenv.cfg`` and the generated-file header, always apply and are
@@ -171,7 +177,8 @@ def discover_tree(
     * ``paths`` (``Policy.paths``; ``None`` or empty means auto-detect, AC-F9.2) names the
       only instruction files. An entry that matches an S6 pattern keeps its scope, any
       other scopes to the whole repo (A-6). Named files are not subject to ``excludes``;
-      one that is hard-excluded is dropped with a note, not a ``SkippedFile``.
+      one that is hard-excluded, or missing from the tree (SC-2.54), is dropped with a
+      note, not a ``SkippedFile``, and a missing one never falls back to auto-detection.
     * A ``.py`` file is kept only if some kept instruction file's scope contains it.
     * At most ``MAX_INSTRUCTION_FILES`` and ``MAX_PY_FILES`` are kept, first by path bytes
       (A-5); the rest are ``"cap exceeded"``. Symlinks, special files and bad names are
@@ -210,7 +217,7 @@ def discover_tree(
             if has_hard_excluded_component(rel):
                 notes.append(AlwaysExcluded(rel).note)
             elif rel not in by_path:
-                skip(rel, "unreadable")
+                notes.append(f"`{rel}` was not found")
             else:
                 scope = instruction_scope(rel)
                 named.setdefault(rel, "" if scope is None else scope)
@@ -256,6 +263,8 @@ def discover_tree(
     return Discovery(
         tuple(instructions),
         tuple(pys),
+        (),
+        frozenset(),
         tuple(sorted(skipped, key=lambda s: _sort_key(s.path))),
         tuple(notes),
     )

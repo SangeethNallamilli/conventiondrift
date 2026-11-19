@@ -26,6 +26,19 @@ EXIT_REFUSED_TRIGGER = 4
 
 
 @dataclass(frozen=True, slots=True)
+class BasePhaseDone:
+    """Proof that the base config load has run, so head content may be read (SR-015, I-13).
+
+    Every head-side reader, including C4's ``discover_tree``, takes it as its first
+    argument. T-028 adds the only production construction sites and the AST scan that
+    guards them; tests may build it directly.
+    """
+
+    base_config_known: bool
+    """True if a base-side config file was seen to exist (I-13 ``config_known_present``)."""
+
+
+@dataclass(frozen=True, slots=True)
 class UsageErrorOutcome:
     """The run stopped on a usage error (I-4 exit 2), e.g. an unresolvable revision."""
 
