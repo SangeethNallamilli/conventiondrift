@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from tests.fixtures.gitrepo import SYMLINK_UNAVAILABLE_REASON, symlinks_available
@@ -21,7 +22,9 @@ from conventiondrift.discover import (
     discover_tree,
     instruction_scope,
     is_generated,
+    safefs,
 )
+from conventiondrift.discover.globmatch import GlobSet
 from conventiondrift.discover.safefs import AlwaysExcluded
 from conventiondrift.errors import ComponentError, FileSkipped
 from conventiondrift.gitread import GitReader
@@ -248,13 +251,15 @@ def test_paths_entries_are_deduplicated_and_not_subject_to_excludes() -> None:
 
 
 @pytest.mark.parametrize(
-    "entry", [".git/config", "a/node_modules/R.md", ".GIT/x", "docs/GIT~1/x", "x/.git"]
+    "entry",
+    [".git/config", "./.git/config", "a/node_modules/R.md", ".GIT/x", "docs/GIT~1/x", "x/.git"],
 )
 def test_hard_excluded_paths_entry_is_a_note_not_a_skipped_file(entry: str) -> None:
-    git = FakeGit({"AGENTS.md": b"r", entry.lstrip("./"): b"r"})
+    rel = entry.removeprefix("./")  # the entry is normalized; `.git/config` must stay itself
+    git = FakeGit({"AGENTS.md": b"r", rel: b"r"})
     found = discover_tree(PHASE, git, SHA, paths=[entry])
-    assert found.notes == (AlwaysExcluded(entry).note,)
-    assert found.notes == (f"`{entry}` is always excluded",)
+    assert found.notes == (AlwaysExcluded(rel).note,)
+    assert found.notes == (f"`{rel}` is always excluded",)
     assert found.skipped == () and found.instruction_files == () and git.blobs == []
 
 
@@ -306,6 +311,9 @@ def test_the_base_phase_token_is_required_and_changes_nothing() -> None:
     assert known == run(files)
     with pytest.raises(TypeError):
         discover_tree(FakeGit(files), SHA)  # type: ignore[call-arg,arg-type]
+    for not_a_token in (object(), None, True):  # a stand-in for the token is refused too
+        with pytest.raises(TypeError, match="BasePhaseDone"):
+            discover_tree(not_a_token, FakeGit(files), SHA)  # type: ignore[arg-type]
     with pytest.raises(AttributeError):
         PHASE.base_config_known = True  # type: ignore[misc]  # frozen
 
@@ -443,8 +451,14 @@ def test_instruction_file_cap_keeps_the_first_200_by_path() -> None:
     assert [(s.path, s.reason) for s in found.skipped] == [
         (f"d{i}/AGENTS.md", "cap exceeded") for i in (200, 201, 202)
     ]
-    capped = run({"AGENTS.md": b"r", "z/AGENTS.md": b"r"}, paths=["AGENTS.md", "z/AGENTS.md"])
-    assert len(capped.instruction_files) == 2
+
+    named = [f"d{i:03}/AGENTS.md" for i in range(MAX_INSTRUCTION_FILES + 3)]
+    capped = run(files, paths=named)  # the cap holds in `paths` mode too
+    assert [f.path for f in capped.instruction_files] == named[:200]
+    assert [(s.path, s.reason) for s in capped.skipped] == [
+        (p, "cap exceeded") for p in named[200:]
+    ]
+    assert all(f.via_paths_input for f in capped.instruction_files)
 
 
 def test_python_file_cap_keeps_the_first_by_path_and_never_reads_the_rest(
@@ -461,10 +475,116 @@ def test_python_file_cap_keeps_the_first_by_path_and_never_reads_the_rest(
     assert git.blobs == ["AGENTS.md", "a.py", "b.py"]
 
 
-def test_a_dropped_generated_file_does_not_use_a_cap_slot(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(discover, "MAX_PY_FILES", 1)
-    found = run({"AGENTS.md": b"r", "a.py": b"# generated, do not edit\n", "b.py": PY})
-    assert names(found)[1] == ["b.py"] and found.skipped == ()
+def test_the_python_cap_bounds_blob_reads_so_generated_files_cannot_bypass_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # L-50-1: a file dropped after its read (generated header) still used a read slot.
+    monkeypatch.setattr(discover, "MAX_PY_FILES", 2)
+    gen = b"# generated, do not edit\n"
+    git = FakeGit({"AGENTS.md": b"r", **{f"g{i}.py": gen for i in range(5)}, "z.py": PY})
+    found = discover_tree(PHASE, git, SHA)
+    assert git.blobs == ["AGENTS.md", "g0.py", "g1.py"]  # two .py reads, never more
+    assert names(found)[1] == []
+    assert [(s.path, s.reason) for s in found.skipped] == [
+        (p, "cap exceeded") for p in ("g2.py", "g3.py", "g4.py", "z.py")
+    ]
+
+
+def test_the_instruction_cap_bounds_blob_reads_even_for_files_that_are_then_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(discover, "MAX_INSTRUCTION_FILES", 2)
+    files = {f"d{i}/AGENTS.md": b"a\x00" for i in range(4)}  # binary: skipped after the read
+    git = FakeGit(files)
+    found = discover_tree(PHASE, git, SHA)
+    assert git.blobs == ["d0/AGENTS.md", "d1/AGENTS.md"]
+    assert [(s.path, s.reason) for s in found.skipped] == [
+        ("d0/AGENTS.md", "binary"),
+        ("d1/AGENTS.md", "binary"),
+        ("d2/AGENTS.md", "cap exceeded"),
+        ("d3/AGENTS.md", "cap exceeded"),
+    ]
+
+
+def test_a_named_symlink_and_a_named_oversize_file_are_skipped_with_their_reason() -> None:
+    # DESIGN has no paths-specific rule; this pins the general R2.2/R2.3 handling.
+    files: dict[str, bytes | tuple[str, bytes]] = {
+        "AGENTS.md": b"root",
+        "link.md": ("120000", b"AGENTS.md"),
+        "big.md": b"x" * 2_000_000,
+        "ok.md": b"r",
+    }
+    git = FakeGit(files)
+    found = discover_tree(PHASE, git, SHA, paths=["link.md", "big.md", "ok.md"])
+    assert names(found)[0] == ["ok.md"]
+    assert found.skipped == (SkippedFile("big.md", "size limit"), SkippedFile("link.md", "symlink"))
+    assert "big.md" not in git.blobs and "link.md" not in git.blobs  # neither is read
+    assert found.notes == ()
+
+
+def test_a_paths_entry_with_a_lone_surrogate_is_escaped_and_does_not_crash() -> None:
+    found = run({"AGENTS.md": b"r"}, paths=["\ud800.md", "ok/\udc80.md"])
+    assert found.skipped == (
+        SkippedFile("U+D800.md", "outside repository"),
+        SkippedFile("ok/U+DC80.md", "outside repository"),
+    )
+    assert found.instruction_files == () and found.notes == ()
+
+
+def _deep(depth: int, name: str = "x.py") -> str:
+    return "/".join(["d"] * (depth - 1) + [name])
+
+
+class _SpyGlobSet(GlobSet):
+    seen: ClassVar[list[str]] = []
+
+    def excludes(self, path: str, is_dir: bool = False) -> bool:
+        _SpyGlobSet.seen.append(path)
+        return super().excludes(path, is_dir)
+
+
+def test_tree_paths_deeper_than_the_walker_cap_are_skipped_before_any_matching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cap = safefs.WALK_MAX_DEPTH
+    assert cap == 64  # the scan-mode walker's cap, reused
+    _SpyGlobSet.seen = []
+    monkeypatch.setattr(discover, "GlobSet", _SpyGlobSet)
+    files = {
+        "AGENTS.md": b"r",
+        _deep(cap): PY,  # exactly 64 components: handled
+        _deep(cap + 1): PY,
+        _deep(2000): PY,
+        _deep(cap + 1, "AGENTS.md"): b"r",
+        _deep(cap + 1, "notes.txt"): b"x",  # not analyzable: not reported
+        _deep(cap + 1, "x.py").replace("d/", ".git/", 1): PY,  # hard-excluded: silent
+    }
+    found = run(files)
+    assert names(found)[1] == [_deep(cap)]
+    assert [(s.path, s.reason) for s in found.skipped] == sorted(
+        [(p, "walk limit") for p in (_deep(cap + 1), _deep(2000), _deep(cap + 1, "AGENTS.md"))],
+        key=lambda item: item[0].encode(),
+    )
+    # Matching only ever saw paths within the cap: the work per path is bounded by it.
+    assert _SpyGlobSet.seen and all(p.count("/") + 1 <= cap for p in _SpyGlobSet.seen)
+
+
+def test_the_depth_cap_is_read_per_call_and_applies_to_paths_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(safefs, "WALK_MAX_DEPTH", 3)
+    files = {"AGENTS.md": b"r", "a/b/c.py": PY, "a/b/c/d.py": PY, "a/b/c/R.md": b"r"}
+    found = run(files)
+    assert names(found)[1] == ["a/b/c.py"]
+    assert found.skipped == (
+        SkippedFile("a/b/c/R.md", "walk limit"),
+        SkippedFile("a/b/c/d.py", "walk limit"),
+    )
+    named = run(files, paths=["a/b/c/R.md", "./a/b/R2.md", "a/b/c/e/Missing.md"])
+    # The named deep entry that is in the tree is not reported twice; one that is not in
+    # the tree is still "walk limit", never matched or looked up.
+    assert named.skipped == (*found.skipped, SkippedFile("a/b/c/e/Missing.md", "walk limit"))
+    assert named.notes == ("`a/b/R2.md` was not found",)
 
 
 def test_a_git_failure_other_than_a_skip_fails_closed() -> None:

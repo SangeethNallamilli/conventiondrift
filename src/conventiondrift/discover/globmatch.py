@@ -14,10 +14,16 @@ trailing ``/`` matches folders only; a pattern with a ``/`` before its end, or a
 ``x/**`` (at least one component) and ``x/**/y`` have their gitignore meaning. Paths are
 repo-relative POSIX strings with no empty segments. Blank lines, comments and trailing
 spaces are for the ``.gitignore`` loader to handle before it calls :func:`compile_glob`.
+
+Differences from git: POSIX classes such as ``[[:alpha:]]`` are not supported (they read
+as the plain characters ``[:alph`` followed by a literal ``]``). Compiling is linear in the
+pattern: an unclosed ``[`` makes its segment, and so the pattern, match nothing, exactly
+as git's wildmatch does, and the rest of the segment is not scanned.
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Iterable
 from typing import Final
 
@@ -28,22 +34,36 @@ _ANY_ONE: Final = object()  # one "?"
 
 
 class _Class:
-    """A ``[...]`` bracket expression: single characters and inclusive ranges."""
+    """A ``[...]`` bracket expression: single characters and inclusive ranges.
 
-    __slots__ = ("negate", "ranges", "singles")
+    The ranges are merged and sorted when the class is built, so a character is tested
+    with one binary search however many ranges the class has.
+    """
 
-    def __init__(self, negate: bool, singles: str, ranges: tuple[tuple[str, str], ...]) -> None:
+    __slots__ = ("his", "los", "negate", "singles")
+
+    def __init__(self, negate: bool, singles: str, ranges: Iterable[tuple[str, str]]) -> None:
         self.negate = negate
-        self.singles = singles
-        self.ranges = ranges
+        self.singles = frozenset(singles)
+        merged: list[list[str]] = []
+        for lo, hi in sorted(r for r in ranges if r[0] <= r[1]):  # a reversed range is empty
+            if merged and ord(lo) <= ord(merged[-1][1]) + 1:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        self.los = [m[0] for m in merged]
+        self.his = [m[1] for m in merged]
 
     def matches(self, ch: str) -> bool:
-        hit = ch in self.singles or any(lo <= ch <= hi for lo, hi in self.ranges)
+        i = bisect_right(self.los, ch) - 1
+        hit = ch in self.singles or (i >= 0 and ch <= self.his[i])
         return hit != self.negate
 
 
 _Token = str | _Class | object
 _Segment = str | tuple[_Token, ...]  # a plain string is an all-literal segment
+_NEVER: Final = object()  # a token no character matches
+_NEVER_SEGMENT: Final[_Segment] = (_NEVER,)
 
 
 def _parse_class(text: str, start: int) -> tuple[_Class, int] | None:
@@ -57,7 +77,7 @@ def _parse_class(text: str, start: int) -> tuple[_Class, int] | None:
     while i < len(text):
         ch = text[i]
         if ch == "]" and not first:
-            return _Class(negate, "".join(singles), tuple(ranges)), i + 1
+            return _Class(negate, "".join(singles), ranges), i + 1
         first = False
         if ch == "\\" and i + 1 < len(text):
             i += 1
@@ -85,7 +105,12 @@ def _compile_segment(text: str) -> _Segment:
                 tokens.append(_STAR)
         elif ch == "?":
             tokens.append(_ANY_ONE)
-        elif ch == "[" and (cls := _parse_class(text, i)) is not None:
+        elif ch == "[":
+            cls = _parse_class(text, i)
+            if cls is None:
+                # Like git's wildmatch, an unclosed "[" matches nothing, so the rest of the
+                # segment is never read: one failed scan, then done. Compile stays linear.
+                return _NEVER_SEGMENT
             tokens.append(cls[0])
             i = cls[1]
             continue
@@ -231,10 +256,9 @@ class GlobSet:
 
     def excludes(self, path: str, is_dir: bool = False) -> bool:
         """True if ``path`` (or a folder above it) is excluded."""
-        parts = path.split("/")
-        folder = ""
-        for part in parts[:-1]:
-            folder = f"{folder}/{part}" if folder else part
-            if self._folder_excluded(folder):
+        end = path.find("/")
+        while end != -1:  # prefixes are sliced from the path, never rejoined
+            if self._folder_excluded(path[:end]):
                 return True
+            end = path.find("/", end + 1)
         return self._verdict(path, is_dir)

@@ -14,9 +14,12 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
+from conventiondrift.core import BasePhaseDone
 from conventiondrift.defaults import DEFAULT_EXCLUDES
+from conventiondrift.discover import safefs
 from conventiondrift.discover.globmatch import GlobSet, compile_glob
 from conventiondrift.discover.safefs import (
+    REASON_WALK_LIMIT,
     AlwaysExcluded,
     FileKind,
     check_size,
@@ -31,7 +34,6 @@ from conventiondrift.model import InstructionFile, ManifestFile, PyFile, Skipped
 
 if TYPE_CHECKING:
     from conventiondrift.components import TreeEntry
-    from conventiondrift.core import BasePhaseDone
 
 __all__ = [
     "MAX_INSTRUCTION_FILES",
@@ -84,7 +86,11 @@ def instruction_scope(path: str) -> str | None:
 
 
 def is_generated(text: str) -> bool:
-    """True if the first 5 lines hold both "generated" and "do not edit", ignoring case (S6)."""
+    """True if the first 5 lines hold both "generated" and "do not edit", ignoring case (S6).
+
+    ``text`` is the whole decoded blob, which C4 has already read up to the size limit
+    (1 MiB); only its first 5 lines are inspected.
+    """
     head = "\n".join(text.splitlines()[:_GENERATED_LINES]).casefold()
     return "generated" in head and "do not edit" in head
 
@@ -130,8 +136,18 @@ def _venv_roots(paths: Iterable[str]) -> frozenset[str]:
 
 
 def _inside(path: str, folders: frozenset[str]) -> bool:
-    parts = path.split("/")[:-1]
-    return any("/".join(parts[:i]) in folders for i in range(1, len(parts) + 1))
+    """True if any folder above ``path`` is in ``folders``; prefixes are sliced, not rejoined."""
+    end = path.find("/")
+    while end != -1:
+        if path[:end] in folders:
+            return True
+        end = path.find("/", end + 1)
+    return False
+
+
+def _looks_analyzable(path: str) -> bool:
+    """Cheap name test for "could be an instruction file or a ``.py`` file", for skip reports."""
+    return path.endswith((".py", ".md", ".mdc", ".cursorrules"))
 
 
 class _Reader:
@@ -173,30 +189,50 @@ def discover_tree(
     * ``excludes`` is the effective glob set (``Policy.excludes``). The hard ``.git/`` and
       ``node_modules/`` exclusions (any component, I-5) and the two content rules, a
       folder holding ``pyvenv.cfg`` and the generated-file header, always apply and are
-      silent: an excluded file is not a ``SkippedFile``.
+      silent: an excluded file is not a ``SkippedFile``. The header check needs the
+      decoded blob, so C4 reads each ``.py`` file (up to the size limit, 1 MiB) and
+      inspects its first 5 lines.
     * ``paths`` (``Policy.paths``; ``None`` or empty means auto-detect, AC-F9.2) names the
       only instruction files. An entry that matches an S6 pattern keeps its scope, any
       other scopes to the whole repo (A-6). Named files are not subject to ``excludes``;
       one that is hard-excluded, or missing from the tree (SC-2.54), is dropped with a
       note, not a ``SkippedFile``, and a missing one never falls back to auto-detection.
     * A ``.py`` file is kept only if some kept instruction file's scope contains it.
-    * At most ``MAX_INSTRUCTION_FILES`` and ``MAX_PY_FILES`` are kept, first by path bytes
-      (A-5); the rest are ``"cap exceeded"``. Symlinks, special files and bad names are
-      reported only when the file would otherwise be analyzed (I-13 ruling 6).
+    * At most ``MAX_INSTRUCTION_FILES`` and ``MAX_PY_FILES`` files are read, first by path
+      bytes (A-5), so the kept set is never larger; the rest are ``"cap exceeded"`` and are
+      never read. A file dropped after its read, such as a generated one, still used a slot.
+    * A path deeper than ``safefs.WALK_MAX_DEPTH`` components is ``"walk limit"``, the
+      scan-mode walker's reason, and is never matched (SR M-50-1).
+    * Symlinks, special files and bad names are reported only when the file would
+      otherwise be analyzed (I-13 ruling 6).
     """
+    if not isinstance(phase, BasePhaseDone):
+        raise TypeError("discover_tree needs the BasePhaseDone token as its first argument")
     reader = _Reader(git, max_file_bytes)
     skipped: list[SkippedFile] = []
     notes: list[str] = []
-    live = sorted(
-        (e for e in git.tree(sha) if e[0] != "160000" and not has_hard_excluded_component(e[3])),
-        key=lambda e: _sort_key(e[3]),
-    )
-    by_path = {e[3]: e for e in live}
-    excluded = GlobSet(excludes)
-    venvs = _venv_roots(by_path)
+    max_depth = safefs.WALK_MAX_DEPTH  # read per call, so tests can patch it
 
     def skip(path: str, reason: SkipReason) -> None:
         skipped.append(SkippedFile(path, reason))
+
+    # Paths deeper than the walker's cap are dropped before any matching (SR M-50-1), with
+    # the walker's reason, "walk limit", when they could have been analyzed.
+    listed: list[TreeEntry] = []
+    too_deep: set[str] = set()
+    for entry in git.tree(sha):
+        if entry[0] == "160000" or has_hard_excluded_component(entry[3]):
+            continue
+        if entry[3].count("/") + 1 > max_depth:
+            if _looks_analyzable(entry[3]):
+                too_deep.add(entry[3])
+                skip(escape_unsupported_path(entry[3]), REASON_WALK_LIMIT)
+        else:
+            listed.append(entry)
+    live = sorted(listed, key=lambda e: _sort_key(e[3]))
+    by_path = {e[3]: e for e in live}
+    excluded = GlobSet(excludes)
+    venvs = _venv_roots(by_path)
 
     def usable(path: str) -> bool:
         try:
@@ -212,12 +248,16 @@ def discover_tree(
             try:
                 rel = validate_relpath(raw, origin="input")
             except FileSkipped as exc:
-                skip(raw, exc.reason)
+                skip(escape_unsupported_path(raw), exc.reason)
                 continue
+            label = escape_unsupported_path(rel)
             if has_hard_excluded_component(rel):
-                notes.append(AlwaysExcluded(rel).note)
+                notes.append(AlwaysExcluded(label).note)
+            elif rel.count("/") + 1 > max_depth:
+                if rel not in too_deep:  # already listed above
+                    skip(label, REASON_WALK_LIMIT)
             elif rel not in by_path:
-                notes.append(f"`{rel}` was not found")
+                notes.append(f"`{label}` was not found")
             else:
                 scope = instruction_scope(rel)
                 named.setdefault(rel, "" if scope is None else scope)
@@ -231,10 +271,12 @@ def discover_tree(
         else [p for p in by_path if instruction_scope(p) is not None and wanted(p)]
     )
     instructions: list[InstructionFile] = []
+    reads = 0  # the R2.6 cap bounds blob reads, so a file dropped later still uses a slot
     for path in instruction_candidates:
-        if len(instructions) >= MAX_INSTRUCTION_FILES:
+        if reads >= MAX_INSTRUCTION_FILES:
             skip(path, "cap exceeded")
         elif path in named or usable(path):
+            reads += 1
             got = reader.read(by_path[path], "instruction")
             if isinstance(got, tuple):
                 scope = named[path] if path in named else instruction_scope(path) or ""
@@ -244,6 +286,7 @@ def discover_tree(
 
     scopes = frozenset(f.scope_dir for f in instructions)
     pys: list[PyFile] = []
+    reads = 0
     for path in by_path:
         if (
             not path.endswith(".py")
@@ -252,9 +295,10 @@ def discover_tree(
             or not wanted(path)
         ):
             continue
-        if len(pys) >= MAX_PY_FILES:
+        if reads >= MAX_PY_FILES:
             skip(path, "cap exceeded")
         elif usable(path):
+            reads += 1
             got = reader.read(by_path[path], "python")
             if not isinstance(got, tuple):
                 skip(path, got)

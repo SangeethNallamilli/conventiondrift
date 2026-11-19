@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import random
+import shutil
+import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
+from conventiondrift.discover import globmatch
 from conventiondrift.discover.globmatch import GlobSet, compile_glob
 
 
@@ -47,7 +52,13 @@ def hit(pattern: str, path: str, *, is_dir: bool = False) -> bool:
         ("[a\\]]x", "]x", False, True),
         ("[+-\\]]x", "]x", False, True),  # an escaped range end
         ("[a-\\]]x", "]x", False, False),  # that range is reversed
-        ("[abx", "[abx", False, True),  # an unclosed [ is literal
+        ("[abx", "[abx", False, False),  # an unclosed [ matches nothing, as in git
+        ("a[", "a[", False, False),
+        ("[]a", "]a", False, False),  # a leading ] is literal, so this class is unclosed
+        ("x/[a", "x/[a", False, False),
+        ("[a-z", "[a-z", False, False),
+        ("*[", "a[", False, False),
+        ("[ab]x[", "ax[", False, False),
         ("a\\*b", "a*b", False, True),
         ("a\\*b", "aXb", False, False),
         ("a\\", "a\\", False, True),  # a trailing backslash is literal
@@ -123,3 +134,95 @@ def test_matching_work_grows_polynomially_not_exponentially() -> None:
 
     small, large = cost(20), cost(40)
     assert large < max(small, 0.001) * 50
+
+
+class _CountingStr(str):
+    """A ``str`` that counts how often a character is read by index."""
+
+    reads = 0
+
+    def __getitem__(self, key):  # type: ignore[no-untyped-def]
+        type(self).reads += 1
+        return super().__getitem__(key)
+
+
+def _compile_reads(pattern: str) -> int:
+    _CountingStr.reads = 0
+    globmatch._compile_segment(_CountingStr(pattern))
+    return _CountingStr.reads
+
+
+@pytest.mark.parametrize("unit", ["[", "[a-z", "[\\]", "[]", "[!", "[a-\\"])
+def test_compiling_unclosed_classes_is_linear_not_quadratic(unit: str) -> None:
+    # An operation count, not a clock: 4x the input may cost about 4x the reads, never 16x.
+    small, large = _compile_reads(unit * 1000), _compile_reads(unit * 4000)
+    assert small > 0
+    assert large <= 5 * small
+
+
+@pytest.mark.parametrize("unit", ["[", "[a-z", "[\\]"])
+def test_hostile_unclosed_class_patterns_compile_and_match_nothing(unit: str) -> None:
+    glob = compile_glob(unit * 20_000)
+    assert not glob.match(unit) and not glob.match("a" * 50)
+
+
+def test_closed_classes_still_compile_in_linear_reads() -> None:
+    small, large = _compile_reads("[a-c]" * 1000), _compile_reads("[a-c]" * 4000)
+    assert large <= 5 * small
+
+
+def test_class_ranges_are_merged_and_sorted_when_built() -> None:
+    cls = globmatch._Class(False, "q", [("x", "z"), ("a", "c"), ("b", "e"), ("f", "g"), ("z", "a")])
+    assert (cls.los, cls.his) == (["a", "x"], ["g", "z"])  # overlapping and adjacent merge
+    assert [ch for ch in "abcdefghijklmnopqrstuvwxyz" if cls.matches(ch)] == list("abcdefgqxyz")
+    assert not cls.matches("A") and not cls.matches("\x00")
+    assert globmatch._Class(True, "", [("a", "c")]).matches("d")
+
+
+def test_class_matching_agrees_with_a_naive_scan_and_uses_a_bisect() -> None:
+    rng = random.Random(20261118)  # noqa: S311 - a fixed-seed test generator
+    for _ in range(300):
+        ranges = [tuple(sorted(rng.sample("abcdefghij", 2))) for _ in range(rng.randint(0, 6))]
+        ranges += [("j", "a")] * rng.randint(0, 1)  # reversed: empty
+        singles = "".join(rng.sample("klmnop", rng.randint(0, 3)))
+        negate = rng.random() < 0.5
+        cls = globmatch._Class(negate, singles, ranges)  # type: ignore[arg-type]
+        for ch in "abcdefghijklmnopq":
+            naive = ch in singles or any(lo <= ch <= hi for lo, hi in ranges if lo <= hi)
+            assert cls.matches(ch) == (naive != negate)
+    many = globmatch._Class(False, "", [(chr(c), chr(c)) for c in range(0x100, 0x100 + 4000, 2)])
+    assert len(many.los) == 2000 and many.matches(chr(0x100 + 3998)) and not many.matches("\u0101")
+
+
+_GIT = shutil.which("git") or "git"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "name"),
+    [
+        ("[abx", "[abx"),
+        ("a[", "a["),
+        ("a[b", "a[b"),
+        ("[]", "[]"),
+        ("[]a", "[]a"),
+        ("[a-", "[a-"),
+        ("[!", "[!"),
+        ("a[b]", "ab"),  # closed: matches
+        ("a\\[b", "a[b"),  # escaped: literal
+        ("[]]a", "]a"),
+    ],
+)
+def test_unclosed_classes_agree_with_git_check_ignore(
+    tmp_path: Path, pattern: str, name: str
+) -> None:
+    (tmp_path / ".gitignore").write_bytes(pattern.encode() + b"\n")
+    env = {"PATH": __import__("os").environ.get("PATH", ""), "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "HOME": str(tmp_path)}  # fmt: skip
+    for args in (["init", "-q"], ["config", "core.excludesFile", ""]):
+        subprocess.run([_GIT, *args], cwd=tmp_path, env=env, check=True, capture_output=True)  # noqa: S603
+    out = subprocess.run(  # noqa: S603
+        [_GIT, "check-ignore", "-q", "--no-index", "--", name],
+        cwd=tmp_path, env=env, capture_output=True, check=False,
+    )  # fmt: skip
+    assert out.returncode in (0, 1)  # 0 ignored, 1 not ignored
+    assert compile_glob(pattern).match(name) == (out.returncode == 0)
