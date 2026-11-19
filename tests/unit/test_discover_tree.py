@@ -429,12 +429,20 @@ def test_unsupported_tree_names_are_reported_only_when_they_would_be_analyzed() 
     assert names(found)[1] == []
 
 
-def test_a_listed_colon_name_is_analyzed_on_posix_only(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_listed_colon_name_is_analyzed_on_posix_and_unsupported_on_nt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Both halves run on every OS: os.name is set explicitly, and only around the call
+    # under test (the runner's own os.name is "nt" on Windows).
     files = {"AGENTS.md": b"r", "::warning::x.py": PY}
-    assert names(run(files))[1] == ["::warning::x.py"]
-    monkeypatch.setattr(os, "name", "nt")
-    found = run(files)
-    assert names(found)[1] == [] and found.skipped[0].reason == "unsupported path"
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "name", "posix")
+        posix = run(files)
+    assert names(posix)[1] == ["::warning::x.py"] and posix.skipped == ()
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "name", "nt")
+        nt = run(files)
+    assert names(nt)[1] == [] and nt.skipped[0].reason == "unsupported path"
 
 
 def test_an_unsupported_instruction_file_name_is_reported() -> None:
@@ -543,48 +551,78 @@ class _SpyGlobSet(GlobSet):
         return super().excludes(path, is_dir)
 
 
-def test_tree_paths_deeper_than_the_walker_cap_are_skipped_before_any_matching(
+def test_tree_paths_whose_folder_is_deeper_than_the_walker_cap_are_never_matched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cap = safefs.WALK_MAX_DEPTH
-    assert cap == 64  # the scan-mode walker's cap, reused
+    assert cap == 64  # the scan-mode walker's cap, reused: a folder is at most 64 deep
     _SpyGlobSet.seen = []
     monkeypatch.setattr(discover, "GlobSet", _SpyGlobSet)
+    deep_vendor = "vendor/" + _deep(cap + 2)
     files = {
         "AGENTS.md": b"r",
-        _deep(cap): PY,  # exactly 64 components: handled
-        _deep(cap + 1): PY,
+        _deep(cap + 1): PY,  # 65 components, folder depth 64: kept, as the walker would
+        _deep(cap + 2): PY,  # 66 components: skipped
         _deep(2000): PY,
-        _deep(cap + 1, "AGENTS.md"): b"r",
-        _deep(cap + 1, "notes.txt"): b"x",  # not analyzable: not reported
-        _deep(cap + 1, "x.py").replace("d/", ".git/", 1): PY,  # hard-excluded: silent
+        _deep(cap + 2, "AGENTS.md"): b"r",
+        _deep(cap + 2, "notes.txt"): b"x",  # ruling 6: not analyzed, so not reported
+        _deep(cap + 2, "notes.md"): b"x",
+        deep_vendor: PY,  # excluded by the defaults: not reported
+        _deep(cap + 2).replace("d/", ".git/", 1): PY,  # hard-excluded: silent
     }
     found = run(files)
-    assert names(found)[1] == [_deep(cap)]
+    assert names(found)[1] == [_deep(cap + 1)]
     assert [(s.path, s.reason) for s in found.skipped] == sorted(
-        [(p, "walk limit") for p in (_deep(cap + 1), _deep(2000), _deep(cap + 1, "AGENTS.md"))],
+        [(p, "walk limit") for p in (_deep(cap + 2), _deep(2000), _deep(cap + 2, "AGENTS.md"))],
         key=lambda item: item[0].encode(),
     )
-    # Matching only ever saw paths within the cap: the work per path is bounded by it.
-    assert _SpyGlobSet.seen and all(p.count("/") + 1 <= cap for p in _SpyGlobSet.seen)
+    # Matching only ever saw paths within the cap, so its work per path is bounded by it.
+    assert _SpyGlobSet.seen and all(p.count("/") <= cap for p in _SpyGlobSet.seen)
 
 
-def test_the_depth_cap_is_read_per_call_and_applies_to_paths_entries(
+def test_the_depth_cap_is_read_per_call_and_follows_ruling_6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(safefs, "WALK_MAX_DEPTH", 3)  # folders up to 3 deep, files up to 4 parts
+    files = {
+        "AGENTS.md": b"r",
+        "a/b/c.py": PY,
+        "a/b/c/d.py": PY,
+        "a/b/c/e/f.py": PY,  # in scope, folder 4 deep: reported
+        "a/b/c/e/AGENTS.md": b"r",  # an instruction file: reported
+        "a/b/c/e/R.md": b"r",  # neither: silent
+        "vendor/a/b/c/x.py": PY,  # excluded by the defaults: silent
+        ".venv/a/b/c/x.py": PY,
+        "env/pyvenv.cfg": b"x",
+        "env/a/b/c/x.py": PY,  # under a virtual environment: silent
+    }
+    found = run(files)
+    assert names(found)[1] == ["a/b/c.py", "a/b/c/d.py"]
+    assert found.skipped == (
+        SkippedFile("a/b/c/e/AGENTS.md", "walk limit"),
+        SkippedFile("a/b/c/e/f.py", "walk limit"),
+    )
+    # Out of every scope, a deep .py is not reported either.
+    scoped = run({"sub/AGENTS.md": b"r", "other/a/b/c/x.py": PY, "sub/a/b/c/y.py": PY})
+    assert scoped.skipped == (SkippedFile("sub/a/b/c/y.py", "walk limit"),)
+
+
+def test_deep_paths_entries_are_walk_limit_when_present_and_not_found_when_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(safefs, "WALK_MAX_DEPTH", 3)
-    files = {"AGENTS.md": b"r", "a/b/c.py": PY, "a/b/c/d.py": PY, "a/b/c/R.md": b"r"}
-    found = run(files)
-    assert names(found)[1] == ["a/b/c.py"]
-    assert found.skipped == (
-        SkippedFile("a/b/c/R.md", "walk limit"),
-        SkippedFile("a/b/c/d.py", "walk limit"),
+    files = {"AGENTS.md": b"r", "a/b/c/e/R.md": b"r", "a/b/c/e/f.py": PY}
+    present = run(files, paths=["a/b/c/e/R.md", "./a/b/R2.md", "a/b/c/e/g/Missing.md"])
+    assert present.skipped == (SkippedFile("a/b/c/e/R.md", "walk limit"),)
+    assert present.notes == ("`a/b/R2.md` was not found", "`a/b/c/e/g/Missing.md` was not found")
+    # A named deep .py that is also in scope is reported once, not twice.
+    both = run(files, paths=["AGENTS.md", "a/b/c/e/f.py", "a/b/c/e/R.md"])
+    assert [f.path for f in both.instruction_files] == ["AGENTS.md"]
+    assert both.skipped == (
+        SkippedFile("a/b/c/e/R.md", "walk limit"),
+        SkippedFile("a/b/c/e/f.py", "walk limit"),
     )
-    named = run(files, paths=["a/b/c/R.md", "./a/b/R2.md", "a/b/c/e/Missing.md"])
-    # The named deep entry that is in the tree is not reported twice; one that is not in
-    # the tree is still "walk limit", never matched or looked up.
-    assert named.skipped == (*found.skipped, SkippedFile("a/b/c/e/Missing.md", "walk limit"))
-    assert named.notes == ("`a/b/R2.md` was not found",)
+    assert both.notes == ()
 
 
 def test_a_git_failure_other_than_a_skip_fails_closed() -> None:

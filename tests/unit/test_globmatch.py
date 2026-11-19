@@ -48,7 +48,14 @@ def hit(pattern: str, path: str, *, is_dir: bool = False) -> bool:
         ("[!a-c]x", "bx", False, False),
         ("[^a-c]x", "dx", False, True),
         ("[]]x", "]x", False, True),  # a leading ] is literal
-        ("[z-a]x", "bx", False, False),  # a reversed range matches nothing
+        ("[z-a]x", "bx", False, False),  # a reversed range matches nothing but its start
+        ("[z-a]x", "zx", False, True),
+        ("[c-a]x", "cx", False, True),
+        ("[c-a]x", "ax", False, False),
+        ("[!c-a]x", "cx", False, False),
+        ("[a-c/]x", "ax", False, False),  # split on "/": unclosed, unlike git
+        ("a/***/b", "a/x/y/b", False, False),  # a *** segment is one *, unlike git's **
+        ("a/***/b", "a/x/b", False, True),
         ("[a\\]]x", "]x", False, True),
         ("[+-\\]]x", "]x", False, True),  # an escaped range end
         ("[a-\\]]x", "]x", False, False),  # that range is reversed
@@ -210,9 +217,13 @@ _GIT = shutil.which("git") or "git"
         ("a[b]", "ab"),  # closed: matches
         ("a\\[b", "a[b"),  # escaped: literal
         ("[]]a", "]a"),
+        ("[c-a]x", "cx"),  # a reversed range still matches its start
+        ("[c-a]x", "bx"),
+        ("[c-a]x", "ax"),
+        ("[z-a]x", "zx"),
     ],
 )
-def test_unclosed_classes_agree_with_git_check_ignore(
+def test_bracket_expressions_agree_with_git_check_ignore(
     tmp_path: Path, pattern: str, name: str
 ) -> None:
     (tmp_path / ".gitignore").write_bytes(pattern.encode() + b"\n")

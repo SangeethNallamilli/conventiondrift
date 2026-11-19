@@ -145,9 +145,12 @@ def _inside(path: str, folders: frozenset[str]) -> bool:
     return False
 
 
-def _looks_analyzable(path: str) -> bool:
-    """Cheap name test for "could be an instruction file or a ``.py`` file", for skip reports."""
-    return path.endswith((".py", ".md", ".mdc", ".cursorrules"))
+def _head(path: str, components: int) -> str:
+    """The first ``components`` components of ``path`` (which has more) as a folder path."""
+    end = -1
+    for _ in range(components):
+        end = path.find("/", end + 1)
+    return path[:end]
 
 
 class _Reader:
@@ -201,8 +204,12 @@ def discover_tree(
     * At most ``MAX_INSTRUCTION_FILES`` and ``MAX_PY_FILES`` files are read, first by path
       bytes (A-5), so the kept set is never larger; the rest are ``"cap exceeded"`` and are
       never read. A file dropped after its read, such as a generated one, still used a slot.
-    * A path deeper than ``safefs.WALK_MAX_DEPTH`` components is ``"walk limit"``, the
-      scan-mode walker's reason, and is never matched (SR M-50-1).
+    * A file whose folder is deeper than ``safefs.WALK_MAX_DEPTH`` components (so a path of
+      more than ``WALK_MAX_DEPTH + 1`` components), the scan-mode walker's rule, is never
+      read or fully matched (SR M-50-1). It is ``"walk limit"`` only if it would otherwise
+      be analyzed (I-13 ruling 6): an instruction-file pattern, or a ``.py`` in scope, that
+      the excludes do not drop, judged on its first ``WALK_MAX_DEPTH + 1`` levels. A named
+      ``paths`` entry in the tree is ``"walk limit"``; a missing one is "not found".
     * Symlinks, special files and bad names are reported only when the file would
       otherwise be analyzed (I-13 ruling 6).
     """
@@ -211,28 +218,33 @@ def discover_tree(
     reader = _Reader(git, max_file_bytes)
     skipped: list[SkippedFile] = []
     notes: list[str] = []
-    max_depth = safefs.WALK_MAX_DEPTH  # read per call, so tests can patch it
+    # The walker's rule (T-010b): a folder is entered if it is at most WALK_MAX_DEPTH
+    # components deep, so a file path may have WALK_MAX_DEPTH + 1 components. Read per call.
+    max_folder_depth = safefs.WALK_MAX_DEPTH
 
     def skip(path: str, reason: SkipReason) -> None:
         skipped.append(SkippedFile(path, reason))
 
-    # Paths deeper than the walker's cap are dropped before any matching (SR M-50-1), with
-    # the walker's reason, "walk limit", when they could have been analyzed.
+    # Deeper paths are set aside before any matching (SR M-50-1) and never read.
     listed: list[TreeEntry] = []
-    too_deep: set[str] = set()
+    deep: list[str] = []
     for entry in git.tree(sha):
         if entry[0] == "160000" or has_hard_excluded_component(entry[3]):
             continue
-        if entry[3].count("/") + 1 > max_depth:
-            if _looks_analyzable(entry[3]):
-                too_deep.add(entry[3])
-                skip(escape_unsupported_path(entry[3]), REASON_WALK_LIMIT)
+        if entry[3].count("/") > max_folder_depth:
+            deep.append(entry[3])
         else:
             listed.append(entry)
+    deep_set = frozenset(deep)
     live = sorted(listed, key=lambda e: _sort_key(e[3]))
     by_path = {e[3]: e for e in live}
     excluded = GlobSet(excludes)
     venvs = _venv_roots(by_path)
+
+    def deep_wanted(path: str) -> bool:
+        """The exclusion test for a deep path, on its first levels only, never the whole path."""
+        head = _head(path, max_folder_depth + 1)
+        return not (_inside(f"{head}/_", venvs) or excluded.excludes(head, is_dir=True))
 
     def usable(path: str) -> bool:
         try:
@@ -243,6 +255,7 @@ def discover_tree(
         return True
 
     named: dict[str, str] = {}  # path -> scope, for `paths` mode
+    named_deep: set[str] = set()  # named entries already reported as "walk limit"
     if paths:
         for raw in dict.fromkeys(paths):
             try:
@@ -253,11 +266,11 @@ def discover_tree(
             label = escape_unsupported_path(rel)
             if has_hard_excluded_component(rel):
                 notes.append(AlwaysExcluded(label).note)
-            elif rel.count("/") + 1 > max_depth:
-                if rel not in too_deep:  # already listed above
-                    skip(label, REASON_WALK_LIMIT)
+            elif rel in deep_set:
+                skip(label, REASON_WALK_LIMIT)
+                named_deep.add(rel)
             elif rel not in by_path:
-                notes.append(f"`{label}` was not found")
+                notes.append(f"`{label}` was not found")  # also for a missing deep entry
             else:
                 scope = instruction_scope(rel)
                 named.setdefault(rel, "" if scope is None else scope)
@@ -270,6 +283,10 @@ def discover_tree(
         if paths
         else [p for p in by_path if instruction_scope(p) is not None and wanted(p)]
     )
+    if not paths:  # I-13 ruling 6: only what would otherwise be analyzed is reported
+        for path in deep:
+            if instruction_scope(path) is not None and deep_wanted(path):
+                skip(escape_unsupported_path(path), REASON_WALK_LIMIT)
     instructions: list[InstructionFile] = []
     reads = 0  # the R2.6 cap bounds blob reads, so a file dropped later still uses a slot
     for path in instruction_candidates:
@@ -285,6 +302,10 @@ def discover_tree(
                 skip(path, got)
 
     scopes = frozenset(f.scope_dir for f in instructions)
+    for path in deep:
+        if path.endswith(".py") and path not in named_deep and _in_scope(path, scopes):
+            if deep_wanted(path):
+                skip(escape_unsupported_path(path), REASON_WALK_LIMIT)
     pys: list[PyFile] = []
     reads = 0
     for path in by_path:

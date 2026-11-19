@@ -15,10 +15,20 @@ trailing ``/`` matches folders only; a pattern with a ``/`` before its end, or a
 repo-relative POSIX strings with no empty segments. Blank lines, comments and trailing
 spaces are for the ``.gitignore`` loader to handle before it calls :func:`compile_glob`.
 
-Differences from git: POSIX classes such as ``[[:alpha:]]`` are not supported (they read
-as the plain characters ``[:alph`` followed by a literal ``]``). Compiling is linear in the
-pattern: an unclosed ``[`` makes its segment, and so the pattern, match nothing, exactly
-as git's wildmatch does, and the rest of the segment is not scanned.
+Differences from git (the rest of the bracket rules, including an unclosed ``[`` matching
+nothing and a reversed range such as ``[c-a]`` matching only ``c``, were checked against
+``git check-ignore``):
+
+* POSIX classes such as ``[[:alpha:]]`` are not supported. They read as the plain
+  characters ``[:alph`` followed by a literal ``]``.
+* The pattern is split on ``/`` before any ``[`` is read, so a class that contains a ``/``
+  is cut in two. ``[a-c/]x`` becomes an unclosed ``[a-c`` and matches nothing here, while
+  git reads it as the class ``a-c`` plus a ``/`` that never matches, so it matches ``ax``.
+* A segment of three or more stars, such as ``a/***/b`` or ``***``, is one ``*`` here: it
+  stays inside one path component. Git treats a bare ``***`` segment like ``**``.
+
+Compiling is linear in the pattern: an unclosed ``[`` makes its segment, and so the
+pattern, match nothing, and the rest of the segment is not scanned.
 """
 
 from __future__ import annotations
@@ -89,6 +99,7 @@ def _parse_class(text: str, start: int) -> tuple[_Class, int] | None:
                 i += 1
                 hi = text[i]
             ranges.append((ch, hi))
+            singles.append(ch)  # as in git, the start also matches on its own: [c-a] matches c
         else:
             singles.append(ch)
         i += 1
