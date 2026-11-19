@@ -251,6 +251,15 @@ def test_depth_resets_between_siblings() -> None:
     assert isinstance(load_yaml(text), dict)
 
 
+def test_depth_is_still_counted_after_an_earlier_sibling_closed(expect_reason) -> None:  # type: ignore[no-untyped-def]
+    # Mapping (1) + list (2) + a chain of MAX_DEPTH - 1 lists = MAX_DEPTH + 1 deep, after a
+    # short sibling list has already opened and closed in the same parent.
+    chain = "[" * (MAX_DEPTH - 1) + "1" + "]" * (MAX_DEPTH - 1)
+    expect_reason(f"a: [[1], {chain}]\n", "depth")
+    short = "[" * (MAX_DEPTH - 2) + "1" + "]" * (MAX_DEPTH - 2)
+    assert isinstance(load_yaml(f"a: [[1], {short}]\n"), dict)
+
+
 # --- anchors and aliases ----------------------------------------------------------
 
 
