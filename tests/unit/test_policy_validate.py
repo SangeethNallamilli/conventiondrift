@@ -544,6 +544,10 @@ OUTSIDE = [
     "docs./a.md",
     "a.md ",
     "..a/b..",
+    # The Architect's I-13 C5 exclude ruling names these exactly; they run on every OS.
+    "foo.",
+    "foo ",
+    "c:x",
 ]
 INSIDE = {
     "AGENTS.md": "AGENTS.md",
