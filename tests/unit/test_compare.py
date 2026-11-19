@@ -7,7 +7,7 @@ Expected values come from the spec text (D-TL-25), never from the code.
 
 import ast
 import inspect
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import get_args, get_type_hints
@@ -131,6 +131,16 @@ def sites(
 R1 = rule("Use requests for HTTP calls", line=9)
 
 
+# I-13 C10 ruling 7: case 1 needs code, i.e. a changed file whose sites moved. A head
+# side that is Stale with sites in an unchanged file (or none) has no causing files.
+CODE_CHANGE: list[ChangedFile] = [("M", "src/a.py", "src/a.py")]
+
+
+def head_side(verdict: Verdict) -> SideResult:
+    """A head side whose sites sit in the changed file ``src/a.py`` (base has no sites)."""
+    return side(verdict, sites("src/a.py", "httpx", False, 3))
+
+
 def only(results: tuple[RuleResult, ...]) -> RuleResult:
     assert len(results) == 1
     return results[0]
@@ -155,7 +165,7 @@ def _expected_same_rule(base: Verdict, head: Verdict) -> str | None:
 @pytest.mark.parametrize("base_v", list(Verdict))
 @pytest.mark.parametrize("head_v", list(Verdict))
 def test_same_rule_case_for_every_verdict_pair(base_v: Verdict, head_v: Verdict) -> None:
-    got = only(compare([(R1, side(base_v))], [(R1, side(head_v))], []))
+    got = only(compare([(R1, side(base_v))], [(R1, head_side(head_v))], CODE_CHANGE))
     assert got.case == _expected_same_rule(base_v, head_v)
     assert got.base_rule == R1 and got.head_rule == R1
 
@@ -174,6 +184,7 @@ def test_base_only_rule_is_fixed_when_stale_else_removed(base_v: Verdict) -> Non
     got = only(compare([(R1, side(base_v))], [], [("D", None, "AGENTS.md")]))
     assert got.case == ("fixed" if base_v is S else "removed")
     assert got.head_rule is None and got.head is None
+    assert got.base == side(base_v)  # I-9: a removed rule still reports its base side
     assert got.rule_id == R1.id
 
 
@@ -190,7 +201,7 @@ def test_every_case_value_is_reachable() -> None:
     seen: set[str | None] = set()
     for b in Verdict:
         for h in Verdict:
-            seen.add(only(compare([(R1, side(b))], [(R1, side(h))], [])).case)
+            seen.add(only(compare([(R1, side(b))], [(R1, head_side(h))], CODE_CHANGE)).case)
         seen.add(only(compare([], [(R1, side(b))], [])).case)
         seen.add(only(compare([(R1, side(b))], [], [])).case)
     assert seen == set(CASES) | {None}
@@ -232,7 +243,7 @@ def test_f5_4_only_the_pr_caused_rule_has_a_case() -> None:
     s_rule = rule("Use logging, not print.", line=5, match=LOGGING_NOT_PRINT, checker="logging")
     out = compare(
         [(r, side(C)), (s_rule, side(H))],
-        [(r, side(C)), (s_rule, side(S))],
+        [(r, side(C)), (s_rule, side(S, sites("src/app.py", "print", False, 2)))],
         [("M", "docs/guide.md", "docs/guide.md"), ("M", "src/app.py", "src/app.py")],
     )
     by_id = {x.rule_id: x for x in out}
@@ -499,6 +510,80 @@ def test_conflict_with_comes_from_the_rule_id_side() -> None:
     }
 
 
+def test_stale_without_causing_files_is_case_2_not_case_1() -> None:
+    # I-13 C10 ruling 7: "made-stale-by-code requires a non-empty causing_files". A rule
+    # that turns Stale with no causing files was caused by the PR's instruction change.
+    got = only(compare([(R1, side(H))], [(R1, side(S, sites("src/a.py", "httpx", False, 3)))], []))
+    assert got.causing_files == ()
+    assert got.case == "stale-rule-added"
+
+
+def test_moved_instruction_file_with_a_new_scope_is_case_2() -> None:
+    # Ruling 7's own example: an instruction file moved and its scope changed, so the same
+    # rule sees other sites. No code changed, so no causing files, and the PR caused it.
+    moved = replace(R1, id="sub/AGENTS.md:9", file="sub/AGENTS.md", scope_dir="sub")
+    head = side(S, sites("sub/x.py", "httpx", False, 4))
+    got = only(compare([(R1, side(H))], [(moved, head)], [("R", "AGENTS.md", "sub/AGENTS.md")]))
+    assert (got.case, got.causing_files) == ("stale-rule-added", ())
+
+
+def test_stale_with_causing_files_stays_case_1() -> None:
+    # Ruling 7, the other side: causing files present, so code caused it.
+    got = only(compare([(R1, side(H))], [(R1, head_side(S))], CODE_CHANGE))
+    assert got.causing_files == (CausingFile("src/a.py", 0, 3),)
+    assert got.case == "made-stale-by-code"
+
+
+def test_line_col_ids_do_not_change_rule_identity() -> None:
+    # I-13 C6 ruling 2 (#53): two rules on one line get ``file:line:col`` ids, and
+    # "identity for comparison is unchanged: (file after renames, normalized text)".
+    # Base: both rules share line 9. Head: the file was renamed and the line edited so
+    # one rule is alone on its line (``file:line``) and the other moved to a new column.
+    one = rule("Use requests for HTTP calls", line=9)
+    two = rule("Use logging, not print.", line=9, match=LOGGING_NOT_PRINT, checker="logging")
+    b1 = replace(one, id="AGENTS.md:9:1")
+    b2 = replace(two, id="AGENTS.md:9:30")
+    h1 = replace(one, id="CLAUDE.md:9:5", file="CLAUDE.md")
+    h2 = replace(two, id="CLAUDE.md:9:40", file="CLAUDE.md")
+    out = compare(
+        [(b1, side(S)), (b2, side(H))],
+        [(h1, side(S)), (h2, side(H))],
+        [("R", "AGENTS.md", "CLAUDE.md")],
+    )
+    # Ties on (file, line) are free (I-13 Result): compare as a mapping.
+    assert {x.rule_id: (x.case, x.base_rule, x.head_rule) for x in out} == {
+        "CLAUDE.md:9:5": ("pre-existing-stale", b1, h1),
+        "CLAUDE.md:9:40": (None, b2, h2),
+    }
+    # An id that loses its column (the other rule left the line) is still the same rule.
+    alone = replace(one, id="AGENTS.md:9")
+    out = compare([(b1, side(S)), (b2, side(H))], [(alone, side(S))], [])
+    assert {x.rule_id: x.case for x in out} == {
+        "AGENTS.md:9": "pre-existing-stale",
+        "AGENTS.md:9:30": "removed",
+    }
+
+
+def test_line_col_ids_flow_into_conflict_with_and_results() -> None:
+    # Two rules on one line conflict with a third; ids (with columns) are used verbatim,
+    # and a removed base rule keeps its base id.
+    a = replace(rule("Use requests for HTTP calls", line=9), id="AGENTS.md:9:1")
+    b = replace(rule("Use httpx for HTTP calls", line=9, match=USE_HTTPX), id="AGENTS.md:9:31")
+    gone = replace(rule("Use requests everywhere", line=9), id="AGENTS.md:9:61")
+    out = compare(
+        [(gone, side(H))],
+        [(a, side(C)), (b, side(C))],
+        [],
+        head_conflicts=[Conflict(("AGENTS.md:9:1", "AGENTS.md:9:31"), "http-client")],
+    )
+    by_id = {x.rule_id: (x.case, x.conflict_with) for x in out}
+    assert by_id == {
+        "AGENTS.md:9:1": (None, ("AGENTS.md:9:31",)),
+        "AGENTS.md:9:31": (None, ("AGENTS.md:9:1",)),
+        "AGENTS.md:9:61": ("removed", ()),
+    }
+
+
 # --- causing_files (I-9, B5) ---------------------------------------------------------
 
 
@@ -743,10 +828,12 @@ _TEXTS = st.sampled_from([f"use requests {i}" for i in range(6)])
     head=st.dictionaries(_TEXTS, _VERDICTS, max_size=6),
 )
 def test_one_result_per_identity(base: dict[str, Verdict], head: dict[str, Verdict]) -> None:
-    def mk(texts: dict[str, Verdict]) -> list[tuple[Rule, SideResult]]:
-        return [(rule(t, line=i + 1), side(v)) for i, (t, v) in enumerate(sorted(texts.items()))]
+    def mk(
+        texts: dict[str, Verdict], build: Callable[[Verdict], SideResult] = side
+    ) -> list[tuple[Rule, SideResult]]:
+        return [(rule(t, line=i + 1), build(v)) for i, (t, v) in enumerate(sorted(texts.items()))]
 
-    out = compare(mk(base), mk(head), [])
+    out = compare(mk(base), mk(head, head_side), CODE_CHANGE)
     assert len(out) == len(set(base) | set(head))
     for x in out:
         assert x.case in set(CASES) | {None}
@@ -807,7 +894,9 @@ def test_compare_module_is_pure() -> None:
             roots.update(a.name.split(".")[0] for a in node.names)
         elif isinstance(node, ast.ImportFrom):
             roots.add((node.module or "").split(".")[0])
-    assert roots <= _ALLOWED_IMPORT_ROOTS
+    # mutmut 3 runs the suite from a ``mutants/`` copy whose trampolines import ``mutmut``.
+    under_mutmut = "mutants" in path.parts
+    assert roots <= _ALLOWED_IMPORT_ROOTS | ({"mutmut"} if under_mutmut else set())
     assert not {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} & _BANNED_NAMES
     conv = {
         node.module

@@ -13,7 +13,8 @@ renames, ``normalized_text``). A base rule's file is mapped through the PR's
 
 - same rule on both sides: Stale at base and head is ``pre-existing-stale``;
   Stale at base only is ``fixed`` (case 3); Stale at head only is
-  ``made-stale-by-code`` (case 1); otherwise ``None``.
+  ``made-stale-by-code`` (case 1) when it has causing files, else
+  ``stale-rule-added`` (I-13 C10 ruling 7); otherwise ``None``.
 - head only (new or edited): Stale at head is ``stale-rule-added`` (case 2),
   otherwise ``None``.
 - base only (deleted, edited away, or its file deleted): Stale at base with no
@@ -102,13 +103,20 @@ def _is_stale(side: SideResult | None) -> bool:
     return side is not None and side.verdict is _STALE
 
 
-def _case(base: SideResult | None, head: SideResult) -> Case | None:
-    """Classify a head rule in compare mode; ``base`` is None for a new or edited rule."""
+def _case(base: SideResult | None, head: SideResult, causing: Sequence[CausingFile]) -> Case | None:
+    """Classify a head rule in compare mode; ``base`` is None for a new or edited rule.
+
+    I-13 C10 ruling 7: case 1 needs code. A rule that turns Stale with no causing
+    files (for example a moved instruction file changed its scope) was caused by the
+    PR's instruction change, so it is ``stale-rule-added``.
+    """
     if base is None:
         return "stale-rule-added" if _is_stale(head) else None
     if _is_stale(base):
         return "pre-existing-stale" if _is_stale(head) else "fixed"
-    return "made-stale-by-code" if _is_stale(head) else None
+    if not _is_stale(head):
+        return None
+    return "made-stale-by-code" if causing else "stale-rule-added"
 
 
 def _causing_files(
@@ -245,6 +253,7 @@ def compare(
     for key, (rule, side) in heads.items():
         base_pair = bases.get(key)
         base_rule, base_side = base_pair if base_pair else (None, None)
+        causing = _causing_files(base_side, side, changed, renames) if base_side is not None else ()
         results.append(
             RuleResult(
                 rule_id=rule.id,
@@ -253,12 +262,8 @@ def compare(
                 base=base_side,
                 head=side,
                 conflict_with=tuple(sorted(head_conf.get(rule.id, ()))),
-                case=_case(base_side, side) if base is not None else None,
-                causing_files=(
-                    _causing_files(base_side, side, changed, renames)
-                    if base_side is not None
-                    else ()
-                ),
+                case=_case(base_side, side, causing) if base is not None else None,
+                causing_files=causing,
                 suggestion=suggest(rule, side),
             )
         )
