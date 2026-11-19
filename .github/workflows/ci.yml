@@ -6,9 +6,12 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, release/develop]
   schedule:
-    - cron: '17 6 * * *'
+    # The nightly full matrix now runs on the nightly promotion PR
+    # (nightly-promote.yml dispatches this workflow on nightly/promote at
+    # 07:00 UTC = 02:00 EST / 03:00 EDT); this workflow keeps only the
+    # weekly mutation schedule.
     # Weekly mutation run (owner decision 2026-11-13): Mondays 07:41 UTC.
     # Only the mutation job keys on this cron; see its `if:`.
     - cron: '41 7 * * 1'
@@ -49,13 +52,14 @@ jobs:
         run: python3 scripts/ci/check_action_pins.py
 
   dco:
-    # Runs on pull_request, and on workflow_dispatch when the ref is not
-    # main, so a manual run on a PR branch cannot produce a green `ci`
+    # Runs on pull_request, on workflow_dispatch when the ref is not
+    # main, and on push to release/develop (range merge-base(main)..HEAD),
+    # so a manual run on a PR branch cannot produce a green `ci`
     # while skipping the DCO gate. Push, schedule, and workflow_dispatch
     # on main still skip this job; the aggregate allows that skip only
     # on refs/heads/main for those events.
     name: dco
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main') || (github.event_name == 'push' && github.ref == 'refs/heads/release/develop')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -181,16 +185,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS legs run in the blocking `test-macos` job below (D-TL-34).
+        # macOS legs run in the blocking `test-macos` job below (D-TL-34,
+        # amended 2026-11-19).
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
-        # On pull_request, Windows runs only 3.11 and 3.15 so the PR queue
-        # stays shorter. Ubuntu keeps the full 3.11–3.15 set. The full
-        # OS × Python matrix still runs on push to main, on the nightly
-        # schedule, and on workflow_dispatch, before any release. Excluded
-        # legs are omitted (they never start), so the `test` job result is
-        # the remaining legs and the required `ci` aggregate is unchanged.
-        exclude: ${{ fromJSON(github.event_name == 'pull_request' && '[{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.13"},{"os":"windows-latest","python-version":"3.14"}]' || '[]') }}
+        # Owner decision 2026-11-19 (amends D-TL-34): PRs into and pushes to
+        # release/develop, PRs into main and pushes to main run Python 3.11
+        # only on each OS. workflow_dispatch (including the nightly
+        # promotion run) and the schedule run the full 3.11–3.15 matrix.
+        # The `test` job result is the legs that run, so the required `ci`
+        # aggregate is unchanged.
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.11","3.12","3.13","3.14","3.15"]' || '["3.11"]') }}
     defaults:
       run:
         shell: bash
@@ -286,9 +290,10 @@ jobs:
 
   test-macos:
     # Blocking since D-TL-34 (TL decision, owner-activated; supersedes
-    # D-TL-30): every macOS leg runs on every event, pull_request included,
-    # and is in the `ci` aggregate's needs, so a failed, cancelled or skipped
-    # leg fails the required check. Same install and test steps as the
+    # D-TL-30), amended by the owner 2026-11-19: PRs into release/develop and
+    # all other PRs and pushes run only test-macos (3.11); workflow_dispatch
+    # and the schedule run 3.11–3.15. test-macos is in the `ci` aggregate's needs on every event,
+    # so a failed, cancelled or skipped leg fails the required check. Same install and test steps as the
     # non-Windows `test` legs.
     name: test-macos (${{ matrix.python-version }})
     needs: [lockfile]
@@ -299,7 +304,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+        python-version: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["3.11","3.12","3.13","3.14","3.15"]' || '["3.11"]') }}
     defaults:
       run:
         shell: bash
@@ -554,8 +559,10 @@ jobs:
       - git-minimum
       # mutation is report-only (D-TL-29, TL decision) and runs only on
       # the weekly schedule; it is not part of the required aggregate.
-      # test-macos is blocking (D-TL-34, supersedes D-TL-30) and runs on
-      # every event; a skipped test-macos fails this aggregate.
+      # test-macos is blocking (D-TL-34, supersedes D-TL-30; amended
+      # 2026-11-19: 3.11 only on all PRs and pushes, 3.11–3.15 on
+      # workflow_dispatch and schedule); a
+      # skipped test-macos fails this aggregate.
       - test-macos
       - secret-scan
       - dependency-scan
