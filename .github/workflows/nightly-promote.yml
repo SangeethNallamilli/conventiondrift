@@ -1,0 +1,82 @@
+# Nightly promotion of release/develop into main (owner decision
+# 2026-11-19). PRs land in release/develop (squash only, 3.11 CI). Each
+# night this job opens or reuses a PR from nightly/promote into main and
+# dispatches the full 3.11-3.15 CI on it. GitHub auto-merges it with a
+# regular merge commit only once the required `ci` check is green.
+#
+# Schedule: 07:00 UTC = 02:00 EST. GitHub cron is UTC-only, so during US
+# daylight time (EDT, UTC-4) this runs at 03:00 EDT. Scheduled runs can
+# start late under load.
+#
+# Why nightly/promote and not release/develop as the PR head: main
+# requires branches to be up to date (strict `ci`). Each promotion adds a
+# merge commit to main that release/develop never gets, and release/develop
+# can't take merge commits (linear history). So the job builds the head
+# branch as main plus a merge of release/develop. Its merge commit carries
+# a Signed-off-by line and is checked by the dco job like any other commit.
+#
+# Security: no checkout and no repository code runs here. It only makes
+# GitHub API calls with the short-lived GITHUB_TOKEN, scoped to this job.
+# No secrets, no PAT, no App, no branch-protection bypass: the merge goes
+# through main's normal protection (required `ci`, up to date,
+# conversation resolution). Schedule and manual runs on main only.
+name: nightly-promote
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nightly-promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: promote
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write        # create/update nightly/promote via the merges API
+      pull-requests: write   # open the PR and enable auto-merge
+      actions: write         # dispatch ci.yml on nightly/promote
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BR: nightly/promote
+      SOB: "Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+    steps:
+      - name: Open or reuse the promotion PR and start full CI
+        run: |
+          set -euo pipefail
+          ahead="$(gh api "repos/$REPO/compare/main...release/develop" --jq .ahead_by)"
+          if [ "$ahead" = "0" ]; then
+            echo "nothing to promote: release/develop has no commits that main lacks"
+            exit 0
+          fi
+          if ! gh api "repos/$REPO/git/ref/heads/$BR" >/dev/null 2>&1; then
+            main_sha="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BR" -f sha="$main_sha" >/dev/null
+          fi
+          # Bring in any new main commits, then release/develop. Each call is
+          # a normal (non-force) merge into nightly/promote, or a no-op.
+          gh api -X POST "repos/$REPO/merges" -f base="$BR" -f head=main \
+            -f commit_message="$(printf 'Merge main into %s\n\n%s' "$BR" "$SOB")" >/dev/null
+          gh api -X POST "repos/$REPO/merges" -f base="$BR" -f head=release/develop \
+            -f commit_message="$(printf 'Merge release/develop into %s for nightly promotion\n\n%s' "$BR" "$SOB")" >/dev/null
+          day="$(date -u +%F)"
+          pr="$(gh pr list --repo "$REPO" --head "$BR" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$pr" ]; then
+            url="$(gh pr create --repo "$REPO" --base main --head "$BR" \
+              --title "Nightly: promote release/develop to main" \
+              --body "Automated nightly promotion (owner decision 2026-11-19). Full 3.11-3.15 CI on ubuntu, windows and macOS. Auto-merges with a merge commit once the required ci check is green.")"
+            pr="${url##*/}"
+          fi
+          gh workflow run ci.yml --repo "$REPO" --ref "$BR"
+          gh pr merge "$pr" --repo "$REPO" --merge --auto \
+            --subject "Nightly promotion of release/develop to main ($day) (#$pr)" \
+            --body "$SOB"
+          echo "promotion PR #$pr: full CI dispatched on $BR, auto-merge enabled"
