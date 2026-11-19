@@ -20,6 +20,9 @@
 # No secrets, no PAT, no App, no branch-protection bypass: the merge goes
 # through main's normal protection (required `ci`, up to date,
 # conversation resolution). Schedule and manual runs on main only.
+# nightly/promote is guarded by a ruleset (only the GitHub Actions app may
+# create, update or delete it), and this job also re-checks its contents
+# and pins auto-merge to the exact SHA it built (H-52-1).
 name: nightly-promote
 
 on:
@@ -57,16 +60,47 @@ jobs:
             echo "nothing to promote: release/develop has no commits that main lacks"
             exit 0
           fi
-          if ! gh api "repos/$REPO/git/ref/heads/$BR" >/dev/null 2>&1; then
+          # H-52-1: nightly/promote must hold nothing except release/develop
+          # commits and this job's own GitHub-signed merge commits. Fail
+          # closed otherwise, both before reusing it and after building it.
+          validate() {
+            local n len
+            n="$(gh api "repos/$REPO/compare/main...$BR" --jq .ahead_by)"
+            len="$(gh api "repos/$REPO/compare/main...$BR" --jq '.commits | length')"
+            if [ "$n" != "$len" ]; then
+              echo "::error::$BR has $n commits not on main; refusing to check a partial list"
+              return 1
+            fi
+            gh api "repos/$REPO/compare/main...$BR" \
+              --jq '.commits[] | [.sha, (.parents | length), (.author.login // ""), .commit.verification.verified, (.commit.message | startswith("Merge "))] | @tsv' |
+            while IFS=$'\t' read -r sha parents login verified merge_msg; do
+              if [ "$parents" = "2" ] && [ "$login" = "github-actions[bot]" ] \
+                 && [ "$verified" = "true" ] && [ "$merge_msg" = "true" ]; then
+                continue
+              fi
+              st="$(gh api "repos/$REPO/compare/$sha...release/develop" --jq .status)"
+              if [ "$st" != "ahead" ] && [ "$st" != "identical" ]; then
+                echo "::error::$BR contains $sha, which is neither on release/develop nor a signed bot merge; refusing to promote"
+                exit 1
+              fi
+            done || return 1
+          }
+          if gh api "repos/$REPO/git/ref/heads/$BR" >/dev/null 2>&1; then
+            validate || exit 1
+          else
             main_sha="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
             gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$BR" -f sha="$main_sha" >/dev/null
           fi
           # Bring in any new main commits, then release/develop. Each call is
-          # a normal (non-force) merge into nightly/promote, or a no-op.
+          # a normal (non-force) merge into nightly/promote, or a no-op. The
+          # merges API refuses conflicts (409 fails the job); this job never
+          # resolves conflicts, so its merge commits carry no authored content.
           gh api -X POST "repos/$REPO/merges" -f base="$BR" -f head=main \
             -f commit_message="$(printf 'Merge main into %s\n\n%s' "$BR" "$SOB")" >/dev/null
           gh api -X POST "repos/$REPO/merges" -f base="$BR" -f head=release/develop \
             -f commit_message="$(printf 'Merge release/develop into %s for nightly promotion\n\n%s' "$BR" "$SOB")" >/dev/null
+          built="$(gh api "repos/$REPO/git/ref/heads/$BR" --jq .object.sha)"
+          validate || exit 1
           day="$(date -u +%F)"
           pr="$(gh pr list --repo "$REPO" --head "$BR" --base main --state open --json number --jq '.[0].number // empty')"
           if [ -z "$pr" ]; then
@@ -76,7 +110,7 @@ jobs:
             pr="${url##*/}"
           fi
           gh workflow run ci.yml --repo "$REPO" --ref "$BR"
-          gh pr merge "$pr" --repo "$REPO" --merge --auto \
+          gh pr merge "$pr" --repo "$REPO" --merge --auto --match-head-commit "$built" \
             --subject "Nightly promotion of release/develop to main ($day) (#$pr)" \
             --body "$SOB"
-          echo "promotion PR #$pr: full CI dispatched on $BR, auto-merge enabled"
+          echo "promotion PR #$pr: full CI dispatched on $BR at $built, auto-merge pinned to $built"
