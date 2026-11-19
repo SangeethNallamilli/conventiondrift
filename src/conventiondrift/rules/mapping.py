@@ -9,7 +9,8 @@
    rule in a gated run (SR C-1); a file with no entry there has no markers.
 2. Rules with the same identity, (file, normalized text), are one rule at
    their first line, with the later lines in ``also_at`` (AC-E.20). Across
-   files nothing merges: the file is part of the identity.
+   files nothing merges: the file is part of the identity. A rule's id is
+   ``file:line``, or ``file:line:column`` when two rules start on one line.
 3. **Mapping** (``map_rule``): every checker's ``match_rule`` runs on the
    normalized text. The highest ``specificity`` wins. A tie, or no match at
    all, gives ``checker=None`` and ``match=None``, which C9 turns into Not
@@ -25,6 +26,7 @@ Mapping is deterministic: checkers are tried in sorted id order and output is
 in (file, line) order.
 """
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -40,7 +42,7 @@ from conventiondrift.model import (
     Rule,
     RuleMatch,
 )
-from conventiondrift.rules.conflicts import find_conflicts
+from conventiondrift.rules.conflicts import ConflictIndex, find_conflicts
 from conventiondrift.rules.extract import ExtractedRule, FileRules, extract_file, normalize
 
 __all__ = [
@@ -49,6 +51,7 @@ __all__ = [
     "RuleExtractor",
     "extract_rules",
     "map_rule",
+    "rule_id",
     "rule_identity",
 ]
 
@@ -69,13 +72,18 @@ class Extraction:
 
     ``files`` holds each file's ``extract_file`` result in path order, so the
     caller can list unattached markers and the R2.6 caps (DESIGN §10 S4).
-    ``conflicts_dropped`` counts conflicts cut by ``MAX_CONFLICTS``.
+    ``conflicts`` lists at most ``MAX_CONFLICTS`` conflicts and
+    ``conflicts_dropped`` counts the rest (I-9 ``counts.conflicts_dropped``).
+    ``conflict_lookup`` answers whether a rule is in a conflict and with which
+    rules, whatever the cap cut (``conflict_with``).
     """
 
     rules: tuple[Rule, ...]
     conflicts: tuple[Conflict, ...]
     files: tuple[FileRules, ...]
     conflicts_dropped: int
+    unattached_markers: tuple[tuple[str, int], ...]
+    conflict_lookup: ConflictIndex
 
 
 def rule_identity(file: str, normalized_text: str) -> tuple[str, str]:
@@ -84,6 +92,15 @@ def rule_identity(file: str, normalized_text: str) -> tuple[str, str]:
     Comparing base and head across file renames is C10's job (T-022).
     """
     return (file, normalized_text)
+
+
+def rule_id(file: str, line: int, column: int, *, shares_line: bool) -> str:
+    """A rule's id (INTERFACES I-13 "C6 conflict cap and rule ids").
+
+    ``file:line``, or ``file:line:column`` for every rule when two or more rules
+    start on that line. Ids are opaque, unique within a side, and never parsed.
+    """
+    return f"{file}:{line}:{column}" if shares_line else f"{file}:{line}"
 
 
 def _is_valid(match: object, options: frozenset[str]) -> bool:
@@ -152,6 +169,8 @@ def _build(
     group: Sequence[ExtractedRule],
     policy: Policy,
     checkers: Mapping[str, Checker],
+    *,
+    shares_line: bool,
 ) -> Rule:
     first = group[0]
     lines = frozenset(rule.line for rule in group)
@@ -166,7 +185,7 @@ def _build(
         _entry_matches(entry, file.path, lines, first.normalized_text) for entry in policy.ignores
     )
     return Rule(
-        id=f"{file.path}:{first.line}",
+        id=rule_id(file.path, first.line, first.column, shares_line=shares_line),
         file=file.path,
         line=first.line,
         also_at=tuple(sorted(lines - {first.line})),
@@ -203,24 +222,31 @@ def extract_rules(
         for rule in result.rules:
             identity = rule_identity(file.path, rule.normalized_text)
             groups.setdefault(identity, (file, []))[1].append(rule)
-    rules = [_build(file, group, policy, checkers) for file, group in groups.values()]
+    starts = Counter((file.path, group[0].line) for file, group in groups.values())
+    rules = [
+        _build(file, group, policy, checkers, shares_line=starts[(file.path, group[0].line)] > 1)
+        for file, group in groups.values()
+    ]
     conflicts = find_conflicts(rules)
     return Extraction(
         rules=tuple(rules),
         conflicts=conflicts.found,
         files=tuple(results),
-        conflicts_dropped=conflicts.dropped,
+        conflicts_dropped=conflicts.unlisted,
+        unattached_markers=tuple(
+            (result.path, line) for result in results for line in result.unattached_markers
+        ),
+        conflict_lookup=conflicts.lookup,
     )
 
 
 class RuleExtractor:
-    """The I-11 ``Extractor`` over ``extract_rules``."""
+    """The I-11 ``Extractor``: ``extract_rules`` and its full ``Extraction`` (I-13 C6 item 3)."""
 
     def extract(
         self,
         files: Sequence[InstructionFile],
         policy: Policy,
         checkers: Mapping[str, Checker],
-    ) -> tuple[Sequence[Rule], Sequence[Conflict]]:
-        extraction = extract_rules(files, policy, checkers)
-        return extraction.rules, extraction.conflicts
+    ) -> Extraction:
+        return extract_rules(files, policy, checkers)

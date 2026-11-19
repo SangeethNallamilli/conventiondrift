@@ -33,11 +33,13 @@ from conventiondrift.rules import mapping
 from conventiondrift.rules.conflicts import MAX_CONFLICTS
 from conventiondrift.rules.extract import MARKER, MAX_RULES_PER_FILE, normalize
 from conventiondrift.rules.mapping import (
+    Extraction,
     UNMAPPED,
     Mapped,
     RuleExtractor,
     extract_rules,
     map_rule,
+    rule_id,
     rule_identity,
 )
 
@@ -457,9 +459,78 @@ def test_the_same_text_in_two_files_is_two_rules() -> None:
     assert [(r.id, r.also_at) for r in rules] == [("AGENTS.md:1", ()), ("CLAUDE.md:1", ())]
 
 
-def test_two_equal_sentences_on_one_line_leave_also_at_empty() -> None:
+def test_two_equal_sentences_on_one_line_are_one_rule_with_a_plain_id() -> None:
     (rule,) = rules_of([instruction_file("AGENTS.md", "Use httpx. Use httpx.\n")])
-    assert (rule.line, rule.also_at) == (1, ())
+    assert (rule.id, rule.line, rule.also_at) == ("AGENTS.md:1", 1, ())
+
+
+def test_a_rule_alone_on_its_line_has_a_file_line_id_even_beside_a_shared_line() -> None:
+    text = "- Use a. Use b.\n- Use c.\n"
+    assert [r.id for r in rules_of([instruction_file("AGENTS.md", text)])] == [
+        "AGENTS.md:1:3",
+        "AGENTS.md:1:10",
+        "AGENTS.md:2",
+    ]
+
+
+def test_every_rule_on_a_shared_line_gets_file_line_column_ids() -> None:
+    text = "Use requests. Never use requests. Use httpx.\n"
+    rules = rules_of([instruction_file("AGENTS.md", text)])
+    assert [(r.id, r.line) for r in rules] == [
+        ("AGENTS.md:1:1", 1),
+        ("AGENTS.md:1:15", 1),
+        ("AGENTS.md:1:35", 1),
+    ]
+    assert len({r.id for r in rules}) == 3
+
+
+def test_ids_stay_unique_per_side_and_the_same_line_in_two_files_is_not_shared() -> None:
+    files = [instruction_file(p, "Use a. Use b.\n") for p in ("A.md", "B.md")]
+    ids = [r.id for r in rules_of(files)]
+    assert ids == ["A.md:1:1", "A.md:1:8", "B.md:1:1", "B.md:1:8"]
+    only = rules_of([instruction_file("A.md", "Use a.\n"), instruction_file("B.md", "Use b.\n")])
+    assert [r.id for r in only] == ["A.md:1", "B.md:1"]
+
+
+def test_identity_is_unchanged_by_the_column_in_an_id() -> None:
+    # Comparison identity stays (file, normalized text); the id is only a label.
+    (first, second) = rules_of([instruction_file("AGENTS.md", "Use a. Use b.\n")])
+    assert rule_identity(first.file, first.normalized_text) == ("AGENTS.md", "use a.")
+    assert rule_identity(second.file, second.normalized_text) == ("AGENTS.md", "use b.")
+
+
+def test_two_sentences_on_one_line_conflict_by_their_distinct_ids() -> None:
+    # I-13 "C6 conflict cap and rule ids": distinct ids, and a conflict reference resolves.
+    text = "Use requests. Use httpx.\n"
+    result = extract_rules([instruction_file("AGENTS.md", text)], make_policy(), http_only())
+    first, second = result.rules
+    assert (first.id, second.id) == ("AGENTS.md:1:1", "AGENTS.md:1:15")
+    assert first.id != second.id
+    assert [(c.rules, c.checker) for c in result.conflicts] == [
+        (("AGENTS.md:1:1", "AGENTS.md:1:15"), "http-client")
+    ]
+    by_id = {r.id: r for r in result.rules}
+    assert all(by_id[i].checker == "http-client" for i in result.conflicts[0].rules)
+    assert result.conflict_lookup.partners(first.id) == (second.id,)
+    assert result.conflict_lookup.partners(second.id) == (first.id,)
+
+
+def test_a_conflict_between_two_rules_on_one_line_names_both_distinct_ids() -> None:
+    # The TE's repro: one line, "Use requests. Never use requests."
+    text = "Use requests. Never use requests.\n"
+    result = extract_rules([instruction_file("AGENTS.md", text)], make_policy(), http_only())
+    assert [r.id for r in result.rules] == ["AGENTS.md:1:1", "AGENTS.md:1:15"]
+    assert [(c.rules, c.checker) for c in result.conflicts] == [
+        (("AGENTS.md:1:1", "AGENTS.md:1:15"), "http-client")
+    ]
+    assert set(result.conflicts[0].rules) == {r.id for r in result.rules}
+    assert result.conflicts_dropped == 0
+
+
+@pytest.mark.parametrize("shares_line", [False, True])
+def test_rule_id_format(shares_line: bool) -> None:
+    got = rule_id("a/B.md", 12, 7, shares_line=shares_line)
+    assert got == ("a/B.md:12:7" if shares_line else "a/B.md:12")
 
 
 def test_duplicates_in_a_file_do_not_conflict_with_themselves() -> None:
@@ -811,23 +882,47 @@ def test_the_conflict_cap_is_reported_by_the_extraction() -> None:
     assert side * side > MAX_CONFLICTS
     assert len(result.conflicts) == MAX_CONFLICTS
     assert result.conflicts_dropped == side * side - MAX_CONFLICTS
+    assert all(result.conflict_lookup.is_conflicting(r.id) for r in result.rules)
+    # Rules whose pairs the cap left unlisted still know their partners (conflict_with).
+    assert all(len(result.conflict_lookup.partners(r.id)) == side for r in result.rules)
+    listed = {i for c in result.conflicts for i in c.rules}
+    assert len(listed) < len(result.rules)
 
 
 # --- the I-11 Extractor ---------------------------------------------------------------------------
 
 
-def test_rule_extractor_is_an_extractor_and_returns_rules_and_conflicts() -> None:
+def test_rule_extractor_returns_the_full_extraction_unchanged() -> None:
+    # I-13 C6 item 3: the Extractor returns what extract_rules produces, nothing trimmed.
     extractor: Extractor = RuleExtractor()
+    policy = make_policy(markers={"AGENTS.md": ((9, False),)})
+    long_file = "".join(f"- Use thing number {n}.\n" for n in range(MAX_RULES_PER_FILE + 2))
     files = [
         instruction_file("AGENTS.md", "Use requests.\n"),
         instruction_file("CLAUDE.md", "Use httpx.\n"),
+        instruction_file("LONG.md", long_file),
     ]
-    rules, conflicts = extractor.extract(files, make_policy(), http_only())
-    full = extract_rules(files, make_policy(), http_only())
-    assert tuple(rules) == full.rules
-    assert tuple(conflicts) == full.conflicts
-    assert len(rules) == 2
-    assert len(conflicts) == 1
+    got = extractor.extract(files, policy, http_only())
+    assert isinstance(got, Extraction)
+    assert got.rules == extract_rules(files, policy, http_only()).rules
+    assert got.conflicts == extract_rules(files, policy, http_only()).conflicts
+    assert len(got.conflicts) == 1
+    assert got.conflicts_dropped == 0
+    assert [(f.path, f.rules_dropped, f.candidates_dropped) for f in got.files] == [
+        ("AGENTS.md", 0, 0),
+        ("CLAUDE.md", 0, 0),
+        ("LONG.md", 2, 0),
+    ]
+    assert got.unattached_markers == (("AGENTS.md", 9),)
+    assert got.conflict_lookup.partners("AGENTS.md:1") == ("CLAUDE.md:1",)
+
+
+def test_unattached_markers_are_listed_by_file_in_path_order() -> None:
+    policy = make_policy(markers={"B.md": ((2, True), (4, False)), "A.md": ((7, False),)})
+    files = [instruction_file("B.md", "- Use x.\n"), instruction_file("A.md", "- Use y.\n")]
+    got = extract_rules(files, policy, {})
+    assert got.unattached_markers == (("A.md", 7), ("B.md", 2), ("B.md", 4))
+    assert extract_rules(files, make_policy(), {}).unattached_markers == ()
 
 
 def test_extraction_is_a_frozen_value() -> None:
@@ -838,5 +933,13 @@ def test_extraction_is_a_frozen_value() -> None:
 
 def test_the_module_exports_its_public_names() -> None:
     assert sorted(mapping.__all__) == sorted(
-        ["Extraction", "Mapped", "RuleExtractor", "extract_rules", "map_rule", "rule_identity"]
+        [
+            "Extraction",
+            "Mapped",
+            "RuleExtractor",
+            "extract_rules",
+            "map_rule",
+            "rule_id",
+            "rule_identity",
+        ]
     )

@@ -1,5 +1,6 @@
 """Unit tests for C6 conflict detection in conventiondrift.rules.conflicts (T-015)."""
 
+import dataclasses
 import itertools
 from collections.abc import Sequence
 from typing import get_args
@@ -188,7 +189,9 @@ def test_ignored_rules_still_conflict() -> None:
 
 
 def test_no_rules_no_conflicts() -> None:
-    assert find_conflicts([]) == cf.Conflicts(found=(), dropped=0)
+    result = find_conflicts([])
+    assert (result.found, result.unlisted) == ((), 0)
+    assert not result.lookup.is_conflicting("A.md:1")
 
 
 # --- scope overlap ---------------------------------------------------------------------
@@ -267,13 +270,91 @@ def test_result_does_not_depend_on_rule_order() -> None:
     ]
     expected = find_conflicts(rules)
     for permutation in itertools.permutations(rules):
-        assert find_conflicts(permutation) == expected
+        assert find_conflicts(permutation).found == expected.found
 
 
-def test_the_same_id_on_both_sides_is_kept() -> None:
-    # Two rules that start on one line share an id; the pair is still listed.
-    rules = [_rule("A.md", 3, REQUESTS), _rule("A.md", 3, HTTPX)]
-    assert _pairs(rules) == [("A.md:3", "A.md:3")]
+def test_rules_that_share_a_line_conflict_under_their_own_ids() -> None:
+    # Two rules that start on one line have distinct ids (I-13 "C6 conflict cap and rule ids");
+    # a conflict between them names both, and each id resolves in the lookup.
+    first = dataclasses.replace(_rule("A.md", 3, REQUESTS), id="A.md:3:1")
+    second = dataclasses.replace(_rule("A.md", 3, HTTPX), id="A.md:3:14")
+    result = find_conflicts([first, second])
+    assert [c.rules for c in result.found] == [("A.md:3:1", "A.md:3:14")]
+    assert result.lookup.partners("A.md:3:1") == ("A.md:3:14",)
+    assert result.lookup.partners("A.md:3:14") == ("A.md:3:1",)
+
+
+def test_pairs_are_listed_in_sorted_id_order_with_the_first_id_smaller() -> None:
+    rules = [
+        _rule(f"{name}.md", 1, match)
+        for name, match in (("c", REQUESTS), ("a", HTTPX), ("b", REQUESTS))
+    ]
+    found = find_conflicts(rules).found
+    assert [c.rules for c in found] == [("a.md:1", "b.md:1"), ("a.md:1", "c.md:1")]
+    assert all(c.rules[0] < c.rules[1] for c in found)
+
+
+# --- the lookup does not depend on the cap -------------------------------------------------
+
+
+def test_lookup_gives_each_rules_partners_and_status() -> None:
+    rules = [
+        _rule("A.md", 1, REQUESTS),
+        _rule("B.md", 1, HTTPX),
+        _rule("C.md", 1, HTTPX),
+        _rule("D.md", 1, HTTPX, checker="logging"),
+        _rule("E.md", 1, None),
+    ]
+    lookup = find_conflicts(rules).lookup
+    assert lookup.partners("A.md:1") == ("B.md:1", "C.md:1")
+    assert lookup.partners("B.md:1") == ("A.md:1",)
+    assert lookup.partners("D.md:1") == ()
+    assert [lookup.is_conflicting(r.id) for r in rules] == [True, True, True, False, False]
+
+
+def test_lookup_for_an_unknown_id_is_empty() -> None:
+    lookup = find_conflicts([_rule("A.md", 1, REQUESTS), _rule("B.md", 1, HTTPX)]).lookup
+    assert lookup.partners("nope") == ()
+    assert not lookup.is_conflicting("nope")
+
+
+def test_lookup_covers_every_rule_even_when_the_cap_cuts_the_list() -> None:
+    side = 40
+    rules = [_rule(f"a{n:02}.md", 1, REQUESTS) for n in range(side)]
+    rules += [_rule(f"b{n:02}.md", 1, HTTPX) for n in range(side)]
+    result = find_conflicts(rules)
+    assert result.unlisted == side * side - MAX_CONFLICTS
+    listed = {i for c in result.found for i in c.rules}
+    for rule in rules:
+        assert result.lookup.is_conflicting(rule.id)
+        assert len(result.lookup.partners(rule.id)) == side
+    # The cap stops after the first 25 "a" rules (25 * 40 pairs), so "a39" is not listed at all,
+    # yet the lookup still knows its 40 partners.
+    assert "a39.md:1" not in listed
+    assert result.lookup.partners("a39.md:1") == tuple(f"b{n:02}.md:1" for n in range(side))
+
+
+def test_the_listed_pairs_are_the_first_in_sorted_order_whatever_the_rule_order() -> None:
+    side = 40
+    rules = [_rule(f"a{n:02}.md", 1, REQUESTS) for n in range(side)]
+    rules += [_rule(f"b{n:02}.md", 1, HTTPX) for n in range(side)]
+    expected = sorted((f"a{i:02}.md:1", f"b{j:02}.md:1") for i in range(side) for j in range(side))
+    found = find_conflicts(rules).found
+    assert [c.rules for c in found] == expected[:MAX_CONFLICTS]
+    assert find_conflicts(rules[::-1]).found == found
+
+
+def test_pairs_of_different_checkers_interleave_in_one_sorted_list() -> None:
+    rules = [
+        _rule("a.md", 1, REQUESTS),
+        _rule("b.md", 1, HTTPX),
+        _rule("c.md", 1, REQUESTS, checker="logging"),
+        _rule("d.md", 1, HTTPX, checker="logging"),
+    ]
+    assert find_conflicts(rules).found == (
+        Conflict(("a.md:1", "b.md:1"), HTTP),
+        Conflict(("c.md:1", "d.md:1"), "logging"),
+    )
 
 
 # --- bounded work (SECURITY-RULES R2.6) --------------------------------------------------
@@ -286,17 +367,17 @@ def test_conflicts_are_capped_and_the_rest_counted() -> None:
     result = find_conflicts(rules)
     assert side * side > MAX_CONFLICTS
     assert len(result.found) == MAX_CONFLICTS
-    assert result.dropped == side * side - MAX_CONFLICTS
+    assert result.unlisted == side * side - MAX_CONFLICTS
     assert [c.rules for c in result.found] == sorted(c.rules for c in result.found)
 
 
-def test_exactly_the_cap_drops_nothing() -> None:
+def test_exactly_the_cap_leaves_nothing_unlisted() -> None:
     first = [_rule(f"a{n}.md", 1, REQUESTS) for n in range(MAX_CONFLICTS)]
     result = find_conflicts([*first, _rule("b.md", 1, HTTPX)])
     assert len(result.found) == MAX_CONFLICTS
-    assert result.dropped == 0
+    assert result.unlisted == 0
     over = find_conflicts([*first, _rule("a_extra.md", 1, REQUESTS), _rule("b.md", 1, HTTPX)])
-    assert (len(over.found), over.dropped) == (MAX_CONFLICTS, 1)
+    assert (len(over.found), over.unlisted) == (MAX_CONFLICTS, 1)
 
 
 def test_the_cap_holds_across_many_group_pairs() -> None:
@@ -307,10 +388,11 @@ def test_the_cap_holds_across_many_group_pairs() -> None:
         rules += [_rule(f"{option}{n}.md", 1, _match([option])) for n in range(third)]
     result = find_conflicts(rules)
     assert len(result.found) == MAX_CONFLICTS
-    assert result.dropped == 3 * third * third - MAX_CONFLICTS
+    assert result.unlisted == 3 * third * third - MAX_CONFLICTS
 
 
 def test_many_rules_with_one_match_cost_nothing_per_pair() -> None:
     # 20,000 rules in one group never compare pairwise; only distinct groups do.
     rules = [_rule(f"f{n}.md", 1, REQUESTS) for n in range(20_000)]
-    assert find_conflicts(rules) == cf.Conflicts(found=(), dropped=0)
+    result = find_conflicts(rules)
+    assert (result.found, result.unlisted) == ((), 0)

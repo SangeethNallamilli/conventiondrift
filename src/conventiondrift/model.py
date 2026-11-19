@@ -371,6 +371,12 @@ class ReportCounts:
     new_stale: int
     rules_changed: int
     rules_unchanged: int
+    conflicts_unlisted: int = 0
+    """Conflicts beyond the C6 listing cap (I-13 "C6 conflict cap and rule ids"); 0 if none."""
+
+    def __post_init__(self) -> None:
+        if self.conflicts_unlisted < 0:
+            raise ValueError("ReportCounts.conflicts_unlisted must not be negative")
 
 
 @dataclass(frozen=True, slots=True, eq=True)

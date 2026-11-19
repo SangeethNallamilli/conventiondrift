@@ -232,7 +232,10 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
     ),
     "Window": (WINDOW, ("end", "days", "available", "unavailable_reason")),
     "InternalError": (RESULT.internal_errors[0], ("component", "message")),
-    "ReportCounts": (RESULT.counts, ("stale", "new_stale", "rules_changed", "rules_unchanged")),
+    "ReportCounts": (
+        RESULT.counts,
+        ("stale", "new_stale", "rules_changed", "rules_unchanged", "conflicts_unlisted"),
+    ),
     "Result": (
         RESULT,
         (
@@ -892,3 +895,15 @@ def test_policy_accepts_named_tuple_pairs() -> None:
 
     policy = dataclasses.replace(POLICY, markers={"AGENTS.md": (Marker(3, True),)})
     assert policy.markers["AGENTS.md"] == ((3, True),)
+
+
+def test_report_counts_conflicts_unlisted_defaults_to_zero_and_is_never_negative() -> None:
+    # I-9 counts.conflicts_unlisted (I-13 "C6 conflict cap and rule ids"): additive, 0 when none.
+    assert (
+        ReportCounts(stale=0, new_stale=0, rules_changed=0, rules_unchanged=0).conflicts_unlisted
+        == 0
+    )
+    assert dataclasses.replace(RESULT.counts, conflicts_unlisted=7).conflicts_unlisted == 7
+    assert dataclasses.replace(RESULT.counts, conflicts_unlisted=0).conflicts_unlisted == 0
+    with pytest.raises(ValueError, match="conflicts_unlisted"):
+        dataclasses.replace(RESULT.counts, conflicts_unlisted=-1)
