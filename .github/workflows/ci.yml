@@ -297,10 +297,12 @@ jobs:
     # non-Windows `test` legs.
     name: test-macos (${{ matrix.python-version }})
     needs: [lockfile]
-    # Pinned to macos-15 (2026-11-19): macos-latest now resolves to the
-    # macos-26-arm64 pool, which repeatedly failed to assign runners
-    # ("not acquired by Runner of type hosted") on daytime full-matrix runs.
-    runs-on: macos-15
+    # Pinned to macos-15-intel (owner decision 2026-11-19): GitHub's macOS
+    # arm64 pool (macos-latest = macos-26-arm64, and macos-15) repeatedly
+    # failed to assign runners ("not acquired by Runner of type hosted") on
+    # full-matrix runs. The Intel pool is separate; uv's macOS-X64 checksum
+    # is in the map below. Revisit arm64 once that pool is reliable.
+    runs-on: macos-15-intel
     timeout-minutes: 10
     permissions:
       contents: read
