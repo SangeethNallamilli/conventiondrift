@@ -10,7 +10,7 @@ import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import get_args, get_type_hints
+from typing import cast, get_args, get_type_hints
 
 import pytest
 from hypothesis import given
@@ -133,7 +133,7 @@ R1 = rule("Use requests for HTTP calls", line=9)
 
 # I-13 C10 ruling 7: case 1 needs code, i.e. a changed file whose sites moved. A head
 # side that is Stale with sites in an unchanged file (or none) has no causing files.
-CODE_CHANGE: list[ChangedFile] = [("M", "src/a.py", "src/a.py")]
+CODE_CHANGE: list[ChangedFile] = [("M", None, "src/a.py")]
 
 
 def head_side(verdict: Verdict) -> SideResult:
@@ -173,7 +173,7 @@ def test_same_rule_case_for_every_verdict_pair(base_v: Verdict, head_v: Verdict)
 @pytest.mark.parametrize("head_v", list(Verdict))
 def test_head_only_rule_is_case_2_only_when_stale(head_v: Verdict) -> None:
     # Case 2: "The PR adds or edits a rule that the code contradicts" (Stale at head).
-    got = only(compare([], [(R1, side(head_v))], [("M", "AGENTS.md", "AGENTS.md")]))
+    got = only(compare([], [(R1, side(head_v))], [("M", None, "AGENTS.md")]))
     assert got.case == ("stale-rule-added" if head_v is S else None)
     assert got.base_rule is None and got.base is None
 
@@ -224,9 +224,7 @@ def _f5_1_sides() -> tuple[SideResult, SideResult]:
 
 def test_f5_1_case_1_causing_file_and_replacement() -> None:
     base, head = _f5_1_sides()
-    got = only(
-        compare([(R1, base)], [(R1, head)], [("M", "src/api/client.py", "src/api/client.py")])
-    )
+    got = only(compare([(R1, base)], [(R1, head)], [("M", None, "src/api/client.py")]))
     assert got.case == "made-stale-by-code"
     # AC-F6.3 #5: causing file src/api/client.py; "removed in src/api/client.py".
     assert got.causing_files == (CausingFile("src/api/client.py", -3, 3),)
@@ -244,7 +242,7 @@ def test_f5_4_only_the_pr_caused_rule_has_a_case() -> None:
     out = compare(
         [(r, side(C)), (s_rule, side(H))],
         [(r, side(C)), (s_rule, side(S, sites("src/app.py", "print", False, 2)))],
-        [("M", "docs/guide.md", "docs/guide.md"), ("M", "src/app.py", "src/app.py")],
+        [("M", None, "docs/guide.md"), ("M", None, "src/app.py")],
     )
     by_id = {x.rule_id: x for x in out}
     assert by_id[r.id].case is None
@@ -258,17 +256,34 @@ def test_f5_6_three_pre_existing_plus_one_pr_caused() -> None:
     out = compare(
         [(p, side(S)) for p in pre] + [(new, side(C))],
         [(p, side(S)) for p in pre] + [(new, side(S))],
-        [("M", "src/a.py", "src/a.py")],
+        [("M", None, "src/a.py")],
     )
     assert sum(x.case == "pre-existing-stale" for x in out) == 3
     assert [x.rule_id for x in out if x.case in WARNING_CASES] == [new.id]
+
+
+def test_f5_6_pr_caused_rule_with_sites_in_the_changed_file_is_case_1() -> None:
+    # AC-F5.6 with code behind it: the PR-caused rule's sites sit in the changed file, so
+    # it has causing files and is case 1 (I-13 C10 ruling 7); the 3 pre-existing rules are
+    # not listed.
+    pre = [rule(f"Use requests for thing {i}", line=i) for i in range(1, 4)]
+    new = rule("Use requests for HTTP calls", line=9)
+    out = compare(
+        [(p, side(S)) for p in pre] + [(new, side(H, sites("src/a.py", "requests", True, 3)))],
+        [(p, side(S)) for p in pre] + [(new, side(S, sites("src/a.py", "httpx", False, 3)))],
+        [("M", None, "src/a.py")],
+    )
+    assert sum(x.case == "pre-existing-stale" for x in out) == 3
+    listed = [x for x in out if x.case in WARNING_CASES]
+    assert [(x.rule_id, x.case) for x in listed] == [(new.id, "made-stale-by-code")]
+    assert listed[0].causing_files == (CausingFile("src/a.py", -3, 3),)
 
 
 def test_f5_3a_text_replaced_with_suggestion_that_holds_is_fixed() -> None:
     # AC-F5.3 (a): the PR replaces the Stale rule's text with the suggested wording, which Holds.
     old = rule("Use requests for HTTP calls", line=9)
     new = rule("Use httpx for HTTP calls", line=9, match=USE_HTTPX)
-    out = compare([(old, side(S))], [(new, side(H))], [("M", "AGENTS.md", "AGENTS.md")])
+    out = compare([(old, side(S))], [(new, side(H))], [("M", None, "AGENTS.md")])
     cases = {(x.base_rule is not None, x.head_rule is not None): x.case for x in out}
     assert cases == {(True, False): "fixed", (False, True): None}
     assert not [x for x in out if x.case in WARNING_CASES]
@@ -276,7 +291,7 @@ def test_f5_3a_text_replaced_with_suggestion_that_holds_is_fixed() -> None:
 
 def test_f5_3b_code_change_makes_rule_hold_is_fixed() -> None:
     # AC-F5.3 (b): code changes so the rule Holds at head.
-    got = only(compare([(R1, side(S))], [(R1, side(H))], [("M", "src/a.py", "src/a.py")]))
+    got = only(compare([(R1, side(S))], [(R1, side(H))], [("M", None, "src/a.py")]))
     assert got.case == "fixed"
 
 
@@ -284,7 +299,7 @@ def test_deleted_stale_rule_replaced_by_a_stale_rule_is_not_fixed() -> None:
     # D-PM-05 #3: "deleted or replaced in the PR, with no Stale rule replacing it, counts as fixed".
     old = rule("Use requests for HTTP calls", line=9)
     new = rule("Use requests for all HTTP calls", line=9)
-    out = compare([(old, side(S))], [(new, side(S))], [("M", "AGENTS.md", "AGENTS.md")])
+    out = compare([(old, side(S))], [(new, side(S))], [("M", None, "AGENTS.md")])
     cases = {(x.base_rule is not None, x.head_rule is not None): x.case for x in out}
     assert cases == {(True, False): "removed", (False, True): "stale-rule-added"}
 
@@ -402,9 +417,29 @@ def test_e10_deleted_instruction_file() -> None:
     assert not [x for x in out if x.case in WARNING_CASES]
 
 
-def test_e10_deleted_file_in_t008_status_shape() -> None:
-    # Robust to a deletion reported with the old path filled in.
-    out = compare([(R1, side(S))], [], [("D", "AGENTS.md", "AGENTS.md")])
+def _all_changed_files_in_this_module() -> list[ChangedFile]:
+    """Every literal ``("D", ..., path)`` tuple written in this file, from its AST."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    found: list[ChangedFile] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Tuple)
+            and len(node.elts) == 3
+            and all(isinstance(e, ast.Constant) for e in node.elts)
+            and cast(ast.Constant, node.elts[0]).value == "D"
+        ):
+            status, old, new = ast.literal_eval(node)
+            found.append((status, old, new))
+    return found
+
+
+def test_e10_deleted_file_uses_only_the_canonical_i14_tuple() -> None:
+    # I-13 C10 ruling 8: "I-14's ("D", None, path) is canonical. compare.py accepts only
+    # that form, and T-008 must emit it." Every deletion in this file has that shape.
+    deletions = [c for c in _all_changed_files_in_this_module() if c[0] == "D"]
+    assert deletions
+    assert all(old is None for _status, old, _new in deletions)
+    out = compare([(R1, side(S))], [], [("D", None, "AGENTS.md")])
     assert only(out).case == "fixed"
 
 
@@ -424,7 +459,7 @@ def test_e11_instruction_only_pr_lists_only_the_added_rule() -> None:
     out = compare(
         [(keep, side(H)), (edited_old, side(H))],
         [(keep, side(H)), (edited_new, side(H)), (added, side(S, logging_sites))],
-        [("M", "AGENTS.md", "AGENTS.md")],
+        [("M", None, "AGENTS.md")],
     )
     assert [x.rule_id for x in out if x.case in WARNING_CASES] == [added.id]
     assert only(tuple(x for x in out if x.rule_id == added.id)).case == "stale-rule-added"
@@ -459,6 +494,13 @@ def test_duplicate_identity_on_one_side_is_rejected(which: str) -> None:
             compare([], dup, [])
 
 
+def _rule_of(result: RuleResult) -> Rule:
+    """The head rule, else the base rule (RuleResult guarantees at least one)."""
+    r = result.head_rule or result.base_rule
+    assert r is not None
+    return r
+
+
 def test_results_are_sorted_like_result_rule_results() -> None:
     # I-13 Result.rule_results: sorted by (file, line) of head_rule, else base_rule.
     a = rule("Use requests a", file="b/AGENTS.md", line=1)
@@ -466,10 +508,7 @@ def test_results_are_sorted_like_result_rule_results() -> None:
     gone = rule("Use requests aaa", file="AGENTS.md", line=7)  # sorts before b's text
     c_ = rule("Use requests c", file="AGENTS.md", line=2)
     out = compare([(gone, side(H))], [(a, side(H)), (b, side(H)), (c_, side(H))], [])
-    keys = [
-        ((x.head_rule or x.base_rule).file, (x.head_rule or x.base_rule).line, x.head_rule is None)
-        for x in out
-    ]  # type: ignore[union-attr]
+    keys = [(_rule_of(x).file, _rule_of(x).line, x.head_rule is None) for x in out]
     assert keys == [
         ("AGENTS.md", 2, False),
         ("AGENTS.md", 7, False),
@@ -601,7 +640,7 @@ def test_causing_files_sorted_by_abs_delta_then_path() -> None:
         + sites("a.py", "httpx", False, 2)
         + sites("c.py", "httpx", False, 1),
     )
-    changed: list[ChangedFile] = [("M", p, p) for p in ("c.py", "b.py", "a.py")]
+    changed: list[ChangedFile] = [("M", None, p) for p in ("c.py", "b.py", "a.py")]
     got = only(compare([(R1, base)], [(R1, head)], changed))
     assert [f.file for f in got.causing_files] == ["a.py", "b.py", "c.py"]
     assert got.causing_files[0] == CausingFile("a.py", -2, 2)
@@ -611,7 +650,7 @@ def test_causing_files_sorted_by_abs_delta_then_path() -> None:
 def test_causing_files_larger_delta_first() -> None:
     base = side(C, sites("a.py", "requests", True, 1) + sites("z.py", "requests", True, 4))
     head = side(S, sites("a.py", "httpx", False, 1) + sites("z.py", "httpx", False, 4))
-    got = only(compare([(R1, base)], [(R1, head)], [("M", "a.py", "a.py"), ("M", "z.py", "z.py")]))
+    got = only(compare([(R1, base)], [(R1, head)], [("M", None, "a.py"), ("M", None, "z.py")]))
     assert [f.file for f in got.causing_files] == ["z.py", "a.py"]
 
 
@@ -621,13 +660,13 @@ def test_causing_files_only_changed_files() -> None:
         C, sites("touched.py", "requests", True, 1) + sites("untouched.py", "requests", True, 2)
     )
     head = side(S, sites("touched.py", "httpx", False, 1))
-    got = only(compare([(R1, base)], [(R1, head)], [("M", "touched.py", "touched.py")]))
+    got = only(compare([(R1, base)], [(R1, head)], [("M", None, "touched.py")]))
     assert got.causing_files == (CausingFile("touched.py", -1, 1),)
 
 
 def test_causing_files_changed_file_with_unchanged_sites_is_left_out() -> None:
     same = sites("a.py", "requests", True, 2)
-    got = only(compare([(R1, side(C, same))], [(R1, side(C, same))], [("M", "a.py", "a.py")]))
+    got = only(compare([(R1, side(C, same))], [(R1, side(C, same))], [("M", None, "a.py")]))
     assert got.causing_files == ()
 
 
@@ -704,10 +743,14 @@ def test_suggestion_two_option_rule_with_a_third_top_option() -> None:
 
 def test_suggestion_single_option_rule_changes_only_preferred_tokens() -> None:
     # I-9: the "not Y" swap is for two-option rules; a one-option rule only replaces
-    # its preferred token, even when the candidate is named elsewhere in the text.
-    r = rule("Use requests; httpx is not needed")
+    # its preferred token (every occurrence), and nothing else in the sentence changes.
+    r = rule("Use requests; requests is fine, other libraries are not")
     s = suggest(r, head_with({"httpx": 4}, USE_REQUESTS.preferred))
-    assert s.new_text == "Use httpx; httpx is not needed"
+    assert s.new_text == "Use httpx; httpx is fine, other libraries are not"
+    # CR1 on #54: naming the candidate elsewhere would give "Use httpx; httpx is not needed",
+    # which no longer says what the rule said, so no sentence is generated.
+    r = rule("Use requests; httpx is not needed")
+    assert suggest(r, head_with({"httpx": 4}, USE_REQUESTS.preferred)).new_text is None
 
 
 def test_suggestion_ties_on_count_break_by_option_name() -> None:
@@ -799,7 +842,54 @@ def test_suggestion_multiple_preferred_options() -> None:
     s = suggest(r, head_with({"requests": 8, "httpx": 1}, m.preferred))
     assert s.named_option == "aiohttp"  # the rule's preferred option, picked deterministically
     assert s.alternatives == (Alternative("requests", 8),)
-    assert s.new_text == "Use requests or requests, not aiohttp."
+    # I-9 / DESIGN N3 define the swap only for two-option rules (one preferred, one
+    # prohibited). With two preferred options the literal token swap would give
+    # "Use requests or requests, not aiohttp." (CR1 on #54), so no sentence is generated.
+    assert s.kind == "replace"
+    assert s.new_text is None
+
+
+def test_suggestion_multiple_preferred_options_none_even_when_text_has_no_not_part() -> None:
+    m = RuleMatch(frozenset({"httpx", "aiohttp"}), frozenset(), 1)
+    r = rule("Use httpx or aiohttp for HTTP calls", match=m)
+    s = suggest(r, head_with({"requests": 8}, m.preferred))
+    assert (s.kind, s.named_option, s.new_text) == ("replace", "aiohttp", None)
+
+
+def test_unsuggestable_rule_still_produces_its_finding() -> None:
+    # PM ruling on CR1 #54: with more than one preferred option, or a swap that would
+    # collapse two options, no rewrite text is generated, but the finding is still there.
+    multi = RuleMatch(frozenset({"httpx", "aiohttp"}), frozenset({"requests"}), 1)
+    collapse = RuleMatch(frozenset({"requests"}), frozenset(), 1)
+    for r, wrong in (
+        (rule("Use httpx or aiohttp, not requests.", match=multi), "requests"),
+        (rule("Use requests, not aiohttp.", line=2, match=collapse), "aiohttp"),
+    ):
+        base = side(H, sites("src/a.py", next(iter(r.match.preferred)) if r.match else "", True, 8))
+        head = side(S, sites("src/a.py", wrong, False, 8))
+        got = only(compare([(r, base)], [(r, head)], [("M", None, "src/a.py")]))
+        assert got.case == "made-stale-by-code"  # the finding is present
+        assert got.causing_files == (CausingFile("src/a.py", -8, 8),)
+        assert got.suggestion.kind == "replace"
+        assert got.suggestion.alternatives == (Alternative(wrong, 8),)
+        assert got.suggestion.new_text is None  # and no generated sentence
+
+
+def test_suggestion_that_would_collapse_two_options_has_no_new_text() -> None:
+    # One preferred option, but the top candidate already appears in the text and is not
+    # the rule's prohibited side: replacing would give "Use aiohttp, not aiohttp."
+    m = RuleMatch(frozenset({"requests"}), frozenset(), 1)
+    r = rule("Use requests, not aiohttp.", match=m)
+    s = suggest(r, head_with({"aiohttp": 8}, m.preferred))
+    assert (s.kind, s.new_text) == ("replace", None)
+    # The collapse check ignores case, like the swap itself.
+    r_upper = rule("Use requests, not AIOHTTP.", match=m)
+    assert suggest(r_upper, head_with({"aiohttp": 8}, m.preferred)).new_text is None
+    # Control: the same text where the candidate is not in the sentence is still swapped.
+    r2 = rule("Use requests for HTTP calls.", match=m)
+    assert suggest(r2, head_with({"aiohttp": 8}, m.preferred)).new_text == (
+        "Use aiohttp for HTTP calls."
+    )
 
 
 def test_suggestion_longer_option_token_wins_over_prefix() -> None:
@@ -864,7 +954,7 @@ def test_causing_deltas_sum_to_the_count_change(
         )
 
     b, h = mk(base_rows), mk(head_rows)
-    got = only(compare([(R1, b)], [(R1, h)], [("M", f"{p}.py", f"{p}.py") for p in "abc"]))
+    got = only(compare([(R1, b)], [(R1, h)], [("M", None, f"{p}.py") for p in "abc"]))
     assert (
         sum(f.following_delta for f in got.causing_files)
         == h.overall.following - b.overall.following

@@ -28,8 +28,9 @@ for files changed in the PR, with base paths mapped through renames, sorted by
 **suggestion** (I-9, DESIGN §10 B5 and §11 N3, D-PM-05 #20, SC-2.44): the
 candidates are the options outside ``preferred`` that have head sites, ranked by
 head site count (then option name). ``replace`` swaps option tokens in the rule
-text; ``tie`` lists the candidates with no ``new_text``; ``remove-or-rewrite``
-is for prohibition-only rules and never builds a new prohibition; ``none``
+text (``new_text`` is None unless the rule has exactly one preferred option and the swap
+keeps every option distinct); ``tie`` lists the candidates with no ``new_text``;
+``remove-or-rewrite`` is for prohibition-only rules and never builds a new prohibition; ``none``
 means no candidate sites (or no checker match).
 
 ``compare`` raises ``ValueError`` when one side holds two rules with the same
@@ -143,10 +144,21 @@ def _causing_files(
     return tuple(files)
 
 
+def _word(token: str) -> re.Pattern[str]:
+    return re.compile(r"(?<!\w)" + re.escape(token) + r"(?!\w)", re.IGNORECASE)
+
+
 def _swap_text(text: str, match: RuleMatch, top: str, named: str) -> str | None:
     """Replace each preferred option token with ``top``; for a two-option rule whose
     prohibited side names ``top``, also put ``named`` in its place. Tokens match as
-    whole words, ignoring case. None when no preferred token appears in ``text``."""
+    whole words, ignoring case. None (no generated sentence) when no preferred token
+    appears in ``text``, when the rule has more than one preferred option (N3 defines
+    the swap only for two-option rules), or when ``top`` already appears in the text
+    without being swapped out (the replacement would collapse two options into one)."""
+    if len(match.preferred) != 1:
+        return None
+    if top not in match.prohibited and _word(top).search(text):
+        return None
     mapping = dict.fromkeys(match.preferred, top)
     if top in match.prohibited:
         mapping[top] = named
