@@ -21,7 +21,8 @@ keeps its default (``None`` or empty in the ``SideConfig``, which T-012 fills in
   AC-N3.8, R2.1).
 
 Notes name settings by their I-6 key. Notes for unknown keys and rejected
-paths quote that repo text, cut to :data:`SHOWN_MAX` characters; renderers
+paths quote that repo text, cut to :data:`SHOWN_MAX` characters (a non-string
+key is named only by its type, such as ``<int key>``); renderers
 escape every note (R3). Unknown-key notes stop after :data:`UNKNOWN_KEY_NOTES_MAX`
 and one more note counts the rest, so a file can't flood the summary.
 """
@@ -109,9 +110,15 @@ NOTE_THRESHOLD_ORDER: Final = (
 _FAIL_ON_VALUES: Final[tuple[FailOn, ...]] = get_args(FailOn)
 
 
-def _shown(value: object) -> str:
-    text = value if isinstance(value, str) else repr(value)
+def _shown(text: str) -> str:
     return text if len(text) <= SHOWN_MAX else text[: SHOWN_MAX - 1] + "\u2026"
+
+
+def _key_shown(key: object) -> str:
+    # A non-string key is named by its type only (SR M-51-1): repr of a YAML int key
+    # with thousands of digits raises ValueError (int max str digits), and a type name
+    # is fixed text whatever the file holds.
+    return _shown(key) if isinstance(key, str) else f"<{type(key).__name__} key>"
 
 
 def _is_int(value: object) -> TypeGuard[int]:
@@ -175,7 +182,7 @@ class _Notes:
                 continue
             self._unknown += 1
             if self._unknown <= UNKNOWN_KEY_NOTES_MAX:
-                self.add(f'Unknown config key "{at}{_shown(key)}" was ignored')
+                self.add(f'Unknown config key "{at}{_key_shown(key)}" was ignored')
 
     def done(self) -> tuple[str, ...]:
         extra = self._unknown - UNKNOWN_KEY_NOTES_MAX

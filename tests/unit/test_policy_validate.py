@@ -16,7 +16,7 @@ from hypothesis import strategies as st
 
 from conventiondrift.core import FailOn
 from conventiondrift.model import CheckerId, CheckerPolicy, IgnoreEntry, Thresholds
-from conventiondrift.policy import DEFAULT_CONFIG_PATH
+from conventiondrift.policy import DEFAULT_CONFIG_PATH, load_yaml
 from conventiondrift.policy.config import (
     DEFAULT_CHECKERS,
     DEFAULT_LOGGING_SCRIPT_PATHS,
@@ -283,8 +283,53 @@ def test_long_key_is_cut_in_the_note(length: int) -> None:
     assert note == f'Unknown config key "{shown}" was ignored'
 
 
-def test_non_string_key_is_shown_by_repr() -> None:
-    assert validate_document({"version": 1, 5: 1}).notes == ('Unknown config key "5" was ignored',)
+@pytest.mark.parametrize(
+    ("key", "shown"),
+    [(5, "<int key>"), (1.5, "<float key>"), (True, "<bool key>"), (None, "<NoneType key>")],
+)
+def test_non_string_key_is_named_by_its_type(key: object, shown: str) -> None:
+    config = validate_document({"version": 1, key: 1})
+    assert config.notes == (f'Unknown config key "{shown}" was ignored',)
+
+
+# SR M-51-1: int keys too long for repr (int max str digits) at every level that
+# names unknown keys; hex and binary build any length, sexagesimal is base 60.
+HUGE_INT_KEYS = ["0x" + "f" * 5000, "0b" + "1" * 20000, ":".join(["59"] * 3000)]
+HUGE_KEY_PLACES = {
+    "": "? {n}\n: 1",
+    "thresholds.": "thresholds:\n  ? {n}\n  : 1",
+    "thresholds.stale.": "thresholds:\n  stale:\n    ? {n}\n    : 1",
+    "limits.": "limits:\n  ? {n}\n  : 1",
+    "checkers.": "checkers:\n  ? {n}\n  : {{}}",
+    "checkers.logging.": "checkers:\n  logging:\n    ? {n}\n    : 1",
+    "ignore[1].": "ignore:\n  - text: x\n    ? {n}\n    : 1",
+}
+
+
+@pytest.mark.parametrize("number", HUGE_INT_KEYS, ids=["hex", "binary", "sexagesimal"])
+@pytest.mark.parametrize("prefix", sorted(HUGE_KEY_PLACES))
+def test_huge_int_key_is_named_by_its_type(number: str, prefix: str) -> None:
+    text = f"version: 1\n{HUGE_KEY_PLACES[prefix].format(n=number)}\n"
+    loaded = load_yaml(text.encode())
+    assert isinstance(loaded, dict)
+    with pytest.raises(ValueError):  # the key really is too long for repr
+        repr(next(k for k in _keys(loaded) if not isinstance(k, str)))
+    config = validate_document(loaded)
+    assert config.notes == (f'Unknown config key "{prefix}<int key>" was ignored',)
+
+
+def _keys(value: object) -> list[object]:
+    if isinstance(value, dict):
+        return [k for key, item in value.items() for k in (key, *_keys(item))]
+    if isinstance(value, list):
+        return [k for item in value for k in _keys(item)]
+    return []
+
+
+def test_huge_int_key_repro_from_the_security_review() -> None:
+    loaded = load_yaml(b"version: 1\n? 0x" + b"f" * 5000 + b"\n: 1\n")
+    assert isinstance(loaded, dict)
+    assert validate_document(loaded).notes == ('Unknown config key "<int key>" was ignored',)
 
 
 # --- fail-on and history-days -----------------------------------------------------------
