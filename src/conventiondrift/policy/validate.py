@@ -32,6 +32,8 @@ from collections.abc import Mapping
 from typing import Final, TypeGuard, get_args
 
 from conventiondrift.core import FailOn
+from conventiondrift.discover.safefs import validate_relpath
+from conventiondrift.errors import FileSkipped
 from conventiondrift.model import CheckerId, CheckerPolicy, IgnoreEntry, Thresholds
 from conventiondrift.policy import DEFAULT_CONFIG_PATH
 from conventiondrift.policy.config import (
@@ -125,21 +127,15 @@ def _range_note(key: str, low: int, high: int, default: int) -> str:
 def contained_path(value: str) -> str | None:
     """``value`` as a normalized repo-relative path, or ``None`` if it could leave the repo.
 
-    Refused (I-6, AC-N3.8, SECURITY-RULES R2.1): empty, a NUL, a leading ``/``,
-    any ``..`` segment, a backslash, a ``:`` (drive letters such as ``C:x``,
-    NTFS streams), a lone surrogate, or nothing left after dropping ``.`` and
-    empty segments. Glob characters are left alone. Plain string tests, no
-    regex, linear in ``value``. This mirrors the typed-value branch of
-    ``discover.safefs.validate_relpath`` (T-009), which isn't on main yet.
+    This is ``discover.safefs.validate_relpath`` for typed input (I-13, SECURITY-RULES
+    R2.1, AC-N3.8), so every typed path is judged by one rule: absolute, ``..``, NUL,
+    backslash, ``:``, a lone surrogate, the Windows-only forms it refuses, or nothing
+    left gives ``None``. Glob characters are left alone.
     """
-    if not value or "\x00" in value or value.startswith("/") or "\\" in value or ":" in value:
+    try:
+        return validate_relpath(value, origin="input")
+    except FileSkipped:
         return None
-    if any("\ud800" <= ch <= "\udfff" for ch in value):
-        return None
-    parts = [p for p in value.split("/") if p not in ("", ".")]
-    if not parts or ".." in parts:
-        return None
-    return "/".join(parts)
 
 
 def checked_config_path(value: str | None) -> tuple[str | None, str | None]:
