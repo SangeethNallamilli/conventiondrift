@@ -64,6 +64,7 @@ __all__ = [
     "check_size",
     "decode_text",
     "entry_kind",
+    "escape_unsupported_path",
     "has_hard_excluded_component",
     "is_hard_excluded",
     "read_unless_hard_excluded",
@@ -189,6 +190,10 @@ def _escape_unsupported_path(path: str) -> str:
     this tree; this uses the same I-14 form (uppercase hex, at least 4 digits).
     """
     return "".join(f"U+{ord(ch):04X}" if _has_lone_surrogate(ch) else ch for ch in path)
+
+
+escape_unsupported_path = _escape_unsupported_path
+"""Public name for the label C4 gives a tree path with a lone surrogate (I-13 ruling 3)."""
 
 
 def validate_relpath(value: str, *, origin: PathOrigin) -> str:
