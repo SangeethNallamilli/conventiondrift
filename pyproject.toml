@@ -78,6 +78,14 @@ warn_unreachable = true
 # Vendored PyYAML is third-party source; do not type-check it under strict.
 exclude = ["conventiondrift/_vendor/yaml/"]
 
+# T-011: policy/yamlsafe.py is the only importer of the vendored yaml. mypy follows imports
+# into it even with `exclude`, so treat it as untyped (Any) and don't check it;
+# load_yaml is the typed wrapper.
+[[tool.mypy.overrides]]
+module = ["conventiondrift._vendor.yaml", "conventiondrift._vendor.yaml.*"]
+follow_imports = "skip"
+ignore_errors = true
+
 [tool.coverage.run]
 branch = true
 parallel = true
