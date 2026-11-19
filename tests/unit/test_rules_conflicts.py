@@ -8,7 +8,6 @@ from typing import get_args
 import pytest
 
 from conventiondrift.model import CheckerId, Conflict, Rule, RuleMatch
-from conventiondrift.rules import conflicts as cf
 from conventiondrift.rules.conflicts import (
     MAX_CONFLICTS,
     find_conflicts,

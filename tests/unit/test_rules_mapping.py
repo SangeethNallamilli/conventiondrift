@@ -33,8 +33,8 @@ from conventiondrift.rules import mapping
 from conventiondrift.rules.conflicts import MAX_CONFLICTS
 from conventiondrift.rules.extract import MARKER, MAX_RULES_PER_FILE, normalize
 from conventiondrift.rules.mapping import (
-    Extraction,
     UNMAPPED,
+    Extraction,
     Mapped,
     RuleExtractor,
     extract_rules,
@@ -441,7 +441,11 @@ def test_three_occurrences_list_the_later_lines_in_order() -> None:
 
 
 def test_duplicates_ignore_case_whitespace_emphasis_and_backticks() -> None:
-    text = "Use httpx for HTTP calls.\n\nUSE  `httpx`  for **HTTP** calls.\n\nuse httpx\tfor http calls.\n"
+    text = (
+        "Use httpx for HTTP calls.\n\n"
+        "USE  `httpx`  for **HTTP** calls.\n\n"
+        "use httpx\tfor http calls.\n"
+    )
     (rule,) = rules_of([instruction_file("AGENTS.md", text)])
     assert (rule.line, rule.also_at) == (1, (3, 5))
     assert rule.text == "Use httpx for HTTP calls."  # the first occurrence's own text
@@ -842,7 +846,8 @@ def test_root_and_subfolder_rules_conflict_and_the_rules_are_unchanged() -> None
 
 
 def test_root_files_with_different_preferred_options_conflict() -> None:
-    # AC-E.3: root AGENTS.md "Use requests for HTTP calls", root CLAUDE.md "Use httpx for HTTP calls".
+    # AC-E.3: root AGENTS.md "Use requests for HTTP calls",
+    # root CLAUDE.md "Use httpx for HTTP calls".
     files = [
         instruction_file("AGENTS.md", "Use requests for HTTP calls.\n"),
         instruction_file("CLAUDE.md", "Use httpx for HTTP calls.\n"),
