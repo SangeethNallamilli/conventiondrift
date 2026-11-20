@@ -10,29 +10,54 @@ the root file and "Use httpx" in a subfolder file (AC-E.4).
 A rule with no checker, no match, or a disabled checker never conflicts: it is
 not evaluated (AC-F3.14), so a conflict naming it would point at nothing.
 
-Bounded work and the cap (SECURITY-RULES R2.6; INTERFACES I-13 "C6 conflict cap
-and rule ids"): only rules that share a checker are paired, grouped by match
-and scope so that non-conflicting rules cost nothing per pair. Every pair is
-evaluated, but the listed ``found`` holds only the first ``MAX_CONFLICTS`` in
-sorted ``(a.id, b.id)`` order with ``a.id < b.id``; ``unlisted`` counts the
-rest, so nothing is dropped silently. ``Conflicts.lookup`` (a ``ConflictIndex``)
-answers "is this rule in a conflict" and "which rules does it conflict with" for
-any rule, whatever the cap cut. Rule ids must be unique (``extract_rules`` makes them so).
+Bounded work (SECURITY-RULES R2.6; INTERFACES I-13 C6 items 1, 4, 6). Only
+rules that share a checker are paired, and rules with the same match and scope
+form one *group*, so what is compared is a pair of groups, not of rules; a
+non-conflicting rule costs nothing per pair. An evaluation (one pair of groups)
+costs O(options per checker + ``MAX_SCOPE_DIR_BYTES``): the ``preferred`` and
+``prohibited`` frozensets hold the checker's own option ids (registry
+constants, never rule text; ``map_rule`` rejects anything else), and the scope
+test is a prefix test on two ``scope_dir`` paths that C4 has validated and that
+this module refuses above ``MAX_SCOPE_DIR_BYTES``. Rule text is never touched.
+At most ``MAX_CONFLICT_PAIRS`` evaluations run per side, so that is a real time
+bound. They run in a deterministic order, I-13 C6 item 8: groups sorted by
+their key ``(checker, sorted preferred, sorted prohibited, scope_dir)``, then
+pairs in that order, so the same rules always stop at the same pair, whatever
+order the files came in. When the budget runs out, every rule with a pair not yet
+evaluated is *incomplete* (``ConflictIndex.is_incomplete``): the partners found
+so far stay, ``total`` becomes a lower bound, and nothing is dropped silently.
+
+The listed ``found`` holds only the first ``MAX_CONFLICTS`` in sorted
+``(a.id, b.id)`` order with ``a.id < b.id``; ``unlisted`` counts the rest.
+``Conflicts.lookup`` (a ``ConflictIndex``) covers every conflict whatever the
+cap cut, and gives at most ``MAX_CONFLICT_WITH`` sorted partners per rule.
+Rule ids must be unique (``extract_rules`` makes them so); ``find_conflicts``
+raises ``ValueError`` on a repeated id.
 """
 
 from bisect import bisect_right
 from collections.abc import Sequence
 from heapq import merge
-from itertools import combinations, islice
+from itertools import islice
 from typing import Final, NamedTuple
 
-from conventiondrift.model import CheckerId, Conflict, Rule, RuleMatch
+from conventiondrift.model import (
+    CheckerId,
+    Conflict,
+    ConflictIndex,
+    GroupKey,
+    Rule,
+    RuleMatch,
+    group_key_order,
+)
 
 __all__ = [
     "MAX_CONFLICTS",
-    "ConflictIndex",
+    "MAX_CONFLICT_PAIRS",
+    "MAX_SCOPE_DIR_BYTES",
     "Conflicts",
     "find_conflicts",
+    "incomplete_note",
     "matches_conflict",
     "scopes_overlap",
 ]
@@ -40,33 +65,11 @@ __all__ = [
 MAX_CONFLICTS: Final = 1_000
 """R2.6: conflicts listed per run; the rest are counted in ``Conflicts.unlisted``."""
 
+MAX_CONFLICT_PAIRS: Final = 5_000_000
+"""R2.6: pair evaluations per side; beyond it the remaining rules are incomplete."""
 
-class ConflictIndex:
-    """Which rules conflict, for every rule and independent of ``MAX_CONFLICTS``."""
-
-    __slots__ = ("_adjacent", "_group_of", "_ids")
-
-    def __init__(
-        self,
-        ids: Sequence[Sequence[str]],
-        adjacent: Sequence[Sequence[int]],
-    ) -> None:
-        # ids[g]: the sorted rule ids of group g; adjacent[g]: the groups g conflicts with.
-        self._ids = ids
-        self._adjacent = adjacent
-        self._group_of = {rule_id: g for g, members in enumerate(ids) for rule_id in members}
-
-    def is_conflicting(self, rule_id: str) -> bool:
-        """Whether ``rule_id`` is in at least one conflict; False for an unknown id."""
-        group = self._group_of.get(rule_id)
-        return group is not None and bool(self._adjacent[group])
-
-    def partners(self, rule_id: str) -> tuple[str, ...]:
-        """The ids ``rule_id`` conflicts with, sorted; empty for an unknown id."""
-        group = self._group_of.get(rule_id)
-        if group is None:
-            return ()
-        return tuple(sorted(i for other in self._adjacent[group] for i in self._ids[other]))
+MAX_SCOPE_DIR_BYTES: Final = 4_096
+"""R2.6: the longest ``Rule.scope_dir`` (UTF-8 bytes) compared; longer ones are incomplete."""
 
 
 class Conflicts(NamedTuple):
@@ -77,12 +80,23 @@ class Conflicts(NamedTuple):
     lookup: ConflictIndex
 
 
+def incomplete_note(count: int) -> str:
+    """The note for ``count`` rules that were not fully checked (I-13 C6 item 4)."""
+    noun = "rule" if count == 1 else "rules"
+    return f"conflict check stopped at the limit; {count} {noun} not fully checked"
+
+
+def _overlap(a: str, a_prefix: str, b: str, b_prefix: str) -> bool:
+    """``scopes_overlap`` on scopes whose ``scope + "/"`` is already built (SR L-55-2)."""
+    return not a or not b or a == b or a.startswith(b_prefix) or b.startswith(a_prefix)
+
+
 def scopes_overlap(a: str, b: str) -> bool:
     """Whether two ``Rule.scope_dir`` folders share code: equal, or one holds the other.
 
     "" is the whole repository, so it overlaps every scope.
     """
-    return not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/")
+    return _overlap(a, a + "/", b, b + "/")
 
 
 def matches_conflict(a: RuleMatch, b: RuleMatch) -> bool:
@@ -92,35 +106,71 @@ def matches_conflict(a: RuleMatch, b: RuleMatch) -> bool:
     return bool(a.preferred) and bool(b.preferred) and not a.preferred & b.preferred
 
 
-def find_conflicts(rules: Sequence[Rule]) -> Conflicts:
-    """Every conflicting pair among ``rules``, the first ``MAX_CONFLICTS`` of them listed."""
-    # One group per (checker, preferred, prohibited, scope). Specificity is not part of the
-    # key: it doesn't matter here.
-    groups: dict[tuple[CheckerId, frozenset[str], frozenset[str], str], tuple[RuleMatch, list[str]]]
-    groups = {}
+def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS) -> Conflicts:
+    """Every conflicting pair among ``rules``, the first ``MAX_CONFLICTS`` of them listed.
+
+    ``max_pairs`` is the evaluation budget; production uses the default and
+    tests pass a small one. Raises ``ValueError`` if two rules share an id.
+    """
+    if len({rule.id for rule in rules}) != len(rules):
+        raise ValueError("rule ids must be unique")
+    # One group per key. Specificity is not part of it: it doesn't matter here.
+    members: dict[GroupKey, list[str]] = {}
+    matches: dict[GroupKey, RuleMatch] = {}
+    unchecked: set[str] = set()
     for rule in rules:
         if rule.checker is None or rule.match is None or rule.disabled:
             continue
+        if len(rule.scope_dir.encode()) > MAX_SCOPE_DIR_BYTES:
+            unchecked.add(rule.id)  # R2.6: never compared, never silent
+            continue
         key = (rule.checker, rule.match.preferred, rule.match.prohibited, rule.scope_dir)
-        groups.setdefault(key, (rule.match, []))[1].append(rule.id)
-    keys = list(groups)
-    ids = [sorted(groups[key][1]) for key in keys]
+        members.setdefault(key, []).append(rule.id)
+        matches[key] = rule.match
+    # Deterministic order: sorted group keys (I-13 C6 item 8).
+    keys = sorted(members, key=group_key_order)
+    ids = tuple(tuple(sorted(members[key])) for key in keys)
+    # Each group's scope and its "/"-terminated form are built once, not once per evaluation.
+    scopes = [key[3] for key in keys]
+    prefixes = [scope + "/" for scope in scopes]
     adjacent: list[list[int]] = [[] for _ in keys]
     by_checker: dict[CheckerId, list[int]] = {}
     for number, key in enumerate(keys):
         by_checker.setdefault(key[0], []).append(number)
     total = 0
+    evaluated = 0
+    unchecked_groups: set[int] = set()
     for numbers in by_checker.values():
-        for a, b in combinations(numbers, 2):
-            if scopes_overlap(keys[a][3], keys[b][3]) and matches_conflict(
-                groups[keys[a]][0], groups[keys[b]][0]
-            ):
-                adjacent[a].append(b)
-                adjacent[b].append(a)
-                total += len(ids[a]) * len(ids[b])
-    lookup = ConflictIndex(ids, adjacent)
+        if unchecked_groups:  # the budget ran out in an earlier checker
+            if len(numbers) > 1:
+                unchecked_groups.update(numbers)
+            continue
+        for position, a in enumerate(numbers):
+            for other in range(position + 1, len(numbers)):
+                if evaluated == max_pairs:
+                    # Group a has pairs left, and so does every group after it in this checker.
+                    unchecked_groups.update(numbers[position:])
+                    break
+                evaluated += 1
+                b = numbers[other]
+                if _overlap(scopes[a], prefixes[a], scopes[b], prefixes[b]) and matches_conflict(
+                    matches[keys[a]], matches[keys[b]]
+                ):
+                    adjacent[a].append(b)
+                    adjacent[b].append(a)
+                    total += len(ids[a]) * len(ids[b])
+            if unchecked_groups:
+                break
+    for group in unchecked_groups:
+        unchecked.update(ids[group])
+    lookup = ConflictIndex(
+        ids=ids,
+        keys=tuple(keys),
+        adjacent=tuple(tuple(group) for group in adjacent),  # ascending by construction
+        incomplete_ids=frozenset(unchecked),
+    )
     found: list[Conflict] = []
-    group_of = {rule_id: g for g, members in enumerate(ids) for rule_id in members}
+    group_of = {rule_id: g for g, group_ids in enumerate(ids) for rule_id in group_ids}
     for rule_id in sorted(group_of):
         room = MAX_CONFLICTS - len(found)
         if not room:

@@ -27,6 +27,8 @@ from conventiondrift.components import (
 from conventiondrift.model import (
     CheckerId,
     CheckerPolicy,
+    ConflictIndex,
+    Extraction,
     InstructionFile,
     Policy,
     ReportCounts,
@@ -34,8 +36,6 @@ from conventiondrift.model import (
     Thresholds,
     Window,
 )
-from conventiondrift.rules.conflicts import ConflictIndex
-from conventiondrift.rules.mapping import Extraction
 
 FIELDS = (
     "git_reader",
@@ -150,7 +150,7 @@ EMPTY_EXTRACTION = Extraction(
     files=(),
     conflicts_dropped=0,
     unattached_markers=(),
-    conflict_lookup=ConflictIndex((), ()),
+    conflict_lookup=ConflictIndex(),
 )
 
 

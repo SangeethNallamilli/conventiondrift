@@ -36,6 +36,8 @@ from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Final, NamedTuple
 
+from conventiondrift.model import ExtractedRule, FileRules
+
 __all__ = [
     "MARKER",
     "MAX_CANDIDATES_PER_FILE",
@@ -43,8 +45,6 @@ __all__ = [
     "REGEXES",
     "SHAPES",
     "Candidate",
-    "ExtractedRule",
-    "FileRules",
     "Marker",
     "Shape",
     "attach_markers",
@@ -134,33 +134,6 @@ class Marker(NamedTuple):
 
     line: int
     alone: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ExtractedRule:
-    """A recognized rule, before checker mapping (T-015)."""
-
-    line: int
-    column: int
-    text: str
-    normalized_text: str
-    shape: str
-    ignored: bool
-
-
-@dataclass(frozen=True, slots=True)
-class FileRules:
-    """Extraction result for one instruction file.
-
-    ``candidates_dropped`` and ``rules_dropped`` count what the R2.6 caps cut,
-    so the caller can list it (DESIGN §10 S4, "skipped and listed").
-    """
-
-    path: str
-    rules: tuple[ExtractedRule, ...]
-    unattached_markers: tuple[int, ...]
-    candidates_dropped: int
-    rules_dropped: int
 
 
 def _split_lines(text: str) -> list[str]:

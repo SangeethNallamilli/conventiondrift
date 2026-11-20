@@ -7,6 +7,7 @@ phrases it is given, so mapping is tested without the real checkers
 
 import ast
 import dataclasses
+import inspect
 import itertools
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
@@ -18,8 +19,10 @@ from conventiondrift.checkers.base import Checker
 from conventiondrift.components import Extractor
 from conventiondrift.errors import ComponentError
 from conventiondrift.model import (
+    MAX_CONFLICT_WITH,
     CheckerId,
     CheckerPolicy,
+    Extraction,
     FileContext,
     IgnoreEntry,
     InstructionFile,
@@ -30,11 +33,14 @@ from conventiondrift.model import (
     Thresholds,
 )
 from conventiondrift.rules import mapping
-from conventiondrift.rules.conflicts import MAX_CONFLICTS
+from conventiondrift.rules.conflicts import (
+    MAX_CONFLICT_PAIRS,
+    MAX_CONFLICTS,
+    MAX_SCOPE_DIR_BYTES,
+)
 from conventiondrift.rules.extract import MARKER, MAX_RULES_PER_FILE, normalize
 from conventiondrift.rules.mapping import (
     UNMAPPED,
-    Extraction,
     Mapped,
     RuleExtractor,
     extract_rules,
@@ -887,11 +893,99 @@ def test_the_conflict_cap_is_reported_by_the_extraction() -> None:
     assert side * side > MAX_CONFLICTS
     assert len(result.conflicts) == MAX_CONFLICTS
     assert result.conflicts_dropped == side * side - MAX_CONFLICTS
-    assert all(result.conflict_lookup.is_conflicting(r.id) for r in result.rules)
+    assert all(result.conflict_lookup.total(r.id) > 0 for r in result.rules)
     # Rules whose pairs the cap left unlisted still know their partners (conflict_with).
-    assert all(len(result.conflict_lookup.partners(r.id)) == side for r in result.rules)
+    assert side > MAX_CONFLICT_WITH
+    lookup = result.conflict_lookup
+    assert all(len(lookup.partners(r.id)) == MAX_CONFLICT_WITH for r in result.rules)
+    assert all(lookup.total(r.id) == side for r in result.rules)
     listed = {i for c in result.conflicts for i in c.rules}
     assert len(listed) < len(result.rules)
+
+
+def _budget_files(side: int = 4) -> list[InstructionFile]:
+    """``side`` rules of one option in their own folders and ``side`` of another at the root.
+
+    Groups run in sorted key order, so the "httpx" folders come first and the shared
+    "requests" group is last: the last pair evaluated is (a3, that group), a conflict.
+
+    The first are one group each, the second share one: ``side + 1`` groups, so
+    ``(side + 1) * side / 2`` pair evaluations.
+    """
+    files = [instruction_file(f"a{n}/AGENTS.md", "Use httpx.\n", f"a{n}") for n in range(side)]
+    files += [instruction_file(f"b{n}/AGENTS.md", "Use requests.\n", "") for n in range(side)]
+    return files
+
+
+def test_exactly_the_pair_budget_gives_no_note_and_one_more_gives_one() -> None:
+    side = 4
+    pairs = (side + 1) * side // 2
+    files = _budget_files(side)
+    exact = extract_rules(files, make_policy(), http_only(), max_conflict_pairs=pairs)
+    assert exact.notes == ()
+    assert exact.conflict_lookup.incomplete == 0
+    assert exact == extract_rules(files, make_policy(), http_only())
+
+    short = extract_rules(files, make_policy(), http_only(), max_conflict_pairs=pairs - 1)
+    lookup = short.conflict_lookup
+    # The last pair is (a3, the "b" group): both groups are incomplete, nothing else.
+    expected = {"a3/AGENTS.md:1"} | {f"b{n}/AGENTS.md:1" for n in range(side)}
+    assert {r.id for r in short.rules if lookup.is_incomplete(r.id)} == expected
+    assert lookup.incomplete == len(expected) == 5
+    assert short.notes == ("conflict check stopped at the limit; 5 rules not fully checked",)
+    for rule in short.rules:
+        assert lookup.total(rule.id) >= len(lookup.partners(rule.id))
+    # a0 to a2 conflict with all four "b" rules; each "b" rule with a0 to a2 and, were it run,
+    # a3 (a lower bound); a3 itself got no pair.
+    totals = {r.id: lookup.total(r.id) for r in short.rules}
+    assert [totals[f"a{n}/AGENTS.md:1"] for n in range(side)] == [side, side, side, 0]
+    assert [totals[f"b{n}/AGENTS.md:1"] for n in range(side)] == [side - 1] * side
+
+
+def test_a_stopped_conflict_check_lists_what_it_found_and_nothing_twice() -> None:
+    side = 4
+    pairs = (side + 1) * side // 2
+    files = _budget_files(side)
+    full = extract_rules(files, make_policy(), http_only())
+    short = extract_rules(files, make_policy(), http_only(), max_conflict_pairs=pairs - 1)
+    assert len(full.conflicts) == side * side
+    # The one unevaluated pair is (a3, the b group): side conflicts fewer, none dropped as unlisted.
+    assert len(short.conflicts) == side * side - side
+    assert short.conflicts_dropped == 0
+    assert set(short.conflicts) <= set(full.conflicts)
+
+
+def test_reordering_the_files_does_not_change_the_extraction_or_its_cutoff() -> None:
+    files = _budget_files(5)
+    for budget in (0, 3, 7, 14, 15, 100):
+        expected = extract_rules(files, make_policy(), http_only(), max_conflict_pairs=budget)
+        for order in (files[::-1], files[3:] + files[:3], files[1::2] + files[0::2]):
+            got = extract_rules(order, make_policy(), http_only(), max_conflict_pairs=budget)
+            assert got == expected
+            assert got.conflict_lookup == expected.conflict_lookup
+
+
+def test_a_rule_in_a_too_deep_folder_is_incomplete_and_noted() -> None:
+    # The C6 backstop for I-13 C6 item 6: C4 should have skipped this file, but if one arrives
+    # its rules are not compared (so not conflicting) and are counted, with the note.
+    deep = "d" * MAX_SCOPE_DIR_BYTES
+    files = [
+        instruction_file("AGENTS.md", "Use httpx.\n"),
+        instruction_file("ok/AGENTS.md", "Use requests.\n", deep),
+        instruction_file("big/AGENTS.md", "Use requests.\n", deep + "d"),
+    ]
+    got = extract_rules(files, make_policy(), http_only())
+    lookup = got.conflict_lookup
+    assert [r.id for r in got.rules if lookup.is_incomplete(r.id)] == ["big/AGENTS.md:1"]
+    assert lookup.total("big/AGENTS.md:1") == 0
+    assert [c.rules for c in got.conflicts] == [("AGENTS.md:1", "ok/AGENTS.md:1")]
+    assert got.notes == ("conflict check stopped at the limit; 1 rule not fully checked",)
+
+
+def test_the_extractor_uses_the_default_budget() -> None:
+    assert inspect.signature(extract_rules).parameters["max_conflict_pairs"].default == (
+        MAX_CONFLICT_PAIRS
+    )
 
 
 # --- the I-11 Extractor ---------------------------------------------------------------------------
@@ -939,7 +1033,6 @@ def test_extraction_is_a_frozen_value() -> None:
 def test_the_module_exports_its_public_names() -> None:
     assert sorted(mapping.__all__) == sorted(
         [
-            "Extraction",
             "Mapped",
             "RuleExtractor",
             "extract_rules",

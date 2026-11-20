@@ -2,7 +2,7 @@
 
 Pure (DESIGN §1, I-11 C10): no I/O, no subprocess, no clock, no globals. The
 inputs are each side's rules with their C9 ``SideResult``, the PR's changed
-files (I-14 ``ChangedFile``) and each side's C6 conflicts. The output is one
+files (I-14 ``ChangedFile``) and each side's C6 ``ConflictIndex``. The output is one
 ``RuleResult`` per rule identity, sorted as ``Result.rule_results`` requires.
 
 **Rule identity** (D-PM-05 #3, DESIGN §7 step 5): (instruction file after
@@ -33,8 +33,16 @@ keeps every option distinct); ``tie`` lists the candidates with no ``new_text``;
 ``remove-or-rewrite`` is for prohibition-only rules and never builds a new prohibition; ``none``
 means no candidate sites (or no checker match).
 
+**Conflicts** (I-13 C6 items 5 and 6): ``conflict_with`` and ``conflict_with_total`` come
+from the ``ConflictIndex`` of the side ``rule_id`` is taken from (the head rule's id, else the
+base rule's), ``None`` meaning no conflicts. ``conflict_incomplete`` is the OR of both sides:
+whether either side's C6 left a pair of that rule unevaluated, so ``conflict_with_total`` is
+then a lower bound and no gate may read it. Compare reports no conflict change for such a rule:
+the state is unknown, and the flag says so.
+
 ``compare`` raises ``ValueError`` when one side holds two rules with the same
-identity, which C6 never produces (it merges duplicates into ``also_at``).
+identity, which C6 never produces (it merges duplicates into ``also_at``), and when a
+deletion is not I-14's canonical ``("D", None, path)`` (I-13 C10 ruling 8).
 """
 
 import re
@@ -47,7 +55,7 @@ from conventiondrift.model import (
     Alternative,
     Case,
     CausingFile,
-    Conflict,
+    ConflictIndex,
     Rule,
     RuleMatch,
     RuleResult,
@@ -67,6 +75,8 @@ SUGGESTION_KINDS: tuple[SuggestionKind, ...] = get_args(SuggestionKind)
 
 #: The ``ChangedFile`` status letter for a rename (I-14, ``diff-tree --name-status -M``).
 RENAME_STATUS = "R"
+#: The ``ChangedFile`` status letter for a deletion; its old path is None (I-13 C10 ruling 8).
+DELETE_STATUS = "D"
 
 RuleSide = tuple[Rule, SideResult]
 _Key = tuple[str, str]
@@ -84,8 +94,16 @@ def _rename_map(changed_files: Iterable[ChangedFile]) -> dict[str, str]:
 
 def _changed_paths(changed_files: Iterable[ChangedFile]) -> frozenset[str]:
     """Every path the PR touched, by its head-side name. A rename's old name is not
-    needed: base sites are mapped to the new name before they are looked up."""
-    return frozenset(new for _status, _old, new in changed_files)
+    needed: base sites are mapped to the new name before they are looked up.
+
+    Raises ``ValueError`` for a deletion that carries an old path: only
+    ``("D", None, path)`` is accepted (I-13 C10 ruling 8)."""
+    paths: set[str] = set()
+    for status, old, new in changed_files:
+        if status == DELETE_STATUS and old is not None:
+            raise ValueError('a deletion must be ("D", None, path)')
+        paths.add(new)
+    return frozenset(paths)
 
 
 def _index(
@@ -151,7 +169,9 @@ def _word(token: str) -> re.Pattern[str]:
 def _swap_text(text: str, match: RuleMatch, top: str, named: str) -> str | None:
     """Replace each preferred option token with ``top``; for a two-option rule whose
     prohibited side names ``top``, also put ``named`` in its place. Tokens match as
-    whole words, ignoring case. None (no generated sentence) when no preferred token
+    whole words, ignoring case. A rule with one preferred and two prohibited options keeps the
+    prohibited option that is not ``top``: "Use a, not b or c" with ``top`` b gives "Use b, not
+    a or c". None (no generated sentence) when no preferred token
     appears in ``text``, when the rule has more than one preferred option (N3 defines
     the swap only for two-option rules), or when ``top`` already appears in the text
     without being swapped out (the replacement would collapse two options into one)."""
@@ -210,13 +230,11 @@ def suggest(rule: Rule, head: SideResult | None) -> Suggestion:
     )
 
 
-def _conflict_index(conflicts: Iterable[Conflict]) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    for conflict in conflicts:
-        a, b = conflict.rules
-        out.setdefault(a, set()).add(b)
-        out.setdefault(b, set()).add(a)
-    return out
+def _conflicts_of(index: ConflictIndex | None, rule_id: str) -> tuple[tuple[str, ...], int, bool]:
+    """``conflict_with``, ``conflict_with_total`` and whether the rule was not fully checked."""
+    if index is None:
+        return (), 0, False
+    return index.partners(rule_id), index.total(rule_id), index.is_incomplete(rule_id)
 
 
 def _sort_key(result: RuleResult) -> tuple[str, int, bool, str]:
@@ -230,8 +248,8 @@ def compare(
     head: Sequence[RuleSide],
     changed_files: Sequence[ChangedFile],
     *,
-    base_conflicts: Sequence[Conflict] = (),
-    head_conflicts: Sequence[Conflict] = (),
+    base_conflicts: ConflictIndex | None = None,
+    head_conflicts: ConflictIndex | None = None,
 ) -> tuple[RuleResult, ...]:
     """Build one ``RuleResult`` per rule identity (I-11 C10).
 
@@ -240,8 +258,9 @@ def compare(
       ``causing_files`` is empty.
     - ``head``: each head rule with its C9 ``SideResult``.
     - ``changed_files``: ``changed_files(base, head)`` from C3 (I-14).
-    - ``base_conflicts`` / ``head_conflicts``: each side's C6 conflicts. A result
-      takes ``conflict_with`` from the side its ``rule_id`` comes from.
+    - ``base_conflicts`` / ``head_conflicts``: each side's ``Extraction.conflict_lookup``,
+      or None for no conflicts. A result takes ``conflict_with`` and ``conflict_with_total``
+      from the side its ``rule_id`` comes from; ``conflict_incomplete`` is the OR of both.
 
     Disabled rules must already be dropped (I-13, T-028).
     """
@@ -249,8 +268,6 @@ def compare(
     changed = _changed_paths(changed_files)
     heads = _index(head, {}, "head")
     bases = _index(base or (), renames, "base")
-    head_conf = _conflict_index(head_conflicts)
-    base_conf = _conflict_index(base_conflicts)
 
     # D-PM-05 #3: a deleted base-Stale rule is fixed only when no Stale rule replaces
     # it, i.e. no new head rule in the same file (after renames) for the same checker
@@ -266,6 +283,9 @@ def compare(
         base_pair = bases.get(key)
         base_rule, base_side = base_pair if base_pair else (None, None)
         causing = _causing_files(base_side, side, changed, renames) if base_side is not None else ()
+        with_, total, incomplete = _conflicts_of(head_conflicts, rule.id)
+        if base_rule is not None:
+            incomplete = incomplete or _conflicts_of(base_conflicts, base_rule.id)[2]
         results.append(
             RuleResult(
                 rule_id=rule.id,
@@ -273,7 +293,9 @@ def compare(
                 head_rule=rule,
                 base=base_side,
                 head=side,
-                conflict_with=tuple(sorted(head_conf.get(rule.id, ()))),
+                conflict_with=with_,
+                conflict_with_total=total,
+                conflict_incomplete=incomplete,
                 case=_case(base_side, side, causing) if base is not None else None,
                 causing_files=causing,
                 suggestion=suggest(rule, side),
@@ -284,6 +306,7 @@ def compare(
             continue
         # D-PM-05 #3 and #4: deleted, edited away, or its file deleted.
         replaced = (key[0], rule.checker) in stale_new
+        with_, total, incomplete = _conflicts_of(base_conflicts, rule.id)
         results.append(
             RuleResult(
                 rule_id=rule.id,
@@ -291,7 +314,9 @@ def compare(
                 head_rule=None,
                 base=side,
                 head=None,
-                conflict_with=tuple(sorted(base_conf.get(rule.id, ()))),
+                conflict_with=with_,
+                conflict_with_total=total,
+                conflict_incomplete=incomplete,
                 case="fixed" if _is_stale(side) and not replaced else "removed",
                 causing_files=(),
                 suggestion=suggest(rule, None),

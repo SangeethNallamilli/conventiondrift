@@ -6,7 +6,7 @@ and is where the rule's first character is, including after an I-7 marker.
 
 import pytest
 
-from conventiondrift.rules.extract import MARKER, extract_file, segment
+from conventiondrift.rules.extract import MARKER, Candidate, extract_file, segment
 
 
 def _columns(text: str, path: str = "AGENTS.md") -> list[tuple[int, int]]:
@@ -75,7 +75,12 @@ def test_column_between_a_marker_and_a_later_sentence() -> None:
 def test_candidates_carry_the_column_but_compare_without_it() -> None:
     candidates = list(segment("AGENTS.md", "x\n- Use a. Never b.\n"))
     assert [(c.line, c.column) for c in candidates] == [(1, 1), (2, 3), (2, 10)]
-    from conventiondrift.rules.extract import Candidate
 
     assert candidates[1] == Candidate(line=2, text="Use a.")
     assert Candidate(line=2, text="Use a.").column == 0
+
+
+def test_the_column_counts_characters_not_bytes() -> None:
+    # "é" is two UTF-8 bytes and U+1F600 four, but each is one column.
+    assert _columns("é\U0001f600 x. Use a. Never b.\n") == [(1, 7), (1, 14)]
+    assert _columns("\U0001f600\U0001f600 x. Use a.\n") == [(1, 7)]
