@@ -7,7 +7,7 @@ import ast
 import textwrap
 
 import pytest
-from checker_support import counts, rules_of, sites_of
+from checker_support import assert_linear, counts, rules_of, sites_of
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.exceptions import ExceptionsChecker
@@ -259,3 +259,25 @@ def test_the_handler_reads_the_node_directly() -> None:
 def test_the_handler_gives_nothing_for_a_node_that_is_not_a_handler() -> None:
     ctx = FileContext("a.py", is_test_file=False, is_script=False, main_guard_spans=())
     assert list(exception_sites(ast.Name("x"), ctx)) == []
+
+
+def test_a_later_always_is_not_a_cue_so_the_whole_sentence_prohibits_bare_except() -> None:
+    # CR1 on #58: "always" is not a cue (and "and" doesn't end the negation), so both halves
+    # read as forbidden and this maps to a prohibition of bare-except. Under the wider cue
+    # list of the follow-up PR the second half may become a request and the sentence unmapped;
+    # revisit this test then.
+    assert match_rule("never use bare except and always use bare except.") == match(
+        ("bare-except",)
+    )
+
+
+HOSTILE_RULES = {
+    "no cue": lambda n: "never " + "bare except " * (n // 12),
+    "request": lambda n: "always catch exception " * (n // 24),
+    "both": lambda n: "never bare except or catch exception " * (n // 38),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_RULES)
+def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
+    assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)

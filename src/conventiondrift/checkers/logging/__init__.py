@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Literal
 
 from conventiondrift.checkers.logging.match import OPTIONS, match_rule
-from conventiondrift.checkers.logging.sites import logging_sites
+from conventiondrift.checkers.logging.sites import LoggingSites
 from conventiondrift.model import CheckerId, FileContext, RuleMatch, Site
 
 __all__ = ["LoggingChecker"]
@@ -30,7 +30,7 @@ class LoggingChecker:
     def ast_handlers(
         self,
     ) -> Mapping[type[ast.AST], Callable[[ast.AST, FileContext], Iterable[Site]]]:
-        return {ast.Call: logging_sites}
+        return {ast.Call: LoggingSites()}
 
     def manifest_sites(self, files: Mapping[str, bytes]) -> Iterable[Site]:
         return ()

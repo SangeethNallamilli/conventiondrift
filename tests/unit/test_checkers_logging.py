@@ -7,17 +7,35 @@ reach the checker the way they do in a run.
 
 import ast
 import textwrap
+from functools import partial
 
 import pytest
-from checker_support import counts, rules_of, sites_of
+from checker_support import (
+    MIB,
+    REGISTRY_UNDER_TEST,
+    assert_linear,
+    best_time,
+    counts,
+    rules_of,
+    sites_of,
+)
+from hypothesis import given
+from hypothesis import strategies as st
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.logging import LoggingChecker
 from conventiondrift.checkers.logging.match import OPTIONS, match_rule
-from conventiondrift.checkers.logging.sites import LEVEL_METHODS, logging_sites
+from conventiondrift.checkers.logging.sites import (
+    LEVEL_METHODS,
+    LoggingSites,
+    in_guard,
+    logging_sites,
+    merge_spans,
+)
 from conventiondrift.checkers.walk import parse
 from conventiondrift.discover.globmatch import GlobSet
 from conventiondrift.model import FileContext, RuleMatch, Site
+from conventiondrift.rules.mapping import map_rule
 
 USE_LOGGING = match_rule("use logging, not print.")
 
@@ -436,3 +454,90 @@ def test_a_custom_script_paths_setting_replaces_the_default_in_a_run() -> None:
 def test_the_handler_gives_nothing_for_a_node_that_is_not_a_call() -> None:
     plain = FileContext("a.py", is_test_file=False, is_script=False, main_guard_spans=())
     assert list(logging_sites(ast.Name("print"), plain)) == []
+
+
+# --- linear time (R2.5; CR1 on #58) ---------------------------------------------------------
+
+HOSTILE_RULES = {
+    "no cue": lambda n: "Use " + "print " * (n // 6),
+    "cue first": lambda n: "never " + "print " * (n // 6),
+    "both options": lambda n: "never use print " + "or logging " * (n // 11),
+    "cue before each": lambda n: "never print " * (n // 12),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_RULES)
+def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
+    assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
+
+
+def test_the_cr1_sentence_with_100_000_prints_is_fast() -> None:
+    text = "Use " + "print " * 100_000
+    assert best_time(partial(match_rule, text), repeat=1) < 5.0
+    assert match_rule(text) == match(("print",), (), 1)
+
+
+def test_the_registry_maps_a_1_mib_rule_sentence_in_linear_time() -> None:
+
+    text = "use " + "print " * (MIB // 6)
+    assert best_time(partial(map_rule, text, REGISTRY_UNDER_TEST), repeat=1) < 5.0
+
+
+def guard_source(guards: int, prints: int) -> str:
+    return 'if __name__ == "__main__":\n    pass\n' * guards + "print(1)\n" * prints
+
+
+def test_many_guards_and_many_prints_are_linear_in_a_run() -> None:
+    # The per-print scan of every guard span was quadratic: 8,000 guards and 32,000 prints
+    # took 10 s. Sizes here are in bytes, so the budget in assert_linear applies.
+    def make(n: int) -> str:
+        guards = n // 120  # about 38 bytes per guard, and four prints (9 bytes each) per guard
+        return guard_source(guards, 4 * guards)
+
+    assert_linear(make, lambda text: sites_of("logging", {"src/a.py": text}), label="guards")
+
+
+def test_prints_before_between_and_after_many_guards_are_all_found() -> None:
+    source = "print('before')\n" + guard_source(50, 0) + "print('after')\n"
+    sites = sites_of("logging", {"src/a.py": source})
+    assert [s.line for s in sites] == [1, 102]
+
+
+span_lists = st.lists(
+    st.tuples(st.integers(1, 40), st.integers(1, 40)).map(lambda p: (min(p), max(p))), max_size=8
+)
+
+
+@given(spans=span_lists, line=st.integers(0, 45))
+def test_the_guard_index_answers_like_a_scan_of_the_spans(
+    spans: list[tuple[int, int]], line: int
+) -> None:
+    expected = any(first <= line <= last for first, last in spans)
+    assert in_guard(merge_spans(spans), line) is expected
+
+
+def test_merge_spans_joins_nested_and_overlapping_spans_and_keeps_gaps() -> None:
+    assert merge_spans([]) == ((), ())
+    assert merge_spans([(10, 12), (1, 5)]) == ((1, 10), (5, 12))
+    assert merge_spans([(1, 20), (5, 10)]) == ((1,), (20,))  # nested: the outer one stays
+    assert merge_spans([(1, 5), (5, 9), (3, 7)]) == ((1,), (9,))  # overlapping, touching
+    assert merge_spans([(1, 5), (6, 9)]) == ((1, 6), (5, 9))  # adjacent lines stay apart
+
+
+def test_in_guard_at_each_edge() -> None:
+    guards = merge_spans([(3, 5), (9, 9)])
+    assert [line for line in range(0, 12) if in_guard(guards, line)] == [3, 4, 5, 9]
+    assert in_guard(((), ()), 1) is False
+
+
+def test_the_handler_follows_the_file_it_is_given() -> None:
+    # One handler walks many files: its cached guard index must change with the context.
+    call = parse(b"print('x')\n").body[0]
+    assert isinstance(call, ast.Expr)
+    handler = LoggingSites()
+    plain = FileContext("a.py", is_test_file=False, is_script=False, main_guard_spans=())
+    guarded = FileContext("b.py", is_test_file=False, is_script=False, main_guard_spans=((1, 1),))
+    assert [s.file for s in handler(call.value, plain)] == ["a.py"]
+    assert list(handler(call.value, guarded)) == []
+    assert [s.file for s in handler(call.value, plain)] == ["a.py"]
+    assert list(handler(call.value, guarded)) == []

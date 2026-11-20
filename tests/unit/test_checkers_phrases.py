@@ -3,11 +3,12 @@
 import ast
 import re
 import sys
-import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 
 import pytest
+from checker_support import assert_linear, best_time
 
 from conventiondrift.checkers.phrases import (
     BREAK_MARKS,
@@ -16,6 +17,7 @@ from conventiondrift.checkers.phrases import (
     TOKEN,
     classify,
     clauses,
+    first_cue,
     is_negated,
 )
 from conventiondrift.model import RuleMatch
@@ -301,9 +303,56 @@ def test_token_is_a_single_compiled_regex() -> None:
     ],
 )
 def test_clauses_run_in_linear_time_on_adversarial_text(hostile: str) -> None:
-    start = time.perf_counter()
-    clauses(hostile)
-    assert time.perf_counter() - start < 2.0
+    # Best of three, and 5 s for a text this size that takes milliseconds: a loaded runner
+    # can't fail it, a quadratic path (minutes) can.
+    assert best_time(partial(clauses, hostile)) < 5.0
+
+
+HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
+    # About n bytes each; every one puts ~n/2 mentions in one clause or in many clauses.
+    "cue then many mentions": lambda n: "never " + "a " * (n // 2),
+    "no cue, many mentions": lambda n: "use " + "a " * (n // 2),
+    "mentions with commas": lambda n: "never " + "a, " * (n // 3),
+    "mentions with or": lambda n: "never a" + " or a" * (n // 5),
+    "a cue before every mention": lambda n: "never a " * (n // 8),
+    "one mention per clause": lambda n: "never a. " * (n // 9),
+    "instead of before every mention": lambda n: "use a instead of b " * (n // 19),
+    "mixed options": lambda n: "never a b c " * (n // 12),
+    "dashes": lambda n: "never a - " * (n // 10),
+    "cues only": lambda n: "never " * (n // 6),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_SENTENCES)
+def test_classify_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
+    make = HOSTILE_SENTENCES[kind]
+    assert_linear(make, lambda text: classify(text, find, OPTIONS), label=kind)
+    assert_linear(make, clauses, label=kind)
+
+
+def test_one_clause_with_100_000_mentions_is_read_once() -> None:
+    # The CR1 case: is_negated used to scan clause[:index] for every mention (quadratic).
+    for text, expected in (
+        ("never " + "a " * 100_000, rule(prohibited="a", specificity=1)),
+        ("use " + "a " * 100_000, rule(preferred="a", specificity=1)),
+    ):
+        assert best_time(partial(classify, text, find, OPTIONS), repeat=1) < 5.0
+        assert classify(text, find, OPTIONS) == expected
+
+
+def test_first_cue_is_the_index_of_the_first_cue() -> None:
+    assert first_cue(("use", "a", "not", "b", "never")) == 2
+    assert first_cue(("never",)) == 0
+    assert first_cue(("use", "a")) is None
+    assert first_cue(()) is None
+
+
+def test_a_mention_on_the_cue_itself_is_not_negated() -> None:
+    def cues_as_options(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((i, "a") for i, word in enumerate(clause) if word == "not")
+
+    # The mention is the cue word: nothing comes before it, so it is preferred.
+    assert classify("not", cues_as_options, OPTIONS) == rule(preferred="a", specificity=1)
 
 
 # --- the import rule (INTERFACES I-10, "Shared phrase helper") ------------------------------

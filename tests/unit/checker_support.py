@@ -4,8 +4,11 @@
 is preferred and the option isn't prohibited; relevant sites are every site of the checker.
 """
 
+import time
 from collections.abc import Callable, Mapping
+from functools import partial
 from types import MappingProxyType
+from typing import TypeVar
 
 from conventiondrift.checkers import registry
 from conventiondrift.checkers.pool import analyze
@@ -87,4 +90,55 @@ def rules_of(text: str) -> list[tuple[int, str | None]]:
     return [(rule.line, rule.checker) for rule in extraction.rules]
 
 
-__all__ = ["counts", "default_is_script", "policy", "rules_of", "sites_of"]
+_T = TypeVar("_T")
+MIB = 1 << 20
+LINEAR_SIZES = (1 << 17, 1 << 18, 1 << 19, 1 << 20)
+"""128 KiB up to 1 MiB, the instruction-file size cap (R2.3). A quadratic path takes minutes at
+the top and several seconds already at the bottom, so it fails at the first size."""
+
+
+def best_time(func: Callable[[], object], repeat: int = 3) -> float:
+    """The fastest of ``repeat`` runs, as in the extraction tests: one slow run on a loaded
+    runner doesn't count."""
+    best = float("inf")
+    for _ in range(repeat):
+        start = time.perf_counter()
+        func()
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def assert_linear(
+    make: Callable[[int], _T],
+    run: Callable[[_T], object],
+    *,
+    sizes: tuple[int, ...] = LINEAR_SIZES,
+    label: str = "",
+) -> None:
+    """``run(make(n))`` is linear in ``n`` for each size, in the repo's ReDoS-test style.
+
+    Two checks, both generous (linear code takes milliseconds here): an absolute budget that
+    grows from 1.0 s with 4 s per MiB, and doubling the size must not much more than
+    triple the time (the 3x plus slack of ``test_rules_extract``).
+    """
+    previous = 0.0
+    for n in sizes:
+        data = make(n)
+        elapsed = best_time(partial(run, data), repeat=3 if n < MIB else 1)
+        assert elapsed < 1.0 + 4.0 * n / MIB, (label, n, elapsed)
+        if previous:
+            assert elapsed < 3 * previous + 0.05, (label, n, elapsed, previous)
+        previous = elapsed
+
+
+__all__ = [
+    "LINEAR_SIZES",
+    "MIB",
+    "assert_linear",
+    "best_time",
+    "counts",
+    "default_is_script",
+    "policy",
+    "rules_of",
+    "sites_of",
+]

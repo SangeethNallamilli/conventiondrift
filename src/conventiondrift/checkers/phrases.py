@@ -40,6 +40,10 @@ Specificity is the number of distinct options the sentence mentions
 that each find one option in a sentence tie, and a tie is Not verifiable
 (AC-F2.6).
 
+Everything here is linear in the length of the sentence: ``clauses`` reads each
+token once, ``first_cue`` runs once per clause, and a mention is negated exactly
+when it comes after that cue.
+
 The one regex, ``TOKEN``, is applied to repo text (SECURITY-RULES R2.5). It is a
 single character class repeated, an optional ``.name`` suffix that starts with a
 literal dot, single characters, and ``--`` followed by more hyphens, so it can't
@@ -60,6 +64,7 @@ __all__ = [
     "Finder",
     "classify",
     "clauses",
+    "first_cue",
     "is_negated",
 ]
 
@@ -121,9 +126,22 @@ def clauses(text: str) -> tuple[tuple[str, ...], ...]:
     return tuple(found)
 
 
+def first_cue(clause: tuple[str, ...]) -> int | None:
+    """The index of the first negation cue in ``clause``, or None when it has none."""
+    for index, word in enumerate(clause):
+        if word in NEGATIONS:
+            return index
+    return None
+
+
+def _after(cue: int | None, index: int) -> bool:
+    """Whether the word at ``index`` comes after the clause's first cue (so it is negated)."""
+    return cue is not None and cue < index
+
+
 def is_negated(clause: tuple[str, ...], index: int) -> bool:
-    """Whether a negation word comes before ``clause[index]`` in its clause."""
-    return any(word in NEGATIONS for word in clause[:index])
+    """Whether a negation cue comes before ``clause[index]`` in its clause."""
+    return _after(first_cue(clause), index)
 
 
 def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | None:
@@ -131,8 +149,11 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
     preferred: set[str] = set()
     prohibited: set[str] = set()
     for clause in clauses(text):
+        # The cue is found once per clause, not once per mention: a hostile sentence with
+        # 100,000 mentions in one clause must not cost 100,000 scans (linear time, R2.5).
+        cue = first_cue(clause)
         for index, option in find(clause):
-            (prohibited if is_negated(clause, index) else preferred).add(option)
+            (prohibited if _after(cue, index) else preferred).add(option)
     mentioned = preferred | prohibited
     if not mentioned or preferred & prohibited:
         return None
