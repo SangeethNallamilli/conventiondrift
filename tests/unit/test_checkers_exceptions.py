@@ -94,7 +94,7 @@ def test_match_rule_reads_prohibitions(sentence: str, prohibited: tuple[str, ...
         "use bare except.",  # a request, not a prohibition
         "always catch exception.",
         "always catch exception, never use bare except.",  # asks and forbids
-        "never use bare except and always use bare except.",
+        "never use bare except; always use bare except.",
         "use bare except and bare except.",
     ],
 )

@@ -36,12 +36,13 @@ def sites_of(
     *,
     entry_points: frozenset[str] = frozenset(),
     max_workers: int | None = 1,
+    is_script: Callable[[str], bool] | None = None,
 ) -> list[Site]:
     """All of ``checker``'s sites over ``files`` ({path: source}), in the walk's order."""
     result = analyze(
         [PyFile(path, text.encode()) for path, text in files.items()],
         checkers=REGISTRY_UNDER_TEST,
-        is_script=default_is_script(),
+        is_script=is_script or default_is_script(),
         entry_points=entry_points,
         max_workers=max_workers,
     )

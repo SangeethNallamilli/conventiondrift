@@ -3,26 +3,47 @@
 ``match_rule`` gets the normalized text of one rule sentence (lowercase, single
 spaces; DESIGN §7 step 2). A checker reads it in three steps:
 
-1. ``clauses`` cuts the sentence into word lists at ``,`` ``;`` ``:`` and the
-   words "and", "but" and "then", so "use logging, not print" is two clauses.
+1. ``clauses`` cuts the sentence into word lists (the clause rules below).
 2. The checker's own ``find`` says which of its options a clause mentions, and
    at which word.
-3. ``classify`` sorts each mention by polarity: a mention after a negation word
-   in its clause (``NEGATIONS``) is prohibited, any other mention is preferred.
-   So "never use print or requests" prohibits print and "use logging instead
-   of print" prefers logging and prohibits print.
+3. ``classify`` sorts each mention by polarity: a mention after a negation cue
+   (``NEGATIONS``) in its clause is prohibited, any other mention is preferred.
 
-A sentence that doesn't give a usable ``RuleMatch`` (nothing mentioned, the same
-option both preferred and prohibited, or every option prohibited) is not
-mapped, which makes the rule Not verifiable, never a wrong verdict.
+Clause rules (INTERFACES I-10, "Negation in phrases.py"):
 
-Specificity is the number of distinct options the sentence mentions. Two
-checkers that each find one option in a sentence tie, and a tie is Not
-verifiable (AC-F2.6).
+* A negation cue applies from the cue to the end of its clause. Words before
+  the cue are not negated, so "use logging, not print" prefers logging and
+  prohibits print.
+* A clause ends at ``.``, ``;``, ``:``, ``(``, ``)``, a dash (an en or em dash,
+  ``--``, or a hyphen with a space on both sides; a hyphen inside a word such
+  as "bare-except" is not a dash), and at the words ``but``, ``then``,
+  ``instead`` and ``however``.
+* ``and``, ``or``, ``nor`` and ``,`` do **not** end a clause, so "never use
+  print or requests" and "do not use print, requests" prohibit both.
+* "X instead of Y" and "X rather than Y" prohibit Y. ``instead of`` is read as
+  one cue that starts a new clause; a bare ``instead`` (as in "don't print,
+  instead use logging") only ends the clause.
+* Only the cues in ``NEGATIONS`` are read. Any other phrasing ("no print",
+  "print is banned") is not a cue, so what it mentions reads as preferred.
 
-The one regex, ``TOKEN``, is applied to repo text (SECURITY-RULES R2.5): it is a
-single character class repeated, and an optional ``.name`` suffix that starts
-with a literal dot, so it can't backtrack and runs in linear time.
+A sentence that doesn't give a usable ``RuleMatch`` is not mapped, which makes
+the rule Not verifiable, never a wrong verdict. That is the case when:
+
+* nothing is mentioned;
+* an option is named in both a negated and a non-negated clause;
+* every option is prohibited (the rule would allow nothing); or
+* every option is preferred (every site would follow, so the rule would always
+  hold; this is also what an unread cue such as "no" looks like).
+
+Specificity is the number of distinct options the sentence mentions
+(``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
+that each find one option in a sentence tie, and a tie is Not verifiable
+(AC-F2.6).
+
+The one regex, ``TOKEN``, is applied to repo text (SECURITY-RULES R2.5). It is a
+single character class repeated, an optional ``.name`` suffix that starts with a
+literal dot, single characters, and ``--`` followed by more hyphens, so it can't
+backtrack and runs in linear time.
 """
 
 import re
@@ -31,34 +52,70 @@ from typing import Final
 
 from conventiondrift.model import RuleMatch
 
-__all__ = ["BREAKS", "NEGATIONS", "TOKEN", "Finder", "classify", "clauses", "is_negated"]
+__all__ = [
+    "BREAK_MARKS",
+    "BREAK_WORDS",
+    "NEGATIONS",
+    "TOKEN",
+    "Finder",
+    "classify",
+    "clauses",
+    "is_negated",
+]
 
-TOKEN: Final = re.compile(r"[,;:]|[a-z0-9_'\u2019]+(?:\.[a-z0-9_]+)*")
-"""A clause delimiter, or a word. A dotted name such as ``logging.warn`` is one word."""
+TOKEN: Final = re.compile(
+    r"[a-z0-9_'\u2019]+(?:\.[a-z0-9_]+)*|[;:().\u2013\u2014]|(?<=\s)-(?=\s)|--+"
+)
+"""A word, or a clause mark. A dotted name such as ``logging.warn`` is one word."""
 
-BREAKS: Final = frozenset({",", ";", ":", "and", "but", "then"})
-"""Tokens that end a clause; negation doesn't carry across them."""
+BREAK_MARKS: Final = frozenset(";:().-\u2013\u2014")
+"""First characters of the mark tokens, each of which ends a clause."""
+
+BREAK_WORDS: Final = frozenset({"but", "then", "instead", "however"})
+"""Words that end a clause; negation doesn't carry across them."""
+
+INSTEAD_OF: Final = "instead of"
+"""The cue ``clauses`` makes of the words "instead of" (a clause break, then a cue)."""
 
 NEGATIONS: Final = frozenset(
-    {"never", "not", "dont", "don't", "don\u2019t", "avoid", "over", "instead", "rather", "without"}
+    {
+        "never",
+        "not",
+        "dont",
+        "don't",
+        "don\u2019t",
+        "avoid",
+        "over",
+        "rather",
+        "without",
+        INSTEAD_OF,
+    }
 )
-"""Words that make what follows, in the same clause, something the rule forbids."""
+"""Cues that make what follows, to the end of the same clause, something the rule forbids."""
 
 Finder = Callable[[tuple[str, ...]], Iterable[tuple[int, str]]]
 """Gives the ``(word index, option)`` pairs one checker finds in a clause."""
 
 
 def clauses(text: str) -> tuple[tuple[str, ...], ...]:
-    """The sentence as non-empty word lists, cut at ``BREAKS``."""
+    """The sentence as non-empty word lists, cut at the clause breaks above."""
+    tokens = TOKEN.findall(text.lower())
     found: list[tuple[str, ...]] = []
     current: list[str] = []
-    for token in TOKEN.findall(text.lower()):
-        if token in BREAKS:
+    index = 0
+    while index < len(tokens):
+        word = tokens[index]
+        index += 1
+        is_instead_of = word == "instead" and tokens[index : index + 1] == ["of"]
+        if word in BREAK_WORDS or word[0] in BREAK_MARKS:
             if current:
                 found.append(tuple(current))
                 current = []
+            if is_instead_of:
+                current.append(INSTEAD_OF)
+                index += 1
         else:
-            current.append(token)
+            current.append(word)
     if current:
         found.append(tuple(current))
     return tuple(found)
@@ -80,6 +137,8 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
     if not mentioned or preferred & prohibited:
         return None
     if not preferred and prohibited >= options:
+        return None
+    if preferred >= options:
         return None
     return RuleMatch(
         preferred=frozenset(preferred), prohibited=frozenset(prohibited), specificity=len(mentioned)

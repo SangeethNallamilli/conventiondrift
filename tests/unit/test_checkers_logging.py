@@ -16,6 +16,7 @@ from conventiondrift.checkers.logging import LoggingChecker
 from conventiondrift.checkers.logging.match import OPTIONS, match_rule
 from conventiondrift.checkers.logging.sites import LEVEL_METHODS, logging_sites
 from conventiondrift.checkers.walk import parse
+from conventiondrift.discover.globmatch import GlobSet
 from conventiondrift.model import FileContext, RuleMatch, Site
 
 USE_LOGGING = match_rule("use logging, not print.")
@@ -62,6 +63,9 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("use the logging module.", match(("logging",), (), 1)),
         ("always use a logger.", match(("logging",), (), 1)),
         ("use loggers, never print statements.", match(("logging",), ("print",), 2)),
+        ("don't use print; use logging.", match(("logging",), ("print",), 2)),
+        ("don't use print, instead use logging.", match(("logging",), ("print",), 2)),
+        ("never use print or logging.warn.", match((), ("print",), 1)),
         ("prefer logging over print.", match(("logging",), ("print",), 2)),
         ("use logging instead of print.", match(("logging",), ("print",), 2)),
         ("use logging rather than print.", match(("logging",), ("print",), 2)),
@@ -72,7 +76,6 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("don\u2019t use prints.", match((), ("print",), 1)),
         ("do not use print() for debug output.", match((), ("print",), 1)),
         ("avoid print.", match((), ("print",), 1)),
-        ("never log with print, use logging.", match(("logging",), ("print",), 2)),
         ("use print() for debug output.", match(("print",), (), 1)),
         ("use print, not logging.", match(("print",), ("logging",), 2)),
         ("USE LOGGING, NOT PRINT.", match(("logging",), ("print",), 2)),
@@ -95,6 +98,12 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         "use print and never print.",  # print both preferred and prohibited: unreadable
         "do not use print for logging.",  # every option prohibited: nothing is allowed
         "never use logging or print.",
+        "never log with print, use logging.",  # the negation runs on through the comma
+        "don't print, use logging.",
+        # Every option preferred: every site would follow, so the rule would always hold.
+        "use logging; no print.",
+        "use logging (print is banned).",
+        "use the logger to print status messages.",
     ],
 )
 def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
@@ -396,6 +405,32 @@ def test_the_handler_reads_the_context_flags_directly() -> None:
     assert [s.option for s in logging_sites(call.value, plain)] == ["print"]
     assert list(logging_sites(call.value, script)) == []
     assert list(logging_sites(call.value, guarded)) == []
+
+
+def test_a_print_in_a_test_file_that_is_not_a_script_is_a_site() -> None:
+    # Only is_script and the main guard exempt a print: is_test_file alone does not.
+    call = parse(b"print('x')\n").body[0]
+    assert isinstance(call, ast.Expr)
+    ctx = FileContext("a.py", is_test_file=True, is_script=False, main_guard_spans=())
+    assert [s.option for s in logging_sites(call.value, ctx)] == ["print"]
+
+
+def test_a_custom_script_paths_setting_replaces_the_default_in_a_run() -> None:
+    # `script-paths` replaces the default list (I-6): here only tools/ is a script path, so a
+    # print under scripts/ or tests/ (default paths; tests/ is also a test file) now counts.
+    custom = GlobSet(["tools/**"]).excludes
+    files = {
+        "tools/run.py": PRINT_ONLY,
+        "scripts/run.py": PRINT_ONLY,
+        "tests/test_x.py": PRINT_ONLY,
+        "conftest.py": PRINT_ONLY,
+    }
+    sites = sites_of("logging", files, is_script=custom)
+    assert [(s.file, s.option) for s in sites] == [
+        ("conftest.py", "print"),
+        ("scripts/run.py", "print"),
+        ("tests/test_x.py", "print"),
+    ]
 
 
 def test_the_handler_gives_nothing_for_a_node_that_is_not_a_call() -> None:
