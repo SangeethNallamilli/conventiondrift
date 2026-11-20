@@ -1282,6 +1282,9 @@ def test_item_5a_the_last_of_several_trailing_cues_counts() -> None:
         "never use b or c without a reason",  # the last cue, "without", reaches nothing
         "use a and b, never",
         "a. b is fine, never in tests",
+        # A prefix cue just before or just after a trailing cue is not part of it.
+        "a never is banned",
+        "a is banned, no exceptions",
     ],
 )
 def test_item_5b_a_prefix_cue_that_reaches_no_mention_is_unreadable(text: str) -> None:
