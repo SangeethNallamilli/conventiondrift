@@ -12,6 +12,8 @@ The polarity of each mention comes from ``phrases.classify``. So "Use f-strings 
 formatting." prefers f-strings, "Use f-strings, not .format()." also forbids ``format``, and
 "Don't use the % operator or .format()." forbids ``percent`` and ``format``. The words
 "string formatting" alone name nothing, and a bare "%" (as in "90% coverage") is not read.
+The spellings are whole words only (``SPELLINGS``): ``.format_map``, ``config.formatter``
+and "100% style" name nothing.
 
 A rule that limits the choice to some strings is not mapped (D-PM-44 b, D-PM-26 #2, AC-N1.5):
 "Log messages are f-strings.", "Use f-strings in log messages." and "Error messages use
@@ -19,13 +21,14 @@ A rule that limits the choice to some strings is not mapped (D-PM-44 b, D-PM-26 
 A sentence is read as limited when it has one of the words in ``SCOPE_WORDS``.
 """
 
+import re
 from collections.abc import Iterator
 from typing import Final
 
 from conventiondrift.checkers.phrases import Mention, classify, clauses
 from conventiondrift.model import RuleMatch
 
-__all__ = ["OPTIONS", "SCOPE_WORDS", "match_rule"]
+__all__ = ["OPTIONS", "SCOPE_WORDS", "SPELLINGS", "match_rule"]
 
 OPTIONS: Final = frozenset({"f-string", "format", "percent"})
 """The string-format checker's options (INTERFACES leaves their ids open; T-017)."""
@@ -61,17 +64,19 @@ SCOPE_WORDS: Final = frozenset(
 )
 """Words that name a kind of string: a rule that has one is about those strings only."""
 
-_PERCENT_FORMS: Final = (
-    "%s",
-    "%d",
-    "%r",
-    "% operator",
-    "% formatting",
-    "%-formatting",
-    "%-style",
-    "% style",
+SPELLINGS: Final = re.compile(
+    r"(?<![a-z0-9_.])(?:str)?\.format(?![a-z0-9_])"
+    r"|(?<![a-z0-9_])%(?:[sdr](?![a-z0-9_])| operator| formatting|-formatting|-style| style)"
 )
-"""Spellings of ``%`` formatting that are made one word before the sentence is read."""
+"""``.format``/``str.format`` and the ``%`` spellings, matched only as whole words.
+
+``.format`` must not run on into an identifier (``.format_map``, ``.formatted``,
+``config.formatter``) or follow one (``config.format``); ``str.format`` is the one dotted
+form read. A ``%`` must not follow a letter, digit or underscore, so "keep 100% style" and
+"90% formatting" name nothing, and ``%s``, ``%d`` and ``%r`` must not run on into a word.
+The regex is applied to repo text (SECURITY-RULES R2.5). It is an alternation of literals
+with optional fixed parts and one-character lookarounds, so it can't backtrack and runs in
+linear time."""
 
 _PERCENT_WORD: Final = "cd_percent"
 _F_STRING_WORDS: Final = frozenset({"f-string", "f-strings", "fstring", "fstrings"})
@@ -79,12 +84,13 @@ _F_STRING_WORDS: Final = frozenset({"f-string", "f-strings", "fstring", "fstring
 _FORMAT_WORD: Final = "str.format"
 
 
+def _word(found: re.Match[str]) -> str:
+    return f" {_PERCENT_WORD if found.group().startswith('%') else _FORMAT_WORD} "
+
+
 def _prepare(text: str) -> str:
     """Make the spellings above single words, which the shared clause rules would split."""
-    text = text.replace("()", "").replace(".format", f" {_FORMAT_WORD} ")
-    for form in _PERCENT_FORMS:
-        text = text.replace(form, f" {_PERCENT_WORD} ")
-    return text
+    return SPELLINGS.sub(_word, text.replace("()", ""))
 
 
 def _find(clause: tuple[str, ...]) -> Iterator[Mention]:

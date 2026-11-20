@@ -9,7 +9,7 @@ import sys
 import textwrap
 
 import pytest
-from checker_support import counts, rules_of, sites_of
+from checker_support import assert_linear, counts, rules_of, sites_of
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.string_format import StringFormatChecker
@@ -100,6 +100,8 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("avoid percent formatting.", (), ("percent",)),
         ("avoid printf-style formatting.", (), ("percent",)),
         ("avoid printf style formatting.", (), ("percent",)),
+        ("never use % style formatting.", (), ("percent",)),
+        ('use "{}".format(x).', ("format",), ()),
         # Two-word mentions are one list item for the trailing-cue contiguity guard (I-10 4a).
         ("f strings and percent formatting are banned.", (), ("f-string", "percent")),
         ("never use f-strings.", (), ("f-string",)),
@@ -126,6 +128,16 @@ def test_match_rule_reads_the_formats_and_their_polarity(
         "never use f-strings; always use f-strings.",  # one option, both polarities
         "never use f-strings, .format() or %s.",  # forbids every option
         "use f-strings, .format() and %s.",  # prefers every option
+        # Whole words only (CR1 S1, TE on #63): no % after a digit, no .format in a name.
+        "keep 100% style consistency with black.",
+        "keep coverage at 90% formatting aside.",
+        "never edit config.formatter by hand.",
+        "never use config.format().",
+        "use .format_map().",
+        "use str.format_map().",
+        "use .formatted().",
+        "avoid %self.",
+        "never use x%s.",
         # I-10 Negation 5(d): a comparison with no positive verb before "than" is not mapped.
         "f-strings are better than .format().",
     ],
@@ -384,3 +396,38 @@ def test_files_give_the_same_sites_alone_and_together_in_either_order() -> None:
     reversed_ = sites_of("string-format", dict(reversed(files.items())))
     assert together == alone == reversed_
     assert [s.option for s in together] == ["f-string"] * 2 + ["format", "f-string", "percent"]
+
+
+# --- linear time (R2.5; CR1 B1 and SR L-63-1 on #63) ----------------------------------------
+
+HOSTILE_RULES = {
+    "many mentions": lambda n: "use " + "f-strings " * (n // 10),
+    "cue first": lambda n: "never " + ".format() " * (n // 10),
+    "trailing-cue list": lambda n: "f strings and " * (n // 14) + "percent formatting are banned",
+    "comparatives": lambda n: "prefer f-strings over " + "%s or " * (n // 6),
+    "packed %s": lambda n: "avoid " + "%s" * (n // 2),  # each %s grows to 12 characters
+    "packed .format": lambda n: "use " + ".format" * (n // 7),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_RULES)
+def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
+    assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
+
+
+PAD = "  # " + "x" * 60 + "\n"
+"""A comment that keeps the node count per byte near ordinary code, so the budget measures the
+handlers and the walk rather than CPython's parser on a file made only of f-strings."""
+
+HOSTILE_SOURCES = {
+    "every form": lambda n: (
+        ('f"{a}"' + PAD + '"{}".format(b)' + PAD + '"%s" % c' + PAD) * (n // 226)
+    ),
+    "specs": lambda n: ('f"{a:>{w}}{b:.2f}"' + PAD) * (n // 82),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_SOURCES)
+def test_the_site_handlers_are_linear_in_a_run(kind: str) -> None:
+    make = HOSTILE_SOURCES[kind]
+    assert_linear(make, lambda text: sites_of("string-format", {"src/a.py": text}), label=kind)

@@ -19,6 +19,8 @@ Limits in v1 (the docs list them):
 * Imports inside a function, a class or a lambda are not followed.
 * ``urllib3`` and ``http.client`` are not counted.
 * A name that is rebound after its import is still read as the import.
+* A name that two top-level imports bind (the ``try: import httpx as h`` /
+  ``except ImportError: import requests as h`` fallback) is read as the last import.
 * Relative imports are not followed.
 """
 

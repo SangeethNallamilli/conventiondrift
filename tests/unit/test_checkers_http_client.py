@@ -7,7 +7,7 @@ walk and pool.
 import ast
 
 import pytest
-from checker_support import counts, rules_of, sites_of
+from checker_support import assert_linear, counts, rules_of, sites_of
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.http_client import HttpClientChecker
@@ -340,6 +340,9 @@ def test_imports_under_module_level_blocks_are_followed(block: str) -> None:
 def test_the_last_import_of_a_name_wins() -> None:
     source = "import requests as c\nimport httpx as c\nc.get(u)\n"
     assert run(source) == ["httpx"]
+    # A documented v1 limit (TE on #63): a try/except fallback binds the last import too.
+    fallback = "try:\n    import httpx as h\nexcept ImportError:\n    import requests as h\n"
+    assert run(fallback + "h.get(u)\n") == ["requests"]
 
 
 def test_a_construction_is_a_site_and_a_call_on_its_variable_is_not() -> None:
@@ -408,3 +411,47 @@ def test_the_handlers_give_nothing_for_a_node_of_another_kind() -> None:
     handlers = HttpSites()
     assert list(handlers.calls(ast.Name("requests"), ctx())) == []
     assert list(handlers.imports(ast.Name("requests"), ctx())) == []
+
+
+# --- linear time (R2.5; CR1 B1 and SR L-63-1 on #63) ----------------------------------------
+
+HOSTILE_RULES = {
+    "many mentions": lambda n: "use " + "httpx " * (n // 6),
+    "cue first": lambda n: "never " + "requests " * (n // 9),
+    "trailing-cue list": lambda n: "requests and " * (n // 13) + "httpx are banned",
+    "comparatives": lambda n: "prefer httpx over " + "requests or " * (n // 12),
+    "than": lambda n: "httpx is better than " + "requests " * (n // 9),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_RULES)
+def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
+    assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
+
+
+def imports_and_calls(n: int) -> str:
+    count = n // 40  # an import of about 22 bytes and a call of about 16 for each
+    imports = "".join(f"import m{i} as a{i}\n" for i in range(count))
+    # requests is bound last, so a call that searched the table in order would read it all.
+    return imports + "import requests\n" + "requests.get(u)\n" * count
+
+
+def aliases(n: int) -> str:
+    count = n // 40
+    imports = "".join(f"import requests as r{i}\n" for i in range(count))
+    return imports + "".join(f"r{i}.get(u)\n" for i in range(count))
+
+
+HOSTILE_SOURCES = {
+    "many imports and many calls": imports_and_calls,
+    "many aliases": aliases,
+    # A comment per call keeps the node count per byte near ordinary code (see the
+    # string-format tests), so the budget measures the handler and the walk, not the parser.
+    "many calls": lambda n: "import httpx\n" + ("httpx.get(u)  # " + "x" * 40 + "\n") * (n // 57),
+}
+
+
+@pytest.mark.parametrize("kind", HOSTILE_SOURCES)
+def test_the_site_handlers_are_linear_in_a_run(kind: str) -> None:
+    make = HOSTILE_SOURCES[kind]
+    assert_linear(make, lambda text: sites_of("http-client", {"src/a.py": text}), label=kind)
