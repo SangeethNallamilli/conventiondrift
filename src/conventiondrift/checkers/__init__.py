@@ -2,7 +2,8 @@
 
 Checkers are registered only in ``REGISTRY``, a fixed tuple. There is no entry
 point or plugin loading (SCOPE won't-have #6, THREAT-MODEL T-01). The eight
-checkers are added here by T-016 to T-019; so far ``exceptions`` and ``logging`` (T-016).
+checkers are added here by T-016 to T-019; so far ``exceptions`` and ``logging`` (T-016),
+and ``http-client`` and ``string-format`` (T-017).
 """
 
 from collections.abc import Iterable, Mapping
@@ -11,10 +12,17 @@ from typing import get_args
 
 from conventiondrift.checkers.base import Checker
 from conventiondrift.checkers.exceptions import ExceptionsChecker
+from conventiondrift.checkers.http_client import HttpClientChecker
 from conventiondrift.checkers.logging import LoggingChecker
+from conventiondrift.checkers.string_format import StringFormatChecker
 from conventiondrift.model import CheckerId
 
-REGISTRY: tuple[Checker, ...] = (ExceptionsChecker(), LoggingChecker())
+REGISTRY: tuple[Checker, ...] = (
+    ExceptionsChecker(),
+    HttpClientChecker(),
+    LoggingChecker(),
+    StringFormatChecker(),
+)
 """Every built-in checker. The order doesn't matter; the registry is iterated by id."""
 
 

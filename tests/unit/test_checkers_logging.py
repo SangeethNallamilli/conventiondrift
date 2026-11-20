@@ -7,7 +7,9 @@ reach the checker the way they do in a run.
 
 import ast
 import textwrap
+from collections.abc import Iterator
 from functools import partial
+from typing import SupportsIndex, overload
 
 import pytest
 from checker_support import (
@@ -134,7 +136,8 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         # Every option preferred: every site would follow, so the rule would always hold.
         "use the logger to print status messages.",
         "use logging and print.",
-        "prefer logging over print.",  # I-10 item 4c: "over" is no cue, so both are preferred
+        # "prefer logging over print." was here (I-10 item 4c: both preferred). Under item 5d it
+        # prefers logging and prohibits print: test_item_5d_prefer_over_prohibits_what_follows.
     ],
 )
 def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
@@ -169,7 +172,7 @@ def test_the_eight_canonical_sentences_only_line_1_is_logging_ac_f2_5() -> None:
     assert taken == [1]
 
 
-def test_the_registry_maps_the_canonical_file_to_logging_and_exceptions_ac_f2_5() -> None:
+def test_the_registry_maps_the_canonical_file_to_its_checkers_ac_f2_5() -> None:
     text = "\n".join(
         [
             "Use logging, not print.",
@@ -182,22 +185,22 @@ def test_the_registry_maps_the_canonical_file_to_logging_and_exceptions_ac_f2_5(
             "Use uv for dependencies.",
         ]
     )
-    # All eight are rules at lines 1-8; the other six checkers arrive with T-017 to T-019, so
-    # until then only these two lines are mapped, each to its own checker.
+    # All eight are rules at lines 1-8; the other four checkers arrive with T-018 and T-019, so
+    # until then only these four lines are mapped, each to its own checker.
     assert rules_of(text) == [
         (1, "logging"),
-        (2, None),
+        (2, "http-client"),
         (3, None),
         (4, None),
-        (5, None),
+        (5, "string-format"),
         (6, "exceptions"),
         (7, None),
         (8, None),
     ]
 
 
-def test_never_use_print_or_requests_is_still_mapped_to_logging_alone_until_t017() -> None:
-    assert rules_of("Never use print or requests.") == [(1, "logging")]
+def test_never_use_print_or_requests_is_a_tie_between_logging_and_http_client_ac_f2_6() -> None:
+    assert rules_of("Never use print or requests.") == [(1, None)]
 
 
 # --- sites: AC-F3.2 -------------------------------------------------------------------------
@@ -510,6 +513,45 @@ def test_many_guards_and_many_prints_are_linear_in_a_run() -> None:
     assert_linear(make, lambda text: sites_of("logging", {"src/a.py": text}), label="guards")
 
 
+class CountingSpans(tuple[tuple[int, int], ...]):
+    """``main_guard_spans`` that count every span read out of them, by iteration or by index."""
+
+    reads = 0
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        for span in super().__iter__():
+            self.reads += 1
+            yield span
+
+    @overload
+    def __getitem__(self, key: SupportsIndex) -> tuple[int, int]: ...
+    @overload
+    def __getitem__(self, key: slice) -> tuple[tuple[int, int], ...]: ...
+    def __getitem__(
+        self, key: SupportsIndex | slice
+    ) -> tuple[int, int] | tuple[tuple[int, int], ...]:
+        got = super().__getitem__(key)
+        self.reads += len(got) if isinstance(key, slice) else 1
+        return got
+
+
+def test_the_guard_spans_are_read_once_per_file_however_many_prints() -> None:
+    # CR1 on #61: the timed test above catches a per-print scan of the guards (seed b in the
+    # #61 description) by a margin of 3.4 s against 3 s. This counts the reads instead, so the
+    # same scan fails by a factor of thousands and the answer doesn't depend on the runner.
+    guards, prints = 1_000, 4_000
+    spans = CountingSpans((10 * i + 1, 10 * i + 2) for i in range(guards))
+    ctx = FileContext("src/a.py", is_test_file=False, is_script=False, main_guard_spans=spans)
+    calls = [
+        node for node in ast.walk(ast.parse("print(1)\n" * prints)) if isinstance(node, ast.Call)
+    ]
+    handler = LoggingSites()
+    sites = [site for node in calls for site in handler(node, ctx)]
+    # Lines 1, 2, 11, 12, ... are inside a guard: 2 of every 10 lines up to line 10,000.
+    assert len(sites) == prints - 2 * (prints // 10)
+    assert spans.reads == guards  # one pass, to build the index
+
+
 def test_prints_before_between_and_after_many_guards_are_all_found() -> None:
     source = "print('before')\n" + guard_source(50, 0) + "print('after')\n"
     sites = sites_of("logging", {"src/a.py": source})
@@ -669,10 +711,24 @@ def test_item_4b_no_matter_no_doubt_and_not_only_never_prohibit(sentence: str) -
     assert match_rule("use logging not only for errors.") == match(("logging",), (), 1)
 
 
-def test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable() -> None:
-    assert match_rule("prefer logging over print.") is None
+def test_item_5d_prefer_over_prohibits_what_follows() -> None:
+    # Was test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable (None). I-10 item 5d
+    # makes "over" after a positive verb cue a reverse-form cue like "rather than".
+    assert match_rule("prefer logging over print.") == match(("logging",), ("print",), 2)
+    assert match_rule("logging over print.") is None  # no positive verb before "over"
+    assert match_rule("logging is better than print.") is None
+    assert match_rule("logging vs. print.") is None
     assert match_rule("use logging rather than print.") == match(("logging",), ("print",), 2)
     assert match_rule("dont use print.") == match((), ("print",), 1)
+
+
+def test_item_6b_ban_verbs_never_prefer_the_banned_option() -> None:
+    # D-PM-50 item 2: prohibited, or Not verifiable; never preferred.
+    assert match_rule("Always prohibit print.") == match((), ("print",), 1)
+    assert match_rule("Forbid print; use logging.") == match(("logging",), ("print",), 2)
+    assert match_rule("print is banned.") == match((), ("print",), 1)
+    assert match_rule("never forbid print.") is None  # the double-negation guard
+    assert match_rule("don't avoid logging.") is None
 
 
 # --- CON-67 round 2: the comma guard (CR1 F1 on #61, I-10 item 4a) --------------------------
