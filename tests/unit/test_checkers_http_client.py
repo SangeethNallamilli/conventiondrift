@@ -121,6 +121,83 @@ def test_match_rule_does_not_map_what_names_no_library_or_cannot_be_read(sentenc
     assert match_rule(sentence) is None
 
 
+# --- "requests" the noun (INTERFACES I-10 item 6(a)) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sentence", "preferred", "prohibited"),
+    [
+        # The I-10 6(a) sentences that still map.
+        ("use requests.", ("requests",), ()),
+        ("use requests for http calls.", ("requests",), ()),
+        ("use httpx, not requests.", ("httpx",), ("requests",)),
+        ("prefer httpx over requests.", ("httpx",), ("requests",)),
+        ("never use print or requests.", (), ("requests",)),
+        ("neither requests nor urllib is allowed.", (), ("requests", "urllib")),
+        ("requests is forbidden.", (), ("requests",)),
+        ("requests and urllib are banned.", (), ("requests", "urllib")),
+        # Each way of looking like the library.
+        ("use `requests` for calls.", ("requests",), ()),
+        ("the requests library is deprecated.", (), ("requests",)),
+        ("always use the requests package.", ("requests",), ()),
+        ("switch to requests.", ("requests",), ()),
+        ("use httpx instead of requests.", ("httpx",), ("requests",)),
+        ("use httpx rather than requests.", ("httpx",), ("requests",)),
+        ("stop using requests.", (), ("requests",)),
+        ("don\u2019t use requests.", (), ("requests",)),
+        ("never use print() or requests().", (), ("requests",)),
+        ("use httpx, requests or aiohttp.", ("httpx", "requests", "aiohttp"), ()),
+        ("use `httpx` `requests`.", ("httpx", "requests"), ()),
+        # A list that starts a trailing-cue clause: two items, or a singular verb.
+        ("requests has been deprecated.", (), ("requests",)),
+        ("requests was banned.", (), ("requests",)),
+        ("requests is not allowed.", (), ("requests",)),
+        ("httpx or requests are banned.", (), ("httpx", "requests")),
+        # The noun leaves the other options to map.
+        ("use httpx to make requests.", ("httpx",), ()),
+        ("use httpx for all http requests.", ("httpx",), ()),
+        ("don't make http requests in unit tests; use httpx.", ("httpx",), ()),
+        ("use httpx and make requests.", ("httpx",), ()),
+    ],
+)
+def test_requests_maps_only_where_it_looks_like_the_library(
+    sentence: str, preferred: tuple[str, ...], prohibited: tuple[str, ...]
+) -> None:
+    assert match_rule(sentence) == match(preferred, prohibited)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        # I-10 6(a) and TE's sentences on #63: requests the noun, and nothing else named.
+        "always set a timeout on requests.",
+        "always validate incoming requests.",
+        "use retries for failed requests.",
+        "never log requests.",
+        "never block on network requests.",
+        "requests are forbidden.",  # one item, plural verb: accepted coverage loss
+        "requests in tests are banned.",  # the cue doesn't follow the list
+        "requests are slow.",
+        "use httpx vs. requests.",  # 5(d): requests at the vs anchor
+        "use httpx v. requests.",
+        "httpx is fine and requests is forbidden.",  # I-10 4(a) contiguity guard still holds
+        "httpx is better than requests.",
+        "httpx over requests.",
+        "use the requests_noun.",
+    ],
+)
+def test_requests_the_noun_names_nothing(sentence: str) -> None:
+    assert match_rule(sentence) is None
+
+
+@pytest.mark.xfail(strict=True, reason="needs SE3's I-10 6(b) ban verbs in phrases.py")
+@pytest.mark.parametrize("sentence", ["always forbid requests.", "never ban requests."])
+def test_requests_after_a_ban_verb_is_the_library(sentence: str) -> None:
+    match_ = match_rule(sentence)
+    assert match_ is not None
+    assert "requests" in match_.prohibited
+
+
 def test_specificity_is_the_number_of_options_named() -> None:
     one = match_rule("use httpx for http calls.")
     two = match_rule("use httpx, not requests.")
@@ -421,6 +498,9 @@ HOSTILE_RULES = {
     "trailing-cue list": lambda n: "requests and " * (n // 13) + "httpx are banned",
     "comparatives": lambda n: "prefer httpx over " + "requests or " * (n // 12),
     "than": lambda n: "httpx is better than " + "requests " * (n // 9),
+    "nouns": lambda n: "always set a timeout on " + "requests " * (n // 9),
+    "comma list": lambda n: "use " + "requests, " * (n // 10),
+    "trailing list": lambda n: "requests or " * (n // 12) + "httpx is banned",
 }
 
 
