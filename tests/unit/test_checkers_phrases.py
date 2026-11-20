@@ -14,6 +14,8 @@ from conventiondrift.checkers.phrases import (
     BREAK_MARKS,
     BREAK_WORDS,
     CALL_SUFFIX,
+    COMPARATIVE_VERBS,
+    COMPARATIVES,
     MAX_TRAILING,
     MERGED,
     NEGATIONS,
@@ -257,6 +259,8 @@ def test_the_tables_are_what_the_docs_say() -> None:
         ("no", "matter"): "no matter",
         ("no", "doubt"): "no doubt",
         ("not", "only"): "not only",
+        ("vs", "."): "vs",
+        ("v", "."): "vs",
     }
 
 
@@ -579,6 +583,8 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
         "a " + "is no longer allowed " * (n // 21)
     ),
     "many mentions then an unreached cue": lambda n: "a " * (n // 2) + "never",
+    # I-10 item 5d: every comparative word checked, none with an option after it.
+    "one mention then many comparatives": lambda n: "use a " + "x over x than x vs. " * (n // 20),
 }
 # Left out of the list above, each one the same path as one kept (the shapes of #58 and of the
 # first two rounds of #61; CI took over 10 minutes with them):
@@ -1110,9 +1116,14 @@ def test_item_4b_the_set_phrases_need_both_words_and_a_real_cue_after_them_still
 
 
 def test_item_4c_over_and_a_bare_rather_are_not_cues_but_rather_than_is() -> None:
-    assert first_cue(("prefer", "a", "over", "b")) is None
+    # I-10 item 5d supersedes 4c for "over" after a positive verb cue: "prefer a over b" used to
+    # prefer both (first_cue None); now "over" is the cue and b is prohibited.
+    assert first_cue(("prefer", "a", "over", "b")) == 2
+    assert first_cue(("a", "over", "b")) is None
     assert first_cue(("rather", "a")) is None
-    assert classify("prefer a over b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+    assert classify("prefer a over b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
     assert classify("rather a", find, OPTIONS) == rule(preferred="a", specificity=1)
     assert classify("use a rather than b", find, OPTIONS) == rule(
         preferred="a", prohibited="b", specificity=2
@@ -1352,6 +1363,164 @@ def test_item_5c_four_options() -> None:
 def test_item_5_cr1_neither_nor_on_four_options_never_prefers_both() -> None:
     result = classify("neither requests nor urllib is allowed.", find_http, HTTP)
     assert result is None or not result.preferred & {"requests", "urllib"}
+
+
+# --- I-10 "Negation" item 5 (d): comparative forms ------------------------------------------------
+
+PYTEST = frozenset({"pytest", "unittest"})
+
+
+def find_pytest(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+    """A finder for a two-option test-framework checker (the real one comes with T-018)."""
+    return ((index, word) for index, word in enumerate(clause) if word in PYTEST)
+
+
+def test_item_5d_the_tables_are_what_i10_says() -> None:
+    assert COMPARATIVE_VERBS == {"use", "prefer", "choose", "pick", "switch", "always"}
+    assert COMPARATIVE_VERBS == VERB_CUES - {"instead"}
+    assert COMPARATIVES == {"than", "vs", "versus"}
+    assert "over" not in NEGATIONS  # 4c: still no cue on its own
+
+
+@pytest.mark.parametrize("verb", sorted(COMPARATIVE_VERBS))
+def test_item_5d_over_after_a_positive_verb_prohibits_what_follows(verb: str) -> None:
+    assert classify(f"{verb} a over b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert classify(f"{verb} a over b or c", find, frozenset("abcd")) == rule(
+        preferred="a", prohibited="bc", specificity=3
+    )
+    assert first_cue((verb, "a", "over", "b")) == 2
+    assert is_negated((verb, "a", "over", "b"), 3) is True
+    assert is_negated((verb, "a", "over", "b"), 1) is False
+
+
+def test_item_5d_the_i10_and_ac_f2_3_examples() -> None:
+    assert classify("prefer pytest over unittest.", find_pytest, PYTEST) == RuleMatch(
+        frozenset({"pytest"}), frozenset({"unittest"}), 2
+    )
+    assert classify("prefer httpx over requests.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests"}), 2
+    )
+    assert classify("httpx is better than requests.", find_http, HTTP) is None
+    assert classify("httpx vs requests", find_http, HTTP) is None
+
+
+def test_item_5d_over_as_a_cue_stops_at_a_break() -> None:
+    assert classify("prefer a over b; use c", find, OPTIONS) == rule(
+        preferred="ac", prohibited="b", specificity=3
+    )
+    assert classify("prefer a over b. c", find, OPTIONS) == rule(
+        preferred="ac", prohibited="b", specificity=3
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a over b",  # no positive verb at all
+        "httpx over requests.",
+        "use c. a over b",  # the verb is in another clause
+        "prefer c; a over b",
+        "a over b use c",  # the verb comes after "over"
+        "a over `b`",  # backticks are not words
+        "instead, a over b",  # "instead" ends a clause, so it is never a verb for "over"
+    ],
+)
+def test_item_5d_an_option_right_after_over_with_no_verb_before_is_unreadable(text: str) -> None:
+    assert classify(text, find if "httpx" not in text else find_http, HTTP | OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a is better than b",
+        "use a, it is faster than b",
+        "prefer a than b",  # a positive verb doesn't help "than"
+        "a vs b",
+        "a versus b",
+        "use a vs b",
+        "use a versus b",
+        "use a vs. b",  # "vs." is "vs", not a clause break (Architect)
+        "use a v. b",  # so is "v."
+        "never a vs b",
+    ],
+)
+def test_item_5d_an_option_right_after_than_vs_or_versus_is_unreadable(text: str) -> None:
+    assert classify(text, find, OPTIONS) is None
+
+
+def test_item_5d_vs_and_v_with_a_dot_are_one_word_and_no_clause_break() -> None:
+    assert clauses("use httpx vs. requests") == (("use", "httpx", "vs", "requests"),)
+    assert clauses("use httpx v. requests") == (("use", "httpx", "vs", "requests"),)
+    assert classify("use httpx vs. requests.", find_http, HTTP) is None
+    assert classify("use httpx v. requests.", find_http, HTTP) is None
+    # The Architect's case: no option after "v.", so httpx is still preferred.
+    assert clauses("use httpx v. 0.27") == (("use", "httpx", "vs", "0.27"),)
+    assert classify("use httpx v. 0.27", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset(), 1
+    )
+    # Other one-letter words keep their dot as a break, and a bare "v" is no comparative.
+    assert clauses("use a x. b") == (("use", "a", "x"), ("b",))
+    assert classify("use a v b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # "over" before a word that is no option changes nothing (AC-F2.4's "over HTTP").
+        ("a over http", rule(preferred="a", specificity=1)),
+        ("use a over http", rule(preferred="a", specificity=1)),
+        ("prefer a over http for calls", rule(preferred="a", specificity=1)),
+        (
+            "we talk over http. use a, not b, for those calls",
+            rule(preferred="a", prohibited="b", specificity=2),
+        ),
+        ("a is better than x", rule(preferred="a", specificity=1)),
+        ("use a vs x", rule(preferred="a", specificity=1)),
+        ("use a versus x", rule(preferred="a", specificity=1)),
+        # Whole words only.
+        ("use a moreover b", rule(preferred="ab", specificity=2)),
+        ("use a overall b", rule(preferred="ab", specificity=2)),
+        ("use a thanks b", rule(preferred="ab", specificity=2)),
+        ("use a vss b", rule(preferred="ab", specificity=2)),
+        ("use a over-the-top b", rule(preferred="ab", specificity=2)),
+        # An option right before the comparative word is not "right after" it.
+        ("b than", rule(preferred="b", specificity=1)),
+        ("b over", rule(preferred="b", specificity=1)),
+    ],
+)
+def test_item_5d_no_option_right_after_a_comparative_changes_nothing(
+    text: str, expected: RuleMatch
+) -> None:
+    assert classify(text, find, OPTIONS) == expected
+
+
+def test_item_5d_rather_than_and_instead_of_keep_their_item_2_reading() -> None:
+    # 5d must not touch them: with or without a verb, what follows is prohibited.
+    for text in ("use a rather than b", "a rather than b", "prefer a rather than b"):
+        assert classify(text, find, OPTIONS) == rule(
+            preferred="a", prohibited="b", specificity=2
+        ), text
+    for text in ("use a instead of b", "a instead of b", "prefer a instead of b"):
+        assert classify(text, find, OPTIONS) == rule(
+            preferred="a", prohibited="b", specificity=2
+        ), text
+    assert clauses("use a rather than b") == (("use", "a", "rather than", "b"),)
+    assert first_cue(("a", "rather than", "b")) == 1
+
+
+def test_item_5d_a_mention_after_over_is_found_by_its_index() -> None:
+    # A multi-word mention right after a comparative starts at the next word.
+    assert (
+        classify(
+            "catching exception is better than bare except.", find_phrases, BARE_BROAD_SPECIFIC
+        )
+        is None
+    )
+    assert classify(
+        "prefer catching exception over bare except.", find_phrases, BARE_BROAD_SPECIFIC
+    ) == RuleMatch(frozenset({"broad"}), frozenset({"bare"}), 2)
 
 
 # --- the import rule (INTERFACES I-10, "Shared phrase helper") ------------------------------

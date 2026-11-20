@@ -136,7 +136,8 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         # Every option preferred: every site would follow, so the rule would always hold.
         "use the logger to print status messages.",
         "use logging and print.",
-        "prefer logging over print.",  # I-10 item 4c: "over" is no cue, so both are preferred
+        # "prefer logging over print." was here (I-10 item 4c: both preferred). Under item 5d it
+        # prefers logging and prohibits print: test_item_5d_prefer_over_prohibits_what_follows.
     ],
 )
 def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
@@ -710,8 +711,13 @@ def test_item_4b_no_matter_no_doubt_and_not_only_never_prohibit(sentence: str) -
     assert match_rule("use logging not only for errors.") == match(("logging",), (), 1)
 
 
-def test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable() -> None:
-    assert match_rule("prefer logging over print.") is None
+def test_item_5d_prefer_over_prohibits_what_follows() -> None:
+    # Was test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable (None). I-10 item 5d
+    # makes "over" after a positive verb cue a reverse-form cue like "rather than".
+    assert match_rule("prefer logging over print.") == match(("logging",), ("print",), 2)
+    assert match_rule("logging over print.") is None  # no positive verb before "over"
+    assert match_rule("logging is better than print.") is None
+    assert match_rule("logging vs. print.") is None
     assert match_rule("use logging rather than print.") == match(("logging",), ("print",), 2)
     assert match_rule("dont use print.") == match((), ("print",), 1)
 

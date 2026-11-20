@@ -17,9 +17,18 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
   "without", "shouldn't", "mustn't", "stop using", "instead of", "rather than",
   and so "do not", "should not" and "must not" through "not") applies from the
   cue to the end of its clause. Words before the cue are not negated, so "use
-  logging, not print" prefers logging and prohibits print. A bare "rather" or
-  "over" is not a cue ("prefer X over Y" prefers both, which the all-preferred
-  guard below turns into Not verifiable).
+  logging, not print" prefers logging and prohibits print. A bare "rather" is
+  not a cue.
+* ``over`` is a cue like "rather than" only when a positive verb cue
+  (``COMPARATIVE_VERBS``: "use", "prefer", "choose", "pick", "switch",
+  "always") comes before it in its clause (I-10 item 5d): "prefer pytest over
+  unittest" prefers pytest and prohibits unittest. With no such verb before it,
+  ``over`` is no cue, and an option named right after it makes the sentence
+  unreadable (below), as does one named right after ``than``, ``vs`` or
+  ``versus`` (``COMPARATIVES``): "httpx over requests", "httpx is better than
+  requests", "httpx vs requests". ``over`` before a word that is no option
+  ("over http") changes nothing. "vs." and "v." are read as "vs", never as a
+  word and a clause break.
 * A trailing cue applies from the start of its clause to the cue: "print is
   banned", "print is forbidden", "prohibited", "disallowed", "deprecated", "is
   not allowed" and "are banned" prohibit what is mentioned before them in the
@@ -80,7 +89,9 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
 * a clause names an option but its last prefix cue (one that is not part of a
   trailing cue) reaches none of its mentions (the unreached-cue guard, I-10
   item 5b): "print never in library code" or "print should not be called"
-  are not mapped, rather than preferring print.
+  are not mapped, rather than preferring print; or
+* a clause names an option right after ``than``, ``vs``, ``versus``, or an
+  ``over`` that no positive verb cue comes before (I-10 item 5d).
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -110,6 +121,8 @@ __all__ = [
     "BREAK_MARKS",
     "BREAK_WORDS",
     "CALL_SUFFIX",
+    "COMPARATIVES",
+    "COMPARATIVE_VERBS",
     "NEGATIONS",
     "TOKEN",
     "TRAILING_PAIRS",
@@ -159,9 +172,22 @@ MERGED: Final = {
     ("no", "matter"): "no matter",
     ("no", "doubt"): "no doubt",
     ("not", "only"): "not only",
+    ("vs", "."): "vs",
+    ("v", "."): "vs",
 }
-"""Word pairs that ``clauses`` reads as one word. The first two are cues; the other three are
-set phrases that are never cues (their first word would be one)."""
+"""Word pairs that ``clauses`` reads as one word. The first two are cues; the next three are
+set phrases that are never cues (their first word would be one); and "vs." and "v." are
+"vs", so their dot ends no clause (I-10 item 5d)."""
+
+OVER: Final = "over"
+"""A cue like "rather than" after a ``COMPARATIVE_VERBS`` word in its clause (I-10 item 5d)."""
+
+COMPARATIVE_VERBS: Final = frozenset({"use", "prefer", "choose", "pick", "switch", "always"})
+"""The positive verb cues that make a later ``over`` in the same clause a cue."""
+
+COMPARATIVES: Final = frozenset({"than", "vs", "versus"})
+"""Words after which a named option makes the sentence unreadable, as after an ``over`` that no
+``COMPARATIVE_VERBS`` word comes before ("rather than" is one word, a cue, and not ``than``)."""
 
 NEGATIONS: Final = frozenset(
     {
@@ -184,8 +210,8 @@ NEGATIONS: Final = frozenset(
 )
 """Cues that make what follows, to the end of the same clause, something the rule forbids.
 
-"do not", "should not" and "must not" are read through "not". A bare "rather" or "over" is not
-a cue."""
+"do not", "should not" and "must not" are read through "not". A bare "rather" is not a cue, and
+``over`` is one only after a ``COMPARATIVE_VERBS`` word (``first_cue``)."""
 
 TRAILING_WORDS: Final = frozenset({"forbidden", "prohibited", "disallowed", "deprecated"})
 """Cues that make what comes before them, from the start of the same clause, forbidden."""
@@ -288,11 +314,26 @@ def clauses(text: str) -> tuple[tuple[str, ...], ...]:
 
 
 def first_cue(clause: tuple[str, ...]) -> int | None:
-    """The index of the first negation cue in ``clause``, or None when it has none."""
+    """The index of the first negation cue in ``clause``, or None when it has none. ``over`` is a
+    cue when a ``COMPARATIVE_VERBS`` word comes before it in the clause (I-10 item 5d)."""
+    verb = False
     for index, word in enumerate(clause):
-        if word in NEGATIONS:
+        if word in NEGATIONS or (verb and word == OVER):
             return index
+        verb = verb or word in COMPARATIVE_VERBS
     return None
+
+
+def _comparative(clause: tuple[str, ...], mentions: list[Mention]) -> bool:
+    """Whether ``clause`` names an option right after ``than``, ``vs``, ``versus``, or an
+    ``over`` that no ``COMPARATIVE_VERBS`` word comes before (I-10 item 5d)."""
+    starts = {mention[0] for mention in mentions}
+    verb = False
+    for index, word in enumerate(clause):
+        if (word in COMPARATIVES or (word == OVER and not verb)) and index + 1 in starts:
+            return True
+        verb = verb or word in COMPARATIVE_VERBS
+    return False
 
 
 def _trailing_spans(clause: tuple[str, ...]) -> list[tuple[int, int]]:
@@ -397,7 +438,7 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
         mentions = list(find(clause))
         if end is not None and _unreadable(clause, commas, mentions, end):
             return None
-        if mentions and _unreached(clause, spans, mentions):
+        if mentions and (_unreached(clause, spans, mentions) or _comparative(clause, mentions)):
             return None
         for mention in mentions:
             index, option = mention[0], mention[1]
