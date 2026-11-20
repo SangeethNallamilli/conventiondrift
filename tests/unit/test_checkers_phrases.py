@@ -585,8 +585,8 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
         "a " + "is no longer allowed " * (n // 21)
     ),
     "many mentions then an unreached cue": lambda n: "a " * (n // 2) + "never",
-    # I-10 item 5d: every comparative word checked, none with an option after it.
-    "one mention then many comparatives": lambda n: "use a " + "x over x than x vs. " * (n // 20),
+    # I-10 item 5d (ruling 2): every word before the last mention read, none a comparative.
+    "many mentions then a comparative": lambda n: "use " + "a " * (n // 2) + "than x",
 }
 # Left out of the list above, each one the same path as one kept (the shapes of #58 and of the
 # first two rounds of #61; CI took over 10 minutes with them):
@@ -1504,15 +1504,65 @@ def test_item_5d_vs_and_v_with_a_dot_are_one_word_and_no_clause_break() -> None:
         ("use a thanks b", rule(preferred="ab", specificity=2)),
         ("use a vss b", rule(preferred="ab", specificity=2)),
         ("use a over-the-top b", rule(preferred="ab", specificity=2)),
-        # An option right before the comparative word is not "right after" it.
+        # An option only before the comparative word is not after it.
         ("b than", rule(preferred="b", specificity=1)),
         ("b over", rule(preferred="b", specificity=1)),
+        ("use b vs x y z", rule(preferred="b", specificity=1)),
+        # An option after it in another clause doesn't count.
+        ("a is better than x. use b", rule(preferred="ab", specificity=2)),
+        ("a over http; never b", rule(preferred="a", prohibited="b", specificity=2)),
     ],
 )
-def test_item_5d_no_option_right_after_a_comparative_changes_nothing(
+def test_item_5d_no_option_later_in_the_clause_changes_nothing(
     text: str, expected: RuleMatch
 ) -> None:
     assert classify(text, find, OPTIONS) == expected
+
+
+# Item 5 ruling 2: the None cases cover any option later in the same clause, not only the next word.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a is better than the b",
+        "a over the b",  # no positive verb before "over"
+        "a than x y z b",
+        "use a vs the b",
+        "use a versus some old b",
+        "use a, which is faster than the old b",
+        "use a v. x and b",
+        "a over x, b",  # the comma ends nothing here
+    ],
+)
+def test_item_5d_ruling_2_an_option_anywhere_later_in_the_clause_is_unreadable(text: str) -> None:
+    assert classify(text, find, OPTIONS) is None
+
+
+def test_item_5d_ruling_2_examples() -> None:
+    assert classify("httpx is better than the requests library.", find_http, HTTP) is None
+    assert classify("httpx over the requests library.", find_http, HTTP) is None
+    # Unchanged: "prefer X over Y", "over HTTP" and the Architect's "v. 0.27".
+    assert classify("prefer httpx over the requests library.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests"}), 2
+    )
+    assert classify("prefer a over the b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert classify("use httpx v. 0.27", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset(), 1
+    )
+    assert classify(
+        "our services talk to each other over http. use httpx, not requests, for those calls.",
+        find_http,
+        HTTP,
+    ) == RuleMatch(frozenset({"httpx"}), frozenset({"requests"}), 2)
+
+
+def test_item_5d_ruling_2_reads_only_the_words_before_the_last_mention() -> None:
+    def on_vs(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        # The comparative word is itself the (last) mention: it has no option after it.
+        return ((i, "a") for i, word in enumerate(clause) if word == "vs")
+
+    assert classify("use vs", on_vs, OPTIONS) == rule(preferred="a", specificity=1)
 
 
 def test_item_5d_rather_than_and_instead_of_keep_their_item_2_reading() -> None:
@@ -1530,7 +1580,7 @@ def test_item_5d_rather_than_and_instead_of_keep_their_item_2_reading() -> None:
 
 
 def test_item_5d_a_mention_after_over_is_found_by_its_index() -> None:
-    # A multi-word mention right after a comparative starts at the next word.
+    # A multi-word mention after a comparative is found by its index.
     assert (
         classify(
             "catching exception is better than bare except.", find_phrases, BARE_BROAD_SPECIFIC

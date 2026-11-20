@@ -24,12 +24,13 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
   (``COMPARATIVE_VERBS``: "use", "prefer", "choose", "pick", "switch",
   "always") comes before it in its clause (I-10 item 5d): "prefer pytest over
   unittest" prefers pytest and prohibits unittest. With no such verb before it,
-  ``over`` is no cue, and an option named right after it makes the sentence
-  unreadable (below), as does one named right after ``than``, ``vs`` or
-  ``versus`` (``COMPARATIVES``): "httpx over requests", "httpx is better than
-  requests", "httpx vs requests". ``over`` before a word that is no option
-  ("over http") changes nothing. "vs." and "v." are read as "vs", never as a
-  word and a clause break.
+  ``over`` is no cue, and an option named anywhere after it in the clause
+  makes the sentence unreadable (below), as does one named after ``than``,
+  ``vs`` or ``versus`` (``COMPARATIVES``): "httpx over requests", "httpx is
+  better than requests", "httpx is better than the requests library", "httpx
+  vs requests" (item 5 ruling 2: not only the next word). ``over`` with no
+  option after it in its clause ("over http") changes nothing. "vs." and "v."
+  are read as "vs", never as a word and a clause break.
 * A trailing cue applies from the start of its clause to the cue: "print is
   banned", "print is forbidden", "prohibited", "disallowed", "deprecated", "is
   not allowed" and "are banned" prohibit what is mentioned before them in the
@@ -91,8 +92,8 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
   trailing cue) reaches none of its mentions (the unreached-cue guard, I-10
   item 5b): "print never in library code" or "print should not be called"
   are not mapped, rather than preferring print; or
-* a clause names an option right after ``than``, ``vs``, ``versus``, or an
-  ``over`` that no positive verb cue comes before (I-10 item 5d).
+* a clause names an option anywhere after ``than``, ``vs``, ``versus``, or an
+  ``over`` that no positive verb cue comes before (I-10 item 5d and ruling 2).
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -332,12 +333,15 @@ def first_cue(clause: tuple[str, ...]) -> int | None:
 
 
 def _comparative(clause: tuple[str, ...], mentions: list[Mention]) -> bool:
-    """Whether ``clause`` names an option right after ``than``, ``vs``, ``versus``, or an
-    ``over`` that no ``COMPARATIVE_VERBS`` word comes before (I-10 item 5d)."""
-    starts = {mention[0] for mention in mentions}
+    """Whether ``clause`` names an option anywhere after ``than``, ``vs``, ``versus``, or an
+    ``over`` that no ``COMPARATIVE_VERBS`` word comes before (I-10 item 5d, ruling 2): that is,
+    whether one of those words comes before the last mention. Only the words before it are
+    read."""
+    last = max(mention[0] for mention in mentions)
     verb = False
-    for index, word in enumerate(clause):
-        if (word in COMPARATIVES or (word == OVER and not verb)) and index + 1 in starts:
+    for index in range(last):
+        word = clause[index]
+        if word in COMPARATIVES or (word == OVER and not verb):
             return True
         verb = verb or word in COMPARATIVE_VERBS
     return False
