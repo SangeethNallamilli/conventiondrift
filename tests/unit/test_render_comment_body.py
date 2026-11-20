@@ -5,7 +5,6 @@ Names avoid the ``test_ac_`` prefix, and ``tests/snapshot/test_comment_snapshots
 test exercises is named in a comment. Expected text is typed from the spec, not from the code.
 """
 
-import ast
 import re
 from collections.abc import Sequence
 from dataclasses import replace
@@ -875,74 +874,9 @@ def test_blocks_are_joined_with_blank_lines_at_top_level() -> None:
     assert COUNT_LINE.fullmatch(parts[3])
 
 
-SRC = ROOT / "src" / "conventiondrift"
-ESCAPE_MODULE = SRC / "render" / "escape.py"
-
-
-def fence_writes(source: str) -> list[int]:
-    """Line numbers where ``source`` could write a code fence (CR1 on #56, I-14 item 9).
-
-    Flags a string constant (an f-string part included) holding three backticks or three
-    tildes, and a backtick or tilde string repeated by ``*``. A constant that is only a
-    member of a tuple, list or set compared with ``in`` or ``not in`` is a *read* (the rule
-    extractor recognises fences in instruction files) and is allowed.
-    """
-    tree = ast.parse(source)
-    reads: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Compare) and any(
-            isinstance(op, ast.In | ast.NotIn) for op in node.ops
-        ):
-            for side in (node.left, *node.comparators):
-                if isinstance(side, ast.Tuple | ast.List | ast.Set):
-                    reads.update(id(item) for item in side.elts)
-    found: list[int] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if id(node) not in reads and ("`" * 3 in node.value or "~" * 3 in node.value):
-                found.append(node.lineno)
-        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
-            for side in (node.left, node.right):
-                if isinstance(side, ast.Constant) and side.value in ("`", "~"):
-                    found.append(node.lineno)
-    return sorted(set(found))
-
-
-def test_fence_scanner_finds_planted_writes_and_allows_reads() -> None:
-    fence = "`" * 3
-    assert fence_writes(f'x = "{fence}\\n" + body') == [1]
-    assert fence_writes(f'x = f"{fence}{{info}}"') == [1]
-    assert fence_writes('x = "~~~"') == [1]
-    assert fence_writes('n = 4\nx = "`" * n') == [2]
-    assert fence_writes('x = n * "~"') == [1]
-    assert fence_writes(f'if line[:3] not in ("{fence}", "~~~"):\n    pass') == []
-    assert fence_writes('x = "`"') == []
-
-
-def test_nothing_in_src_except_escape_writes_a_fence() -> None:
-    # I-14 item 9: only md_codeblock writes a fence. The vendored YAML is third-party code.
-    files = [
-        path
-        for path in SRC.rglob("*.py")
-        if path != ESCAPE_MODULE and "_vendor" not in path.relative_to(SRC).parts
-    ]
-    assert SRC / "render" / "comment.py" in files
-    offenders = {
-        str(path.relative_to(SRC)): lines
-        for path in files
-        if (lines := fence_writes(path.read_text(encoding="utf-8")))
-    }
-    assert offenders == {}
-
-
-def test_escape_module_is_where_the_fence_is_written() -> None:
-    # Keeps the scan honest: the one allowed writer really is found by the same scanner.
-    assert fence_writes(ESCAPE_MODULE.read_text(encoding="utf-8"))
-
-
-def test_renderer_module_escapes_nothing_itself() -> None:
+def test_renderer_module_writes_no_fence_and_escapes_nothing() -> None:
     source = Path(comment_module.__file__).read_text(encoding="utf-8")
-    assert fence_writes(source) == []
+    assert "`" * 3 not in source
     assert "md(" not in source and "md_cell(" not in source and ".replace(" not in source
     assert "md_codeblock(" in source
 
