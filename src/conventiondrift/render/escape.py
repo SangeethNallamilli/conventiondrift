@@ -10,6 +10,7 @@ repo, the event payload or another user goes through exactly one of these:
 * :func:`workflow_prop` - a property value of a workflow command (``file=``, ``title=``).
 * :func:`output_heredoc` - one ``GITHUB_OUTPUT`` entry with a random delimiter.
 * :func:`sarif_text` - a SARIF ``message.text`` (plain text, never Markdown).
+* :func:`md_codeblock` - text inside a fenced code block in the comment or job summary.
 
 Nothing in this package ever writes ``GITHUB_ENV`` or ``GITHUB_PATH``.
 """
@@ -19,12 +20,13 @@ from __future__ import annotations
 import re
 import secrets
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Final
 
 __all__ = [
     "md",
     "md_cell",
+    "md_codeblock",
     "output_heredoc",
     "sarif_text",
     "workflow_cmd",
@@ -95,6 +97,40 @@ def md_cell(text: str) -> str:
     the code span; that is accepted.
     """
     return md(text).replace("\\", "\\\\").replace("|", "\\|")
+
+
+_FENCE_MIN: Final = 3
+MAX_CODEBLOCK_LINE: Final = 1000
+"""The most characters one ``md_codeblock`` line keeps after mapping (SR, INTERFACES I-14)."""
+_INFO: Final = re.compile(r"[a-z0-9-]{0,32}")  # fullmatch; linear
+
+
+def _cap_line(mapped: str) -> str:
+    """Cut a mapped line to ``MAX_CODEBLOCK_LINE`` characters plus a visible marker."""
+    if len(mapped) <= MAX_CODEBLOCK_LINE:
+        return mapped
+    return f"{mapped[:MAX_CODEBLOCK_LINE]} [\u2026{len(mapped) - MAX_CODEBLOCK_LINE} more chars]"
+
+
+def md_codeblock(lines: Sequence[str], info: str = "") -> str:
+    """Return ``lines`` as one whole fenced code block (INTERFACES I-14, option A).
+
+    GFM renders nothing inside a fence (no mention, link, image, HTML, emphasis or ``#123``
+    reference), so the only risk is text that closes the fence. Each line gets the
+    invisible-character mapping and nothing else; LF, CR and every other line separator
+    become visible symbols, so one input line is always one output line. A mapped line longer
+    than ``MAX_CODEBLOCK_LINE`` is cut and ends with `` [\u2026N more chars]``. The fence is
+    backticks, ``max(3, longest backtick run in any cut line + 1)`` long, so no line can close
+    it whatever its indentation. ``info`` must match ``[a-z0-9-]{0,32}``, otherwise
+    ``ValueError``. Returns ``fence + info + LF + lines joined by LF + LF + fence``; the caller
+    adds no fence of its own.
+    """
+    if not _INFO.fullmatch(info):
+        raise ValueError("invalid code block info string")
+    kept = [_cap_line(_visible_text(line)) for line in lines]
+    longest = max((len(run) for line in kept for run in _BACKTICK_RUN.findall(line)), default=0)
+    fence = "`" * max(_FENCE_MIN, longest + 1)
+    return f"{fence}{info}\n" + "\n".join(kept) + f"\n{fence}"
 
 
 def _reject_residual_controls(text: str) -> str:

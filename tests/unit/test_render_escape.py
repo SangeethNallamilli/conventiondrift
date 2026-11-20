@@ -759,6 +759,7 @@ def test_public_surface_is_exactly_one_function_per_sink() -> None:
     assert sorted(esc.__all__) == [
         "md",
         "md_cell",
+        "md_codeblock",
         "output_heredoc",
         "sarif_text",
         "workflow_cmd",
