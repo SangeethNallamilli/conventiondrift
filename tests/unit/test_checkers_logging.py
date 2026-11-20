@@ -7,7 +7,9 @@ reach the checker the way they do in a run.
 
 import ast
 import textwrap
+from collections.abc import Iterator
 from functools import partial
+from typing import SupportsIndex, overload
 
 import pytest
 from checker_support import (
@@ -508,6 +510,45 @@ def test_many_guards_and_many_prints_are_linear_in_a_run() -> None:
         return guard_source(guards, 4 * guards)
 
     assert_linear(make, lambda text: sites_of("logging", {"src/a.py": text}), label="guards")
+
+
+class CountingSpans(tuple[tuple[int, int], ...]):
+    """``main_guard_spans`` that count every span read out of them, by iteration or by index."""
+
+    reads = 0
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        for span in super().__iter__():
+            self.reads += 1
+            yield span
+
+    @overload
+    def __getitem__(self, key: SupportsIndex) -> tuple[int, int]: ...
+    @overload
+    def __getitem__(self, key: slice) -> tuple[tuple[int, int], ...]: ...
+    def __getitem__(
+        self, key: SupportsIndex | slice
+    ) -> tuple[int, int] | tuple[tuple[int, int], ...]:
+        got = super().__getitem__(key)
+        self.reads += len(got) if isinstance(key, slice) else 1
+        return got
+
+
+def test_the_guard_spans_are_read_once_per_file_however_many_prints() -> None:
+    # CR1 on #61: the timed test above catches a per-print scan of the guards (seed b in the
+    # #61 description) by a margin of 3.4 s against 3 s. This counts the reads instead, so the
+    # same scan fails by a factor of thousands and the answer doesn't depend on the runner.
+    guards, prints = 1_000, 4_000
+    spans = CountingSpans((10 * i + 1, 10 * i + 2) for i in range(guards))
+    ctx = FileContext("src/a.py", is_test_file=False, is_script=False, main_guard_spans=spans)
+    calls = [
+        node for node in ast.walk(ast.parse("print(1)\n" * prints)) if isinstance(node, ast.Call)
+    ]
+    handler = LoggingSites()
+    sites = [site for node in calls for site in handler(node, ctx)]
+    # Lines 1, 2, 11, 12, ... are inside a guard: 2 of every 10 lines up to line 10,000.
+    assert len(sites) == prints - 2 * (prints // 10)
+    assert spans.reads == guards  # one pass, to build the index
 
 
 def test_prints_before_between_and_after_many_guards_are_all_found() -> None:
