@@ -1624,6 +1624,47 @@ def test_item_5d_ruling_8_first_cue_skips_over_to() -> None:
     assert first_cue(("switch", "over", "to", "a", "over", "b")) == 4
 
 
+# Item 5 ruling 9: in a clause with a positive verb cue, an option after "from" is unreadable.
+def test_item_5_ruling_9_the_architects_examples() -> None:
+    assert classify("switch to httpx from requests.", find_http, HTTP) is None
+    assert classify("switch over to httpx from requests.", find_http, HTTP) is None
+    assert classify("use httpx from now on.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset(), 1
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "use a from b",
+        "prefer a, from b",
+        "always use a from x c",
+        "from b we switch to a",  # the verb may come after "from"
+        # Read literally, any option after "from" counts, even one that is the target: accepted
+        # coverage loss (Not verifiable, never a wrong preference).
+        "from now on use a",
+        "use a from x and y and b",
+    ],
+)
+def test_item_5_ruling_9_an_option_after_from_in_a_verb_clause_is_unreadable(text: str) -> None:
+    assert classify(text, find, OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("use a from now on", rule(preferred="a", specificity=1)),  # no option after "from"
+        ("from b, switch to a", rule(preferred="ab", specificity=2)),  # the comma ends a clause
+        ("use a; b comes from x", rule(preferred="ab", specificity=2)),  # another clause
+        ("a from b", rule(preferred="ab", specificity=2)),  # no positive verb cue: not this guard
+        ("use a fromage b", rule(preferred="ab", specificity=2)),  # whole word only
+        ("use a. never b from x", rule(preferred="a", prohibited="b", specificity=2)),
+    ],
+)
+def test_item_5_ruling_9_what_still_maps(text: str, expected: RuleMatch) -> None:
+    assert classify(text, find, OPTIONS) == expected
+
+
 def test_item_5d_rather_than_and_instead_of_keep_their_item_2_reading() -> None:
     # 5d must not touch them: with or without a verb, what follows is prohibited.
     for text in ("use a rather than b", "a rather than b", "prefer a rather than b"):

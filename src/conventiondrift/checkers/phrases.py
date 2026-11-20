@@ -100,7 +100,9 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
   are not mapped, rather than preferring print; or
 * a clause names an option anywhere after ``than``, ``vs``, ``versus``, or an
   ``over`` that is neither the cue nor a particle (I-10 item 5d, rulings 2
-  and 8).
+  and 8); or
+* a clause with a positive verb cue names an option after a whole-word
+  ``from``: "switch to httpx from requests" (item 5 ruling 9).
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -193,6 +195,10 @@ set phrases that are never cues (their first word would be one); and "vs." and "
 "vs", so their dot ends no clause (I-10 item 5d)."""
 
 OVER: Final = "over"
+FROM: Final = "from"
+"""After it, in a clause with a positive verb cue, a named option makes the sentence unreadable
+("switch to httpx from requests"; item 5 ruling 9)."""
+
 TO: Final = ("to",)
 """The word after which ``over`` is a particle, never a cue ("switch over to"; ruling 8)."""
 """A cue like "rather than" after a ``COMPARATIVE_VERBS`` word in its clause (I-10 item 5d)."""
@@ -450,6 +456,15 @@ def _unreadable(
     )
 
 
+def _from(clause: tuple[str, ...], mentions: list[Mention]) -> bool:
+    """Whether ``clause`` holds a positive verb cue and names an option after its first ``from``
+    (I-10 item 5 ruling 9): "switch to httpx from requests" says what to move away from, which
+    this reader doesn't parse, so the sentence is unreadable rather than preferring both."""
+    return not VERB_CUES.isdisjoint(clause) and max(
+        mention[0] for mention in mentions
+    ) > clause.index(FROM)
+
+
 def is_negated(clause: tuple[str, ...], index: int) -> bool:
     """Whether a negation cue in ``clause`` reaches ``clause[index]``."""
     return _reached(first_cue(clause), last_trailing_cue(clause), index)
@@ -473,6 +488,7 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
         if mentions and (
             (not NEGATIONS.isdisjoint(clause) and _unreached(clause, spans, mentions))
             or (not _COMPARED.isdisjoint(clause) and _comparative(clause, mentions))
+            or (FROM in clause and _from(clause, mentions))
         ):
             return None
         for mention in mentions:
