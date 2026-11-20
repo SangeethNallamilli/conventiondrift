@@ -1541,12 +1541,13 @@ def test_item_5d_ruling_2_an_option_anywhere_later_in_the_clause_is_unreadable(t
 def test_item_5d_ruling_2_examples() -> None:
     assert classify("httpx is better than the requests library.", find_http, HTTP) is None
     assert classify("httpx over the requests library.", find_http, HTTP) is None
+    # Ruling 8 narrows this: after a verb, "over" is the cue only right before an option, so
+    # these two (a prohibited b / requests before ruling 8) are now unreadable.
+    assert classify("prefer httpx over the requests library.", find_http, HTTP) is None
+    assert classify("prefer a over the b", find, OPTIONS) is None
     # Unchanged: "prefer X over Y", "over HTTP" and the Architect's "v. 0.27".
-    assert classify("prefer httpx over the requests library.", find_http, HTTP) == RuleMatch(
+    assert classify("prefer httpx over requests.", find_http, HTTP) == RuleMatch(
         frozenset({"httpx"}), frozenset({"requests"}), 2
-    )
-    assert classify("prefer a over the b", find, OPTIONS) == rule(
-        preferred="a", prohibited="b", specificity=2
     )
     assert classify("use httpx v. 0.27", find_http, HTTP) == RuleMatch(
         frozenset({"httpx"}), frozenset(), 1
@@ -1564,6 +1565,63 @@ def test_item_5d_ruling_2_reads_only_the_words_before_the_last_mention() -> None
         return ((i, "a") for i, word in enumerate(clause) if word == "vs")
 
     assert classify("use vs", on_vs, OPTIONS) == rule(preferred="a", specificity=1)
+
+
+# Item 5 ruling 8: "over to" is a particle; after a verb, "over" is the cue only right before
+# an option.
+def test_item_5d_ruling_8_the_architects_examples() -> None:
+    assert classify("switch over to httpx.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset(), 1
+    )
+    assert classify("prefer pytest over unittest.", find_pytest, PYTEST) == RuleMatch(
+        frozenset({"pytest"}), frozenset({"unittest"}), 2
+    )
+    assert (
+        classify("use requests for calls made over http, and httpx elsewhere.", find_http, HTTP)
+        is None
+    )
+    assert classify("prefer pytest over the unittest module.", find_pytest, PYTEST) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # "over to" changes nothing, with or without a verb before it.
+        ("switch over to a", rule(preferred="a", specificity=1)),
+        ("move over to a", rule(preferred="a", specificity=1)),
+        ("switch over to a, not b", rule(preferred="a", prohibited="b", specificity=2)),
+        ("a over to b", rule(preferred="ab", specificity=2)),
+        # The very next word is the option: the cue (backticks are not words).
+        ("prefer a over `b`", rule(preferred="a", prohibited="b", specificity=2)),
+        ("prefer a over b and c", rule(preferred="a", prohibited="bc", specificity=3)),
+        # No option after "over" at all: nothing changes.
+        ("prefer a over http", rule(preferred="a", specificity=1)),
+        ("use a over time", rule(preferred="a", specificity=1)),
+    ],
+)
+def test_item_5d_ruling_8_what_still_maps(text: str, expected: RuleMatch) -> None:
+    assert classify(text, find, OPTIONS) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "prefer a over x b",  # another word right after "over", then an option
+        "use a over the b",
+        "use b for calls made over http and a elsewhere",
+        "prefer a over to x over the b",  # the particle doesn't excuse a later "over"
+        "a over x b",  # no verb: ruling 2 as before
+    ],
+)
+def test_item_5d_ruling_8_another_word_after_over_then_an_option_is_unreadable(text: str) -> None:
+    assert classify(text, find, OPTIONS) is None
+
+
+def test_item_5d_ruling_8_first_cue_skips_over_to() -> None:
+    assert first_cue(("switch", "over", "to", "a")) is None
+    assert first_cue(("switch", "over", "a")) == 1
+    assert first_cue(("switch", "over")) == 1  # nothing after it: no "to" either
+    assert first_cue(("switch", "over", "to", "a", "over", "b")) == 4
 
 
 def test_item_5d_rather_than_and_instead_of_keep_their_item_2_reading() -> None:

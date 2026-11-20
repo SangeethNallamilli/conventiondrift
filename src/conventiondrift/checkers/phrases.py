@@ -22,10 +22,13 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
   item 5 rulings). A bare "rather" is not a cue.
 * ``over`` is a cue like "rather than" only when a positive verb cue
   (``COMPARATIVE_VERBS``: "use", "prefer", "choose", "pick", "switch",
-  "always") comes before it in its clause (I-10 item 5d): "prefer pytest over
-  unittest" prefers pytest and prohibits unittest. With no such verb before it,
-  ``over`` is no cue, and an option named anywhere after it in the clause
-  makes the sentence unreadable (below), as does one named after ``than``,
+  "always") comes before it in its clause and the very next word is an option
+  (I-10 item 5d, ruling 8): "prefer pytest over unittest" prefers pytest and
+  prohibits unittest. ``over to`` is a particle and changes nothing: "switch
+  over to httpx" prefers httpx. Any other ``over`` is no cue, and an option
+  named anywhere after it in the clause makes the sentence unreadable (below):
+  "prefer pytest over the unittest module", "use requests for calls made over
+  http, and httpx elsewhere". So does one named after ``than``,
   ``vs`` or ``versus`` (``COMPARATIVES``): "httpx over requests", "httpx is
   better than requests", "httpx is better than the requests library", "httpx
   vs requests" (item 5 ruling 2: not only the next word). ``over`` with no
@@ -96,7 +99,8 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
   item 5b): "print never in library code" or "print should not be called"
   are not mapped, rather than preferring print; or
 * a clause names an option anywhere after ``than``, ``vs``, ``versus``, or an
-  ``over`` that no positive verb cue comes before (I-10 item 5d and ruling 2).
+  ``over`` that is neither the cue nor a particle (I-10 item 5d, rulings 2
+  and 8).
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -189,6 +193,8 @@ set phrases that are never cues (their first word would be one); and "vs." and "
 "vs", so their dot ends no clause (I-10 item 5d)."""
 
 OVER: Final = "over"
+TO: Final = ("to",)
+"""The word after which ``over`` is a particle, never a cue ("switch over to"; ruling 8)."""
 """A cue like "rather than" after a ``COMPARATIVE_VERBS`` word in its clause (I-10 item 5d)."""
 
 COMPARATIVE_VERBS: Final = frozenset({"use", "prefer", "choose", "pick", "switch", "always"})
@@ -322,27 +328,34 @@ def clauses(text: str) -> tuple[tuple[str, ...], ...]:
 
 def first_cue(clause: tuple[str, ...]) -> int | None:
     """The index of the first negation cue in ``clause``, or None when it has none. ``over`` is a
-    cue when a ``COMPARATIVE_VERBS`` word comes before it in the clause (I-10 item 5d)."""
+    cue when a ``COMPARATIVE_VERBS`` word comes before it in the clause (I-10 item 5d), unless
+    ``to`` follows it ("switch over to", a particle: item 5 ruling 8). (When the next word is no
+    option either, ``_comparative`` makes the sentence unreadable if an option comes later.)"""
     if NEGATIONS.isdisjoint(clause) and OVER not in clause:
         return None
     verb = False
     for index, word in enumerate(clause):
-        if word in NEGATIONS or (verb and word == OVER):
+        if word in NEGATIONS or (verb and word == OVER and clause[index + 1 : index + 2] != TO):
             return index
         verb = verb or word in COMPARATIVE_VERBS
     return None
 
 
 def _comparative(clause: tuple[str, ...], mentions: list[Mention]) -> bool:
-    """Whether ``clause`` names an option anywhere after ``than``, ``vs``, ``versus``, or an
-    ``over`` that no ``COMPARATIVE_VERBS`` word comes before (I-10 item 5d, ruling 2): that is,
-    whether one of those words comes before the last mention. Only the words before it are
-    read."""
-    last = max(mention[0] for mention in mentions)
+    """Whether ``clause`` names an option anywhere after ``than``, ``vs`` or ``versus``, or
+    after an ``over`` that is not the reverse-form cue (I-10 item 5d, rulings 2 and 8): that is,
+    whether one of those words comes before the last mention. An ``over`` is the cue when a
+    ``COMPARATIVE_VERBS`` word comes before it and the very next word is a mention; an ``over``
+    followed by ``to`` is a particle and never counts. Only the words before the last mention
+    are read."""
+    starts = {mention[0] for mention in mentions}
+    last = max(starts)
     verb = False
     for index in range(last):
         word = clause[index]
-        if word in COMPARATIVES or (word == OVER and not verb):
+        if word in COMPARATIVES:
+            return True
+        if word == OVER and clause[index + 1] != TO[0] and not (verb and index + 1 in starts):
             return True
         verb = verb or word in COMPARATIVE_VERBS
     return False
