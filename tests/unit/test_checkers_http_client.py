@@ -73,13 +73,18 @@ def test_every_word_names_one_option() -> None:
         ("always use aiohttp.", ("aiohttp",), ()),
         ("use urllib.request for http calls.", ("urllib",), ()),
         ("use urllib for http calls.", ("urllib",), ()),
-        ("prefer httpx over requests.", ("httpx",), ("requests",)),
+        # "over" is not a cue (I-10 4c), so this prefers both; "rather than" is one.
+        ("prefer httpx over requests.", ("httpx", "requests"), ()),
+        ("use httpx rather than requests.", ("httpx",), ("requests",)),
         ("never use requests.", (), ("requests",)),
         ("don't use urllib.request or requests.", (), ("urllib", "requests")),
         ("avoid aiohttp.", (), ("aiohttp",)),
         ("USE HTTPX FOR HTTP CALLS.", ("httpx",), ()),
         # AC-F2.6: the sentence reads as http-client with requests alone.
         ("never use print or requests.", (), ("requests",)),
+        # Trailing cues (I-10 4a): an unbroken list before the cue is prohibited.
+        ("requests and urllib are banned.", (), ("requests", "urllib")),
+        ("requests is forbidden, use httpx.", ("httpx",), ("requests",)),
     ],
 )
 def test_match_rule_reads_the_libraries_and_their_polarity(
@@ -96,6 +101,10 @@ def test_match_rule_reads_the_libraries_and_their_polarity(
         "use httpx2 for http calls.",  # DECISIONS: "Use httpx2" is Not verifiable
         "use urllib.parse for urls.",
         "use urllib3.",
+        # I-10 4a guards: comma with mentions on both sides, and a broken list.
+        "httpx, requests and urllib are banned.",
+        "httpx is fine and requests is forbidden.",
+        "use httpx, everything else is forbidden.",
         "use logging, not print.",
         "use pytest, not unittest.",
         "never use requests; always use requests.",  # one option, both polarities

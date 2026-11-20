@@ -6,7 +6,7 @@ A rule is about string formatting when its sentence names one of these:
 * ``format``: ``.format()`` and ``str.format`` (a leading dot or a call suffix is read as
   part of the name, so neither ends the clause).
 * ``percent``: ``%s``, ``%d`` and ``%r``, "% operator", "% formatting", "%-formatting",
-  "percent formatting" and "printf-style".
+  "percent formatting", "printf-style" and "printf style".
 
 The polarity of each mention comes from ``phrases.classify``. So "Use f-strings for string
 formatting." prefers f-strings, "Use f-strings, not .format()." also forbids ``format``, and
@@ -22,7 +22,7 @@ A sentence is read as limited when it has one of the words in ``SCOPE_WORDS``.
 from collections.abc import Iterator
 from typing import Final
 
-from conventiondrift.checkers.phrases import classify, clauses
+from conventiondrift.checkers.phrases import Mention, classify, clauses
 from conventiondrift.model import RuleMatch
 
 __all__ = ["OPTIONS", "SCOPE_WORDS", "match_rule"]
@@ -74,6 +74,8 @@ _PERCENT_FORMS: Final = (
 """Spellings of ``%`` formatting that are made one word before the sentence is read."""
 
 _PERCENT_WORD: Final = "cd_percent"
+_F_STRING_WORDS: Final = frozenset({"f-string", "f-strings", "fstring", "fstrings"})
+"""One-word spellings of f-string (the clause rules keep a hyphenated word whole, I-10 4b)."""
 _FORMAT_WORD: Final = "str.format"
 
 
@@ -85,17 +87,19 @@ def _prepare(text: str) -> str:
     return text
 
 
-def _find(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+def _find(clause: tuple[str, ...]) -> Iterator[Mention]:
     for index, word in enumerate(clause):
         after = clause[index + 1] if index + 1 < len(clause) else ""
-        if word in ("fstring", "fstrings") or (word == "f" and after in ("string", "strings")):
+        if word in _F_STRING_WORDS:
             yield index, "f-string"
+        elif word == "f" and after in ("string", "strings"):
+            yield index, "f-string", range(index, index + 2)
         elif word == _FORMAT_WORD:
             yield index, "format"
-        elif word == _PERCENT_WORD or (word == "percent" and after == "formatting"):
+        elif word in (_PERCENT_WORD, "printf-style"):
             yield index, "percent"
-        elif word == "printf" and after == "style":
-            yield index, "percent"
+        elif (word, after) in (("percent", "formatting"), ("printf", "style")):
+            yield index, "percent", range(index, index + 2)
 
 
 def match_rule(normalized_text: str) -> RuleMatch | None:

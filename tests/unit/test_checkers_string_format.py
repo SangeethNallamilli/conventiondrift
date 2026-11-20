@@ -86,7 +86,9 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("use f-strings, not .format().", ("f-string",), ("format",)),
         ("use f-strings, not str.format().", ("f-string",), ("format",)),
         ("use f-strings, not the % operator.", ("f-string",), ("percent",)),
-        ("prefer f-strings over .format() or %s formatting.", ("f-string",), ("format", "percent")),
+        # "over" is not a cue (I-10 4c), so this prefers both; "rather than" is one.
+        ("prefer f-strings over .format().", ("f-string", "format"), ()),
+        ("use f-strings rather than .format() or %s.", ("f-string",), ("format", "percent")),
         ("use str.format().", ("format",), ()),
         ("use .format() for translations.", ("format",), ()),
         ("don't use the % operator or .format().", (), ("percent", "format")),
@@ -95,6 +97,9 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("avoid %d and %r placeholders.", (), ("percent",)),
         ("avoid percent formatting.", (), ("percent",)),
         ("avoid printf-style formatting.", (), ("percent",)),
+        ("avoid printf style formatting.", (), ("percent",)),
+        # Two-word mentions are one list item for the trailing-cue contiguity guard (I-10 4a).
+        ("f strings and percent formatting are banned.", (), ("f-string", "percent")),
         ("never use f-strings.", (), ("f-string",)),
         ("USE F-STRINGS.", ("f-string",), ()),
     ],
@@ -119,6 +124,7 @@ def test_match_rule_reads_the_formats_and_their_polarity(
         "never use f-strings; always use f-strings.",  # one option, both polarities
         "never use f-strings, .format() or %s.",  # forbids every option
         "use f-strings, .format() and %s.",  # prefers every option
+        "prefer f-strings over .format() or %s formatting.",  # "over" is no cue: prefers all
     ],
 )
 def test_match_rule_does_not_map_what_names_no_format_or_cannot_be_read(sentence: str) -> None:
