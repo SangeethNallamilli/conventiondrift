@@ -1,0 +1,2 @@
+# Approved snapshots are compared byte for byte (AC-F6.7, SC-2.58): keep LF on every OS.
+tests/snapshot/** text eol=lf
