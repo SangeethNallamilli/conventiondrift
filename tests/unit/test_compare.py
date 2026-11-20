@@ -10,7 +10,7 @@ import inspect
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, get_args, get_type_hints
+from typing import get_args, get_type_hints
 
 import pytest
 from hypothesis import given
@@ -20,9 +20,10 @@ from conventiondrift import compare as compare_module
 from conventiondrift.compare import CASES, RENAME_STATUS, SUGGESTION_KINDS, compare, suggest
 from conventiondrift.components import ChangedFile
 from conventiondrift.model import (
+    MAX_CONFLICT_WITH,
     Alternative,
     CausingFile,
-    Conflict,
+    ConflictIndex,
     Counts,
     Rule,
     RuleMatch,
@@ -100,6 +101,21 @@ def rule(
         scope_dir="",
         ignored=False,
         disabled=False,
+    )
+
+
+def conflict_index(
+    pairs: Sequence[tuple[str, str]], incomplete: Sequence[str] = (), lone: Sequence[str] = ()
+) -> ConflictIndex:
+    """A C6 index of single-rule groups: ``pairs`` conflict, ``lone`` rules have none."""
+    names = sorted({n for pair in pairs for n in pair} | set(lone) | set(incomplete))
+    adjacent = [
+        sorted(names.index(b if a == n else a) for a, b in pairs if n in (a, b)) for n in names
+    ]
+    return ConflictIndex(
+        ids=tuple((n,) for n in names),
+        adjacent=tuple(tuple(g) for g in adjacent),
+        incomplete_ids=frozenset(incomplete),
     )
 
 
@@ -417,30 +433,25 @@ def test_e10_deleted_instruction_file() -> None:
     assert not [x for x in out if x.case in WARNING_CASES]
 
 
-def _all_changed_files_in_this_module() -> list[ChangedFile]:
-    """Every literal ``("D", ..., path)`` tuple written in this file, from its AST."""
-    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    found: list[ChangedFile] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Tuple)
-            and len(node.elts) == 3
-            and all(isinstance(e, ast.Constant) for e in node.elts)
-            and cast(ast.Constant, node.elts[0]).value == "D"
-        ):
-            status, old, new = ast.literal_eval(node)
-            found.append((status, old, new))
-    return found
-
-
-def test_e10_deleted_file_uses_only_the_canonical_i14_tuple() -> None:
+def test_e10_a_deletion_is_accepted_only_as_the_canonical_i14_tuple() -> None:
     # I-13 C10 ruling 8: "I-14's ("D", None, path) is canonical. compare.py accepts only
-    # that form, and T-008 must emit it." Every deletion in this file has that shape.
-    deletions = [c for c in _all_changed_files_in_this_module() if c[0] == "D"]
-    assert deletions
-    assert all(old is None for _status, old, _new in deletions)
+    # that form, and T-008 must emit it." The canonical tuple gives the AC-E.10 result.
     out = compare([(R1, side(S))], [], [("D", None, "AGENTS.md")])
     assert only(out).case == "fixed"
+    # A deletion that names an old path, in any shape, is refused: it is a T-008 bug.
+    for old in ("AGENTS.md", "OLD.md", ""):
+        with pytest.raises(ValueError, match=r"^a deletion must be \(\"D\", None, path\)$"):
+            compare([(R1, side(S))], [], [("D", old, "AGENTS.md")])
+
+
+def test_a_rename_or_copy_keeps_its_old_path_and_other_statuses_are_not_checked() -> None:
+    # The old path is non-None for R and C only (I-14); only a deletion with one is refused.
+    files: list[ChangedFile] = [
+        ("R", "OLD.md", "NEW.md"),
+        ("C", "A.md", "B.md"),
+        ("M", None, "x.py"),
+    ]
+    assert only(compare([(R1, side(S))], [], files)).case == "fixed"
 
 
 def test_e11_instruction_only_pr_lists_only_the_added_rule() -> None:
@@ -534,19 +545,80 @@ def test_conflict_with_comes_from_the_rule_id_side() -> None:
         [(gone, side(H))],
         [(R1, side(C)), (other, side(C)), (third, side(C))],
         [],
-        head_conflicts=[
-            Conflict(("AGENTS.md:9", "z.md:1"), "http-client"),
-            Conflict(("AGENTS.md:9", "CLAUDE.md:3"), "http-client"),
-        ],
-        base_conflicts=[Conflict(("AGENTS.md:4", "CLAUDE.md:3"), "http-client")],
+        head_conflicts=conflict_index([("AGENTS.md:9", "z.md:1"), ("AGENTS.md:9", "CLAUDE.md:3")]),
+        base_conflicts=conflict_index([("AGENTS.md:4", "CLAUDE.md:3")]),
     )
-    by_id = {x.rule_id: x.conflict_with for x in out}
+    by_id = {x.rule_id: (x.conflict_with, x.conflict_with_total) for x in out}
     assert by_id == {
-        "AGENTS.md:4": ("CLAUDE.md:3",),
-        "AGENTS.md:9": ("CLAUDE.md:3", "z.md:1"),
-        "CLAUDE.md:3": ("AGENTS.md:9",),
-        "z.md:1": ("AGENTS.md:9",),
+        "AGENTS.md:4": (("CLAUDE.md:3",), 1),
+        "AGENTS.md:9": (("CLAUDE.md:3", "z.md:1"), 2),
+        "CLAUDE.md:3": (("AGENTS.md:9",), 1),
+        "z.md:1": (("AGENTS.md:9",), 1),
     }
+
+
+def test_no_conflict_index_means_no_conflicts() -> None:
+    got = only(compare([(R1, side(H))], [(R1, side(C))], []))
+    assert (got.conflict_with, got.conflict_with_total, got.conflict_incomplete) == ((), 0, False)
+    removed = only(compare([(R1, side(H))], [], []))
+    assert (removed.conflict_with, removed.conflict_with_total) == ((), 0)
+    assert not removed.conflict_incomplete
+
+
+def test_conflict_with_is_the_first_twenty_and_the_total_is_exact() -> None:
+    partners = [f"B.md:{n:03}" for n in range(MAX_CONFLICT_WITH + 5)]
+    index = conflict_index([(R1.id, p) for p in partners])
+    got = only(compare(None, [(R1, side(C))], [], head_conflicts=index))
+    assert got.conflict_with == tuple(partners[:MAX_CONFLICT_WITH])
+    assert got.conflict_with_total == len(partners)
+    assert not got.conflict_incomplete
+
+
+def test_a_rule_that_is_a_conflict_on_one_side_only_takes_the_taken_sides_partners() -> None:
+    # The head rule's id picks the head index; the base index is read only for the flag.
+    base_index = conflict_index([(R1.id, "CLAUDE.md:3")])
+    got = only(compare([(R1, side(C))], [(R1, side(C))], [], base_conflicts=base_index))
+    assert (got.conflict_with, got.conflict_with_total) == ((), 0)
+    assert not got.conflict_incomplete
+
+
+@pytest.mark.parametrize("on", ["head", "base", "both"])
+def test_conflict_incomplete_is_the_or_of_both_sides(on: str) -> None:
+    flagged = conflict_index([], incomplete=[R1.id])
+    clean = conflict_index([(R1.id, "CLAUDE.md:3")])
+    head = flagged if on in ("head", "both") else clean
+    base = flagged if on in ("base", "both") else clean
+    got = only(
+        compare([(R1, side(C))], [(R1, side(C))], [], base_conflicts=base, head_conflicts=head)
+    )
+    assert got.conflict_incomplete
+    # The partners and the (lower-bound) total still come from the head side.
+    assert got.conflict_with == (() if on != "base" else ("CLAUDE.md:3",))
+    assert got.conflict_with_total == len(got.conflict_with)
+
+
+def test_an_incomplete_base_only_rule_is_flagged_from_the_base_index() -> None:
+    base = conflict_index([(R1.id, "CLAUDE.md:3")], incomplete=[R1.id])
+    got = only(compare([(R1, side(H))], [], [], base_conflicts=base))
+    assert got.conflict_incomplete
+    assert (got.conflict_with, got.conflict_with_total) == (("CLAUDE.md:3",), 1)
+
+
+def test_a_head_rule_with_a_different_base_id_is_flagged_by_the_base_ids_index() -> None:
+    # The same rule moved from line 1 to line 5: each side flags its own id.
+    moved = replace(R1, id="AGENTS.md:5", line=5)
+    base = conflict_index([], incomplete=[R1.id])
+    got = only(compare([(R1, side(H))], [(moved, side(H))], [], base_conflicts=base))
+    assert got.rule_id == "AGENTS.md:5"
+    assert got.conflict_incomplete
+    assert not only(
+        compare(
+            [(R1, side(H))],
+            [(moved, side(H))],
+            [],
+            base_conflicts=conflict_index([], lone=[moved.id]),
+        )
+    ).conflict_incomplete
 
 
 def test_stale_without_causing_files_is_case_2_not_case_1() -> None:
@@ -613,7 +685,7 @@ def test_line_col_ids_flow_into_conflict_with_and_results() -> None:
         [(gone, side(H))],
         [(a, side(C)), (b, side(C))],
         [],
-        head_conflicts=[Conflict(("AGENTS.md:9:1", "AGENTS.md:9:31"), "http-client")],
+        head_conflicts=conflict_index([("AGENTS.md:9:1", "AGENTS.md:9:31")]),
     )
     by_id = {x.rule_id: (x.case, x.conflict_with) for x in out}
     assert by_id == {
@@ -739,6 +811,16 @@ def test_suggestion_two_option_rule_with_a_third_top_option() -> None:
     s = suggest(r, head_with({"structlog": 9, "print": 3}, LOGGING_NOT_PRINT.preferred))
     assert s.kind == "replace"
     assert s.new_text == "Use structlog, not print."
+
+
+def test_suggestion_two_prohibited_options_swap_only_the_named_pair() -> None:
+    # One preferred and two prohibited options: when the candidate is one of the prohibited
+    # options, the sentence swaps that pair and leaves the other prohibited option alone.
+    match = RuleMatch(frozenset({"a"}), frozenset({"b", "c"}), 1)
+    r = rule("Use a, not b or c.", match=match)
+    s = suggest(r, head_with({"b": 5}, match.preferred))
+    assert s.kind == "replace"
+    assert s.new_text == "Use b, not a or c."
 
 
 def test_suggestion_single_option_rule_changes_only_preferred_tokens() -> None:
