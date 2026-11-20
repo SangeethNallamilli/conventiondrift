@@ -20,10 +20,10 @@ constants, never rule text; ``map_rule`` rejects anything else), and the scope
 test is a prefix test on two ``scope_dir`` paths that C4 has validated and that
 this module refuses above ``MAX_SCOPE_DIR_BYTES``. Rule text is never touched.
 At most ``MAX_CONFLICT_PAIRS`` evaluations run per side, so that is a real time
-bound. They run in a deterministic order: checkers sorted by id, groups sorted
-by their smallest rule id, pairs in that order; rule ids depend only on path,
-line and column, so the same tree always stops at the same pair, whatever order
-the files came in. When the budget runs out, every rule with a pair not yet
+bound. They run in a deterministic order, I-13 C6 item 8: groups sorted by
+their key ``(checker, sorted preferred, sorted prohibited, scope_dir)``, then
+pairs in that order, so the same rules always stop at the same pair, whatever
+order the files came in. When the budget runs out, every rule with a pair not yet
 evaluated is *incomplete* (``ConflictIndex.is_incomplete``): the partners found
 so far stay, ``total`` becomes a lower bound, and nothing is dropped silently.
 
@@ -53,6 +53,9 @@ __all__ = [
     "matches_conflict",
     "scopes_overlap",
 ]
+
+GroupKey = tuple[CheckerId, frozenset[str], frozenset[str], str]
+"""Rules with one key conflict identically: ``(checker, preferred, prohibited, scope_dir)``."""
 
 MAX_CONFLICTS: Final = 1_000
 """R2.6: conflicts listed per run; the rest are counted in ``Conflicts.unlisted``."""
@@ -92,6 +95,12 @@ def matches_conflict(a: RuleMatch, b: RuleMatch) -> bool:
     return bool(a.preferred) and bool(b.preferred) and not a.preferred & b.preferred
 
 
+def _key_order(key: GroupKey) -> tuple[str, tuple[str, ...], tuple[str, ...], str]:
+    """A group key as something sortable: the option sets become sorted tuples."""
+    checker, preferred, prohibited, scope = key
+    return (checker, tuple(sorted(preferred)), tuple(sorted(prohibited)), scope)
+
+
 def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS) -> Conflicts:
     """Every conflicting pair among ``rules``, the first ``MAX_CONFLICTS`` of them listed.
 
@@ -100,10 +109,9 @@ def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS
     """
     if len({rule.id for rule in rules}) != len(rules):
         raise ValueError("rule ids must be unique")
-    # One group per (checker, preferred, prohibited, scope). Specificity is not part of the
-    # key: it doesn't matter here.
-    members: dict[tuple[CheckerId, frozenset[str], frozenset[str], str], list[str]] = {}
-    matches: dict[tuple[CheckerId, frozenset[str], frozenset[str], str], RuleMatch] = {}
+    # One group per key. Specificity is not part of it: it doesn't matter here.
+    members: dict[GroupKey, list[str]] = {}
+    matches: dict[GroupKey, RuleMatch] = {}
     unchecked: set[str] = set()
     for rule in rules:
         if rule.checker is None or rule.match is None or rule.disabled:
@@ -114,10 +122,9 @@ def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS
         key = (rule.checker, rule.match.preferred, rule.match.prohibited, rule.scope_dir)
         members.setdefault(key, []).append(rule.id)
         matches[key] = rule.match
-    # Deterministic order: by checker, then by each group's smallest id.
-    ordered = sorted((key[0], sorted(group_ids), key) for key, group_ids in members.items())
-    ids = tuple(tuple(group_ids) for _, group_ids, _ in ordered)
-    keys = [key for _, _, key in ordered]
+    # Deterministic order: sorted group keys (I-13 C6 item 8).
+    keys = sorted(members, key=_key_order)
+    ids = tuple(tuple(sorted(members[key])) for key in keys)
     adjacent: list[list[int]] = [[] for _ in keys]
     by_checker: dict[CheckerId, list[int]] = {}
     for number, key in enumerate(keys):

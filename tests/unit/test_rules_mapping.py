@@ -33,7 +33,11 @@ from conventiondrift.model import (
     Thresholds,
 )
 from conventiondrift.rules import mapping
-from conventiondrift.rules.conflicts import MAX_CONFLICT_PAIRS, MAX_CONFLICTS
+from conventiondrift.rules.conflicts import (
+    MAX_CONFLICT_PAIRS,
+    MAX_CONFLICTS,
+    MAX_SCOPE_DIR_BYTES,
+)
 from conventiondrift.rules.extract import MARKER, MAX_RULES_PER_FILE, normalize
 from conventiondrift.rules.mapping import (
     UNMAPPED,
@@ -902,11 +906,14 @@ def test_the_conflict_cap_is_reported_by_the_extraction() -> None:
 def _budget_files(side: int = 4) -> list[InstructionFile]:
     """``side`` rules of one option in their own folders and ``side`` of another at the root.
 
+    Groups run in sorted key order, so the "httpx" folders come first and the shared
+    "requests" group is last: the last pair evaluated is (a3, that group), a conflict.
+
     The first are one group each, the second share one: ``side + 1`` groups, so
     ``(side + 1) * side / 2`` pair evaluations.
     """
-    files = [instruction_file(f"a{n}/AGENTS.md", "Use requests.\n", f"a{n}") for n in range(side)]
-    files += [instruction_file(f"b{n}/AGENTS.md", "Use httpx.\n", "") for n in range(side)]
+    files = [instruction_file(f"a{n}/AGENTS.md", "Use httpx.\n", f"a{n}") for n in range(side)]
+    files += [instruction_file(f"b{n}/AGENTS.md", "Use requests.\n", "") for n in range(side)]
     return files
 
 
@@ -956,6 +963,23 @@ def test_reordering_the_files_does_not_change_the_extraction_or_its_cutoff() -> 
             got = extract_rules(order, make_policy(), http_only(), max_conflict_pairs=budget)
             assert got == expected
             assert got.conflict_lookup == expected.conflict_lookup
+
+
+def test_a_rule_in_a_too_deep_folder_is_incomplete_and_noted() -> None:
+    # The C6 backstop for I-13 C6 item 6: C4 should have skipped this file, but if one arrives
+    # its rules are not compared (so not conflicting) and are counted, with the note.
+    deep = "d" * MAX_SCOPE_DIR_BYTES
+    files = [
+        instruction_file("AGENTS.md", "Use httpx.\n"),
+        instruction_file("ok/AGENTS.md", "Use requests.\n", deep),
+        instruction_file("big/AGENTS.md", "Use requests.\n", deep + "d"),
+    ]
+    got = extract_rules(files, make_policy(), http_only())
+    lookup = got.conflict_lookup
+    assert [r.id for r in got.rules if lookup.is_incomplete(r.id)] == ["big/AGENTS.md:1"]
+    assert lookup.total("big/AGENTS.md:1") == 0
+    assert [c.rules for c in got.conflicts] == [("AGENTS.md:1", "ok/AGENTS.md:1")]
+    assert got.notes == ("conflict check stopped at the limit; 1 rules not fully checked",)
 
 
 def test_the_extractor_uses_the_default_budget() -> None:

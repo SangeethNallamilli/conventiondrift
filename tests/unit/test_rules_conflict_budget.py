@@ -10,6 +10,8 @@ from collections.abc import Sequence
 from itertools import combinations
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from conventiondrift.model import MAX_CONFLICT_WITH, CheckerId, ConflictIndex, Rule, RuleMatch
 from conventiondrift.rules.conflicts import (
@@ -17,6 +19,8 @@ from conventiondrift.rules.conflicts import (
     MAX_SCOPE_DIR_BYTES,
     find_conflicts,
     incomplete_note,
+    matches_conflict,
+    scopes_overlap,
 )
 
 HTTP: CheckerId = "http-client"
@@ -270,3 +274,151 @@ def test_after_the_budget_runs_out_every_later_checker_with_pairs_is_incomplete(
     assert [r.id for r in [*first, *later] if lookup.is_incomplete(r.id)] == _ids(
         [*first[1:], *later]
     )
+
+
+# --- group order and group-pair boundaries (I-13 C6 item 8) -------------------------------
+
+
+def test_groups_run_in_sorted_key_order_not_in_id_order() -> None:
+    # Ids f000 < f001 < f002, but the keys sort a (f001), m (f002), z (f000).
+    rules = [_rule(0, option="z"), _rule(1, option="a"), _rule(2, option="m")]
+    # Pairs in key order: (a, m), (a, z), (m, z). Two run; (m, z) is left.
+    lookup = find_conflicts(rules, max_pairs=2).lookup
+    assert [r.id for r in rules if lookup.is_incomplete(r.id)] == ["f000.md:1", "f002.md:1"]
+
+
+def test_groups_with_one_match_run_in_scope_order() -> None:
+    near = _rule(0, scope="b", option="x")
+    far = _rule(1, scope="a", option="x")
+    other = _rule(2, scope="a", option="y")
+    # Keys: (x, scope a) = far, (x, scope b) = near, (y, scope a) = other, in that order:
+    # the pairs are (far, near), (far, other), (near, other).
+    lookup = find_conflicts([near, far, other], max_pairs=2).lookup
+    assert [r.id for r in (near, far, other) if lookup.is_incomplete(r.id)] == [near.id, other.id]
+
+
+def test_prohibited_options_are_part_of_the_group_key() -> None:
+    plain = _rule(0, option="x")
+    banned = dataclasses.replace(
+        _rule(1, option="x"), match=RuleMatch(frozenset({"x"}), frozenset({"y"}), 1)
+    )
+    # Same checker, preferred and scope, but not the same group: two groups, one pair.
+    assert find_conflicts([plain, banned], max_pairs=1).lookup.incomplete == 0
+    assert find_conflicts([plain, banned], max_pairs=0).lookup.incomplete == 2
+
+
+def _sized_groups() -> tuple[list[Rule], list[list[Rule]]]:
+    sizes = (3, 2, MAX_CONFLICT_WITH + 5, 1)
+    groups: list[list[Rule]] = []
+    number = 0
+    for size, option in zip(sizes, "abcd", strict=True):
+        groups.append([_rule(number + n, option=option) for n in range(size)])
+        number += size
+    return [r for group in groups for r in group], groups
+
+
+def test_the_budget_counts_group_pairs_exactly_at_the_limit() -> None:
+    rules, groups = _sized_groups()
+    group_pairs = _pairs(len(groups))
+    assert group_pairs < len(rules)  # rule pairs would be far more
+    lookup = find_conflicts(rules, max_pairs=group_pairs).lookup
+    assert lookup.incomplete == 0
+    for group in groups:
+        for rule in group:
+            assert lookup.total(rule.id) == len(rules) - len(group)  # exact
+            assert lookup.total(rule.id) >= len(lookup.partners(rule.id))
+            assert len(lookup.partners(rule.id)) <= MAX_CONFLICT_WITH
+            assert list(lookup.partners(rule.id)) == sorted(lookup.partners(rule.id))
+
+
+def test_the_budget_counts_group_pairs_one_more_than_the_limit() -> None:
+    rules, groups = _sized_groups()
+    lookup = find_conflicts(rules, max_pairs=_pairs(len(groups)) - 1).lookup
+    # The last group pair, (c, d), was not evaluated: every member of both is incomplete.
+    left_out = {r.id for r in groups[2] + groups[3]}
+    assert {r.id for r in rules if lookup.is_incomplete(r.id)} == left_out
+    assert lookup.incomplete == len(left_out) == MAX_CONFLICT_WITH + 6
+    for group in groups:
+        for rule in group:
+            partners = lookup.partners(rule.id)
+            assert lookup.total(rule.id) >= len(partners)
+            assert len(partners) <= MAX_CONFLICT_WITH
+            assert list(partners) == sorted(partners)
+    exact = [rule.id for rule in groups[0] + groups[1]]
+    assert [lookup.total(i) for i in exact] == [len(rules) - 3] * 3 + [len(rules) - 2] * 2
+    # A "c" member lacks the "d" rule (a lower bound); the "d" rule lacks the 25 "c" rules.
+    assert lookup.total(groups[2][0].id) == len(rules) - len(groups[2]) - 1
+    assert lookup.total(groups[3][0].id) == len(groups[0]) + len(groups[1])
+
+
+# --- the grouped index against a literal rule-pair reference -------------------------------
+
+_BRUTE_CHECKERS: tuple[CheckerId, ...] = (HTTP, LOGGING)
+_BRUTE_SCOPES = ("", "a", "a/b", "c", "d" * (MAX_SCOPE_DIR_BYTES + 1))
+_OPTIONS = ("x", "y", "z")
+
+
+@st.composite
+def _brute_rules(draw: st.DrawFn) -> list[Rule]:
+    count = draw(st.integers(0, 14))
+    rules: list[Rule] = []
+    for n in range(count):
+        preferred = frozenset(draw(st.sets(st.sampled_from(_OPTIONS))))
+        prohibited = frozenset(draw(st.sets(st.sampled_from(_OPTIONS)))) - preferred
+        match = RuleMatch(preferred, prohibited, 1) if preferred | prohibited else None
+        rules.append(
+            dataclasses.replace(
+                _rule(n),
+                checker=draw(st.sampled_from([*_BRUTE_CHECKERS, None])),
+                match=match,
+                scope_dir=draw(st.sampled_from(_BRUTE_SCOPES)),
+                disabled=draw(st.booleans()) and draw(st.booleans()),
+            )
+        )
+    return rules
+
+
+def _evaluated(rule: Rule) -> bool:
+    return (
+        rule.checker is not None
+        and rule.match is not None
+        and not rule.disabled
+        and len(rule.scope_dir.encode()) <= MAX_SCOPE_DIR_BYTES
+    )
+
+
+def _reference_partners(rules: Sequence[Rule], rule: Rule) -> list[str]:
+    """Every other rule it conflicts with, by testing each pair of rules, no grouping."""
+    if not _evaluated(rule):
+        return []
+    assert rule.match is not None
+    found = []
+    for other in rules:
+        if other.id == rule.id or not _evaluated(other) or other.checker != rule.checker:
+            continue
+        assert other.match is not None
+        if scopes_overlap(rule.scope_dir, other.scope_dir) and matches_conflict(
+            rule.match, other.match
+        ):
+            found.append(other.id)
+    return sorted(found)
+
+
+@given(_brute_rules())
+def test_the_grouped_index_equals_a_rule_pair_reference(rules: list[Rule]) -> None:
+    lookup = find_conflicts(rules).lookup  # the default budget is far above these inputs
+    for rule in rules:
+        expected = _reference_partners(rules, rule)
+        assert lookup.partners(rule.id) == tuple(expected[:MAX_CONFLICT_WITH])
+        assert lookup.total(rule.id) == len(expected)
+        # Only a rule with a checker, a match and an enabled checker whose scope is too long
+        # was left out of the comparison.
+        too_long = (
+            rule.checker is not None
+            and rule.match is not None
+            and not rule.disabled
+            and not _evaluated(rule)
+        )
+        assert lookup.is_incomplete(rule.id) == too_long
+    pairs = {(a.id, b) for a in rules for b in _reference_partners(rules, a) if a.id < b}
+    assert len(find_conflicts(rules).found) + find_conflicts(rules).unlisted == len(pairs)
