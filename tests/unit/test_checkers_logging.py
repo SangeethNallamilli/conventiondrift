@@ -581,14 +581,14 @@ def test_i10_leaves_these_commas_unbroken_so_the_rule_is_not_verifiable(sentence
 
 
 @pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
-def test_ac_t016a_1_a_negated_print_never_maps_as_preferred(sentence: str) -> None:
+def test_t016a_1_a_negated_print_never_maps_as_preferred(sentence: str) -> None:
     found = match_rule(sentence.lower())
     assert found is None or "print" not in found.preferred
     assert found == match((), ("print",), 1)  # the mapping each of them gets now
 
 
 @pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
-def test_ac_t016a_1_holds_at_the_original_and_normalized_case_and_with_a_logging_clause(
+def test_t016a_1_holds_at_the_original_and_normalized_case_and_with_a_logging_clause(
     sentence: str,
 ) -> None:
     assert match_rule(sentence.lower()) == match_rule(sentence.lower().rstrip("."))
@@ -596,7 +596,7 @@ def test_ac_t016a_1_holds_at_the_original_and_normalized_case_and_with_a_logging
     assert with_logging == match(("logging",), ("print",), 2)
 
 
-def test_ac_t016a_1_in_an_agents_md_no_line_maps_print_as_preferred() -> None:
+def test_t016a_1_in_an_agents_md_no_line_maps_print_as_preferred() -> None:
 
     text = "\n".join(CON_67_PHRASINGS) + "\n"
     rules = extracted(text)
@@ -607,7 +607,7 @@ def test_ac_t016a_1_in_an_agents_md_no_line_maps_print_as_preferred() -> None:
         assert rule.match == match((), ("print",), 1)
 
 
-def test_ac_t016a_1_the_registry_maps_each_phrasing_to_logging_with_print_prohibited() -> None:
+def test_t016a_1_the_registry_maps_each_phrasing_to_logging_with_print_prohibited() -> None:
     for sentence in CON_67_PHRASINGS:
         mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
         assert mapped.checker == "logging", sentence

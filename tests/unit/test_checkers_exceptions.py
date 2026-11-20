@@ -292,20 +292,20 @@ CON_67_PHRASINGS = [
 
 
 @pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
-def test_ac_t016a_2_a_negated_bare_except_never_maps_as_preferred(sentence: str) -> None:
+def test_t016a_2_a_negated_bare_except_never_maps_as_preferred(sentence: str) -> None:
     found = match_rule(sentence.lower())
     assert found is None or "bare-except" not in found.preferred
     assert found == match(("bare-except",))
 
 
 @pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
-def test_ac_t016a_2_the_registry_maps_each_phrasing_to_exceptions(sentence: str) -> None:
+def test_t016a_2_the_registry_maps_each_phrasing_to_exceptions(sentence: str) -> None:
     mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
     assert mapped.checker == "exceptions"
     assert mapped.match == match(("bare-except",))
 
 
-def test_ac_t016a_2_in_an_agents_md_no_line_maps_bare_except_as_preferred() -> None:
+def test_t016a_2_in_an_agents_md_no_line_maps_bare_except_as_preferred() -> None:
 
     text = "\n".join(CON_67_PHRASINGS) + "\n"
     rules = extracted(text)
