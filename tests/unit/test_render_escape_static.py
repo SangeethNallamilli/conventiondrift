@@ -183,3 +183,106 @@ def test_scanner_allows_clean_code(src: str) -> None:
 def test_escape_module_may_escape_but_never_names_env_sinks() -> None:
     assert escaping_findings("s = t.replace('%', '%25')\n", is_escape_module=True) == []
     assert escaping_findings("s = 'GITHUB_ENV'\n", is_escape_module=True)
+
+
+# ---- no src/ module writes a fence other than md_codeblock (INTERFACES I-14) ------
+
+# INTERFACES.md, render/escape.py, item 4: "A static test checks that nothing else
+# in src/ writes a fence." Item 9: "nothing in src/ writes a fence other than
+# md_codeblock". rules/extract.py is the sanctioned *reader* of fences in
+# instruction files (it compares a line prefix to ``` / ~~~); it does not emit one.
+_FENCE_MARK = "```"
+_FENCE_READER = SRC / "rules" / "extract.py"
+
+
+def fence_write_findings(source: str) -> list[str]:
+    """Findings for code that would emit a backtick fence (```), not mere prose."""
+    tree = ast.parse(source)
+    docs = _docstring_nodes(tree)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docs:
+                continue
+            if _FENCE_MARK in node.value:
+                found.append(f"{line}: backtick-fence literal {node.value!r}")
+        elif isinstance(node, ast.JoinedStr):
+            if any(
+                isinstance(part, ast.Constant)
+                and isinstance(part.value, str)
+                and _FENCE_MARK in part.value
+                for part in node.values
+            ):
+                found.append(f"{line}: backtick-fence literal in f-string")
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            for literal, other in ((node.left, node.right), (node.right, node.left)):
+                if not (
+                    isinstance(literal, ast.Constant)
+                    and isinstance(literal.value, str)
+                    and literal.value
+                    and set(literal.value) <= {"`"}
+                ):
+                    continue
+                # A multiplied backtick run can emit a fence when the count is >= 3.
+                if isinstance(other, ast.Constant) and isinstance(other.value, int):
+                    if other.value * len(literal.value) >= 3:
+                        found.append(f"{line}: backtick run multiplied to a fence")
+                else:
+                    # Non-constant multiplier (the md_codeblock pattern: '`' * n).
+                    found.append(f"{line}: backtick run multiplied by a computed length")
+                break
+    return found
+
+
+def test_nothing_in_src_writes_a_fence_except_md_codeblock() -> None:
+    """Nothing in src/ writes a fence other than md_codeblock.
+
+    Quoted from INTERFACES.md (render/escape.py):
+    - item 4: "A static test checks that nothing else in ``src/`` writes a fence."
+    - item 9: "Static tests: nothing in ``src/`` writes a fence other than
+      ``md_codeblock``"
+
+    ``render/escape.py`` is the only writer (``md_codeblock``). ``rules/extract.py``
+    parses fences in instruction files and is a sanctioned reader, not a writer.
+    Docstrings are ignored; they are prose, not emitted output.
+    """
+    assert ESCAPE.is_file() and _FENCE_READER.is_file()
+    allowed = {ESCAPE, _FENCE_READER}
+    problems = {
+        str(p.relative_to(ROOT)): f
+        for p in _src_modules()
+        if p not in allowed and (f := fence_write_findings(p.read_text("utf-8")))
+    }
+    assert problems == {}
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "block = '```\\n' + body + '\\n```\\n'\n",
+        "fence = '```'\n",
+        "open_fence = '````python'\n",
+        "line = f'```{info}'\n",
+        "fence = '`' * 3\n",
+        "fence = '`' * n\n",
+        "fence = 3 * '`'\n",
+    ],
+)
+def test_fence_writer_scanner_flags_planted_violation(src: str) -> None:
+    assert fence_write_findings(src)
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        '"""A Markdown fence looks like ``` and is built by md_codeblock."""\n',
+        "def f():\n    '''Mentions ``` in prose.'''\n",
+        "tick = '`'\n",
+        "ticks = '`' * 1\n",
+        "ticks = '`' * 2\n",
+        "if stripped[:3] not in ('~~~',):\n    return\n",
+    ],
+)
+def test_fence_writer_scanner_allows_non_writers(src: str) -> None:
+    assert fence_write_findings(src) == []

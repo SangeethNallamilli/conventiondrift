@@ -497,6 +497,32 @@ def test_ignored_disabled_and_conflicting_rules_have_no_entry() -> None:
     assert "AGENTS.md line 5" in body
 
 
+def test_incomplete_rule_with_known_partners_is_conflicting_and_has_no_entry() -> None:
+    # I-13 C6 item 6, "one status rule": conflicting iff conflict_with_total > 0, incomplete or not.
+    finding = _finding(conflict_with=("CLAUDE.md:3",), conflict_total=1, conflict_incomplete=True)
+    assert render_comment(_result([finding], incomplete=1), previous_comment=False) is None
+
+
+def test_incomplete_rule_with_no_known_partner_is_not_conflicting_and_has_its_entry() -> None:
+    # Same ruling: an incomplete rule with total == 0 may warn on its own verdict, and the
+    # run-level note still flags it.
+    finding = _finding(conflict_incomplete=True)
+    body = _body(_result([finding], incomplete=1))
+    assert 'AGENTS.md line 9: "Use requests for HTTP calls"' in body
+    assert "this PR makes 1 agent rule stale" in body
+    assert "conflict check stopped at the limit; 1 rule not fully checked" in body
+
+
+def test_an_incomplete_conflicting_rule_does_not_hide_another_incomplete_rule() -> None:
+    hidden = _finding(
+        _rule(line=1), conflict_with=("CLAUDE.md:3",), conflict_total=4, conflict_incomplete=True
+    )
+    shown = _finding(_rule(line=2), conflict_incomplete=True)
+    body = _body(_result([hidden, shown], incomplete=2))
+    assert "AGENTS.md line 2" in body and "AGENTS.md line 1:" not in body
+    assert "this PR makes 1 agent rule stale" in body
+
+
 def test_a_rule_without_a_checker_match_still_renders() -> None:
     # Cannot happen for a Stale rule; the renderer must not raise on it.
     rule = replace(_rule(), match=None)
