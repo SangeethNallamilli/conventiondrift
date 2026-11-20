@@ -196,6 +196,7 @@ def test_digits_and_underscores_are_word_characters() -> None:
 PREFIX_CUES = [
     "no",
     "never",
+    "neither",
     "not",
     "don't",
     "don\u2019t",
@@ -237,6 +238,7 @@ def test_the_tables_are_what_the_docs_say() -> None:
     assert NEGATIONS == {
         "no",
         "never",
+        "neither",
         "not",
         "dont",
         "don't",
@@ -1357,17 +1359,29 @@ def test_item_5c_four_options() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "CR1 on #61: 'neither' is not an I-10 cue and 'is allowed' is not a trailing cue, so no "
-        "item 5 rule reaches this sentence and it reads both options as preferred. Open "
-        "question for the Architect; strict, so it fails loudly once the reading is fixed."
-    ),
-)
-def test_item_5_cr1_neither_nor_on_four_options_never_prefers_both() -> None:
-    result = classify("neither requests nor urllib is allowed.", find_http, HTTP)
-    assert result is None or not result.preferred & {"requests", "urllib"}
+def test_item_5_cr1_neither_nor_on_four_options_prohibits_both() -> None:
+    # Item 5 ruling 1: "neither" is a prefix cue, so "nor" (which ends no clause) carries it on.
+    assert classify("neither requests nor urllib is allowed.", find_http, HTTP) == RuleMatch(
+        frozenset(), frozenset({"requests", "urllib"}), 2
+    )
+    assert classify("use httpx; neither requests nor urllib.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests", "urllib"}), 3
+    )
+    # On a two-option checker that is every option: the prohibited-all guard (5c).
+    assert classify("neither a nor b is allowed.", find, frozenset("ab")) is None
+
+
+def test_item_5_neither_stops_at_a_break_and_reaches_only_what_follows_it() -> None:
+    assert classify("neither a nor b; use c", find, OPTIONS) == rule(
+        preferred="c", prohibited="ab", specificity=3
+    )
+    assert classify("use c, neither a nor b", find, OPTIONS) == rule(
+        preferred="c", prohibited="ab", specificity=3
+    )
+    # A neither that reaches no option is the unreached-cue guard (5b), never a preference.
+    assert classify("use a, neither in tests nor in scripts", find, OPTIONS) is None
+    # Whole word only.
+    assert classify("use a neithers b", find, OPTIONS) == rule(preferred="ab", specificity=2)
 
 
 # --- I-10 "Negation" item 5 (d): comparative forms ------------------------------------------------

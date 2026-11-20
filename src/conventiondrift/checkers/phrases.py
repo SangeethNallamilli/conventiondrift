@@ -13,12 +13,13 @@ spaces; DESIGN §7 step 2). A checker reads it in three steps:
 
 Clause rules (INTERFACES I-10, "Negation in phrases.py"):
 
-* A negation cue (``NEGATIONS``: "no", "never", "not", "don't", "avoid",
+* A negation cue (``NEGATIONS``: "no", "never", "neither", "not", "don't", "avoid",
   "without", "shouldn't", "mustn't", "stop using", "instead of", "rather than",
   and so "do not", "should not" and "must not" through "not") applies from the
   cue to the end of its clause. Words before the cue are not negated, so "use
-  logging, not print" prefers logging and prohibits print. A bare "rather" is
-  not a cue.
+  logging, not print" prefers logging and prohibits print, and "neither
+  requests nor urllib is allowed" prohibits both (``neither`` added by the
+  item 5 rulings). A bare "rather" is not a cue.
 * ``over`` is a cue like "rather than" only when a positive verb cue
   (``COMPARATIVE_VERBS``: "use", "prefer", "choose", "pick", "switch",
   "always") comes before it in its clause (I-10 item 5d): "prefer pytest over
@@ -196,6 +197,7 @@ NEGATIONS: Final = frozenset(
     {
         "no",
         "never",
+        "neither",
         "not",
         "dont",
         "don't",
