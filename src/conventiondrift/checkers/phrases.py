@@ -7,8 +7,9 @@ spaces; DESIGN §7 step 2). A checker reads it in three steps:
 2. The checker's own ``find`` says which of its options a clause mentions, and
    at which word.
 3. ``classify`` sorts each mention by polarity: a mention that a negation cue
-   reaches (``NEGATIONS`` after it, or ``TRAILING_WORDS`` / ``TRAILING_PAIRS``
-   before it, in the same clause) is prohibited, any other mention is preferred.
+   reaches (``NEGATIONS`` after it, or ``TRAILING_WORDS`` / ``TRAILING_PAIRS`` /
+   ``TRAILING_PHRASES`` before it, in the same clause) is prohibited, any other
+   mention is preferred.
 
 Clause rules (INTERFACES I-10, "Negation in phrases.py"):
 
@@ -54,20 +55,32 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
 * "X instead of Y" and "X rather than Y" prohibit Y. ``instead of`` is read as
   one cue that starts a new clause; a bare ``instead`` (as in "don't print,
   instead use logging") only ends the clause.
-* Only the cues above are read. Any other phrasing ("print has been banned")
-  is not a cue, so what it mentions reads as preferred.
+* Longer trailing cues (I-10 item 5a, ``TRAILING_PHRASES``) are read as whole
+  phrases: "is", "are", "was", "were", "has been" or "have been" before
+  "banned", "forbidden", "prohibited", "disallowed" or "deprecated"; "is" or
+  "are" before "not allowed", "not permitted", "no longer allowed" or "no
+  longer permitted"; and "should not", "shouldn't", "must not", "mustn't",
+  "cannot", "can't" or "may not" before "be used". So "print has been banned"
+  and "print should not be used" prohibit print. A prefix cue word inside one
+  of these phrases (the "not" of "is not allowed") is part of the trailing cue.
+* Only the cues above are read. Any other phrasing ("print not permitted") is
+  not a cue; the unreached-cue guard below keeps it from reading as preferred.
 
 A sentence that doesn't give a usable ``RuleMatch`` is not mapped, which makes
 the rule Not verifiable, never a wrong verdict. That is the case when:
 
 * nothing is mentioned;
 * an option is named in both a negated and a non-negated clause;
-* every option is prohibited (the rule would allow nothing); or
+* every option is prohibited (the rule would allow nothing, I-10 item 5c); or
 * every option is preferred (every site would follow, so the rule would always
   hold; this is also what a cue that isn't read looks like); or
 * a clause with a trailing cue also holds a positive verb cue, an option
   mentioned after the cue, a comma with option mentions on both sides, or
-  a word other than ``and``, ``or`` and ``nor`` between two mentions.
+  a word other than ``and``, ``or`` and ``nor`` between two mentions; or
+* a clause names an option but its last prefix cue (one that is not part of a
+  trailing cue) reaches none of its mentions (the unreached-cue guard, I-10
+  item 5b): "print never in library code" or "print should not be called"
+  are not mapped, rather than preferring print.
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -75,7 +88,8 @@ that each find one option in a sentence tie, and a tie is Not verifiable
 (AC-F2.6).
 
 Everything here is linear in the length of the sentence: ``clauses`` reads each
-token once, ``first_cue`` and ``last_trailing_cue`` run once per clause, and a
+token once, the cues are found once per clause (a trailing phrase is at most
+``MAX_TRAILING`` words, so each word is compared with a fixed number of them), and a
 mention is negated exactly when it comes after the first cue or before the last
 trailing cue.
 
@@ -99,6 +113,7 @@ __all__ = [
     "NEGATIONS",
     "TOKEN",
     "TRAILING_PAIRS",
+    "TRAILING_PHRASES",
     "TRAILING_WORDS",
     "VERB_CUES",
     "Finder",
@@ -178,6 +193,44 @@ TRAILING_WORDS: Final = frozenset({"forbidden", "prohibited", "disallowed", "dep
 TRAILING_PAIRS: Final = frozenset({("is", "banned"), ("are", "banned"), ("not", "allowed")})
 """Two-word trailing cues; the cue is at the second word."""
 
+_COPULAS: Final = (("is",), ("are",), ("was",), ("were",), ("has", "been"), ("have", "been"))
+_BANS: Final = ("banned", "forbidden", "prohibited", "disallowed", "deprecated")
+_NOT_ALLOWED: Final = (
+    ("not", "allowed"),
+    ("not", "permitted"),
+    ("no", "longer", "allowed"),
+    ("no", "longer", "permitted"),
+)
+_MODALS: Final = (
+    ("should", "not"),
+    ("shouldn't",),
+    ("shouldn\u2019t",),
+    ("must", "not"),
+    ("mustn't",),
+    ("mustn\u2019t",),
+    ("cannot",),
+    ("can't",),
+    ("can\u2019t",),
+    ("may", "not"),
+)
+
+TRAILING_PHRASES: Final = frozenset(
+    {(*copula, ban) for copula in _COPULAS for ban in _BANS}
+    | {(be, *rest) for be in ("is", "are") for rest in _NOT_ALLOWED}
+    | {(*modal, "be", "used") for modal in _MODALS}
+)
+"""The whole-phrase trailing cues of I-10 item 5a, as word tuples; the cue is at the last word.
+(The curly-apostrophe spellings are read like the straight ones, as in ``NEGATIONS``.)"""
+
+_TRAILING: Final = frozenset((word,) for word in TRAILING_WORDS) | TRAILING_PAIRS | TRAILING_PHRASES
+"""Every trailing cue as a word tuple."""
+
+MAX_TRAILING: Final = max(len(phrase) for phrase in _TRAILING)
+"""The most words a trailing cue has (4: "is no longer allowed", "should not be used")."""
+
+_TRAILING_LAST: Final = frozenset(phrase[-1] for phrase in _TRAILING)
+"""The words a trailing cue can end with; only at one of them is a cue looked for."""
+
 CONNECTORS: Final = frozenset({"and", "or", "nor"})
 """The only words that may sit between two mentions in a clause with a trailing cue."""
 
@@ -242,13 +295,39 @@ def first_cue(clause: tuple[str, ...]) -> int | None:
     return None
 
 
-def last_trailing_cue(clause: tuple[str, ...]) -> int | None:
-    """The index of the last trailing cue in ``clause`` (the second word of a pair), or None."""
-    last = None
+def _trailing_spans(clause: tuple[str, ...]) -> list[tuple[int, int]]:
+    """The ``(first, last)`` word indexes of each trailing cue in ``clause``, in order: for each
+    word that ends one, the longest cue that ends there. Each word is compared with at most
+    ``MAX_TRAILING`` slices of at most ``MAX_TRAILING`` words, so this is linear."""
+    spans: list[tuple[int, int]] = []
     for index, word in enumerate(clause):
-        if word in TRAILING_WORDS or (index and (clause[index - 1], word) in TRAILING_PAIRS):
-            last = index
-    return last
+        if word not in _TRAILING_LAST:
+            continue
+        for length in range(min(MAX_TRAILING, index + 1), 0, -1):
+            if clause[index - length + 1 : index + 1] in _TRAILING:
+                spans.append((index - length + 1, index))
+                break
+    return spans
+
+
+def last_trailing_cue(clause: tuple[str, ...]) -> int | None:
+    """The index of the last trailing cue in ``clause`` (the last word of a phrase), or None."""
+    spans = _trailing_spans(clause)
+    return spans[-1][1] if spans else None
+
+
+def _unreached(
+    clause: tuple[str, ...], spans: list[tuple[int, int]], mentions: list[Mention]
+) -> bool:
+    """Whether the last prefix cue of ``clause`` that is not part of a trailing cue (``spans``)
+    reaches none of ``mentions`` (I-10 item 5b, the unreached-cue guard). A cue reaches what
+    comes after it, so the last one reaches the fewest mentions: when it reaches one, every
+    earlier cue does too."""
+    inside = {position for first, last in spans for position in range(first, last + 1)}
+    return any(
+        clause[index] in NEGATIONS and index not in inside
+        for index in range(max(mention[0] for mention in mentions), len(clause))
+    )
 
 
 def _reached(cue: int | None, end: int | None, index: int) -> bool:
@@ -313,9 +392,12 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
         # The cues are found once per clause, not once per mention: a hostile sentence with
         # 100,000 mentions in one clause must not cost 100,000 scans (linear time, R2.5).
         cue = first_cue(clause)
-        end = last_trailing_cue(clause)
+        spans = _trailing_spans(clause)
+        end = spans[-1][1] if spans else None
         mentions = list(find(clause))
         if end is not None and _unreadable(clause, commas, mentions, end):
+            return None
+        if mentions and _unreached(clause, spans, mentions):
             return None
         for mention in mentions:
             index, option = mention[0], mention[1]
@@ -323,7 +405,7 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
     mentioned = preferred | prohibited
     if not mentioned or preferred & prohibited:
         return None
-    if not preferred and prohibited >= options:
+    if prohibited >= options:
         return None
     if preferred >= options:
         return None

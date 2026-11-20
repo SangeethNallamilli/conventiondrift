@@ -14,14 +14,17 @@ from conventiondrift.checkers.phrases import (
     BREAK_MARKS,
     BREAK_WORDS,
     CALL_SUFFIX,
+    MAX_TRAILING,
     MERGED,
     NEGATIONS,
     TOKEN,
     TRAILING_PAIRS,
+    TRAILING_PHRASES,
     TRAILING_WORDS,
     VERB_CUES,
     Mention,
     _read,
+    _trailing_spans,
     classify,
     clauses,
     first_cue,
@@ -306,7 +309,9 @@ def test_an_option_named_after_a_trailing_cue_makes_the_sentence_unreadable() ->
 
 
 def test_the_two_word_cues_need_both_words() -> None:
-    for text in ("a banned", "a is allowed", "a allowed", "a was banned", "a has been banned"):
+    # "a was banned" and "a has been banned" were here too; I-10 item 5a makes them cues (see
+    # ``test_item_5a_each_trailing_phrase_prohibits_what_comes_before_it``).
+    for text in ("a banned", "a is allowed", "a allowed"):
         assert classify(text, find, OPTIONS) == rule(preferred="a", specificity=1), text
     assert last_trailing_cue(("banned",)) is None
     assert last_trailing_cue(("allowed", "a", "not")) is None  # no wrap-around to the last word
@@ -568,6 +573,12 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
     "mentions joined by and, then a trailing cue": lambda n: "a and " * (n // 6) + "are banned",
     "commas only then a trailing cue": lambda n: ", " * (n // 2) + "a is banned",
     "one mention each side of many commas": lambda n: "a " + ", " * (n // 2) + "b is banned",
+    # I-10 item 5a/5b: the longest trailing phrases, every one checked for a prefix cue inside
+    # it; and one long clause whose last prefix cue comes after all of its mentions.
+    "a mention then many four-word trailing cues": lambda n: (
+        "a " + "is no longer allowed " * (n // 21)
+    ),
+    "many mentions then an unreached cue": lambda n: "a " * (n // 2) + "never",
 }
 # Left out of the list above, each one the same path as one kept (the shapes of #58 and of the
 # first two rounds of #61; CI took over 10 minutes with them):
@@ -1124,8 +1135,223 @@ def test_a_mention_on_the_cue_itself_is_not_negated() -> None:
     def cues_as_options(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
         return ((i, "a") for i, word in enumerate(clause) if word == "not")
 
-    # The mention is the cue word: nothing comes before it, so it is preferred.
-    assert classify("not", cues_as_options, OPTIONS) == rule(preferred="a", specificity=1)
+    # The mention is the cue word, so the cue doesn't reach it (nothing is before it)...
+    assert is_negated(("not",), 0) is False
+    # ... and since the cue then reaches no mention in a clause that names one, I-10 item 5b
+    # (the unreached-cue guard) makes the sentence unreadable. Before item 5 this read the
+    # mention as preferred.
+    assert classify("not", cues_as_options, OPTIONS) is None
+
+
+# --- I-10 "Negation" item 5 (a) to (c) -----------------------------------------------------------
+
+# Every whole-phrase trailing cue of item 5a, written out (not built the way phrases.py builds it).
+ITEM_5A_CUES = [
+    *(
+        f"{copula} {ban}"
+        for copula in ("is", "are", "was", "were", "has been", "have been")
+        for ban in ("banned", "forbidden", "prohibited", "disallowed", "deprecated")
+    ),
+    "is not allowed",
+    "is not permitted",
+    "is no longer allowed",
+    "is no longer permitted",
+    "are not allowed",
+    "are not permitted",
+    "are no longer allowed",
+    "are no longer permitted",
+    "should not be used",
+    "shouldn't be used",
+    "shouldn\u2019t be used",
+    "must not be used",
+    "mustn't be used",
+    "mustn\u2019t be used",
+    "cannot be used",
+    "can't be used",
+    "can\u2019t be used",
+    "may not be used",
+]
+
+
+def test_item_5a_the_phrase_table_is_what_i10_says() -> None:
+    assert len(ITEM_5A_CUES) == 48
+    assert {tuple(cue.split()) for cue in ITEM_5A_CUES} == TRAILING_PHRASES
+    assert MAX_TRAILING == 4
+    # The item 3 cues stay as they were.
+    assert TRAILING_WORDS == {"forbidden", "prohibited", "disallowed", "deprecated"}
+    assert TRAILING_PAIRS == {("is", "banned"), ("are", "banned"), ("not", "allowed")}
+
+
+@pytest.mark.parametrize("cue", ITEM_5A_CUES)
+def test_item_5a_each_trailing_phrase_prohibits_what_comes_before_it(cue: str) -> None:
+    assert classify(f"b {cue}", find, OPTIONS) == rule(prohibited="b", specificity=1)
+    assert classify(f"use a. b {cue}", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert classify(f"a and b {cue}", find, OPTIONS) == rule(prohibited="ab", specificity=2)
+    assert classify(f"requests {cue}; use httpx.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests"}), 2
+    )
+    words = ("a", *cue.split())
+    assert last_trailing_cue(words) == len(words) - 1
+    assert is_negated(words, 0) is True
+
+
+@pytest.mark.parametrize("cue", ITEM_5A_CUES)
+def test_item_5a_each_trailing_phrase_stops_at_a_break_and_reaches_nothing_after_it(
+    cue: str,
+) -> None:
+    assert classify(f"use a; b {cue}; use c", find, OPTIONS) == rule(
+        preferred="ac", prohibited="b", specificity=3
+    )
+    assert classify(f"b {cue}. a", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    # Item 4a holds for the new cues too: an option after the cue is unreadable.
+    assert classify(f"b {cue} a", find, OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a been banned",  # no "has"/"have"
+        "a has banned",  # no "been"
+        "a is longer allowed",  # no "no"
+        "a is permitted",
+        "a are allowed",
+        "a should be used",
+        "a can be used",
+        "a be used",
+        "a cannot used",  # no "be"
+        "a cannot be",  # no "used"
+        "a cannot be use",
+    ],
+)
+def test_item_5a_a_part_of_a_phrase_is_no_cue(text: str) -> None:
+    assert last_trailing_cue(tuple(text.split())) is None
+    assert classify(text, find, OPTIONS) == rule(preferred="a", specificity=1)
+
+
+def test_item_5a_phrases_do_not_wrap_around_or_reach_past_the_clause_start() -> None:
+    assert last_trailing_cue(("used", "a", "should", "not", "be")) is None
+    assert last_trailing_cue(("allowed", "a", "is", "no", "longer")) is None
+    assert last_trailing_cue(("no", "longer", "allowed")) is None  # needs "is" or "are"
+    assert last_trailing_cue(("is", "no", "longer", "allowed")) == 3
+    assert last_trailing_cue(("not", "be", "used")) is None
+    assert last_trailing_cue(("should", "not", "be", "used")) == 3
+
+
+def test_item_5a_each_word_ending_a_cue_gives_its_longest_cue() -> None:
+    assert _trailing_spans(("a", "is", "not", "allowed")) == [(1, 3)]
+    assert _trailing_spans(("a", "not", "allowed")) == [(1, 2)]
+    assert _trailing_spans(("a", "forbidden")) == [(1, 1)]
+    assert _trailing_spans(("a", "was", "forbidden")) == [(1, 2)]
+    assert _trailing_spans(("a", "is", "no", "longer", "permitted")) == [(1, 4)]
+    assert _trailing_spans(("a", "should", "not", "be", "used")) == [(1, 4)]
+    assert _trailing_spans(("a", "is", "banned", "b", "deprecated")) == [(1, 2), (4, 4)]
+    assert _trailing_spans(()) == []
+
+
+def test_item_5a_the_last_of_several_trailing_cues_counts() -> None:
+    assert last_trailing_cue(("a", "is", "banned", "b", "should", "not", "be", "used")) == 7
+    assert classify("a is banned; b has been deprecated", find, OPTIONS) == rule(
+        prohibited="ab", specificity=2
+    )
+
+
+# I-10 item 5b: the last prefix cue (not part of a trailing cue) reaches no mention.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a never in library code",
+        "a should not be called",  # not an item 5a phrase: "not" is a plain prefix cue
+        "a not permitted",  # no "is"/"are"
+        "a no longer allowed",
+        "use a, not in tests",
+        "never use b or c without a reason",  # the last cue, "without", reaches nothing
+        "use a and b, never",
+        "a. b is fine, never in tests",
+    ],
+)
+def test_item_5b_a_prefix_cue_that_reaches_no_mention_is_unreadable(text: str) -> None:
+    assert classify(text, find, OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("never use a", rule(prohibited="a", specificity=1)),
+        ("use a, not b", rule(preferred="a", prohibited="b", specificity=2)),
+        ("never b without c", rule(prohibited="bc", specificity=2)),
+        # The cue's clause names no option: the guard needs one.
+        ("use a. never in tests", rule(preferred="a", specificity=1)),
+        ("use a; it is not allowed", rule(preferred="a", specificity=1)),
+        # A prefix cue word inside a trailing cue is part of that cue.
+        ("a is not allowed", rule(prohibited="a", specificity=1)),
+        ("a not allowed", rule(prohibited="a", specificity=1)),
+        ("a is no longer permitted", rule(prohibited="a", specificity=1)),
+        ("a shouldn't be used", rule(prohibited="a", specificity=1)),
+        ("a must not be used, use b", rule(preferred="b", prohibited="a", specificity=2)),
+    ],
+)
+def test_item_5b_a_cue_that_reaches_a_mention_or_is_in_a_trailing_cue_maps(
+    text: str, expected: RuleMatch
+) -> None:
+    assert classify(text, find, OPTIONS) == expected
+
+
+def test_item_5b_a_mention_on_the_last_cue_is_not_reached() -> None:
+    def on_cue(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((i, "a") for i, word in enumerate(clause) if word in {"never", "x"})
+
+    assert classify("x never", on_cue, OPTIONS) is None  # the mention at the cue: not reached
+    assert classify("never x", on_cue, OPTIONS) is None  # one mention after, one at, the cue
+    assert classify("never y x", on_cue, frozenset("ab")) is None  # "a" both ways (guard 1)
+
+
+def test_item_5b_four_options() -> None:
+    assert classify("use httpx, not in tests.", find_http, HTTP) is None
+    assert classify("requests never in library code.", find_http, HTTP) is None
+    assert classify("use httpx, not requests, for those calls.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests"}), 2
+    )
+
+
+def test_item_5c_prohibiting_every_option_is_unreadable_whatever_is_preferred() -> None:
+    def with_stray(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        # A finder that also gives a non-option ("z"); only such a finder can prefer something
+        # while every option is prohibited, so it is how the guard is told apart from guard 2.
+        for index, word in enumerate(clause):
+            if word in {"a", "b", "z"}:
+                yield index, word
+
+    assert classify("use z, never a or b", with_stray, frozenset("ab")) is None
+    assert classify("use z, never a", with_stray, frozenset("ab")) == rule(
+        preferred="z", prohibited="a", specificity=2
+    )
+
+
+def test_item_5c_four_options() -> None:
+    assert classify("never use requests, httpx, urllib or aiohttp.", find_http, HTTP) is None
+    assert classify(
+        "use httpx; requests and urllib and aiohttp are banned.", find_http, HTTP
+    ) == RuleMatch(frozenset({"httpx"}), frozenset({"requests", "urllib", "aiohttp"}), 4)
+    assert classify("never use requests, urllib or aiohttp.", find_http, HTTP) == RuleMatch(
+        frozenset(), frozenset({"requests", "urllib", "aiohttp"}), 3
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "CR1 on #61: 'neither' is not an I-10 cue and 'is allowed' is not a trailing cue, so no "
+        "item 5 rule reaches this sentence and it reads both options as preferred. Open "
+        "question for the Architect; strict, so it fails loudly once the reading is fixed."
+    ),
+)
+def test_item_5_cr1_neither_nor_on_four_options_never_prefers_both() -> None:
+    result = classify("neither requests nor urllib is allowed.", find_http, HTTP)
+    assert result is None or not result.preferred & {"requests", "urllib"}
 
 
 # --- the import rule (INTERFACES I-10, "Shared phrase helper") ------------------------------
