@@ -13,7 +13,7 @@ from checker_support import counts, rules_of, sites_of
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.string_format import StringFormatChecker
-from conventiondrift.checkers.string_format.match import OPTIONS, match_rule
+from conventiondrift.checkers.string_format.match import OPTIONS, SCOPE_WORDS, match_rule
 from conventiondrift.checkers.string_format.sites import FormatSites
 from conventiondrift.checkers.walk import parse
 from conventiondrift.model import FileContext, RuleMatch, Site
@@ -88,7 +88,7 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("use f-strings, not the % operator.", ("f-string",), ("percent",)),
         ("prefer f-strings over .format() or %s formatting.", ("f-string",), ("format", "percent")),
         ("use str.format().", ("format",), ()),
-        ("use .format() for templates.", ("format",), ()),
+        ("use .format() for translations.", ("format",), ()),
         ("don't use the % operator or .format().", (), ("percent", "format")),
         ("never use %-formatting.", (), ("percent",)),
         ("never use % formatting.", (), ("percent",)),
@@ -123,6 +123,43 @@ def test_match_rule_reads_the_formats_and_their_polarity(
 )
 def test_match_rule_does_not_map_what_names_no_format_or_cannot_be_read(sentence: str) -> None:
     assert match_rule(sentence) is None
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        # D-PM-44 (b): a rule about some strings only is not about all strings.
+        "Log messages are f-strings.",
+        "Use f-strings in log messages.",
+        "Error messages use %-formatting.",
+        "Use f-strings for logging.",
+        "Use .format() for SQL queries.",
+        "Use f-strings, not %s, in exception messages.",
+        "Never use f-strings in URLs.",
+        "Use str.format() for templates.",
+        "Use f-strings for docstrings and comments.",
+        "Use f-strings for output.",
+        "Use f-strings for file paths.",
+    ],
+)
+def test_a_rule_about_some_strings_only_is_not_mapped(sentence: str) -> None:
+    from conventiondrift.rules.extract import normalize
+
+    assert match_rule(normalize(sentence)) is None
+    # Some of these are not rules at all (no imperative shape); none maps to string-format.
+    assert "string-format" not in {checker for _, checker in rules_of(sentence)}
+
+
+def test_the_scope_words_are_whole_words() -> None:
+    # "formatting" contains "format" but no scope word; "path" is not "pathlib"-like prose.
+    assert match_rule("use f-strings for string formatting.") == match(("f-string",))
+    assert match_rule("use f-strings for catalogs.") == match(("f-string",))
+    assert match_rule("use f-strings for pathways.") == match(("f-string",))
+
+
+def test_the_unscoped_canonical_rule_still_maps_ac_f2_5() -> None:
+    assert rules_of("Use f-strings for string formatting.") == [(1, "string-format")]
+    assert SCOPE_WORDS >= {"log", "message", "messages", "error", "sql"}
 
 
 def test_specificity_is_the_number_of_options_named() -> None:
@@ -323,3 +360,18 @@ def test_the_handlers_give_nothing_for_a_node_of_another_kind() -> None:
     other = ast.Name("x")
     for handler in (handlers.note_spec, handlers.f_string, handlers.format_call, handlers.percent):
         assert list(handler(other, ctx())) == []
+
+
+# --- files do not affect each other (INTERFACES I-10, "Per-file handler state") -------------
+
+FILE_A = 'a = f"{x:.2f}"\nb = f"{y:>{w}}"\n'
+FILE_B = 'c = "{}".format(1)\nd = f"{z}"\ne = "%s" % 1\n'
+
+
+def test_files_give_the_same_sites_alone_and_together_in_either_order() -> None:
+    files = {"a.py": FILE_A, "b.py": FILE_B}
+    alone = [s for name, text in files.items() for s in sites_of("string-format", {name: text})]
+    together = sites_of("string-format", files)
+    reversed_ = sites_of("string-format", dict(reversed(files.items())))
+    assert together == alone == reversed_
+    assert [s.option for s in together] == ["f-string"] * 2 + ["format", "f-string", "percent"]
