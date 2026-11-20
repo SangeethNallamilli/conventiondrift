@@ -23,6 +23,7 @@ CRITICAL_SUFFIXES = (
     "/verdicts.py",
     "/compare.py",
     "/render/escape.py",
+    "/checkers/phrases.py",
 )
 
 

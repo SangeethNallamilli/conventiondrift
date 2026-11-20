@@ -5,14 +5,25 @@ bundle that tests pass to ``core.run``. Every field left as ``None`` means
 "use the production default"; T-028 wires the defaults.
 """
 
-from collections.abc import Callable, Generator, Mapping, Sequence
+import ast
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
-from conventiondrift.checkers.base import Checker
-from conventiondrift.model import Extraction, InstructionFile, Policy, PyFile, Result, Window
+from conventiondrift.model import (
+    CheckerId,
+    Extraction,
+    FileContext,
+    InstructionFile,
+    Policy,
+    PyFile,
+    Result,
+    RuleMatch,
+    Site,
+    Window,
+)
 
 Side = Literal["base", "head"]
 TreeEntry = tuple[str, str, int | None, str]
@@ -20,6 +31,28 @@ TreeEntry = tuple[str, str, int | None, str]
 ChangedFile = tuple[str, str | None, str]
 """(status letter, old path or None, new path)."""
 PublishOutcome = Literal["posted", "updated", "skipped"]
+
+
+class Checker(Protocol):
+    """One convention family (e.g. logging) compared across its options (I-10, ADR-0003).
+
+    Internal in v1, shaped as a future plugin API. The Protocol lives here, with the
+    other I-11 Protocols, so importing this module never loads a checker
+    (I-13 C6 item 8). ``checkers.base`` re-exports it.
+    """
+
+    id: CheckerId
+    experimental: bool
+    options: frozenset[str]
+    inputs: frozenset[Literal["python-ast", "manifest"]]
+
+    def match_rule(self, normalized_text: str) -> RuleMatch | None: ...
+
+    def ast_handlers(
+        self,
+    ) -> Mapping[type[ast.AST], Callable[[ast.AST, FileContext], Iterable[Site]]]: ...
+
+    def manifest_sites(self, files: Mapping[str, bytes]) -> Iterable[Site]: ...
 
 
 class GitReaderProtocol(Protocol):
