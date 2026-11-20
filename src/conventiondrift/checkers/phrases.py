@@ -13,7 +13,9 @@ spaces; DESIGN §7 step 2). A checker reads it in three steps:
 
 Clause rules (INTERFACES I-10, "Negation in phrases.py"):
 
-* A negation cue (``NEGATIONS``: "no", "never", "neither", "not", "don't", "avoid",
+* A negation cue (``NEGATIONS``: "no", "never", "neither", "not", "don't", the
+  ban verbs "avoid", "forbid", "prohibit", "ban", "disallow" with their -s and
+  -ed forms (I-10 item 6b),
   "without", "shouldn't", "mustn't", "stop using", "instead of", "rather than",
   and so "do not", "should not" and "must not" through "not") applies from the
   cue to the end of its clause. Words before the cue are not negated, so "use
@@ -94,6 +96,9 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
 * a clause with a trailing cue also holds a positive verb cue, an option
   mentioned after the cue, a comma with option mentions on both sides, or
   a word other than ``and``, ``or`` and ``nor`` between two mentions; or
+* a prefix cue follows another one in its clause with no option mention
+  between them (the double-negation guard, I-10 item 6b): "no ban on
+  requests", "don't avoid httpx", "never forbid print"; or
 * a clause names an option but its last prefix cue (one that is not part of a
   trailing cue) reaches none of its mentions (the unreached-cue guard, I-10
   item 5b): "print never in library code" or "print should not be called"
@@ -222,6 +227,20 @@ NEGATIONS: Final = frozenset(
         "dont",
         "don't",
         "avoid",
+        "avoids",
+        "avoided",
+        "forbid",
+        "forbids",
+        "forbade",
+        "prohibit",
+        "prohibits",
+        "prohibited",
+        "ban",
+        "bans",
+        "banned",
+        "disallow",
+        "disallows",
+        "disallowed",
         "without",
         "shouldn't",
         "mustn't",
@@ -407,6 +426,25 @@ def _unreached(
     )
 
 
+def _doubled(
+    clause: tuple[str, ...], spans: list[tuple[int, int]], mentions: list[Mention]
+) -> bool:
+    """Whether a prefix cue of ``clause`` (not part of a trailing cue, ``spans``) follows another
+    one with no option mention between them (I-10 item 6b, the double-negation guard): "no ban
+    on requests", "don't avoid httpx", "never forbid print". One pass over the clause."""
+    inside = {position for first, last in spans for position in range(first, last + 1)}
+    starts = {mention[0] for mention in mentions}
+    pending = False
+    for index, word in enumerate(clause):
+        if index in starts:
+            pending = False
+        elif word in NEGATIONS and index not in inside:
+            if pending:
+                return True
+            pending = True
+    return False
+
+
 def _reached(cue: int | None, end: int | None, index: int) -> bool:
     """Whether a cue reaches the word at ``index``: after the first cue, or before the last
     trailing cue."""
@@ -486,7 +524,17 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
         # Each guard is skipped by one set test when the clause holds none of its words, which
         # keeps the many-short-clauses texts cheap (R2.5 tests, CI time).
         if mentions and (
-            (not NEGATIONS.isdisjoint(clause) and _unreached(clause, spans, mentions))
+            (
+                not NEGATIONS.isdisjoint(clause)
+                and (
+                    _unreached(clause, spans, mentions)
+                    or (
+                        cue is not None
+                        and not NEGATIONS.isdisjoint(clause[cue + 1 :])
+                        and _doubled(clause, spans, mentions)
+                    )
+                )
+            )
             or (not _COMPARED.isdisjoint(clause) and _comparative(clause, mentions))
             or (FROM in clause and _from(clause, mentions))
         ):

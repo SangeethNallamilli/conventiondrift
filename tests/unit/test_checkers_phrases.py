@@ -215,6 +215,20 @@ PREFIX_CUES = [
     "stop using",
     "instead of",
     "rather than",
+    # The ban verbs (I-10 item 6b). "prohibited" and "disallowed" are trailing cues as well; see
+    # ``test_item_6b_a_ban_verb_that_is_also_a_trailing_cue_reads_as_the_trailing_cue``.
+    "avoids",
+    "avoided",
+    "forbid",
+    "forbids",
+    "forbade",
+    "prohibit",
+    "prohibits",
+    "ban",
+    "bans",
+    "banned",
+    "disallow",
+    "disallows",
 ]
 TRAILING_CUES = [
     "is banned",
@@ -245,6 +259,20 @@ def test_the_tables_are_what_the_docs_say() -> None:
         "dont",
         "don't",
         "avoid",
+        "avoids",
+        "avoided",
+        "forbid",
+        "forbids",
+        "forbade",
+        "prohibit",
+        "prohibits",
+        "prohibited",
+        "ban",
+        "bans",
+        "banned",
+        "disallow",
+        "disallows",
+        "disallowed",
         "without",
         "shouldn't",
         "mustn't",
@@ -316,8 +344,10 @@ def test_an_option_named_after_a_trailing_cue_makes_the_sentence_unreadable() ->
 def test_the_two_word_cues_need_both_words() -> None:
     # "a was banned" and "a has been banned" were here too; I-10 item 5a makes them cues (see
     # ``test_item_5a_each_trailing_phrase_prohibits_what_comes_before_it``).
-    for text in ("a banned", "a is allowed", "a allowed"):
+    for text in ("a is allowed", "a allowed"):
         assert classify(text, find, OPTIONS) == rule(preferred="a", specificity=1), text
+    # Since I-10 item 6b a bare "banned" is a prefix cue, and here it reaches nothing (item 5b).
+    assert classify("a banned", find, OPTIONS) is None
     assert last_trailing_cue(("banned",)) is None
     assert last_trailing_cue(("allowed", "a", "not")) is None  # no wrap-around to the last word
     assert last_trailing_cue(("banned", "a", "is")) is None
@@ -454,7 +484,9 @@ def test_is_negated_sees_a_trailing_cue_after_the_word_and_not_before_it(cue: st
     clause = ("a", *cue.split())
     assert is_negated(clause, 0) is True
     assert is_negated(("use", "a", *cue.split(), "b"), 1) is True
-    if "not" not in cue.split():  # "not" is also a prefix cue: it reaches what follows it
+    # "not", "banned", "prohibited" and "disallowed" are also prefix cues (I-10 item 6b for the
+    # last three): they reach what follows them. In ``classify`` an option there is unreadable.
+    if NEGATIONS.isdisjoint(cue.split()):
         assert is_negated(("use", "a", *cue.split(), "b"), len(cue.split()) + 2) is False
 
 
@@ -1228,8 +1260,6 @@ def test_item_5a_each_trailing_phrase_stops_at_a_break_and_reaches_nothing_after
 @pytest.mark.parametrize(
     "text",
     [
-        "a been banned",  # no "has"/"have"
-        "a has banned",  # no "been"
         "a is longer allowed",  # no "no"
         "a is permitted",
         "a are allowed",
@@ -1244,6 +1274,13 @@ def test_item_5a_each_trailing_phrase_stops_at_a_break_and_reaches_nothing_after
 def test_item_5a_a_part_of_a_phrase_is_no_cue(text: str) -> None:
     assert last_trailing_cue(tuple(text.split())) is None
     assert classify(text, find, OPTIONS) == rule(preferred="a", specificity=1)
+
+
+# Since I-10 item 6b the bare "banned" left over is a prefix cue that reaches nothing (5b).
+@pytest.mark.parametrize("text", ["a been banned", "a has banned"])
+def test_item_5a_a_part_of_a_banned_phrase_is_no_trailing_cue(text: str) -> None:
+    assert last_trailing_cue(tuple(text.split())) is None
+    assert classify(text, find, OPTIONS) is None
 
 
 def test_item_5a_phrases_do_not_wrap_around_or_reach_past_the_clause_start() -> None:
@@ -1663,6 +1700,93 @@ def test_item_5_ruling_9_an_option_after_from_in_a_verb_clause_is_unreadable(tex
 )
 def test_item_5_ruling_9_what_still_maps(text: str, expected: RuleMatch) -> None:
     assert classify(text, find, OPTIONS) == expected
+
+
+LOG = frozenset({"print", "logging"})
+
+
+def find_log(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+    """A finder for a two-option print-vs-logging checker (the real one is in logging.py)."""
+    return ((index, word) for index, word in enumerate(clause) if word in LOG)
+
+
+# I-10 item 6b: the ban verbs are prefix cues, with a double-negation guard.
+def test_item_6b_the_interfaces_examples() -> None:
+    assert classify("Always forbid requests.", find_http, HTTP) == RuleMatch(
+        frozenset(), frozenset({"requests"}), 1
+    )
+    assert classify("Always prohibit print.", find_log, LOG) == RuleMatch(
+        frozenset(), frozenset({"print"}), 1
+    )
+    assert classify("no ban on requests", find_http, HTTP) is None
+    assert classify("don't avoid httpx", find_http, HTTP) is None
+    assert classify("never forbid print", find_log, LOG) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "no ban on b",
+        "never avoid b",
+        "don't avoid b",
+        "use a, never forbid b",
+        "not without b",
+        "never x y z forbid b",  # other words between the cues are no option
+        "do not ban b or c",
+        "never use a. don't ban b",  # each clause on its own: the second has two cues
+    ],
+)
+def test_item_6b_a_prefix_cue_after_another_with_no_option_between_is_unreadable(
+    text: str,
+) -> None:
+    assert classify(text, find, OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # An option between the two cues: no double negation.
+        ("never a, never b", rule(prohibited="ab", specificity=2)),
+        ("avoid a and ban b", rule(prohibited="ab", specificity=2)),
+        ("no a without b", rule(prohibited="ab", specificity=2)),
+        # The cues in different clauses.
+        ("never b; ban c", rule(prohibited="bc", specificity=2)),
+        ("use a. never b. ban c", rule(preferred="a", prohibited="bc", specificity=3)),
+        # A cue word inside a trailing cue is not a second prefix cue.
+        ("b is prohibited and disallowed", rule(prohibited="b", specificity=1)),
+        ("b is not allowed and is banned", rule(prohibited="b", specificity=1)),
+        ("never b and c is not allowed", rule(prohibited="bc", specificity=2)),
+        # One ban verb alone, before an option or in a sentence with a positive verb.
+        ("forbid b", rule(prohibited="b", specificity=1)),
+        ("use a and ban b", rule(preferred="a", prohibited="b", specificity=2)),
+        # A word that only starts like a ban verb is no cue.
+        ("banner a", rule(preferred="a", specificity=1)),
+        ("forbidding a", rule(preferred="a", specificity=1)),
+    ],
+)
+def test_item_6b_what_still_maps(text: str, expected: RuleMatch) -> None:
+    assert classify(text, find, OPTIONS) == expected
+
+
+@pytest.mark.parametrize("cue", ["prohibited", "disallowed"])
+def test_item_6b_a_ban_verb_that_is_also_a_trailing_cue_reads_as_the_trailing_cue(
+    cue: str,
+) -> None:
+    assert classify(f"b {cue}", find, OPTIONS) == rule(prohibited="b", specificity=1)
+    # As a prefix cue it would prohibit b; as a trailing cue an option after it is
+    # unreadable (item 4a). Not verifiable, never a wrong preference.
+    assert classify(f"{cue} b", find, OPTIONS) is None
+    assert first_cue((cue, "b")) == 0
+
+
+def test_item_6b_the_guard_runs_only_with_a_cue_word_after_the_first_cue() -> None:
+    # One cue, then many options: the guard's one-pass scan is skipped, the answer unchanged.
+    assert classify("never " + "a " * 50 + "b", find, OPTIONS) == rule(
+        prohibited="ab", specificity=2
+    )
+    assert classify("use a over b never c", find, OPTIONS) == rule(
+        preferred="a", prohibited="bc", specificity=3
+    )
 
 
 def test_item_5d_rather_than_and_instead_of_keep_their_item_2_reading() -> None:

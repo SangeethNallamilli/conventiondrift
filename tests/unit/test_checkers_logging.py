@@ -722,6 +722,15 @@ def test_item_5d_prefer_over_prohibits_what_follows() -> None:
     assert match_rule("dont use print.") == match((), ("print",), 1)
 
 
+def test_item_6b_ban_verbs_never_prefer_the_banned_option() -> None:
+    # D-PM-50 item 2: prohibited, or Not verifiable; never preferred.
+    assert match_rule("Always prohibit print.") == match((), ("print",), 1)
+    assert match_rule("Forbid print; use logging.") == match(("logging",), ("print",), 2)
+    assert match_rule("print is banned.") == match((), ("print",), 1)
+    assert match_rule("never forbid print.") is None  # the double-negation guard
+    assert match_rule("don't avoid logging.") is None
+
+
 # --- CON-67 round 2: the comma guard (CR1 F1 on #61, I-10 item 4a) --------------------------
 
 
