@@ -12,7 +12,8 @@ What is read as each option:
   "broad / generic / blanket except or exception(s)", and "BaseException".
 
 A mention is made of all the words of its phrase ("bare except", "catching Exception"), which is
-what ``classify`` needs to tell a list of mentions from words between them.
+what ``classify`` needs to tell a list of mentions from words between them. It starts at its first
+word, and two mentions never share a word.
 
 A hyphen joins words (``phrases.TOKEN``), so the hyphenated spellings "bare-except",
 "broad-except" and so on are one word each; they are read as the same options, as they were
@@ -40,19 +41,28 @@ _HYPHENATED: Final = {
 
 
 def _find(clause: tuple[str, ...]) -> Iterator[Mention]:
+    """The mentions in ``clause``, each as ``(start, option, range(start, stop))``: the index is
+    the first word of the phrase, as ``classify`` needs, and no two mentions share a word. When
+    two phrases would overlap ("bare except exception"), the first one is the mention."""
+    taken = 0  # the first word that no mention yielded so far has used
     for index, word in enumerate(clause):
         before = clause[index - 1] if index else ""
         after = clause[index + 1] if index + 1 < len(clause) else ""
         if word == "bare" and after in _EXCEPT_WORDS:
-            yield index, "bare-except", range(index, index + 2)
+            start, stop, option = index, index + 2, "bare-except"
         elif word in _HYPHENATED:
-            yield index, _HYPHENATED[word]
+            start, stop, option = index, index + 1, _HYPHENATED[word]
         elif word == "baseexception":
-            yield index, "broad-except"
+            start, stop, option = index, index + 1, "broad-except"
         elif word == "exception" and before in _CATCH_WORDS:
-            yield index, "broad-except", range(index - 1, index + 1)
+            start, stop, option = index - 1, index + 1, "broad-except"
         elif word in _EXCEPT_WORDS and before in _BROAD_WORDS:
-            yield index, "broad-except", range(index - 1, index + 1)
+            start, stop, option = index - 1, index + 1, "broad-except"
+        else:
+            continue
+        if start >= taken:
+            yield start, option, range(start, stop)
+            taken = stop
 
 
 def match_rule(normalized_text: str) -> RuleMatch | None:

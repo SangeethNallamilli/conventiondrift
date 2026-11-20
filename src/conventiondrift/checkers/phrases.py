@@ -182,8 +182,12 @@ CONNECTORS: Final = frozenset({"and", "or", "nor"})
 """The only words that may sit between two mentions in a clause with a trailing cue."""
 
 Mention = tuple[int, str] | tuple[int, str, range]
-"""``(word index, option)``, or with the words the mention is made of as a ``range`` (for
-"bare except" at index 0, ``range(0, 2)``). Without one, a mention is its one word."""
+"""``(word index, option)``, or with the words the mention is made of as a half-open ``range`` of
+word indexes (for "bare except" at index 0, ``range(0, 2)``). Without one, a mention covers its
+one word. A range **must start at the index** (``classify`` reads the cues' reach from the
+index and the gaps between mentions from the ranges), and the ranges of one clause must not
+overlap: a finder that breaks either has a bug. Private to ``checkers/``: the ``Checker``
+protocol in ``components.py`` doesn't know about it."""
 
 Finder = Callable[[tuple[str, ...]], Iterable[Mention]]
 """Gives the mentions one checker finds in a clause."""
@@ -254,9 +258,10 @@ def _reached(cue: int | None, end: int | None, index: int) -> bool:
 
 
 def _span(mention: Mention) -> tuple[int, int]:
-    """The first word of a mention and the one after its last."""
+    """The first word of a mention (its index) and the one after its last. The range's own start
+    is not read: a mention starts at its index, as ``Mention`` says."""
     if len(mention) == 3:
-        return mention[2].start, mention[2].stop
+        return mention[0], mention[2].stop
     return mention[0], mention[0] + 1
 
 

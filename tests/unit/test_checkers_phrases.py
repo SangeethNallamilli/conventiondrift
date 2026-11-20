@@ -950,13 +950,13 @@ def test_item_4a_contiguity_is_only_read_in_a_clause_with_a_trailing_cue() -> No
 
 
 def find_phrases(clause: tuple[str, ...]) -> Iterator[Mention]:
-    """Two-word mentions that tell ``classify`` which words are theirs: "bare except" (the index
-    is its first word) and "catching exception" (the index is its last word)."""
+    """Two-word mentions that tell ``classify`` which words are theirs: "bare except" and
+    "catching exception". Each one's index is its first word, as ``Mention`` requires."""
     for index, word in enumerate(clause):
         if word == "bare" and clause[index + 1 : index + 2] == ("except",):
             yield index, "bare", range(index, index + 2)
-        elif word == "exception" and clause[index - 1 : index] == ("catching",):
-            yield index, "broad", range(index - 1, index + 1)
+        elif word == "catching" and clause[index + 1 : index + 2] == ("exception",):
+            yield index, "broad", range(index, index + 2)
 
 
 def find_phrases_without_spans(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
@@ -980,6 +980,27 @@ def test_item_4a_the_words_of_a_mention_are_not_words_between_mentions() -> None
         "bare except is fine and catching exception is banned.",
     ):
         assert classify(sentence, find_phrases, options) is None, sentence
+
+
+def test_item_4a_a_mention_starts_at_its_index_whatever_its_range_says() -> None:
+    # The contract is that a range starts at the index. ``classify`` doesn't read the range's
+    # start: a finder that gives the *last* word as the index (and a range that starts before
+    # it) is read as a one-word-and-after mention, so the first word counts as a word between.
+    def last_word_as_index(clause: tuple[str, ...]) -> Iterator[Mention]:
+        for index, word in enumerate(clause):
+            if word == "bare" and clause[index + 1 : index + 2] == ("except",):
+                yield index, "bare", range(index, index + 2)
+            elif word == "exception" and clause[index - 1 : index] == ("catching",):
+                yield index, "broad", range(index - 1, index + 1)
+
+    options = frozenset({"bare", "broad", "specific"})
+    assert classify("bare except and catching exception are banned.", find_phrases, options) == (
+        RuleMatch(frozenset(), frozenset({"bare", "broad"}), 2)
+    )
+    assert (
+        classify("bare except and catching exception are banned.", last_word_as_index, options)
+        is None
+    )
 
 
 def test_item_4a_the_order_the_finder_gives_mentions_in_does_not_matter() -> None:

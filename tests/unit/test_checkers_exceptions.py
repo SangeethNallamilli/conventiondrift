@@ -4,6 +4,8 @@ Covers AC-F3.7 and the exceptions half of AC-F2.5. Counts go through the real wa
 """
 
 import ast
+import itertools
+import random
 import textwrap
 
 import pytest
@@ -18,7 +20,7 @@ from checker_support import (
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.exceptions import ExceptionsChecker
-from conventiondrift.checkers.exceptions.match import OPTIONS, match_rule
+from conventiondrift.checkers.exceptions.match import OPTIONS, _find, match_rule
 from conventiondrift.checkers.exceptions.sites import BROAD_NAMES, exception_sites
 from conventiondrift.checkers.walk import parse
 from conventiondrift.model import FileContext, RuleMatch, Site
@@ -457,6 +459,90 @@ def test_round_3_with_a_prefix_cue_the_words_between_mentions_do_not_matter() ->
     assert match_rule("never use a bare except or, worse, catching exception.") == match(
         ("bare-except", "broad-except")
     )
+
+
+def test_round_3_a_second_phrase_that_would_share_a_word_is_not_a_second_mention() -> None:
+    # "except exception" would start inside "bare except": the first phrase is the mention.
+    assert match_rule("never use bare except exception.") == match(("bare-except",))
+    assert match_rule("broad except exception is banned.") == match(("broad-except",))
+    # Phrases that follow each other without sharing a word are both mentions.
+    assert match_rule("bare except catching exception are banned.") == match(
+        ("bare-except", "broad-except")
+    )
+    assert match_rule("catching exception bare except are banned.") == match(
+        ("bare-except", "broad-except")
+    )
+
+
+def test_round_3_cue_reach_is_the_same_for_a_phrase_that_starts_at_its_index() -> None:
+    # A prefix cue reaches a phrase that follows it, and a trailing cue one that precedes it, for
+    # each shape of phrase (the mention's index is its first word).
+    both = ("bare-except", "broad-except")
+    assert match_rule("never catching exception.") == match(("broad-except",))
+    assert match_rule("never use bare except or catching exception.") == match(both)
+    assert match_rule("never use catching exception, bare except.") == match(both)
+    assert match_rule("do not use broad except.") == match(("broad-except",))
+    assert match_rule("avoid generic exceptions and bare excepts.") == match(both)
+    assert match_rule("catching exception is banned.") == match(("broad-except",))
+    assert match_rule("broad excepts and bare except are not allowed.") == match(both)
+    assert match_rule("blanket exception is forbidden, use specific exceptions.") == match(
+        ("broad-except",)
+    )
+    # A phrase after the trailing cue, or one before a prefix cue, is not reached.
+    assert match_rule("bare except is banned catching exception") is None
+    assert match_rule("catching exception, never bare except.") is None  # preferred mention
+
+
+_WORDS = (
+    "bare except excepts exception exceptions catch catching catches broad generic blanket "
+    "baseexception bare-except broad-exceptions generic-except and or the x"
+).split()
+
+
+def _spans(clause: tuple[str, ...]) -> list[tuple[int, int, int]]:
+    """``(index, start, stop)`` of each mention ``_find`` gives, after checking its shape."""
+    found = []
+    for mention in _find(clause):
+        assert len(mention) == 3, (clause, mention)
+        index, _option, words = mention
+        assert words.step == 1 and len(words) >= 1, (clause, mention)
+        assert words.start == index, (clause, mention)  # a span starts at its index
+        assert 0 <= words.start and words.stop <= len(clause), (clause, mention)
+        found.append((index, words.start, words.stop))
+    for (_, _, stop), (_, start, _) in itertools.pairwise(found):
+        assert stop <= start, (clause, found)  # no two spans share a word, in order
+    return found
+
+
+def test_round_3_find_gives_spans_that_start_at_their_index_and_never_overlap() -> None:
+    # Every clause of up to four words, from the words the finder looks at and a few it doesn't.
+    count = 0
+    for size in range(1, 5):
+        for clause in itertools.product(_WORDS, repeat=size):
+            _spans(clause)
+            count += 1
+    assert count > 100_000
+    # Longer clauses: a seeded random sample, and the phrases that run into each other.
+    rng = random.Random(61)  # noqa: S311 - a fixed-seed test generator
+    for _ in range(20_000):
+        _spans(tuple(rng.choices(_WORDS, k=rng.randint(5, 14))))
+    for text in (
+        "bare except exception",
+        "broad except exception exception",
+        "catching exception except exception",
+        "bare except bare except bare except",
+        "catch catching exception exception",
+        "bare " * 50 + "except exception " * 50,
+    ):
+        _spans(tuple(text.split()))
+
+
+def test_round_3_find_spans_match_the_phrases() -> None:
+    assert _spans(("bare", "except")) == [(0, 0, 2)]
+    assert _spans(("x", "catching", "exception")) == [(1, 1, 3)]
+    assert _spans(("a", "broad", "excepts", "b")) == [(1, 1, 3)]
+    assert _spans(("bare-except",)) == [(0, 0, 1)]
+    assert _spans(("baseexception", "bare", "except")) == [(0, 0, 1), (1, 1, 3)]
 
 
 @pytest.mark.parametrize(
