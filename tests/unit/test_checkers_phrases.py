@@ -13,12 +13,17 @@ from checker_support import MIB, assert_linear, best_time
 from conventiondrift.checkers.phrases import (
     BREAK_MARKS,
     BREAK_WORDS,
+    CALL_SUFFIX,
+    COMMA_BREAKS,
     NEGATIONS,
     TOKEN,
+    TRAILING_PAIRS,
+    TRAILING_WORDS,
     classify,
     clauses,
     first_cue,
     is_negated,
+    last_trailing_cue,
 )
 from conventiondrift.model import RuleMatch
 
@@ -95,12 +100,17 @@ def test_clauses_before_a_cue_are_not_negated_even_across_a_comma() -> None:
 
 
 def test_a_negation_runs_through_a_comma_to_the_end_of_the_clause() -> None:
-    # The negation reaches "b" after the comma; only a break stops it.
-    assert classify("never use a, use b. use c", find, OPTIONS) == rule(
+    # The negation reaches "b" after the comma: "b" is no positive verb cue. Only a break
+    # stops it.
+    assert classify("never use a, b. use c", find, OPTIONS) == rule(
         preferred="c", prohibited="ab", specificity=3
     )
-    assert classify("never use a, use b; use c", find, OPTIONS) == rule(
+    assert classify("never use a, b; use c", find, OPTIONS) == rule(
         preferred="c", prohibited="ab", specificity=3
+    )
+    assert classify("no a, b or c", find, OPTIONS) is None  # all three prohibited: nothing allowed
+    assert classify("no a, b or c", find, frozenset("abcd")) == rule(
+        prohibited="abc", specificity=3
     )
 
 
@@ -172,10 +182,50 @@ def test_digits_and_underscores_are_word_characters() -> None:
     assert clauses("use __name__ and log2") == (("use", "__name__", "and", "log2"),)
 
 
+PREFIX_CUES = [
+    "no",
+    "never",
+    "not",
+    "don't",
+    "don\u2019t",
+    "dont",
+    "do not",
+    "avoid",
+    "without",
+    "shouldn't",
+    "shouldn\u2019t",
+    "should not",
+    "mustn't",
+    "mustn\u2019t",
+    "must not",
+    "stop using",
+    "instead of",
+    "rather than",
+    "over",
+]
+TRAILING_CUES = [
+    "is banned",
+    "are banned",
+    "forbidden",
+    "is forbidden",
+    "prohibited",
+    "is prohibited",
+    "disallowed",
+    "are disallowed",
+    "deprecated",
+    "is deprecated",
+    "not allowed",
+    "is not allowed",
+    "are not allowed",
+]
+
+
 def test_the_tables_are_what_the_docs_say() -> None:
     assert BREAK_WORDS == {"but", "then", "instead", "however"}
     assert BREAK_MARKS == set(";:().-\u2013\u2014")
+    assert COMMA_BREAKS == {"use", "prefer", "choose", "pick", "switch", "always", "instead"}
     assert NEGATIONS == {
+        "no",
         "never",
         "not",
         "dont",
@@ -185,26 +235,185 @@ def test_the_tables_are_what_the_docs_say() -> None:
         "over",
         "rather",
         "without",
+        "shouldn't",
+        "shouldn\u2019t",
+        "mustn't",
+        "mustn\u2019t",
+        "stop using",
         "instead of",
     }
+    assert TRAILING_WORDS == {"forbidden", "prohibited", "disallowed", "deprecated"}
+    assert TRAILING_PAIRS == {("is", "banned"), ("are", "banned"), ("not", "allowed")}
 
 
-def test_the_wider_cue_list_is_not_read_yet() -> None:
-    # A separate follow-up adds these; until then they are not cues, so a mention reads as
-    # preferred (and the all-preferred guard keeps "use a; no b" from ever reading as Holds).
-    for text in (
-        "no a",
-        "shouldn't a",
-        "mustn't a",
-        "stop using a",
-        "a is banned",
-        "a forbidden",
-        "a is prohibited",
-        "a is disallowed",
-        "a deprecated",
-        "a is not allowed",  # the trailing "not" only reaches what follows it
-    ):
+# --- the wider cue list (INTERFACES I-10 item 3; CON-67) ------------------------------------
+
+
+@pytest.mark.parametrize("cue", PREFIX_CUES)
+def test_each_prefix_cue_prohibits_what_follows_it(cue: str) -> None:
+    assert classify(f"{cue} b", find, OPTIONS) == rule(prohibited="b", specificity=1)
+    assert classify(f"use a {cue} b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert classify(f"use a. {cue} b, c", find, OPTIONS) == rule(
+        preferred="a", prohibited="bc", specificity=3
+    )
+
+
+@pytest.mark.parametrize("cue", PREFIX_CUES)
+def test_each_prefix_cue_stops_at_a_break(cue: str) -> None:
+    assert classify(f"{cue} b; use c", find, OPTIONS) == rule(
+        preferred="c", prohibited="b", specificity=2
+    )
+
+
+@pytest.mark.parametrize("cue", TRAILING_CUES)
+def test_each_trailing_cue_prohibits_what_comes_before_it(cue: str) -> None:
+    assert classify(f"b {cue}", find, OPTIONS) == rule(prohibited="b", specificity=1)
+    assert classify(f"use a. b {cue}", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert classify(f"a and b {cue}", find, OPTIONS) == rule(prohibited="ab", specificity=2)
+
+
+@pytest.mark.parametrize("cue", TRAILING_CUES)
+def test_a_trailing_cue_stops_at_a_break_in_both_directions(cue: str) -> None:
+    # What is in a clause before or after the cue's own clause is not reached.
+    assert classify(f"use a; b {cue}; use c", find, OPTIONS) == rule(
+        preferred="ac", prohibited="b", specificity=3
+    )
+    assert classify(f"b {cue}. a", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+
+
+def test_a_trailing_cue_does_not_reach_what_comes_after_it() -> None:
+    assert classify("b is banned a", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+
+
+def test_the_two_word_cues_need_both_words() -> None:
+    for text in ("a banned", "a is allowed", "a allowed", "a was banned", "a has been banned"):
         assert classify(text, find, OPTIONS) == rule(preferred="a", specificity=1), text
+    assert last_trailing_cue(("banned",)) is None
+    assert last_trailing_cue(("allowed", "a", "not")) is None  # no wrap-around to the last word
+    assert last_trailing_cue(("banned", "a", "is")) is None
+
+
+def test_last_trailing_cue_is_the_index_of_the_last_cue_and_of_a_pair_its_second_word() -> None:
+    assert last_trailing_cue(("a", "is", "banned")) == 2
+    assert last_trailing_cue(("a", "forbidden", "b", "is", "not", "allowed")) == 5
+    assert last_trailing_cue(("a", "deprecated", "b")) == 1
+    assert last_trailing_cue(("a", "b")) is None
+    assert last_trailing_cue(()) is None
+
+
+def test_a_mention_on_the_trailing_cue_itself_is_not_negated() -> None:
+    def cue_as_option(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((i, "a") for i, word in enumerate(clause) if word == "forbidden")
+
+    # Nothing comes after the mention here, so the trailing cue doesn't reach it.
+    assert classify("x forbidden", cue_as_option, OPTIONS) == rule(preferred="a", specificity=1)
+
+
+def test_a_prefix_and_a_trailing_cue_together() -> None:
+    # "never a" reaches b and c after it; "c is banned" reaches a, b before it: all three.
+    assert classify("a never b c is banned", find, OPTIONS) is None
+    assert classify("a never b c is banned", find, frozenset("abcd")) == rule(
+        prohibited="abc", specificity=3
+    )
+
+
+def test_stop_using_is_one_cue() -> None:
+    assert clauses("stop using a") == (("stop using", "a"),)
+    assert clauses("stop using") == (("stop using",),)
+    assert clauses("please stop a using") == (("please", "stop", "a", "using"),)
+    assert clauses("stop usingx a") == (("stop", "usingx", "a"),)
+    assert classify("stop a", find, OPTIONS) == rule(preferred="a", specificity=1)
+
+
+# --- commas (I-10 refinement b) -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("verb", sorted(COMMA_BREAKS))
+def test_a_comma_before_a_positive_verb_cue_ends_the_negated_clause(verb: str) -> None:
+    assert classify(f"don't a, {verb} b", find, OPTIONS) == rule(
+        preferred="b", prohibited="a", specificity=2
+    )
+    # "instead" is a break word and is dropped; the other verbs start the next clause.
+    second = ("b",) if verb == "instead" else (verb, "b")
+    assert clauses(f"never a, {verb} b") == (("never", "a"), second)
+    # Also without a space after the comma and with a space before it.
+    assert clauses(f"never a,{verb} b") == (("never", "a"), second)
+    assert clauses(f"never a , {verb} b") == (("never", "a"), second)
+
+
+@pytest.mark.parametrize("word", ["b", "or", "and", "also", "usex", "user", "1", "not", "no"])
+def test_a_comma_before_anything_else_does_not_end_the_clause(word: str) -> None:
+    assert len(clauses(f"never a, {word} b")) == 1
+    assert classify(f"no a, {word} b", find, OPTIONS) == rule(prohibited="ab", specificity=2)
+
+
+def test_a_comma_before_a_clause_mark_leaves_that_mark_to_end_the_clause() -> None:
+    assert clauses("never a, (b") == (("never", "a"), ("b",))
+
+
+def test_a_comma_at_the_end_or_before_a_mark_ends_nothing() -> None:
+    assert clauses("never a,") == (("never", "a"),)
+    assert clauses("never a,,b") == (("never", "a", "b"),)
+    assert clauses("never a, , use b") == (("never", "a"), ("use", "b"))
+    assert clauses(",") == ()
+
+
+def test_the_comma_examples_of_i10() -> None:
+    # "Don't print, use logging." prohibits print and prefers logging; "no print, requests or
+    # urllib" prohibits all three.
+    assert classify("don't a, use b", find, OPTIONS) == rule(
+        preferred="b", prohibited="a", specificity=2
+    )
+    assert classify("no a, b or c", find, frozenset("abcd")) == rule(
+        prohibited="abc", specificity=3
+    )
+
+
+# --- empty () after a name (I-10 refinement a) ----------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["a", "`a`", "`a()`", "A", "a_", "a1", "logging.warn", "a.b"])
+def test_an_empty_call_suffix_is_removed_and_ends_nothing(name: str) -> None:
+    assert clauses(f"never use {name}() or b()") == clauses(f"never use {name} or b")
+    assert len(clauses(f"never use {name}() or b()")) == 1
+
+
+def test_a_call_suffix_is_deleted_not_replaced_by_anything() -> None:
+    # Whatever follows it is joined to the name (a replacement could split the word).
+    assert clauses("use a()b") == (("use", "ab"),)
+
+
+def test_the_i10_example_with_call_suffixes_prohibits_both() -> None:
+    assert classify("Never use a() or b()", find, OPTIONS) == rule(prohibited="ab", specificity=2)
+    assert classify("Never use `a()` or `b()`", find, OPTIONS) == rule(
+        prohibited="ab", specificity=2
+    )
+    assert classify("Never use `a`() or `b`()", find, OPTIONS) == rule(
+        prohibited="ab", specificity=2
+    )
+
+
+def test_parentheses_that_are_not_an_empty_call_suffix_still_end_the_clause() -> None:
+    assert clauses("never a () b") == (("never", "a"), ("b",))  # a space before the "("
+    assert clauses("never a(b)") == (("never", "a"), ("b",))
+    assert clauses("never a( )b") == (("never", "a"), ("b",))
+    assert clauses("() a") == (("a",),)  # nothing before it, so nothing is a name
+    assert clauses("never a;() b") == (("never", "a"), ("b",))
+    assert clauses("never a-() b") == (("never", "a"), ("b",))
+
+
+def test_call_suffix_is_one_character_of_lookbehind_and_two_literal_characters() -> None:
+    assert CALL_SUFFIX.sub("", "a() `a`() _() 1() x()") == "a `a` _ 1 x"
+    assert CALL_SUFFIX.sub("", " () (()") == " () (()"  # not after a name character
+    assert CALL_SUFFIX.pattern == r"(?<=[a-z0-9_`])\(\)"
 
 
 # --- negation -------------------------------------------------------------------------------
@@ -214,6 +423,15 @@ def test_the_wider_cue_list_is_not_read_yet() -> None:
 def test_every_negation_cue_negates_what_follows_it(word: str) -> None:
     clause = ("use", word, "a")
     assert is_negated(clause, 2) is True
+
+
+@pytest.mark.parametrize("cue", TRAILING_CUES)
+def test_is_negated_sees_a_trailing_cue_after_the_word_and_not_before_it(cue: str) -> None:
+    clause = ("a", *cue.split())
+    assert is_negated(clause, 0) is True
+    assert is_negated(("use", "a", *cue.split(), "b"), 1) is True
+    if "not" not in cue.split():  # "not" is also a prefix cue: it reaches what follows it
+        assert is_negated(("use", "a", *cue.split(), "b"), len(cue.split()) + 2) is False
 
 
 def test_negation_needs_a_cue_before_the_target() -> None:
@@ -320,6 +538,16 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
     "mixed options": lambda n: "never a b c " * (n // 12),
     "dashes": lambda n: "never a - " * (n // 10),
     "cues only": lambda n: "never " * (n // 6),
+    # CON-67: trailing cues, commas before a verb cue, call suffixes, "stop using".
+    "mentions then a trailing cue": lambda n: "a " * (n // 2) + "is banned",
+    "a trailing cue after every mention": lambda n: "a is banned " * (n // 12),
+    "trailing cues only": lambda n: "not allowed " * (n // 12),
+    "commas before a verb cue": lambda n: "never a, use " * (n // 13),
+    "commas before other words": lambda n: "never a, " * (n // 9),
+    "commas only": lambda n: "," * n,
+    "call suffixes": lambda n: "never a() " * (n // 10),
+    "unbalanced parentheses": lambda n: "never a( " * (n // 9),
+    "stop using before every mention": lambda n: "stop using a " * (n // 13),
 }
 
 

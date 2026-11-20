@@ -16,6 +16,7 @@ from checker_support import (
     assert_linear,
     best_time,
     counts,
+    extracted,
     rules_of,
     sites_of,
 )
@@ -97,6 +98,18 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("use print() for debug output.", match(("print",), (), 1)),
         ("use print, not logging.", match(("print",), ("logging",), 2)),
         ("USE LOGGING, NOT PRINT.", match(("logging",), ("print",), 2)),
+        # CON-67: the wider cue list, trailing cues, commas before a verb cue, call suffixes.
+        ("use logging; no print.", match(("logging",), ("print",), 2)),
+        ("use logging (print is banned).", match(("logging",), ("print",), 2)),
+        ("don't print, use logging.", match(("logging",), ("print",), 2)),
+        ("never log with print, use logging.", match(("logging",), ("print",), 2)),
+        ("never use print() or requests().", match((), ("print",), 1)),
+        ("never use `print()` or `requests()`.", match((), ("print",), 1)),
+        ("no print, requests or urllib.", match((), ("print",), 1)),
+        ("stop using print, use logging.", match(("logging",), ("print",), 2)),
+        ("print is forbidden; use logging.", match(("logging",), ("print",), 2)),
+        ("use logging. print is deprecated.", match(("logging",), ("print",), 2)),
+        ("using print is disallowed.", match((), ("print",), 1)),
     ],
 )
 def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: RuleMatch) -> None:
@@ -116,12 +129,12 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         "use print and never print.",  # print both preferred and prohibited: unreadable
         "do not use print for logging.",  # every option prohibited: nothing is allowed
         "never use logging or print.",
-        "never log with print, use logging.",  # the negation runs on through the comma
-        "don't print, use logging.",
+        "never log with print, use logging, use print.",  # print is prohibited and preferred
+        "use logging, never print; use print.",
+        "no print, logging or requests.",  # a comma before a non-verb: both prohibited
         # Every option preferred: every site would follow, so the rule would always hold.
-        "use logging; no print.",
-        "use logging (print is banned).",
         "use the logger to print status messages.",
+        "use logging and print.",
     ],
 )
 def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
@@ -541,3 +554,61 @@ def test_the_handler_follows_the_file_it_is_given() -> None:
     assert list(handler(call.value, guarded)) == []
     assert [s.file for s in handler(call.value, plain)] == ["a.py"]
     assert list(handler(call.value, guarded)) == []
+
+
+# --- CON-67 / T-016a: no negated phrasing ever maps print as preferred ----------------------
+
+# AC-T016a.1: these five phrasings never map print as preferred. Each one maps to the logging
+# checker with print prohibited (and nothing preferred), or it is Not verifiable (None).
+CON_67_PHRASINGS = [
+    "No print.",
+    "print is banned.",
+    "Never use print.",
+    "print is not allowed.",
+    "Don't use print.",
+]
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "use logging, print is banned.",  # no break at a comma before a non-verb: both prohibited
+        "don't print, and use logging.",  # "and" is not a positive verb cue either
+    ],
+)
+def test_i10_leaves_these_commas_unbroken_so_the_rule_is_not_verifiable(sentence: str) -> None:
+    assert match_rule(sentence) is None
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_ac_t016a_1_a_negated_print_never_maps_as_preferred(sentence: str) -> None:
+    found = match_rule(sentence.lower())
+    assert found is None or "print" not in found.preferred
+    assert found == match((), ("print",), 1)  # the mapping each of them gets now
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_ac_t016a_1_holds_at_the_original_and_normalized_case_and_with_a_logging_clause(
+    sentence: str,
+) -> None:
+    assert match_rule(sentence.lower()) == match_rule(sentence.lower().rstrip("."))
+    with_logging = match_rule(f"use logging. {sentence.lower()}")
+    assert with_logging == match(("logging",), ("print",), 2)
+
+
+def test_ac_t016a_1_in_an_agents_md_no_line_maps_print_as_preferred() -> None:
+
+    text = "\n".join(CON_67_PHRASINGS) + "\n"
+    rules = extracted(text)
+    # Only "Never use print." (line 3) and "Don't use print." (line 5) are rule shapes
+    # (rules/extract.py); the other three lines are not extracted as rules at all.
+    assert [(r.line, r.checker) for r in rules] == [(3, "logging"), (5, "logging")]
+    for rule in rules:
+        assert rule.match == match((), ("print",), 1)
+
+
+def test_ac_t016a_1_the_registry_maps_each_phrasing_to_logging_with_print_prohibited() -> None:
+    for sentence in CON_67_PHRASINGS:
+        mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
+        assert mapped.checker == "logging", sentence
+        assert mapped.match == match((), ("print",), 1), sentence

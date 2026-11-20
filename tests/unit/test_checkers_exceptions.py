@@ -7,7 +7,14 @@ import ast
 import textwrap
 
 import pytest
-from checker_support import assert_linear, counts, rules_of, sites_of
+from checker_support import (
+    REGISTRY_UNDER_TEST,
+    assert_linear,
+    counts,
+    extracted,
+    rules_of,
+    sites_of,
+)
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.exceptions import ExceptionsChecker
@@ -15,6 +22,7 @@ from conventiondrift.checkers.exceptions.match import OPTIONS, match_rule
 from conventiondrift.checkers.exceptions.sites import BROAD_NAMES, exception_sites
 from conventiondrift.checkers.walk import parse
 from conventiondrift.model import FileContext, RuleMatch, Site
+from conventiondrift.rules.mapping import map_rule
 
 NO_BARE_OR_BROAD = match_rule("do not use bare except or catch exception")
 
@@ -262,13 +270,62 @@ def test_the_handler_gives_nothing_for_a_node_that_is_not_a_handler() -> None:
 
 
 def test_a_later_always_is_not_a_cue_so_the_whole_sentence_prohibits_bare_except() -> None:
-    # CR1 on #58: "always" is not a cue (and "and" doesn't end the negation), so both halves
-    # read as forbidden and this maps to a prohibition of bare-except. Under the wider cue
-    # list of the follow-up PR the second half may become a request and the sentence unmapped;
-    # revisit this test then.
+    # Pinned in #58 and revisited in CON-67 (T-016a): the wider cue list and the comma rule
+    # (I-10) leave this answer as it was. "always" ends a clause only after a comma ("never use
+    # bare except, always use bare except" does read as prohibit then prefer), and "and" never
+    # ends one, so here the negation of "never" runs on to the end and both halves read as
+    # forbidden. A sentence that is self-contradictory anyway; its reading is a prohibition.
     assert match_rule("never use bare except and always use bare except.") == match(
         ("bare-except",)
     )
+    assert match_rule("never use bare except, always use bare except.") is None  # prohibit + prefer
+
+
+# CON-67 / AC-T016a.2: the five phrasings with "bare except" never map it as preferred.
+CON_67_PHRASINGS = [
+    "No bare except.",
+    "bare except is banned.",
+    "Never use bare except.",
+    "bare except is not allowed.",
+    "Don't use bare except.",
+]
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_ac_t016a_2_a_negated_bare_except_never_maps_as_preferred(sentence: str) -> None:
+    found = match_rule(sentence.lower())
+    assert found is None or "bare-except" not in found.preferred
+    assert found == match(("bare-except",))
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_ac_t016a_2_the_registry_maps_each_phrasing_to_exceptions(sentence: str) -> None:
+    mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
+    assert mapped.checker == "exceptions"
+    assert mapped.match == match(("bare-except",))
+
+
+def test_ac_t016a_2_in_an_agents_md_no_line_maps_bare_except_as_preferred() -> None:
+
+    text = "\n".join(CON_67_PHRASINGS) + "\n"
+    rules = extracted(text)
+    assert [(r.line, r.checker) for r in rules] == [(3, "exceptions"), (5, "exceptions")]
+    for rule in rules:
+        assert rule.match == match(("bare-except",))
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("never use bare except() or baseexception.", ("bare-except", "broad-except")),
+        ("don't use bare except, use specific exceptions.", ("bare-except",)),
+        ("stop using bare except.", ("bare-except",)),
+        ("bare except and catch exception are forbidden.", ("bare-except", "broad-except")),
+        ("catching exception is deprecated.", ("broad-except",)),
+    ],
+)
+def test_the_wider_cues_read_for_exceptions_too(sentence: str, prohibited: tuple[str, ...]) -> None:
+    assert match_rule(sentence) == match(prohibited)
 
 
 HOSTILE_RULES = {

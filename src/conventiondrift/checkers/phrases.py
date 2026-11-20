@@ -6,25 +6,39 @@ spaces; DESIGN §7 step 2). A checker reads it in three steps:
 1. ``clauses`` cuts the sentence into word lists (the clause rules below).
 2. The checker's own ``find`` says which of its options a clause mentions, and
    at which word.
-3. ``classify`` sorts each mention by polarity: a mention after a negation cue
-   (``NEGATIONS``) in its clause is prohibited, any other mention is preferred.
+3. ``classify`` sorts each mention by polarity: a mention that a negation cue
+   reaches (``NEGATIONS`` after it, or ``TRAILING_WORDS`` / ``TRAILING_PAIRS``
+   before it, in the same clause) is prohibited, any other mention is preferred.
 
 Clause rules (INTERFACES I-10, "Negation in phrases.py"):
 
-* A negation cue applies from the cue to the end of its clause. Words before
-  the cue are not negated, so "use logging, not print" prefers logging and
-  prohibits print.
+* A negation cue (``NEGATIONS``: "no", "never", "not", "don't", "avoid",
+  "without", "shouldn't", "mustn't", "stop using", "instead of", "rather than",
+  "over", and so "do not", "should not" and "must not" through "not") applies
+  from the cue to the end of its clause. Words before the cue are not negated,
+  so "use logging, not print" prefers logging and prohibits print.
+* A trailing cue applies from the start of its clause to the cue: "print is
+  banned", "print is forbidden", "prohibited", "disallowed", "deprecated", "is
+  not allowed" and "are banned" prohibit what is mentioned before them in the
+  same clause. ("banned" alone, as in "print was banned", is not a cue.)
 * A clause ends at ``.``, ``;``, ``:``, ``(``, ``)``, a dash (an en or em dash,
   ``--``, or a hyphen with a space on both sides; a hyphen inside a word such
   as "bare-except" is not a dash), and at the words ``but``, ``then``,
   ``instead`` and ``however``.
-* ``and``, ``or``, ``nor`` and ``,`` do **not** end a clause, so "never use
-  print or requests" and "do not use print, requests" prohibit both.
+* A comma ends a clause only when the next word is a positive verb cue
+  (``COMMA_BREAKS``: "use", "prefer", "choose", "pick", "switch", "always",
+  "instead"). So "don't print, use logging" prohibits print and prefers
+  logging, while "no print, requests or urllib" prohibits all three.
+* ``and``, ``or`` and ``nor`` do **not** end a clause, so "never use print or
+  requests" prohibits both.
+* An empty ``()`` right after a name, with or without backticks (``print()``,
+  `` `print`() ``), is a call suffix. It is removed before the sentence is cut
+  into clauses, so "never use print() or requests()" prohibits both.
 * "X instead of Y" and "X rather than Y" prohibit Y. ``instead of`` is read as
   one cue that starts a new clause; a bare ``instead`` (as in "don't print,
   instead use logging") only ends the clause.
-* Only the cues in ``NEGATIONS`` are read. Any other phrasing ("no print",
-  "print is banned") is not a cue, so what it mentions reads as preferred.
+* Only the cues above are read. Any other phrasing ("print has been banned")
+  is not a cue, so what it mentions reads as preferred.
 
 A sentence that doesn't give a usable ``RuleMatch`` is not mapped, which makes
 the rule Not verifiable, never a wrong verdict. That is the case when:
@@ -33,7 +47,7 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
 * an option is named in both a negated and a non-negated clause;
 * every option is prohibited (the rule would allow nothing); or
 * every option is preferred (every site would follow, so the rule would always
-  hold; this is also what an unread cue such as "no" looks like).
+  hold; this is also what a cue that isn't read looks like).
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -41,13 +55,15 @@ that each find one option in a sentence tie, and a tie is Not verifiable
 (AC-F2.6).
 
 Everything here is linear in the length of the sentence: ``clauses`` reads each
-token once, ``first_cue`` runs once per clause, and a mention is negated exactly
-when it comes after that cue.
+token once, ``first_cue`` and ``last_trailing_cue`` run once per clause, and a
+mention is negated exactly when it comes after the first cue or before the last
+trailing cue.
 
-The one regex, ``TOKEN``, is applied to repo text (SECURITY-RULES R2.5). It is a
-single character class repeated, an optional ``.name`` suffix that starts with a
-literal dot, single characters, and ``--`` followed by more hyphens, so it can't
-backtrack and runs in linear time.
+The two regexes, ``TOKEN`` and ``CALL_SUFFIX``, are applied to repo text
+(SECURITY-RULES R2.5). ``TOKEN`` is a single character class repeated, an
+optional ``.name`` suffix that starts with a literal dot, single characters, and
+``--`` followed by more hyphens; ``CALL_SUFFIX`` is one character of lookbehind
+and the literal ``()``. Neither can backtrack, so both run in linear time.
 """
 
 import re
@@ -59,19 +75,27 @@ from conventiondrift.model import RuleMatch
 __all__ = [
     "BREAK_MARKS",
     "BREAK_WORDS",
+    "CALL_SUFFIX",
+    "COMMA_BREAKS",
     "NEGATIONS",
     "TOKEN",
+    "TRAILING_PAIRS",
+    "TRAILING_WORDS",
     "Finder",
     "classify",
     "clauses",
     "first_cue",
     "is_negated",
+    "last_trailing_cue",
 ]
 
 TOKEN: Final = re.compile(
-    r"[a-z0-9_'\u2019]+(?:\.[a-z0-9_]+)*|[;:().\u2013\u2014]|(?<=\s)-(?=\s)|--+"
+    r"[a-z0-9_'\u2019]+(?:\.[a-z0-9_]+)*|[;:().,\u2013\u2014]|(?<=\s)-(?=\s)|--+"
 )
 """A word, or a clause mark. A dotted name such as ``logging.warn`` is one word."""
+
+CALL_SUFFIX: Final = re.compile(r"(?<=[a-z0-9_`])\(\)")
+"""An empty ``()`` right after a name or its closing backtick: ``print()``, `` `print`() ``."""
 
 BREAK_MARKS: Final = frozenset(";:().-\u2013\u2014")
 """First characters of the mark tokens, each of which ends a clause."""
@@ -79,11 +103,18 @@ BREAK_MARKS: Final = frozenset(";:().-\u2013\u2014")
 BREAK_WORDS: Final = frozenset({"but", "then", "instead", "however"})
 """Words that end a clause; negation doesn't carry across them."""
 
+COMMA_BREAKS: Final = frozenset({"use", "prefer", "choose", "pick", "switch", "always", "instead"})
+"""A comma followed by one of these words ends a clause (a positive verb cue)."""
+
 INSTEAD_OF: Final = "instead of"
 """The cue ``clauses`` makes of the words "instead of" (a clause break, then a cue)."""
 
+STOP_USING: Final = "stop using"
+"""The cue ``clauses`` makes of the words "stop using"."""
+
 NEGATIONS: Final = frozenset(
     {
+        "no",
         "never",
         "not",
         "dont",
@@ -93,10 +124,24 @@ NEGATIONS: Final = frozenset(
         "over",
         "rather",
         "without",
+        "shouldn't",
+        "shouldn\u2019t",
+        "mustn't",
+        "mustn\u2019t",
+        STOP_USING,
         INSTEAD_OF,
     }
 )
-"""Cues that make what follows, to the end of the same clause, something the rule forbids."""
+"""Cues that make what follows, to the end of the same clause, something the rule forbids.
+
+"do not", "should not" and "must not" are read through "not", and "rather than" through
+"rather"."""
+
+TRAILING_WORDS: Final = frozenset({"forbidden", "prohibited", "disallowed", "deprecated"})
+"""Cues that make what comes before them, from the start of the same clause, forbidden."""
+
+TRAILING_PAIRS: Final = frozenset({("is", "banned"), ("are", "banned"), ("not", "allowed")})
+"""Two-word trailing cues; the cue is at the second word."""
 
 Finder = Callable[[tuple[str, ...]], Iterable[tuple[int, str]]]
 """Gives the ``(word index, option)`` pairs one checker finds in a clause."""
@@ -104,23 +149,29 @@ Finder = Callable[[tuple[str, ...]], Iterable[tuple[int, str]]]
 
 def clauses(text: str) -> tuple[tuple[str, ...], ...]:
     """The sentence as non-empty word lists, cut at the clause breaks above."""
-    tokens = TOKEN.findall(text.lower())
+    tokens = TOKEN.findall(CALL_SUFFIX.sub("", text.lower()))
     found: list[tuple[str, ...]] = []
     current: list[str] = []
     index = 0
     while index < len(tokens):
         word = tokens[index]
+        following = tokens[index + 1 : index + 2]
         index += 1
-        is_instead_of = word == "instead" and tokens[index : index + 1] == ["of"]
-        if word in BREAK_WORDS or word[0] in BREAK_MARKS:
+        is_break = word in BREAK_WORDS or word[0] in BREAK_MARKS
+        if word == ",":
+            is_break = bool(following) and following[0] in COMMA_BREAKS
+        elif word == "stop" and following == ["using"]:
+            current.append(STOP_USING)
+            index += 1
+        elif not is_break:
+            current.append(word)
+        if is_break:
             if current:
                 found.append(tuple(current))
                 current = []
-            if is_instead_of:
+            if word == "instead" and following == ["of"]:
                 current.append(INSTEAD_OF)
                 index += 1
-        else:
-            current.append(word)
     if current:
         found.append(tuple(current))
     return tuple(found)
@@ -134,14 +185,24 @@ def first_cue(clause: tuple[str, ...]) -> int | None:
     return None
 
 
-def _after(cue: int | None, index: int) -> bool:
-    """Whether the word at ``index`` comes after the clause's first cue (so it is negated)."""
-    return cue is not None and cue < index
+def last_trailing_cue(clause: tuple[str, ...]) -> int | None:
+    """The index of the last trailing cue in ``clause`` (the second word of a pair), or None."""
+    last = None
+    for index, word in enumerate(clause):
+        if word in TRAILING_WORDS or (index and (clause[index - 1], word) in TRAILING_PAIRS):
+            last = index
+    return last
+
+
+def _reached(cue: int | None, end: int | None, index: int) -> bool:
+    """Whether a cue reaches the word at ``index``: after the first cue, or before the last
+    trailing cue."""
+    return (cue is not None and cue < index) or (end is not None and index < end)
 
 
 def is_negated(clause: tuple[str, ...], index: int) -> bool:
-    """Whether a negation cue comes before ``clause[index]`` in its clause."""
-    return _after(first_cue(clause), index)
+    """Whether a negation cue in ``clause`` reaches ``clause[index]``."""
+    return _reached(first_cue(clause), last_trailing_cue(clause), index)
 
 
 def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | None:
@@ -149,11 +210,12 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
     preferred: set[str] = set()
     prohibited: set[str] = set()
     for clause in clauses(text):
-        # The cue is found once per clause, not once per mention: a hostile sentence with
+        # The cues are found once per clause, not once per mention: a hostile sentence with
         # 100,000 mentions in one clause must not cost 100,000 scans (linear time, R2.5).
         cue = first_cue(clause)
+        end = last_trailing_cue(clause)
         for index, option in find(clause):
-            (prohibited if _after(cue, index) else preferred).add(option)
+            (prohibited if _reached(cue, end, index) else preferred).add(option)
     mentioned = preferred | prohibited
     if not mentioned or preferred & prohibited:
         return None
