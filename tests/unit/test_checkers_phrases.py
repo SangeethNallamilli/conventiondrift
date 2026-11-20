@@ -1610,6 +1610,10 @@ def test_item_5d_ruling_8_the_architects_examples() -> None:
     assert classify("switch over to httpx.", find_http, HTTP) == RuleMatch(
         frozenset({"httpx"}), frozenset(), 1
     )
+    # SE2's case: "requests" right after the particle is preferred, not prohibited.
+    assert classify("switch over to requests.", find_http, HTTP) == RuleMatch(
+        frozenset({"requests"}), frozenset(), 1
+    )
     assert classify("prefer pytest over unittest.", find_pytest, PYTEST) == RuleMatch(
         frozenset({"pytest"}), frozenset({"unittest"}), 2
     )
