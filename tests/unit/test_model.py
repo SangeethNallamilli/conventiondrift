@@ -448,6 +448,7 @@ def test_unhashable_types_declare_hash_none() -> None:
 def test_history_result_stats_are_read_only_and_copied() -> None:
     source = {"scan_diff_work": 4}
     result = HistoryResult(frozenset(), True, (), source)
+    assert isinstance(result.stats, MappingProxyType)
     source["scan_diff_work"] = 9
     assert result.stats == {"scan_diff_work": 4}
     with pytest.raises(TypeError):

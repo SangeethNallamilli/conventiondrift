@@ -17,11 +17,12 @@ from tests.fixtures.gitrepo import GitRepo
 from conventiondrift import history
 from conventiondrift.components import TreeEntry
 from conventiondrift.discover.safefs import FILE_MAX_BYTES
+from conventiondrift.errors import ComponentError
 from conventiondrift.gitread import GitReader
-from conventiondrift.history import compute_recent
+from conventiondrift.history import GitHistory, compute_recent
 from conventiondrift.model import HistoryResult, PyFile, TrackedState, Window
 
-TIP = sha(5)
+TIP = sha(1)  # FakeGit's HEAD: scan mode resolves it through the reader
 
 
 def blob_id(data: bytes, family: str = "sha1") -> str:
@@ -51,6 +52,7 @@ def scan(
     sites: Mapping[str, Sequence[int]],
     files: Mapping[str, bytes],
     tracked: Mapping[str, TrackedState] | None = None,
+    max_file_bytes: int | None = None,
 ) -> HistoryResult:
     result = compute_recent(
         git,
@@ -58,7 +60,7 @@ def scan(
         {"head": {path: frozenset(lines) for path, lines in sites.items()}},
         scan_files=[PyFile(path, data) for path, data in files.items()],
         scan_tracked=tracked_from(git, files) if tracked is None else tracked,
-        tips={"head": TIP},
+        max_file_bytes=max_file_bytes,
     )
     assert git.tree_calls == []  # C8 never lists the tree (I-14 ruling 3)
     return result
@@ -199,6 +201,62 @@ def test_a_head_blob_exactly_at_the_py_size_limit_is_diffed() -> None:
     assert result.stats["scan_all_recent_line_limit"] == 0
     assert result.stats["scan_diff_work"] == 1
     assert result.notes == ()
+
+
+def test_max_file_bytes_none_uses_the_default_py_limit() -> None:
+    git, work = head_blob_case(10)
+    scan(git, {"a.py": [1]}, {"a.py": work}, max_file_bytes=None)
+    assert git.blob_calls == [(blob_id(b"h" * 10), FILE_MAX_BYTES)]
+
+
+def test_an_explicit_max_file_bytes_replaces_the_default() -> None:
+    # I-14 C8 ruling 7: the value passed is the size limit for the HEAD blob.
+    git, work = head_blob_case(10)
+    scan(git, {"a.py": [1]}, {"a.py": work}, max_file_bytes=50)
+    assert git.blob_calls == [(blob_id(b"h" * 10), 50)]
+
+
+@pytest.mark.parametrize(("size", "over"), [(49, False), (50, False), (51, True)])
+def test_the_explicit_limit_is_inclusive_at_the_boundary(size: int, over: bool) -> None:
+    git, work = head_blob_case(size)
+    result = scan(git, {"a.py": [1]}, {"a.py": work}, max_file_bytes=50)
+    assert recent_lines(result, "a.py") == {1}  # the one line changed either way
+    assert result.stats["scan_all_recent_line_limit"] == int(over)
+    assert result.stats["scan_diff_work"] == int(not over)
+    assert result.notes == ((history.SCAN_LINE_LIMIT_NOTE,) if over else ())
+
+
+def test_a_zero_limit_is_a_limit_not_the_default() -> None:
+    git, work = head_blob_case(1)
+    result = scan(git, {"a.py": [1]}, {"a.py": work}, max_file_bytes=0)
+    assert git.blob_calls == [(blob_id(b"h"), 0)]
+    assert result.stats["scan_all_recent_line_limit"] == 1
+
+
+def test_a_limit_above_the_default_is_used_as_given() -> None:
+    git, work = head_blob_case(FILE_MAX_BYTES + 1)
+    result = scan(git, {"a.py": [1]}, {"a.py": work}, max_file_bytes=FILE_MAX_BYTES + 1)
+    assert result.stats["scan_all_recent_line_limit"] == 0
+    assert result.stats["scan_diff_work"] == 1
+
+
+def test_a_negative_limit_is_a_history_error() -> None:
+    git, work = head_blob_case(10)
+    with pytest.raises(ComponentError):
+        scan(git, {"a.py": [1]}, {"a.py": work}, max_file_bytes=-1)
+
+
+def test_git_history_passes_max_file_bytes_through() -> None:
+    git, work = head_blob_case(10)
+    result = GitHistory().recent(
+        git,
+        window(),
+        {"head": {"a.py": frozenset({1})}},
+        scan_files=[PyFile("a.py", work)],
+        scan_tracked=tracked_from(git, {"a.py": work}),
+        max_file_bytes=9,
+    )
+    assert result.stats["scan_all_recent_line_limit"] == 1
 
 
 def test_several_oversize_blobs_each_count_once() -> None:
@@ -385,7 +443,6 @@ def test_every_note_in_one_run_comes_in_a_fixed_order(monkeypatch: pytest.Monkey
         {"head": {path: frozenset(lines) for path, lines in sites.items()}},
         scan_files=[PyFile(path, data) for path, data in files.items()],
         scan_tracked=tracked_from(git, files),
-        tips={"head": sha(1)},
     )
     assert result.notes[:3] == (
         history.COMMIT_CAP_NOTE,

@@ -92,10 +92,10 @@ def bare_cr_note(count: int) -> str:
 
     DRAFT wording in the D-PM-45 style, pending PM approval.
     """
-    noun = "file has" if count == 1 else "files have"
+    noun, pronoun = ("file has", "it") if count == 1 else ("files have", "them")
     return (
         f"{count} {noun} bare carriage-return line endings, which git does not count as "
-        "line breaks, so recent adherence may be approximate for them."
+        f"line breaks, so recent adherence may be approximate for {pronoun}."
     )
 
 
@@ -458,14 +458,14 @@ class _ScanPlan:
     diff_work: int = 0
 
 
-def _head_lines(git: GitReaderProtocol, blob: str) -> list[bytes] | None:
-    """The ``HEAD`` blob's lines, or ``None`` if it is over C4's per-file ``.py`` limit.
+def _head_lines(git: GitReaderProtocol, blob: str, max_bytes: int) -> list[bytes] | None:
+    """The ``HEAD`` blob's lines, or ``None`` if it is over ``max_bytes``.
 
     The reader checks the blob's size before it reads the body and raises
     ``FileSkipped`` for one over the limit, so a huge blob is never read.
     """
     try:
-        return _lines(git.blob(blob, size_limit("python")))
+        return _lines(git.blob(blob, max_bytes))
     except FileSkipped:
         return None
 
@@ -475,6 +475,7 @@ def _scan_plan(
     head_sites: Mapping[str, frozenset[int]],
     scan_files: Sequence[PyFile],
     scan_tracked: Mapping[str, TrackedState],
+    max_bytes: int,
 ) -> _ScanPlan:
     """A-3: split the head sites into dated-by-history, recent, and mapped-by-difflib.
 
@@ -509,7 +510,7 @@ def _scan_plan(
             plan.budget_files += 1
             plan.recent.update((path, line) for line in lines)
             continue
-        head_lines = _head_lines(git, state.head_blob)
+        head_lines = _head_lines(git, state.head_blob, max_bytes)
         if head_lines is None or len(head_lines) > SCAN_LINE_LIMIT:
             plan.line_limit_files += 1
             plan.recent.update((path, line) for line in lines)
@@ -549,9 +550,12 @@ def _tips_for(
 ) -> dict[Side, str | None]:
     """The commit each side with site lines analyzes; ``None`` is the reader's ``HEAD``.
 
-    Only scan mode (no tips, scan files) may leave the head side without a tip.
+    Only scan mode (no tips, scan files) may leave the head side without a tip, and
+    tips together with scan files are a caller bug.
     """
-    scan_mode = not tips and bool(scan_files)
+    if tips and scan_files:
+        raise ValueError("tips and scan files are for different modes; a call has one")
+    scan_mode = bool(scan_files)
     found: dict[Side, str | None] = {}
     for side in ("base", "head"):
         if not any(sites.get(side, {}).values()):
@@ -573,6 +577,7 @@ def _compute(
     needed: Mapping[Side, str | None],
     scan_files: Sequence[PyFile],
     scan_tracked: Mapping[str, TrackedState],
+    max_bytes: int,
 ) -> HistoryResult:
     start = _since(end, window.days)
     recent: set[tuple[Side, str, int]] = set()
@@ -584,7 +589,7 @@ def _compute(
         tip = given if given is not None else git.resolve("HEAD")
         wanted: Mapping[str, Sequence[int]] = {p: sorted(v) for p, v in side_sites.items()}
         if side == "head" and scan_files:
-            plan = _scan_plan(git, side_sites, scan_files, scan_tracked)
+            plan = _scan_plan(git, side_sites, scan_files, scan_tracked, max_bytes)
             wanted = plan.wanted
         if any(wanted.values()):
             dated, side_notes, side_cr = _walk(git, tip, wanted, start, end)
@@ -620,23 +625,29 @@ def compute_recent(
     tips: Mapping[Side, str] = {},
     scan_files: Sequence[PyFile] = (),
     scan_tracked: Mapping[str, TrackedState] = {},
+    max_file_bytes: int | None = None,
 ) -> HistoryResult:
     """The recent site lines per side, with the notes and ``scan_*`` counters (I-14 ``History``).
 
     PR mode: ``tips`` has the commit each side's site lines were read from (base: the
     merge base, head: the PR head). Scan mode: ``tips`` is empty, ``scan_files`` is the
     working tree and the head side is dated from the reader's ``HEAD``. A side with
-    site lines and no tip is a caller bug and raises ``ValueError`` (checked first).
+    site lines and no tip, and ``tips`` together with ``scan_files``, are caller bugs
+    and raise ``ValueError`` (checked first).
+
+    ``max_file_bytes`` is the size limit for a ``HEAD`` blob read in scan mode: the
+    value passed, or C4's per-file ``.py`` limit when it is ``None``.
 
     If ``git`` is ``None``, or the window is not available (or has no end), nothing
     is read and the result is ``available=False`` with an empty set. Any git failure,
     and any patch text that cannot be read, raises ``ComponentError("history")``.
     """
     needed = _tips_for(sites, tips, scan_files)
+    max_bytes = size_limit("python") if max_file_bytes is None else max_file_bytes
     if git is None or not window.available or window.end is None:
         return HistoryResult(frozenset(), False, (), _no_stats())
     try:
-        return _compute(git, window.end, window, sites, needed, scan_files, scan_tracked)
+        return _compute(git, window.end, window, sites, needed, scan_files, scan_tracked, max_bytes)
     except ComponentError as exc:
         if exc.component == _COMPONENT:
             raise
@@ -665,6 +676,7 @@ class GitHistory:
         tips: Mapping[Side, str] = {},
         scan_files: Sequence[PyFile] = (),
         scan_tracked: Mapping[str, TrackedState] = {},
+        max_file_bytes: int | None = None,
     ) -> HistoryResult:
         return compute_recent(
             git,
@@ -673,4 +685,5 @@ class GitHistory:
             tips=tips,
             scan_files=scan_files,
             scan_tracked=scan_tracked,
+            max_file_bytes=max_file_bytes,
         )

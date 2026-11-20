@@ -7,6 +7,7 @@ Test Engineer. The AC or rule each case exercises is given in a comment instead.
 import dataclasses
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 
 import pytest
 from history_support import END, FakeGit, file_diff, hunk, marker, sha, when, window
@@ -89,9 +90,12 @@ def test_the_notes_use_the_pm_approved_wording() -> None:
 def test_the_bare_cr_note_gives_the_count() -> None:
     assert bare_cr_note(1) == (
         "1 file has bare carriage-return line endings, which git does not count as line breaks, "
+        "so recent adherence may be approximate for it."
+    )
+    assert bare_cr_note(3) == (
+        "3 files have bare carriage-return line endings, which git does not count as line breaks, "
         "so recent adherence may be approximate for them."
     )
-    assert bare_cr_note(3).startswith("3 files have bare carriage-return line endings")
 
 
 def test_git_history_satisfies_the_history_protocol() -> None:
@@ -137,6 +141,7 @@ def test_an_available_result_says_so_and_carries_every_counter() -> None:
         FakeGit(chain, patches), window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD}
     )
     assert result.available and result.notes == () and dict(result.stats) == NO_STATS
+    assert isinstance(result.stats, MappingProxyType)
 
 
 def test_no_site_lines_means_no_git_calls() -> None:
@@ -194,37 +199,41 @@ def test_scan_mode_resolves_head_through_the_reader() -> None:
     assert git.chain_calls == [(sha(7), COMMIT_CAP)]
 
 
-@pytest.mark.parametrize(
-    ("sites", "tips"),
-    [
-        ({"base": {"a.py": lines(1)}}, {}),  # scan mode has no base side
-        ({"head": {"a.py": lines(1)}}, {"base": HEAD}),  # tips given: PR mode, so head needs one
-    ],
-)
-def test_scan_files_do_not_stand_in_for_a_missing_tip(sites: Sites, tips: dict[Side, str]) -> None:
+def test_scan_mode_has_no_base_side() -> None:
     with pytest.raises(ValueError, match="no tip commit"):
         compute_recent(
             FakeGit([(HEAD, END)], [marker(HEAD)]),
             window(),
-            sites,
-            tips=tips,
+            {"base": {"a.py": lines(1)}},
             scan_files=[PyFile("a.py", b"x\n")],
         )
 
 
-def test_a_given_head_tip_is_used_even_with_scan_files() -> None:
-    git = FakeGit(
-        [(sha(7), END)], [marker(sha(7)) + file_diff(b"a.py", hunk(1, 0, 1, 1))], head=sha(9)
-    )
-    compute_recent(
-        git,
-        window(),
-        {"head": {"a.py": lines(1)}},
-        tips={"head": sha(7)},
-        scan_files=[PyFile("a.py", b"x\n")],
-        scan_tracked={"a.py": TrackedState("c" * 40, True)},
-    )
-    assert git.chain_calls == [(sha(7), COMMIT_CAP)]
+@pytest.mark.parametrize(
+    "tips", [{"head": HEAD}, {"base": HEAD}, {"base": sha(2), "head": HEAD}], ids=str
+)
+@pytest.mark.parametrize("sites", [{"head": {"a.py": lines(1)}}, {}], ids=["sites", "no sites"])
+def test_tips_and_scan_files_together_are_a_value_error(
+    tips: dict[Side, str], sites: Sites
+) -> None:
+    # I-14 C8 ruling 7: a call is PR mode (tips) or scan mode (scan files), never both.
+    git = FakeGit([(HEAD, END)], [marker(HEAD)])
+    with pytest.raises(ValueError, match="different modes"):
+        compute_recent(git, window(), sites, tips=tips, scan_files=[PyFile("a.py", b"x\n")])
+    assert git.chain_calls == []
+
+
+def test_tips_and_scan_files_are_a_value_error_even_when_recent_is_unavailable() -> None:
+    bad = Window(end=None, days=90, available=False, unavailable_reason="no history")
+    with pytest.raises(ValueError, match="different modes"):
+        compute_recent(None, bad, {}, tips={"head": HEAD}, scan_files=[PyFile("a.py", b"x\n")])
+
+
+def test_a_side_with_empty_site_lines_needs_no_tip_in_scan_mode() -> None:
+    git = FakeGit([(HEAD, END)], [marker(HEAD)])
+    sites: Sites = {"base": {"a.py": frozenset()}, "head": {}}
+    result = compute_recent(git, window(), sites, scan_files=[PyFile("a.py", b"x\n")])
+    assert result.available and git.chain_calls == []
 
 
 # ---------------------------------------------------------------- classification

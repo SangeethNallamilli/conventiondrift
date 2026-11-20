@@ -109,7 +109,8 @@ class History(Protocol):
     PR mode: ``tips`` has the commit each side analyzes (base: merge base, head: PR head).
     Scan mode: ``git`` is the HEAD reader (None without a HEAD), ``tips`` is empty,
     ``scan_files`` are the working-tree files and ``scan_tracked`` has one entry per
-    tracked scan file, from C4 (A-3).
+    tracked scan file, from C4 (A-3). ``max_file_bytes`` is the size limit for a
+    ``HEAD`` blob C8 reads (``None``: C4's per-file ``.py`` limit).
     """
 
     def recent(
@@ -121,6 +122,7 @@ class History(Protocol):
         tips: Mapping[Side, str] = {},
         scan_files: Sequence[PyFile] = (),
         scan_tracked: Mapping[str, TrackedState] = {},
+        max_file_bytes: int | None = None,
     ) -> HistoryResult: ...
 
 

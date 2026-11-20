@@ -98,6 +98,7 @@ class _History:
         tips: Mapping[Side, str] = {},
         scan_files: Sequence[PyFile] = (),
         scan_tracked: Mapping[str, TrackedState] = {},
+        max_file_bytes: int | None = None,
     ) -> HistoryResult:
         recent: frozenset[tuple[Side, str, int]] = frozenset(
             ("head", f, n) for f, lines in sites["head"].items() for n in lines
@@ -210,6 +211,7 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
         ("tips", KW, {}),
         ("scan_files", KW, ()),
         ("scan_tracked", KW, {}),
+        ("max_file_bytes", KW, None),
     ),
     (Renderer, "render"): (("result", POS, NO), ("previous_comment", KW, NO)),
     (GitHubClient, "publish"): (

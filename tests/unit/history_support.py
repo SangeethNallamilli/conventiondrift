@@ -139,6 +139,8 @@ class FakeGit:
 
     def blob(self, oid: str, max_bytes: int) -> bytes:
         self.blob_calls.append((oid, max_bytes))
+        if max_bytes < 0:  # like the real reader
+            raise ComponentError("gitread", "invalid size limit")
         if len(self.blobs[oid]) > max_bytes:  # the real reader checks the size before the body
             raise FileSkipped("size limit")
         return self.blobs[oid]
