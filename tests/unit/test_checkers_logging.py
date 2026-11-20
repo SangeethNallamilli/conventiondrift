@@ -169,7 +169,7 @@ def test_the_eight_canonical_sentences_only_line_1_is_logging_ac_f2_5() -> None:
     assert taken == [1]
 
 
-def test_the_registry_maps_the_canonical_file_to_logging_and_exceptions_ac_f2_5() -> None:
+def test_the_registry_maps_the_canonical_file_to_its_checkers_ac_f2_5() -> None:
     text = "\n".join(
         [
             "Use logging, not print.",
@@ -182,22 +182,22 @@ def test_the_registry_maps_the_canonical_file_to_logging_and_exceptions_ac_f2_5(
             "Use uv for dependencies.",
         ]
     )
-    # All eight are rules at lines 1-8; the other six checkers arrive with T-017 to T-019, so
-    # until then only these two lines are mapped, each to its own checker.
+    # All eight are rules at lines 1-8; the other four checkers arrive with T-018 and T-019, so
+    # until then only these four lines are mapped, each to its own checker.
     assert rules_of(text) == [
         (1, "logging"),
-        (2, None),
+        (2, "http-client"),
         (3, None),
         (4, None),
-        (5, None),
+        (5, "string-format"),
         (6, "exceptions"),
         (7, None),
         (8, None),
     ]
 
 
-def test_never_use_print_or_requests_is_still_mapped_to_logging_alone_until_t017() -> None:
-    assert rules_of("Never use print or requests.") == [(1, "logging")]
+def test_never_use_print_or_requests_is_a_tie_between_logging_and_http_client_ac_f2_6() -> None:
+    assert rules_of("Never use print or requests.") == [(1, None)]
 
 
 # --- sites: AC-F3.2 -------------------------------------------------------------------------
