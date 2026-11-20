@@ -40,6 +40,8 @@ INJECT_RULE = (
     "::stop-commands::tok %0A::error::x %0D"
 )
 INJECT_PATH = "src/::warning::%0A.py"
+# AC-N3.13 / SC-2.52: the causing path also contains a ',' and a lone '%'.
+INJECT_PATH_SC252 = "src/::warning::%0A,b%.py"
 
 # One representative per character class the mappings care about.
 C0_NUL = "\x00"
@@ -513,13 +515,25 @@ def runner_unescape_prop(s: str) -> str:
     return runner_unescape_data(s.replace("%3A", ":").replace("%2C", ","))
 
 
-def test_injected_rule_and_path_form_one_annotation_line() -> None:
-    line = f"::warning file={workflow_prop(INJECT_PATH)},line=9::{workflow_cmd(INJECT_RULE)}"
+@pytest.mark.parametrize(
+    "path",
+    [INJECT_PATH, INJECT_PATH_SC252],
+    ids=["inject-path", "sc252-comma-and-lone-percent"],
+)
+def test_injected_rule_and_path_form_one_annotation_line(path: str) -> None:
+    # Gap 7 / SC-2.52: the combined annotation line must also survive ',' and a lone '%'.
+    line = f"::warning file={workflow_prop(path)},line=9::{workflow_cmd(INJECT_RULE)}"
     assert "\n" not in line and "\r" not in line
     m = re.fullmatch(r"::warning file=([^,:]*),line=9::(.*)", line)
     assert m, "properties must not be split by injected ':' or ','"
-    assert runner_unescape_prop(m.group(1)) == visible(INJECT_PATH)
+    assert runner_unescape_prop(m.group(1)) == visible(path)
     assert runner_unescape_data(m.group(2)) == visible(INJECT_RULE)
+    if path == INJECT_PATH_SC252:
+        assert "," in path
+        # A lone '%' remains after the '%0A' sequence is removed.
+        assert path.replace("%0A", "").count("%") >= 1
+        assert "%2C" in line  # comma is encoded, not a new property separator
+        assert "%25" in workflow_prop(path)  # lone '%' is encoded
 
 
 @settings(max_examples=500, derandomize=True)
