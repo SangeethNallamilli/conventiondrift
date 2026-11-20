@@ -1687,6 +1687,17 @@ def test_item_5_ruling_9_an_option_after_from_in_a_verb_clause_is_unreadable(tex
     assert classify(text, find, OPTIONS) is None
 
 
+def test_item_5_ruling_9_a_mention_on_from_itself_is_not_after_it() -> None:
+    options = frozenset({"a", "b", "from"})
+
+    def find_from(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((index, word) for index, word in enumerate(clause) if word in options)
+
+    assert classify("use a from", find_from, options) == RuleMatch(
+        frozenset({"a", "from"}), frozenset(), 2
+    )
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -1734,6 +1745,7 @@ def test_item_6b_the_interfaces_examples() -> None:
         "never x y z forbid b",  # other words between the cues are no option
         "do not ban b or c",
         "never use a. don't ban b",  # each clause on its own: the second has two cues
+        "never no b is banned",  # two free cues before a trailing cue
     ],
 )
 def test_item_6b_a_prefix_cue_after_another_with_no_option_between_is_unreadable(
