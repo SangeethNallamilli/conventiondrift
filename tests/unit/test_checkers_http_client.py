@@ -73,8 +73,10 @@ def test_every_word_names_one_option() -> None:
         ("always use aiohttp.", ("aiohttp",), ()),
         ("use urllib.request for http calls.", ("urllib",), ()),
         ("use urllib for http calls.", ("urllib",), ()),
-        # "over" is not a cue (I-10 4c), so this prefers both; "rather than" is one.
-        ("prefer httpx over requests.", ("httpx", "requests"), ()),
+        # I-10 Negation 5(d): after a positive verb, "over" prohibits what follows it, like
+        # "rather than" (D-PM-47 #1, AC-F2.3's "Prefer X over Y").
+        ("prefer httpx over requests.", ("httpx",), ("requests",)),
+        ("prefer httpx over requests and aiohttp.", ("httpx",), ("requests", "aiohttp")),
         ("use httpx rather than requests.", ("httpx",), ("requests",)),
         ("never use requests.", (), ("requests",)),
         ("don't use urllib.request or requests.", (), ("urllib", "requests")),
@@ -101,6 +103,8 @@ def test_match_rule_reads_the_libraries_and_their_polarity(
         "use httpx2 for http calls.",  # DECISIONS: "Use httpx2" is Not verifiable
         "use urllib.parse for urls.",
         "use urllib3.",
+        # I-10 Negation 5(d): a comparison with no positive verb before "than" is not mapped.
+        "httpx is better than requests.",
         # I-10 4a guards: comma with mentions on both sides, and a broken list.
         "httpx, requests and urllib are banned.",
         "httpx is fine and requests is forbidden.",

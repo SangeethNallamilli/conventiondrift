@@ -86,8 +86,10 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("use f-strings, not .format().", ("f-string",), ("format",)),
         ("use f-strings, not str.format().", ("f-string",), ("format",)),
         ("use f-strings, not the % operator.", ("f-string",), ("percent",)),
-        # "over" is not a cue (I-10 4c), so this prefers both; "rather than" is one.
-        ("prefer f-strings over .format().", ("f-string", "format"), ()),
+        # I-10 Negation 5(d): after a positive verb, "over" prohibits what follows it, like
+        # "rather than" (D-PM-47 #1).
+        ("prefer f-strings over .format().", ("f-string",), ("format",)),
+        ("prefer f-strings over .format() or %s formatting.", ("f-string",), ("format", "percent")),
         ("use f-strings rather than .format() or %s.", ("f-string",), ("format", "percent")),
         ("use str.format().", ("format",), ()),
         ("use .format() for translations.", ("format",), ()),
@@ -124,7 +126,8 @@ def test_match_rule_reads_the_formats_and_their_polarity(
         "never use f-strings; always use f-strings.",  # one option, both polarities
         "never use f-strings, .format() or %s.",  # forbids every option
         "use f-strings, .format() and %s.",  # prefers every option
-        "prefer f-strings over .format() or %s formatting.",  # "over" is no cue: prefers all
+        # I-10 Negation 5(d): a comparison with no positive verb before "than" is not mapped.
+        "f-strings are better than .format().",
     ],
 )
 def test_match_rule_does_not_map_what_names_no_format_or_cannot_be_read(sentence: str) -> None:
