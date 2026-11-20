@@ -114,6 +114,7 @@ def conflict_index(
     ]
     return ConflictIndex(
         ids=tuple((n,) for n in names),
+        keys=tuple(("http-client", frozenset({n}), frozenset(), "") for n in names),
         adjacent=tuple(tuple(g) for g in adjacent),
         incomplete_ids=frozenset(incomplete),
     )

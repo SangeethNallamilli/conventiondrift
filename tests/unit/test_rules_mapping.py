@@ -979,7 +979,7 @@ def test_a_rule_in_a_too_deep_folder_is_incomplete_and_noted() -> None:
     assert [r.id for r in got.rules if lookup.is_incomplete(r.id)] == ["big/AGENTS.md:1"]
     assert lookup.total("big/AGENTS.md:1") == 0
     assert [c.rules for c in got.conflicts] == [("AGENTS.md:1", "ok/AGENTS.md:1")]
-    assert got.notes == ("conflict check stopped at the limit; 1 rules not fully checked",)
+    assert got.notes == ("conflict check stopped at the limit; 1 rule not fully checked",)
 
 
 def test_the_extractor_uses_the_default_budget() -> None:

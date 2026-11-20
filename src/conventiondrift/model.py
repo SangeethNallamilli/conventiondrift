@@ -285,39 +285,83 @@ class FileRules:
     rules_dropped: int
 
 
+GroupKey = tuple[CheckerId, frozenset[str], frozenset[str], str]
+"""Rules with one key conflict identically: ``(checker, preferred, prohibited, scope_dir)``."""
+
+
+def group_key_order(key: GroupKey) -> tuple[str, tuple[str, ...], tuple[str, ...], str]:
+    """A group key as something sortable: the option sets become sorted tuples."""
+    checker, preferred, prohibited, scope = key
+    return (checker, tuple(sorted(preferred)), tuple(sorted(prohibited)), scope)
+
+
+_NO_CONFLICTS: Final[tuple[tuple[str, ...], int]] = ((), 0)
+"""What an id the index does not know gets: no partners, a total of 0."""
+
+
 @dataclass(frozen=True, slots=True)
 class ConflictIndex:
-    """Which rules conflict, for every rule and independent of ``MAX_CONFLICTS`` (I-13 C6 item 5).
+    """Which rules conflict, for every rule, whatever ``MAX_CONFLICTS`` cut (I-13 C6 items 5, 8).
 
-    A value type: two indexes built from the same rules compare equal. Rules
-    with the same checker match and scope form a *group*; ``ids[g]`` holds the
-    sorted rule ids of group ``g`` and ``adjacent[g]`` the groups it conflicts
-    with. ``incomplete_ids`` holds the rules for which some pair was not
-    evaluated (the R2.6 pair budget ran out, or the scope was too long to
-    compare): their ``total`` is a lower bound (item 6).
+    A value type: two indexes built from the same rules compare equal. Rules with one
+    ``GroupKey`` form a *group*, listed in sorted key order: ``keys[g]`` is its key,
+    ``ids[g]`` its sorted rule ids and ``adjacent[g]`` the groups it conflicts with.
+    ``incomplete_ids`` holds the rules for which some pair was not evaluated (the R2.6
+    pair budget ran out, or the scope was too long to compare): their ``total`` is a lower
+    bound (item 6).
+
+    The constructor is public, so ``__post_init__`` checks the structure (item 8.6) and
+    raises ``ValueError``. It then computes each group's ``total`` and first
+    ``MAX_CONFLICT_WITH`` partners once, so that ``partners``, ``total`` and
+    ``is_incomplete`` are O(1) lookups that never touch the adjacency (item 8.5).
     """
 
     ids: tuple[tuple[str, ...], ...] = ()
+    keys: tuple[GroupKey, ...] = ()
     adjacent: tuple[tuple[int, ...], ...] = ()
     incomplete_ids: frozenset[str] = frozenset()
-    _group_of: dict[str, int] = field(init=False, repr=False, compare=False, hash=False)
+    _by_rule: dict[str, tuple[tuple[str, ...], int]] = field(
+        init=False, repr=False, compare=False, hash=False
+    )
 
     def __post_init__(self) -> None:
-        if len(self.ids) != len(self.adjacent):
-            raise ValueError("ConflictIndex.ids and adjacent must have one entry per group")
+        groups = len(self.ids)
+        if len(self.keys) != groups or len(self.adjacent) != groups:
+            raise ValueError("ConflictIndex.ids, keys and adjacent must have one entry per group")
+        for members in self.ids:
+            if any(a >= b for a, b in pairwise(members)):
+                raise ValueError("ConflictIndex group ids must be sorted with no duplicates")
+        if any(a >= b for a, b in pairwise(map(group_key_order, self.keys))):
+            raise ValueError("ConflictIndex groups must be in sorted key order")
+        group_of = {rule_id: g for g, members in enumerate(self.ids) for rule_id in members}
+        if len(group_of) != sum(map(len, self.ids)):
+            raise ValueError("ConflictIndex rule ids must be unique across groups")
+        neighbours = [set(others) for others in self.adjacent]
+        for g, others in enumerate(self.adjacent):
+            if len(neighbours[g]) != len(others):
+                raise ValueError("ConflictIndex adjacency must have no duplicates")
+            if any(not 0 <= o < groups for o in others):
+                raise ValueError("ConflictIndex adjacency index out of range")
+            if g in neighbours[g]:
+                raise ValueError("ConflictIndex group must not conflict with itself")
+        if any(g not in neighbours[o] for g, others in enumerate(self.adjacent) for o in others):
+            raise ValueError("ConflictIndex adjacency must be symmetric")
+        per_group = [
+            (
+                # Each group's ids are sorted and no id is in two groups, so a merge is sorted;
+                # it is lazy, so only the first MAX_CONFLICT_WITH ids are ever built.
+                tuple(islice(merge(*(self.ids[o] for o in others)), MAX_CONFLICT_WITH)),
+                sum(len(self.ids[o]) for o in others),
+            )
+            for others in self.adjacent
+        ]
         object.__setattr__(
-            self,
-            "_group_of",
-            {rule_id: g for g, members in enumerate(self.ids) for rule_id in members},
+            self, "_by_rule", {rule_id: per_group[g] for rule_id, g in group_of.items()}
         )
 
     def partners(self, rule_id: str) -> tuple[str, ...]:
         """The first ``MAX_CONFLICT_WITH`` ids ``rule_id`` conflicts with, sorted; () if unknown."""
-        group = self._group_of.get(rule_id)
-        if group is None:
-            return ()
-        # Each group's ids are sorted and no id is in two groups, so a merge is sorted.
-        return tuple(islice(merge(*(self.ids[o] for o in self.adjacent[group])), MAX_CONFLICT_WITH))
+        return self._by_rule.get(rule_id, _NO_CONFLICTS)[0]
 
     def total(self, rule_id: str) -> int:
         """How many rules ``rule_id`` conflicts with: exact unless ``is_incomplete``, else at least.
@@ -325,10 +369,7 @@ class ConflictIndex:
         Never less than ``len(partners(rule_id))``; 0 for an unknown id. A rule is
         conflicting if and only if this is above 0, whatever either cap cut.
         """
-        group = self._group_of.get(rule_id)
-        if group is None:
-            return 0
-        return sum(len(self.ids[o]) for o in self.adjacent[group])
+        return self._by_rule.get(rule_id, _NO_CONFLICTS)[1]
 
     def is_incomplete(self, rule_id: str) -> bool:
         """Whether some pair involving ``rule_id`` was not evaluated."""

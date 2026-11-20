@@ -16,6 +16,7 @@ from hypothesis import strategies as st
 from conventiondrift.model import MAX_CONFLICT_WITH, CheckerId, ConflictIndex, Rule, RuleMatch
 from conventiondrift.rules.conflicts import (
     MAX_CONFLICT_PAIRS,
+    MAX_CONFLICTS,
     MAX_SCOPE_DIR_BYTES,
     find_conflicts,
     incomplete_note,
@@ -241,8 +242,26 @@ def test_a_repeated_rule_id_is_an_error_not_an_empty_result() -> None:
         find_conflicts([rule, clash])
 
 
-def test_the_note_names_the_count() -> None:
+@pytest.mark.parametrize("count", [1, 2, 5, MAX_CONFLICT_WITH + 1])
+def test_the_note_names_the_count_and_says_rule_for_exactly_one(count: int) -> None:
+    noun = "rule" if count == 1 else "rules"
+    assert incomplete_note(count) == (
+        f"conflict check stopped at the limit; {count} {noun} not fully checked"
+    )
+    # The literal wording, for the two forms the contract pins.
+    assert incomplete_note(1) == "conflict check stopped at the limit; 1 rule not fully checked"
     assert incomplete_note(5) == "conflict check stopped at the limit; 5 rules not fully checked"
+
+
+def test_the_note_uses_the_count_of_incomplete_rules_one_and_many() -> None:
+    one = [_rule(0), _rule(1, scope="d" * (MAX_SCOPE_DIR_BYTES + 1))]
+    assert find_conflicts(one).lookup.incomplete == 1
+    many = [_rule(n, scope="d" * (MAX_SCOPE_DIR_BYTES + 1)) for n in range(3)]
+    lookups = [find_conflicts(one).lookup, find_conflicts(many).lookup]
+    assert [incomplete_note(x.incomplete) for x in lookups] == [
+        "conflict check stopped at the limit; 1 rule not fully checked",
+        "conflict check stopped at the limit; 3 rules not fully checked",
+    ]
 
 
 def test_a_complete_check_is_a_value_independent_of_how_it_was_built() -> None:
@@ -379,6 +398,7 @@ def _brute_rules(draw: st.DrawFn) -> list[Rule]:
 
 
 def _evaluated(rule: Rule) -> bool:
+    """Whether the check looks at the rule at all (the over-long scope is the backstop)."""
     return (
         rule.checker is not None
         and rule.match is not None
@@ -387,38 +407,91 @@ def _evaluated(rule: Rule) -> bool:
     )
 
 
-def _reference_partners(rules: Sequence[Rule], rule: Rule) -> list[str]:
-    """Every other rule it conflicts with, by testing each pair of rules, no grouping."""
-    if not _evaluated(rule):
-        return []
-    assert rule.match is not None
-    found = []
-    for other in rules:
-        if other.id == rule.id or not _evaluated(other) or other.checker != rule.checker:
-            continue
-        assert other.match is not None
-        if scopes_overlap(rule.scope_dir, other.scope_dir) and matches_conflict(
-            rule.match, other.match
-        ):
-            found.append(other.id)
-    return sorted(found)
+def _too_long(rule: Rule) -> bool:
+    return (
+        rule.checker is not None
+        and rule.match is not None
+        and not rule.disabled
+        and not _evaluated(rule)
+    )
 
 
-@given(_brute_rules())
-def test_the_grouped_index_equals_a_rule_pair_reference(rules: list[Rule]) -> None:
-    lookup = find_conflicts(rules).lookup  # the default budget is far above these inputs
+class _Reference:
+    """A literal rule-pair reference for ``find_conflicts`` under a group-pair budget.
+
+    Groups are keyed by hand, run in the order I-13 C6 item 8 gives (sorted key, then pairs
+    in that order), and each evaluated group pair is decided by testing every pair of rules
+    in it, so nothing here relies on groups conflicting identically.
+    """
+
+    def __init__(self, rules: Sequence[Rule], budget: int) -> None:
+        keyed: dict[tuple[str, tuple[str, ...], tuple[str, ...], str], list[Rule]] = {}
+        for rule in rules:
+            if _evaluated(rule):
+                assert rule.match is not None and rule.checker is not None
+                key = (
+                    rule.checker,
+                    tuple(sorted(rule.match.preferred)),
+                    tuple(sorted(rule.match.prohibited)),
+                    rule.scope_dir,
+                )
+                keyed.setdefault(key, []).append(rule)
+        groups = [keyed[key] for key in sorted(keyed)]
+        pairs = [
+            (i, j)
+            for i in range(len(groups))
+            for j in range(i + 1, len(groups))
+            if groups[i][0].checker == groups[j][0].checker
+        ]
+        self.partners: dict[str, list[str]] = {r.id: [] for g in groups for r in g}
+        self.incomplete = {r.id for r in rules if _too_long(r)}
+        for i, j in pairs[:budget]:
+            for a in groups[i]:
+                for b in groups[j]:
+                    assert a.match is not None and b.match is not None
+                    if scopes_overlap(a.scope_dir, b.scope_dir) and matches_conflict(
+                        a.match, b.match
+                    ):
+                        self.partners[a.id].append(b.id)
+                        self.partners[b.id].append(a.id)
+        for i, j in pairs[budget:]:
+            self.incomplete.update(r.id for r in groups[i] + groups[j])
+        self.pairs = sorted((a, b) for a, others in self.partners.items() for b in others if a < b)
+        self.checker = {r.id: r.checker for r in rules}
+
+
+BUDGETS = (0, 1, 2, 5, 13, 40, MAX_CONFLICT_PAIRS)
+
+
+def _assert_matches(rules: Sequence[Rule], budget: int) -> tuple[list[int], dict[str, int]]:
+    expected = _Reference(rules, budget)
+    result = find_conflicts(rules, max_pairs=budget)
+    lookup = result.lookup
     for rule in rules:
-        expected = _reference_partners(rules, rule)
-        assert lookup.partners(rule.id) == tuple(expected[:MAX_CONFLICT_WITH])
-        assert lookup.total(rule.id) == len(expected)
-        # Only a rule with a checker, a match and an enabled checker whose scope is too long
-        # was left out of the comparison.
-        too_long = (
-            rule.checker is not None
-            and rule.match is not None
-            and not rule.disabled
-            and not _evaluated(rule)
-        )
-        assert lookup.is_incomplete(rule.id) == too_long
-    pairs = {(a.id, b) for a in rules for b in _reference_partners(rules, a) if a.id < b}
-    assert len(find_conflicts(rules).found) + find_conflicts(rules).unlisted == len(pairs)
+        partners = sorted(expected.partners.get(rule.id, []))
+        assert lookup.partners(rule.id) == tuple(partners[:MAX_CONFLICT_WITH])
+        assert lookup.total(rule.id) == len(partners)
+        assert lookup.total(rule.id) >= len(lookup.partners(rule.id))
+        assert lookup.is_incomplete(rule.id) == (rule.id in expected.incomplete)
+    assert lookup.incomplete == len(expected.incomplete)
+    assert [c.rules for c in result.found] == expected.pairs[:MAX_CONFLICTS]
+    assert all(c.checker == expected.checker[c.rules[0]] for c in result.found)
+    assert result.unlisted == len(expected.pairs) - len(result.found)
+    return [lookup.incomplete], {r.id: lookup.total(r.id) for r in rules}
+
+
+@given(_brute_rules(), st.data())
+def test_the_grouped_index_equals_a_rule_pair_reference(
+    rules: list[Rule], data: st.DataObject
+) -> None:
+    previous_incomplete = len(rules) + 1
+    previous_totals: dict[str, int] = {r.id: 0 for r in rules}
+    shuffled = data.draw(st.permutations(rules))
+    for budget in BUDGETS:
+        (incomplete,), totals = _assert_matches(rules, budget)
+        # The input order never changes the result under a budget.
+        assert find_conflicts(shuffled, max_pairs=budget) == find_conflicts(rules, max_pairs=budget)
+        # A bigger budget never leaves more rules incomplete, and a total only grows.
+        assert incomplete <= previous_incomplete
+        assert all(totals[i] >= previous_totals[i] for i in totals)
+        previous_incomplete, previous_totals = incomplete, totals

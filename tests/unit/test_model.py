@@ -1,6 +1,7 @@
 """Unit tests for the boundary types in conventiondrift.model (T-005; I-10, I-11, I-13)."""
 
 import dataclasses
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -24,6 +25,7 @@ from conventiondrift.model import (
     Extraction,
     FileContext,
     FileRules,
+    GroupKey,
     IgnoreEntry,
     InstructionFile,
     InternalError,
@@ -43,6 +45,7 @@ from conventiondrift.model import (
     Thresholds,
     Verdict,
     Window,
+    group_key_order,
 )
 
 CHECKER_IDS: tuple[CheckerId, ...] = get_args(CheckerId)
@@ -127,6 +130,10 @@ FILE_RULES = FileRules(
 )
 CONFLICT_INDEX = ConflictIndex(
     ids=(("AGENTS.md:9",), ("CLAUDE.md:3",)),
+    keys=(
+        ("http-client", frozenset({"httpx"}), frozenset(), ""),
+        ("http-client", frozenset({"requests"}), frozenset(), ""),
+    ),
     adjacent=((1,), (0,)),
     incomplete_ids=frozenset({"CLAUDE.md:3"}),
 )
@@ -137,7 +144,7 @@ EXTRACTION = Extraction(
     conflicts_dropped=0,
     unattached_markers=(("AGENTS.md", 30),),
     conflict_lookup=CONFLICT_INDEX,
-    notes=("conflict check stopped at the limit; 1 rules not fully checked",),
+    notes=("conflict check stopped at the limit; 1 rule not fully checked",),
 )
 WINDOW = Window(
     end=datetime(2026, 11, 12, 9, 0, tzinfo=UTC), days=90, available=True, unavailable_reason=None
@@ -243,7 +250,7 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
         FILE_RULES,
         ("path", "rules", "unattached_markers", "candidates_dropped", "rules_dropped"),
     ),
-    "ConflictIndex": (CONFLICT_INDEX, ("ids", "adjacent", "incomplete_ids", "_group_of")),
+    "ConflictIndex": (CONFLICT_INDEX, ("ids", "keys", "adjacent", "incomplete_ids", "_by_rule")),
     "Extraction": (
         EXTRACTION,
         (
@@ -383,6 +390,12 @@ OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
     ("RuleResult", "conflict_with"): {"conflict_with": ("CLAUDE.md:4",)},
     ("RuleResult", "conflict_with_total"): {"conflict_with_total": 2},
     ("ConflictIndex", "ids"): {"ids": (("AGENTS.md:9",), ("CLAUDE.md:4",))},
+    ("ConflictIndex", "keys"): {
+        "keys": (
+            ("http-client", frozenset({"httpx"}), frozenset(), ""),
+            ("http-client", frozenset({"urllib"}), frozenset(), ""),
+        )
+    },
     ("ConflictIndex", "adjacent"): {"adjacent": ((), ())},
 }
 
@@ -391,7 +404,7 @@ OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
 def test_changing_a_field_breaks_equality(name: str) -> None:
     sample, fields = SAMPLES[name]
     for field in fields:
-        if field.startswith("_"):  # derived (ConflictIndex._group_of): not a constructor input
+        if field.startswith("_"):  # derived (ConflictIndex._by_rule): not a constructor input
             continue
         changes = OVERRIDES.get((name, field), {field: _different(getattr(sample, field))})
         assert dataclasses.replace(sample, **changes) != sample, field
@@ -1035,17 +1048,22 @@ def test_report_counts_conflicts_incomplete_defaults_to_zero_and_is_never_negati
 # --- ConflictIndex (I-13 C6 items 5 and 6) ---------------------------------------------------
 
 
+def _group_key(name: str) -> GroupKey:
+    return ("http-client", frozenset({name}), frozenset(), "")
+
+
 def _index(
     members: dict[str, tuple[str, ...]], edges: tuple[tuple[str, str], ...], incomplete: set[str]
 ) -> ConflictIndex:
     """Groups named by key, each holding its sorted ids; ``edges`` join two groups."""
-    names = list(members)
+    names = sorted(members)
     adjacent: list[list[int]] = [[] for _ in names]
     for a, b in edges:
         adjacent[names.index(a)].append(names.index(b))
         adjacent[names.index(b)].append(names.index(a))
     return ConflictIndex(
-        ids=tuple(members.values()),
+        ids=tuple(members[n] for n in names),
+        keys=tuple(_group_key(n) for n in names),
         adjacent=tuple(tuple(sorted(g)) for g in adjacent),
         incomplete_ids=frozenset(incomplete),
     )
@@ -1094,14 +1112,136 @@ def test_index_is_a_value_type() -> None:
     assert hash(first) == hash(second)
     assert first != _index({"x": ("A:1",), "y": ("B:1",)}, (("x", "y"),), set())
     assert first != _index({"x": ("A:1",), "y": ("B:1",)}, (), {"A:1"})
-    assert "_group_of" not in repr(first)
+    assert "_by_rule" not in repr(first)
 
 
-def test_index_rejects_adjacency_that_does_not_match_the_groups() -> None:
-    with pytest.raises(
-        ValueError, match=r"^ConflictIndex\.ids and adjacent must have one entry per group$"
-    ):
-        ConflictIndex(ids=(("A:1",), ("B:1",)), adjacent=((1,),))
+def test_index_rejects_lists_that_do_not_match_the_groups() -> None:
+    # Built from the sample's own parts: dropping the last entry of each list in turn.
+    good = CONFLICT_INDEX
+    for field in ("ids", "keys", "adjacent"):
+        short = {field: getattr(good, field)[:1]}
+        with pytest.raises(
+            ValueError,
+            match=r"^ConflictIndex\.ids, keys and adjacent must have one entry per group$",
+        ):
+            dataclasses.replace(good, **short)
+
+
+def _built(**changes: Any) -> ConflictIndex:
+    """A valid three-group index (``a`` conflicts with ``b`` and ``c``), with ``changes``."""
+    parts: dict[str, Any] = {
+        "ids": (("A:1", "A:2"), ("B:1",), ("C:1",)),
+        "keys": tuple(_group_key(n) for n in "abc"),
+        "adjacent": ((1, 2), (0,), (0,)),
+        "incomplete_ids": frozenset(),
+    }
+    return ConflictIndex(**{**parts, **changes})
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"ids": (("A:1", "A:2"), ("B:1",), ("A:2",))},
+            "ConflictIndex rule ids must be unique across groups",
+        ),
+        (
+            {"ids": (("A:2", "A:1"), ("B:1",), ("C:1",))},
+            "ConflictIndex group ids must be sorted with no duplicates",
+        ),
+        (
+            {"ids": (("A:1", "A:1"), ("B:1",), ("C:1",))},
+            "ConflictIndex group ids must be sorted with no duplicates",
+        ),
+        (
+            {"keys": tuple(_group_key(n) for n in "bac")},
+            "ConflictIndex groups must be in sorted key order",
+        ),
+        (
+            {"keys": tuple(_group_key(n) for n in "aac")},
+            "ConflictIndex groups must be in sorted key order",
+        ),
+        ({"adjacent": ((1, 2), (0,), (3,))}, "ConflictIndex adjacency index out of range"),
+        ({"adjacent": ((1, 2), (0,), (-1,))}, "ConflictIndex adjacency index out of range"),
+        ({"adjacent": ((1, 1, 2), (0,), (0,))}, "ConflictIndex adjacency must have no duplicates"),
+        ({"adjacent": ((1, 2), (0,), ())}, "ConflictIndex adjacency must be symmetric"),
+        ({"adjacent": ((1,), (0,), (0,))}, "ConflictIndex adjacency must be symmetric"),
+        (
+            {"adjacent": ((0, 1, 2), (0,), (0,))},
+            "ConflictIndex group must not conflict with itself",
+        ),
+    ],
+)
+def test_index_rejects_a_broken_structure(changes: dict[str, Any], message: str) -> None:
+    assert _built().total("A:1") == 2  # the unchanged parts are valid
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        _built(**changes)
+
+
+def test_index_group_order_follows_the_whole_key() -> None:
+    # Keys differ only in the checker, the preferred set, the prohibited set or the scope.
+    base: GroupKey = ("http-client", frozenset({"x"}), frozenset({"y"}), "a")
+    ordered: list[GroupKey] = [
+        base,
+        ("http-client", frozenset({"x"}), frozenset({"y"}), "b"),
+        ("http-client", frozenset({"x"}), frozenset({"z"}), "a"),
+        ("http-client", frozenset({"w", "x"}), frozenset({"y"}), "a"),
+        ("logging", frozenset({"x"}), frozenset({"y"}), "a"),
+    ]
+    ordered.sort(key=group_key_order)
+    assert (
+        ConflictIndex(
+            ids=tuple((f"r{n}",) for n in range(5)), keys=tuple(ordered), adjacent=((),) * 5
+        ).incomplete
+        == 0
+    )
+    assert group_key_order(ordered[0]) < group_key_order(ordered[-1])
+    with pytest.raises(ValueError, match="sorted key order"):
+        ConflictIndex(
+            ids=tuple((f"r{n}",) for n in range(5)),
+            keys=tuple(reversed(ordered)),
+            adjacent=((),) * 5,
+        )
+
+
+class _Counted(tuple):  # type: ignore[type-arg]
+    """A tuple that counts every access, to see whether queries touch the adjacency."""
+
+    reads = 0
+
+    def __getitem__(self, item: Any) -> Any:
+        _Counted.reads += 1
+        return super().__getitem__(item)
+
+    def __iter__(self) -> Any:
+        _Counted.reads += 1
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        _Counted.reads += 1
+        return super().__len__()
+
+
+def test_queries_never_touch_the_adjacency_after_the_index_is_built() -> None:
+    # I-13 C6 item 8.5: partners, total and is_incomplete are lookups, not per-call work.
+    ids = _Counted(_Counted(t) for t in (("A:1", "A:2"), ("B:1",), ("C:1",)))
+    adjacent = _Counted(_Counted(t) for t in ((1, 2), (0,), (0,)))
+    _Counted.reads = 0
+    index = ConflictIndex(
+        ids=ids,
+        keys=tuple(_group_key(n) for n in "abc"),
+        adjacent=adjacent,
+        incomplete_ids=frozenset({"C:1"}),
+    )
+    built = _Counted.reads
+    assert built > 0  # the counter sees the build (and so would see a per-query walk)
+    queried = ("A:1", "A:2", "B:1", "C:1", "nope")
+    for _ in range(20_000):
+        for rule_id in queried:
+            index.partners(rule_id)
+            index.total(rule_id)
+            index.is_incomplete(rule_id)
+    assert _Counted.reads == built
 
 
 def test_index_has_no_is_conflicting() -> None:

@@ -41,7 +41,15 @@ from heapq import merge
 from itertools import islice
 from typing import Final, NamedTuple
 
-from conventiondrift.model import CheckerId, Conflict, ConflictIndex, Rule, RuleMatch
+from conventiondrift.model import (
+    CheckerId,
+    Conflict,
+    ConflictIndex,
+    GroupKey,
+    Rule,
+    RuleMatch,
+    group_key_order,
+)
 
 __all__ = [
     "MAX_CONFLICTS",
@@ -53,9 +61,6 @@ __all__ = [
     "matches_conflict",
     "scopes_overlap",
 ]
-
-GroupKey = tuple[CheckerId, frozenset[str], frozenset[str], str]
-"""Rules with one key conflict identically: ``(checker, preferred, prohibited, scope_dir)``."""
 
 MAX_CONFLICTS: Final = 1_000
 """R2.6: conflicts listed per run; the rest are counted in ``Conflicts.unlisted``."""
@@ -77,7 +82,13 @@ class Conflicts(NamedTuple):
 
 def incomplete_note(count: int) -> str:
     """The note for ``count`` rules that were not fully checked (I-13 C6 item 4)."""
-    return f"conflict check stopped at the limit; {count} rules not fully checked"
+    noun = "rule" if count == 1 else "rules"
+    return f"conflict check stopped at the limit; {count} {noun} not fully checked"
+
+
+def _overlap(a: str, a_prefix: str, b: str, b_prefix: str) -> bool:
+    """``scopes_overlap`` on scopes whose ``scope + "/"`` is already built (SR L-55-2)."""
+    return not a or not b or a == b or a.startswith(b_prefix) or b.startswith(a_prefix)
 
 
 def scopes_overlap(a: str, b: str) -> bool:
@@ -85,7 +96,7 @@ def scopes_overlap(a: str, b: str) -> bool:
 
     "" is the whole repository, so it overlaps every scope.
     """
-    return not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/")
+    return _overlap(a, a + "/", b, b + "/")
 
 
 def matches_conflict(a: RuleMatch, b: RuleMatch) -> bool:
@@ -93,12 +104,6 @@ def matches_conflict(a: RuleMatch, b: RuleMatch) -> bool:
     if a.preferred & b.prohibited or b.preferred & a.prohibited:
         return True
     return bool(a.preferred) and bool(b.preferred) and not a.preferred & b.preferred
-
-
-def _key_order(key: GroupKey) -> tuple[str, tuple[str, ...], tuple[str, ...], str]:
-    """A group key as something sortable: the option sets become sorted tuples."""
-    checker, preferred, prohibited, scope = key
-    return (checker, tuple(sorted(preferred)), tuple(sorted(prohibited)), scope)
 
 
 def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS) -> Conflicts:
@@ -123,8 +128,11 @@ def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS
         members.setdefault(key, []).append(rule.id)
         matches[key] = rule.match
     # Deterministic order: sorted group keys (I-13 C6 item 8).
-    keys = sorted(members, key=_key_order)
+    keys = sorted(members, key=group_key_order)
     ids = tuple(tuple(sorted(members[key])) for key in keys)
+    # Each group's scope and its "/"-terminated form are built once, not once per evaluation.
+    scopes = [key[3] for key in keys]
+    prefixes = [scope + "/" for scope in scopes]
     adjacent: list[list[int]] = [[] for _ in keys]
     by_checker: dict[CheckerId, list[int]] = {}
     for number, key in enumerate(keys):
@@ -145,7 +153,7 @@ def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS
                     break
                 evaluated += 1
                 b = numbers[other]
-                if scopes_overlap(keys[a][3], keys[b][3]) and matches_conflict(
+                if _overlap(scopes[a], prefixes[a], scopes[b], prefixes[b]) and matches_conflict(
                     matches[keys[a]], matches[keys[b]]
                 ):
                     adjacent[a].append(b)
@@ -157,6 +165,7 @@ def find_conflicts(rules: Sequence[Rule], *, max_pairs: int = MAX_CONFLICT_PAIRS
         unchecked.update(ids[group])
     lookup = ConflictIndex(
         ids=ids,
+        keys=tuple(keys),
         adjacent=tuple(tuple(group) for group in adjacent),  # ascending by construction
         incomplete_ids=frozenset(unchecked),
     )
