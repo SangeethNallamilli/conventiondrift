@@ -11,6 +11,7 @@ import pytest
 from checker_support import MIB, assert_linear, best_time
 
 from conventiondrift.checkers.phrases import (
+    APOSTROPHES,
     BREAK_MARKS,
     BREAK_WORDS,
     CALL_SUFFIX,
@@ -185,7 +186,8 @@ def test_hyphens_inside_words_are_not_dashes() -> None:
 
 def test_apostrophes_stay_inside_words_and_other_marks_are_dropped() -> None:
     assert clauses("don't use `a`!") == (("don't", "use", "a"),)
-    assert clauses("don\u2019t use a") == (("don\u2019t", "use", "a"),)
+    # Curly apostrophes are made straight first (I-10 item 5 ruling 5).
+    assert clauses("don\u2019t use a") == (("don't", "use", "a"),)
     assert clauses("a/b c") == (("a", "b", "c"),)
 
 
@@ -242,13 +244,10 @@ def test_the_tables_are_what_the_docs_say() -> None:
         "not",
         "dont",
         "don't",
-        "don\u2019t",
         "avoid",
         "without",
         "shouldn't",
-        "shouldn\u2019t",
         "mustn't",
-        "mustn\u2019t",
         "stop using",
         "rather than",
         "instead of",
@@ -1188,7 +1187,9 @@ ITEM_5A_CUES = [
 
 def test_item_5a_the_phrase_table_is_what_i10_says() -> None:
     assert len(ITEM_5A_CUES) == 48
-    assert {tuple(cue.split()) for cue in ITEM_5A_CUES} == TRAILING_PHRASES
+    # The three curly spellings are the straight ones once apostrophes are straightened.
+    assert {tuple(cue.replace("\u2019", "'").split()) for cue in ITEM_5A_CUES} == TRAILING_PHRASES
+    assert len(TRAILING_PHRASES) == 45
     assert MAX_TRAILING == 4
     # The item 3 cues stay as they were.
     assert TRAILING_WORDS == {"forbidden", "prohibited", "disallowed", "deprecated"}
@@ -1205,7 +1206,7 @@ def test_item_5a_each_trailing_phrase_prohibits_what_comes_before_it(cue: str) -
     assert classify(f"requests {cue}; use httpx.", find_http, HTTP) == RuleMatch(
         frozenset({"httpx"}), frozenset({"requests"}), 2
     )
-    words = ("a", *cue.split())
+    (words,) = clauses(f"a {cue}")  # as classify reads it: apostrophes straightened
     assert last_trailing_cue(words) == len(words) - 1
     assert is_negated(words, 0) is True
 
@@ -1590,6 +1591,38 @@ def test_item_5d_a_mention_after_over_is_found_by_its_index() -> None:
     assert classify(
         "prefer catching exception over bare except.", find_phrases, BARE_BROAD_SPECIFIC
     ) == RuleMatch(frozenset({"broad"}), frozenset({"bare"}), 2)
+
+
+# --- I-10 item 5 ruling 5: curly apostrophes -----------------------------------------------------
+
+APOSTROPHE_CUES = [
+    "don't use b",
+    "b shouldn't be used",
+    "b mustn't be used",
+    "b can't be used",
+    "shouldn't b",
+    "mustn't b",
+]
+
+
+@pytest.mark.parametrize("quote", ["\u2019", "\u2018"])
+@pytest.mark.parametrize("text", APOSTROPHE_CUES)
+def test_ruling_5_a_curly_apostrophe_is_read_as_a_straight_one(text: str, quote: str) -> None:
+    curly = text.replace("'", quote)
+    assert curly != text
+    assert clauses(curly) == clauses(text)
+    assert classify(curly, find, OPTIONS) == classify(text, find, OPTIONS)
+    assert classify(f"use a; {curly}", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+
+
+def test_ruling_5_the_apostrophe_table_and_what_it_leaves_alone() -> None:
+    assert "x\u2019y\u2018z".translate(APOSTROPHES) == "x'y'z"
+    assert "\u201cx\u201d `y`".translate(APOSTROPHES) == "\u201cx\u201d `y`"  # double quotes stay
+    assert clauses("use \u2018a\u2019 x") == clauses("use 'a' x")
+    assert not {word for word in NEGATIONS if "\u2019" in word}
+    assert not {phrase for phrase in TRAILING_PHRASES if "\u2019" in " ".join(phrase)}
 
 
 # --- the import rule (INTERFACES I-10, "Shared phrase helper") ------------------------------

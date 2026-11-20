@@ -48,6 +48,9 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
   (and commas, and backticks, which are not words) may sit between two mentions,
   so "catching exception is fine and bare except is forbidden" and "print and the
   requests library are banned" are not mapped either.
+* Curly apostrophes (U+2019 and U+2018) are made straight before anything
+  else, so "don\u2019t" is "don't" and every cue with an apostrophe matches
+  both forms (item 5 ruling 5).
 * Words are joined by a hyphen into one word: "no-op" and "non-blocking" hold no
   cue. The phrases "no matter", "no doubt" and "not only" are never cues.
 * A clause ends at ``.``, ``;``, ``:``, ``(``, ``)``, a dash (an en or em dash,
@@ -120,6 +123,7 @@ from typing import Final
 from conventiondrift.model import RuleMatch
 
 __all__ = [
+    "APOSTROPHES",
     "BREAK_MARKS",
     "BREAK_WORDS",
     "CALL_SUFFIX",
@@ -140,11 +144,14 @@ __all__ = [
     "last_trailing_cue",
 ]
 
-TOKEN: Final = re.compile(
-    r"[a-z0-9_'\u2019]+(?:[.-][a-z0-9_]+)*|[;:().,\u2013\u2014]|(?<=\s)-(?=\s)|--+"
-)
+TOKEN: Final = re.compile(r"[a-z0-9_']+(?:[.-][a-z0-9_]+)*|[;:().,\u2013\u2014]|(?<=\s)-(?=\s)|--+")
 """A word, or a clause mark. A dotted or hyphenated name such as ``logging.warn`` or
 ``no-op`` is one word."""
+
+APOSTROPHES: Final = str.maketrans({"\u2019": "'", "\u2018": "'"})
+"""Curly apostrophes (U+2019, and U+2018 typed for one) made straight before the sentence is cut
+into words, so every cue with an apostrophe matches both forms: "don\u2019t", "shouldn\u2019t",
+"can\u2019t" (I-10 item 5 ruling 5)."""
 
 CALL_SUFFIX: Final = re.compile(r"(?<=[a-z0-9_`])\(\)")
 """An empty ``()`` right after a name or its closing backtick: ``print()``, `` `print`() ``."""
@@ -202,13 +209,10 @@ NEGATIONS: Final = frozenset(
         "not",
         "dont",
         "don't",
-        "don\u2019t",
         "avoid",
         "without",
         "shouldn't",
-        "shouldn\u2019t",
         "mustn't",
-        "mustn\u2019t",
         STOP_USING,
         RATHER_THAN,
         INSTEAD_OF,
@@ -236,13 +240,10 @@ _NOT_ALLOWED: Final = (
 _MODALS: Final = (
     ("should", "not"),
     ("shouldn't",),
-    ("shouldn\u2019t",),
     ("must", "not"),
     ("mustn't",),
-    ("mustn\u2019t",),
     ("cannot",),
     ("can't",),
-    ("can\u2019t",),
     ("may", "not"),
 )
 
@@ -252,7 +253,7 @@ TRAILING_PHRASES: Final = frozenset(
     | {(*modal, "be", "used") for modal in _MODALS}
 )
 """The whole-phrase trailing cues of I-10 item 5a, as word tuples; the cue is at the last word.
-(The curly-apostrophe spellings are read like the straight ones, as in ``NEGATIONS``.)"""
+(Curly apostrophes are straightened before any cue is matched: ``APOSTROPHES``.)"""
 
 _TRAILING: Final = frozenset((word,) for word in TRAILING_WORDS) | TRAILING_PAIRS | TRAILING_PHRASES
 """Every trailing cue as a word tuple."""
@@ -281,7 +282,7 @@ Finder = Callable[[tuple[str, ...]], Iterable[Mention]]
 def _read(text: str) -> list[tuple[tuple[str, ...], tuple[int, ...]]]:
     """The clauses of ``text`` with, for each, the commas that did not end it. A comma is its
     number of words before it, so a word at an index below that is before the comma."""
-    tokens = TOKEN.findall(CALL_SUFFIX.sub("", text.lower()))
+    tokens = TOKEN.findall(CALL_SUFFIX.sub("", text.lower().translate(APOSTROPHES)))
     found: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
     current: list[str] = []
     commas: list[int] = []
