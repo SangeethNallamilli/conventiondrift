@@ -190,6 +190,42 @@ def test_requests_the_noun_names_nothing(sentence: str) -> None:
     assert match_rule(sentence) is None
 
 
+@pytest.mark.parametrize(
+    ("sentence", "not_preferred", "not_prohibited"),
+    [
+        # I-10 6(a) as confirmed by the Architect: the comparatives are anchors, so requests is
+        # named and 5(d) makes the rule Not verifiable instead of preferring httpx.
+        ("httpx is better than requests.", "httpx", ""),
+        ("use httpx vs. requests.", "httpx", ""),
+        ("use httpx v. requests.", "httpx", ""),
+        ("use httpx versus requests.", "httpx", ""),
+        # The list right before a trailing cue counts anywhere in the clause (singular verb).
+        ("httpx is fine and requests is forbidden.", "", "httpx"),
+    ],
+)
+def test_the_confirmed_6a_readings_leave_the_other_option_unmapped(
+    sentence: str, not_preferred: str, not_prohibited: str
+) -> None:
+    assert match_rule(sentence) is None
+    noun = match_rule(sentence.replace("requests", "network calls"))
+    if not_preferred:  # without requests, the same sentence would prefer httpx
+        assert noun is not None
+        assert not_preferred in noun.preferred
+    if not_prohibited:  # and here it would prohibit httpx
+        assert noun is not None
+        assert not_prohibited in noun.prohibited
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    ["network requests are forbidden.", "use v requests."],
+)
+def test_a_noun_phrase_before_a_cue_or_after_a_bare_v_never_names_requests(sentence: str) -> None:
+    # "network requests" is no list of two (no separator) and "are" is plural. A bare "v" is no
+    # anchor (5(d) ruling 6).
+    assert match_rule(sentence) is None
+
+
 @pytest.mark.xfail(strict=True, reason="needs SE3's I-10 6(b) ban verbs in phrases.py")
 @pytest.mark.parametrize("sentence", ["always forbid requests.", "never ban requests."])
 def test_requests_after_a_ban_verb_is_the_library(sentence: str) -> None:

@@ -15,15 +15,14 @@ looks like it (INTERFACES I-10 item 6(a)):
 * it is at an *anchor*, the word right after a positive verb cue ("use", "prefer", "choose",
   "pick", "always", "switch to", "over to"), a prefix negation cue (``phrases.NEGATIONS``)
   or a reverse-form or comparative cue ("rather than", "instead of", "over", "than", "vs",
-  "versus"; the comparatives keep 5(d)'s Not verifiable for "httpx is better than
-  requests.");
+  "vs.", "v.", "versus"; the comparatives keep 5(d)'s Not verifiable for "httpx is better
+  than requests.");
 * it is in a list that starts at an anchor: single words joined only by "and", "or",
   "nor", commas and backticks;
-* it is in a list with a trailing cue right after it, when the list has two or more items
-  or the cue's verb is singular ("is", "was", "has been"). I-10 6(a) names the list that
-  starts the clause; any such list counts here, so "httpx is fine and requests is
-  forbidden." stays Not verifiable under the 4(a) contiguity guard instead of prohibiting
-  httpx.
+* it is in a list with a trailing cue right after it, anywhere in the clause, when the list
+  has two or more items or the cue's verb is singular ("is", "was", "has been"). So "httpx
+  is fine and requests is forbidden." stays Not verifiable under the 4(a) contiguity guard
+  instead of prohibiting httpx.
 
 Any other ``requests`` is read as a noun and names nothing: "Always set a timeout on
 requests.", "Never log requests." and "Use httpx to make requests." (which maps httpx alone).
