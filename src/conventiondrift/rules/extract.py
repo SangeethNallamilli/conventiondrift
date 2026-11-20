@@ -202,6 +202,22 @@ def _raw_index(raw: str, index: int) -> int:
     return index + shift
 
 
+def _is_vs(text: str, period: int) -> bool:
+    """Whether ``text[period]`` is the period of a whole-word "vs." or "v." (any case).
+
+    INTERFACES I-10 item 6(c): a sentence never ends there, unless the text ends there. Only
+    the two or three characters before the period are read, so the split stays linear.
+    """
+    if text[period] != ".":
+        return False
+    for word in ("vs", "v"):
+        start = period - len(word)
+        if start >= 0 and text[start:period].lower() == word:
+            before = text[start - 1] if start else " "
+            return not (before.isalnum() or before == "_")
+    return False
+
+
 def _sentences(block: Sequence[_Line]) -> Iterator[Candidate]:
     """Split one bullet or paragraph into sentences with their start lines and columns."""
     offsets: list[int] = []
@@ -222,6 +238,8 @@ def _sentences(block: Sequence[_Line]) -> Iterator[Candidate]:
             char = text[index]
             index += 1
             if char in _TERMINATORS and (index >= size or text[index].isspace()):
+                if index < size and _is_vs(text, index - 1):
+                    continue
                 break
         which = bisect_right(offsets, start) - 1
         entry = block[which]
