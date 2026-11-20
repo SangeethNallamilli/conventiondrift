@@ -8,7 +8,7 @@ from functools import partial
 from pathlib import Path
 
 import pytest
-from checker_support import assert_linear, best_time
+from checker_support import MIB, assert_linear, best_time
 
 from conventiondrift.checkers.phrases import (
     BREAK_MARKS,
@@ -338,6 +338,18 @@ def test_one_clause_with_100_000_mentions_is_read_once() -> None:
     ):
         assert best_time(partial(classify, text, find, OPTIONS), repeat=1) < 5.0
         assert classify(text, find, OPTIONS) == expected
+
+
+def test_a_cue_in_the_middle_of_a_1_mib_clause_splits_the_polarity() -> None:
+    # INTERFACES I-10: a cue applies from the cue to the end of its clause, so the words
+    # before it are preferred and the words after it are prohibited, however many there are.
+    count = MIB // 4
+    text = "use " + "a " * count + "not " + "b " * count
+    assert len(text) >= MIB - 8
+    options = frozenset({"a", "b"})
+    result = classify(text, find, options)
+    assert result == rule(preferred="a", prohibited="b", specificity=2)
+    assert best_time(partial(classify, text, find, options)) < 5.0
 
 
 def test_first_cue_is_the_index_of_the_first_cue() -> None:

@@ -92,19 +92,26 @@ def rules_of(text: str) -> list[tuple[int, str | None]]:
 
 _T = TypeVar("_T")
 MIB = 1 << 20
+RATIO_FLOOR_S = 0.25
 LINEAR_SIZES = (1 << 17, 1 << 18, 1 << 19, 1 << 20)
 """128 KiB up to 1 MiB, the instruction-file size cap (R2.3). A quadratic path takes minutes at
 the top and several seconds already at the bottom, so it fails at the first size."""
 
 
-def best_time(func: Callable[[], object], repeat: int = 3) -> float:
+def best_time(
+    func: Callable[[], object], repeat: int = 3, *, stop_above: float = float("inf")
+) -> float:
     """The fastest of ``repeat`` runs, as in the extraction tests: one slow run on a loaded
-    runner doesn't count."""
+    runner doesn't count. A run slower than ``stop_above`` ends the repeats (it is far too
+    slow for noise, and a quadratic path would otherwise take three times as long to fail)."""
     best = float("inf")
     for _ in range(repeat):
         start = time.perf_counter()
         func()
-        best = min(best, time.perf_counter() - start)
+        elapsed = time.perf_counter() - start
+        best = min(best, elapsed)
+        if elapsed > stop_above:
+            break
     return best
 
 
@@ -117,16 +124,23 @@ def assert_linear(
 ) -> None:
     """``run(make(n))`` is linear in ``n`` for each size, in the repo's ReDoS-test style.
 
-    Two checks, both generous (linear code takes milliseconds here): an absolute budget that
-    grows from 1.0 s with 4 s per MiB, and doubling the size must not much more than
-    triple the time (the 3x plus slack of ``test_rules_extract``).
+    The check is an absolute budget that grows from 1.0 s with 4 s per MiB, with the best of
+    three runs at every size (a run over five times the budget ends the repeats early). Linear
+    code takes milliseconds to a few hundred ms here, so the budget is generous, and a
+    quadratic path misses it at the smallest size.
+
+    Doubling the size must also not much more than triple the time, but only once the
+    previous step took over ``RATIO_FLOOR_S``: below that, the times are a few milliseconds and
+    a scheduler hiccup or a cold cache moves the ratio far more than any algorithm (a Windows
+    runner saw 3.65x at 0.19 s to 0.69 s on linear code).
     """
     previous = 0.0
     for n in sizes:
         data = make(n)
-        elapsed = best_time(partial(run, data), repeat=3 if n < MIB else 1)
-        assert elapsed < 1.0 + 4.0 * n / MIB, (label, n, elapsed)
-        if previous:
+        budget = 1.0 + 4.0 * n / MIB
+        elapsed = best_time(partial(run, data), repeat=3, stop_above=5 * budget)
+        assert elapsed < budget, (label, n, elapsed)
+        if previous > RATIO_FLOOR_S:
             assert elapsed < 3 * previous + 0.05, (label, n, elapsed, previous)
         previous = elapsed
 
@@ -134,6 +148,7 @@ def assert_linear(
 __all__ = [
     "LINEAR_SIZES",
     "MIB",
+    "RATIO_FLOOR_S",
     "assert_linear",
     "best_time",
     "counts",
