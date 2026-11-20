@@ -85,7 +85,6 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("don't use print; use logging.", match(("logging",), ("print",), 2)),
         ("don't use print, instead use logging.", match(("logging",), ("print",), 2)),
         ("never use print or logging.warn.", match((), ("print",), 1)),
-        ("prefer logging over print.", match(("logging",), ("print",), 2)),
         ("use logging instead of print.", match(("logging",), ("print",), 2)),
         ("use logging rather than print.", match(("logging",), ("print",), 2)),
         ("use logging and never print.", match(("logging",), ("print",), 2)),
@@ -135,6 +134,7 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         # Every option preferred: every site would follow, so the rule would always hold.
         "use the logger to print status messages.",
         "use logging and print.",
+        "prefer logging over print.",  # I-10 item 4c: "over" is no cue, so both are preferred
     ],
 )
 def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
@@ -612,3 +612,64 @@ def test_t016a_1_the_registry_maps_each_phrasing_to_logging_with_print_prohibite
         mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
         assert mapped.checker == "logging", sentence
         assert mapped.match == match((), ("print",), 1), sentence
+
+
+# --- CON-67 round 1 (CR1 on #61, I-10 "Negation" item 4) ------------------------------------
+
+# CR1's sentences: a trailing cue whose clause also holds a verb cue, or an option after the
+# cue, is not readable. None of them may prohibit logging or prefer print.
+CR1_TRAILING = [
+    "Use logging, everything else is forbidden.",
+    "Use logging, anything else is banned.",
+    "Use logging only, other approaches are not allowed.",
+    "Use logging for all output, other methods are deprecated.",
+    "Use logging, it is forbidden to print.",
+]
+
+
+@pytest.mark.parametrize("sentence", CR1_TRAILING)
+def test_item_4a_a_trailing_cue_with_a_verb_cue_is_not_verifiable(sentence: str) -> None:
+    # Not verifiable, so in particular it never prohibits logging and never prefers print.
+    assert match_rule(sentence.lower()) is None
+
+
+def test_item_4a_the_comma_and_the_semicolon_forms_of_print_is_banned() -> None:
+    # No break at a comma before a non-verb: the clause holds "use", so it is unreadable.
+    assert match_rule("use logging, print is banned.") is None
+    # The semicolon ends the clause, so print is banned on its own.
+    assert match_rule("use logging; print is banned.") == match(("logging",), ("print",), 2)
+    assert match_rule("print is forbidden.") == match((), ("print",), 1)
+    assert match_rule("print is forbidden, use logging.") == match(("logging",), ("print",), 2)
+
+
+def test_item_4b_no_op_and_non_blocking_are_not_cues() -> None:
+    # "no-op" is one word, not "no": it prohibits nothing by itself.
+    assert match_rule("use a no-op logger in tests.") == match(("logging",), (), 1)
+    assert match_rule("use no-op logging.") == match(("logging",), (), 1)
+    assert match_rule("use non-blocking logging.") == match(("logging",), (), 1)
+    assert match_rule("use a non-blocking logger, no-op in tests.") == match(("logging",), (), 1)
+    # What prohibits logging in "never use no-op logging." is the "never".
+    assert match_rule("never use no-op logging.") == match((), ("logging",), 1)
+    assert match_rule("never use non-blocking print.") == match((), ("print",), 1)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "use print, no matter the logging.",
+        "use print, no doubt about logging.",
+        "use logging, not only print.",
+    ],
+)
+def test_item_4b_no_matter_no_doubt_and_not_only_never_prohibit(sentence: str) -> None:
+    # Neither option is prohibited, so both are preferred: the all-preferred guard.
+    assert match_rule(sentence) is None
+    assert match_rule("use logging, no matter the format.") == match(("logging",), (), 1)
+    assert match_rule("use print, no doubt.") == match(("print",), (), 1)
+    assert match_rule("use logging not only for errors.") == match(("logging",), (), 1)
+
+
+def test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable() -> None:
+    assert match_rule("prefer logging over print.") is None
+    assert match_rule("use logging rather than print.") == match(("logging",), ("print",), 2)
+    assert match_rule("dont use print.") == match((), ("print",), 1)

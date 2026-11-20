@@ -14,11 +14,12 @@ from conventiondrift.checkers.phrases import (
     BREAK_MARKS,
     BREAK_WORDS,
     CALL_SUFFIX,
-    COMMA_BREAKS,
+    MERGED,
     NEGATIONS,
     TOKEN,
     TRAILING_PAIRS,
     TRAILING_WORDS,
+    VERB_CUES,
     classify,
     clauses,
     first_cue,
@@ -61,7 +62,7 @@ BREAKS = [
     " however ",
 ]
 # What does not end a clause: negation carries through each of these.
-NON_BREAKS = [" and ", " or ", " nor ", ", ", ",", " , ", " also ", "-", " -x ", " x- "]
+NON_BREAKS = [" and ", " or ", " nor ", ", ", ",", " , ", " also ", " -x ", " x- "]
 
 
 @pytest.mark.parametrize("mark", BREAKS)
@@ -121,9 +122,7 @@ def test_instead_of_and_rather_than_prohibit_what_follows() -> None:
     assert classify("use a rather than b", find, OPTIONS) == rule(
         preferred="a", prohibited="b", specificity=2
     )
-    assert classify("use a over b", find, OPTIONS) == rule(
-        preferred="a", prohibited="b", specificity=2
-    )
+    assert clauses("use a rather than b") == (("use", "a", "rather than", "b"),)
     assert clauses("use a instead of b") == (("use", "a"), ("instead of", "b"))
 
 
@@ -168,8 +167,13 @@ def test_dotted_names_are_one_word_and_a_final_dot_is_a_break() -> None:
 
 
 def test_hyphens_inside_words_are_not_dashes() -> None:
-    assert clauses("bare-except f-strings x-") == (("bare", "except", "f", "strings", "x"),)
+    # A hyphen between word characters joins them into one word (I-10 item 4b).
+    assert clauses("bare-except f-strings x-") == (("bare-except", "f-strings", "x"),)
     assert clauses("-x") == (("x",),)
+    assert clauses("a-b-c a.b-c a-b.c") == (("a-b-c", "a.b-c", "a-b.c"),)
+    assert clauses("never a-b") == (("never", "a-b"),)
+    # ... and they are not dashes, so they end no clause.
+    assert len(clauses("never a-b c")) == 1
 
 
 def test_apostrophes_stay_inside_words_and_other_marks_are_dropped() -> None:
@@ -201,7 +205,6 @@ PREFIX_CUES = [
     "stop using",
     "instead of",
     "rather than",
-    "over",
 ]
 TRAILING_CUES = [
     "is banned",
@@ -223,7 +226,7 @@ TRAILING_CUES = [
 def test_the_tables_are_what_the_docs_say() -> None:
     assert BREAK_WORDS == {"but", "then", "instead", "however"}
     assert BREAK_MARKS == set(";:().-\u2013\u2014")
-    assert COMMA_BREAKS == {"use", "prefer", "choose", "pick", "switch", "always", "instead"}
+    assert VERB_CUES == {"use", "prefer", "choose", "pick", "switch", "always", "instead"}
     assert NEGATIONS == {
         "no",
         "never",
@@ -232,18 +235,24 @@ def test_the_tables_are_what_the_docs_say() -> None:
         "don't",
         "don\u2019t",
         "avoid",
-        "over",
-        "rather",
         "without",
         "shouldn't",
         "shouldn\u2019t",
         "mustn't",
         "mustn\u2019t",
         "stop using",
+        "rather than",
         "instead of",
     }
     assert TRAILING_WORDS == {"forbidden", "prohibited", "disallowed", "deprecated"}
     assert TRAILING_PAIRS == {("is", "banned"), ("are", "banned"), ("not", "allowed")}
+    assert MERGED == {
+        ("stop", "using"): "stop using",
+        ("rather", "than"): "rather than",
+        ("no", "matter"): "no matter",
+        ("no", "doubt"): "no doubt",
+        ("not", "only"): "not only",
+    }
 
 
 # --- the wider cue list (INTERFACES I-10 item 3; CON-67) ------------------------------------
@@ -287,10 +296,11 @@ def test_a_trailing_cue_stops_at_a_break_in_both_directions(cue: str) -> None:
     )
 
 
-def test_a_trailing_cue_does_not_reach_what_comes_after_it() -> None:
-    assert classify("b is banned a", find, OPTIONS) == rule(
-        preferred="a", prohibited="b", specificity=2
-    )
+def test_an_option_named_after_a_trailing_cue_makes_the_sentence_unreadable() -> None:
+    # I-10 item 4a: the cue reaches back, so a mention after it can't be placed.
+    assert classify("b is banned a", find, OPTIONS) is None
+    assert classify("b forbidden a", find, OPTIONS) is None
+    assert classify("use b. a is forbidden, b", find, OPTIONS) is None
 
 
 def test_the_two_word_cues_need_both_words() -> None:
@@ -336,7 +346,7 @@ def test_stop_using_is_one_cue() -> None:
 # --- commas (I-10 refinement b) -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("verb", sorted(COMMA_BREAKS))
+@pytest.mark.parametrize("verb", sorted(VERB_CUES))
 def test_a_comma_before_a_positive_verb_cue_ends_the_negated_clause(verb: str) -> None:
     assert classify(f"don't a, {verb} b", find, OPTIONS) == rule(
         preferred="b", prohibited="a", specificity=2
@@ -548,6 +558,16 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
     "call suffixes": lambda n: "never a() " * (n // 10),
     "unbalanced parentheses": lambda n: "never a( " * (n // 9),
     "stop using before every mention": lambda n: "stop using a " * (n // 13),
+    # CON-67 round 1 (I-10 item 4): hyphens, set phrases, trailing cues with a verb cue.
+    "runs of no-": lambda n: "no-" * (n // 3),
+    "no-op before every mention": lambda n: "no-op a " * (n // 8),
+    "hyphen chain": lambda n: "a-" * (n // 2) + "b",
+    "hyphens and dots": lambda n: "a-b.c" * (n // 5),
+    "set phrases": lambda n: "no matter a " * (n // 12),
+    "not only and no doubt": lambda n: "not only no doubt a " * (n // 20),
+    "rather than before every mention": lambda n: "a rather than " * (n // 14),
+    "a trailing cue with a verb cue": lambda n: "use " * (n // 4) + "a is forbidden",
+    "many trailing cues and mentions after": lambda n: "a is forbidden " * (n // 15),
 }
 
 
@@ -578,6 +598,191 @@ def test_a_cue_in_the_middle_of_a_1_mib_clause_splits_the_polarity() -> None:
     result = classify(text, find, options)
     assert result == rule(preferred="a", prohibited="b", specificity=2)
     assert best_time(partial(classify, text, find, options)) < 5.0
+
+
+# --- I-10 "Negation" item 4 (CR1 on #61) ---------------------------------------------------------
+
+HTTP = frozenset({"requests", "httpx", "urllib", "aiohttp"})
+
+
+def find_http(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+    """A finder for a four-option checker (the http-client one comes with T-017)."""
+    for index, word in enumerate(clause):
+        if word in HTTP:
+            yield index, word
+
+
+def test_item_4a_print_is_forbidden_still_prohibits_it_and_the_comma_splits() -> None:
+    assert classify("a is forbidden.", find, OPTIONS) == rule(prohibited="a", specificity=1)
+    assert classify("a is forbidden, use b.", find, OPTIONS) == rule(
+        preferred="b", prohibited="a", specificity=2
+    )
+    assert clauses("a is forbidden, use b") == (("a", "is", "forbidden"), ("use", "b"))
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "use a, everything else is forbidden.",
+        "use a, anything else is banned.",
+        "use a only, other approaches are not allowed.",
+        "use a for all output, other methods are deprecated.",
+        "use a, it is forbidden to b.",  # a verb cue, and an option after the trailing cue
+        "use a, b is banned.",
+        "use a, other things are prohibited.",
+        "use a, others are disallowed.",
+    ],
+)
+def test_item_4a_a_trailing_cue_in_a_clause_with_a_verb_cue_is_unreadable(sentence: str) -> None:
+    assert classify(sentence, find, OPTIONS) is None
+
+
+@pytest.mark.parametrize("verb", sorted(VERB_CUES - {"instead"}))
+def test_item_4a_every_verb_cue_makes_a_trailing_cue_clause_unreadable(verb: str) -> None:
+    # Anywhere in the clause: before the cue, after it, or before the option.
+    assert classify(f"{verb} x, b is forbidden", find, OPTIONS) is None
+    assert classify(f"b {verb} x is forbidden", find, OPTIONS) is None
+    assert classify(f"b is forbidden to {verb} x", find, OPTIONS) is None
+    assert classify(f"x {verb} is forbidden", find, OPTIONS) is None  # no option at all: None
+
+
+def test_item_4a_a_bare_instead_is_a_break_so_the_trailing_clause_stays_readable() -> None:
+    assert classify("use a instead, b is forbidden", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+
+
+def test_item_4a_a_verb_cue_in_another_clause_does_not_matter() -> None:
+    assert classify("use a; b is forbidden", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert classify("use a. b is banned. use c", find, OPTIONS) == rule(
+        preferred="ac", prohibited="b", specificity=3
+    )
+    assert classify("b is forbidden; use a, c", find, OPTIONS) == rule(
+        preferred="ac", prohibited="b", specificity=3
+    )
+
+
+def test_item_4a_only_an_option_after_the_cue_counts_not_one_on_the_cue() -> None:
+    def on_the_cue(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((i, "a") for i, word in enumerate(clause) if word == "forbidden")
+
+    assert classify("x forbidden", on_the_cue, OPTIONS) == rule(preferred="a", specificity=1)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "use httpx, everything else is forbidden.",
+        "use httpx, other clients are banned.",
+        "use httpx only, anything else is not allowed.",
+        "use httpx, requests is forbidden.",
+        "use httpx, it is forbidden to use urllib or aiohttp.",
+    ],
+)
+def test_item_4a_with_four_options_a_trailing_cue_with_a_verb_cue_is_unreadable(
+    sentence: str,
+) -> None:
+    assert classify(sentence, find_http, HTTP) is None
+
+
+@pytest.mark.parametrize(
+    ("sentence", "expected"),
+    [
+        (
+            "requests, urllib and aiohttp are banned; use httpx.",
+            RuleMatch(frozenset({"httpx"}), frozenset({"requests", "urllib", "aiohttp"}), 4),
+        ),
+        (
+            "requests is forbidden, use httpx.",
+            RuleMatch(frozenset({"httpx"}), frozenset({"requests"}), 2),
+        ),
+        ("httpx is forbidden.", RuleMatch(frozenset(), frozenset({"httpx"}), 1)),
+        (
+            "requests, urllib and aiohttp are forbidden.",
+            RuleMatch(frozenset(), frozenset({"requests", "urllib", "aiohttp"}), 3),
+        ),
+        (
+            "use httpx; requests and urllib are deprecated.",
+            RuleMatch(frozenset({"httpx"}), frozenset({"requests", "urllib"}), 3),
+        ),
+    ],
+)
+def test_item_4a_with_four_options_a_readable_trailing_cue_prohibits_what_it_reaches(
+    sentence: str, expected: RuleMatch
+) -> None:
+    assert classify(sentence, find_http, HTTP) == expected
+
+
+def test_item_4b_a_hyphen_joins_tokens_so_no_op_and_non_blocking_hold_no_cue() -> None:
+    assert clauses("use a no-op logger") == (("use", "a", "no-op", "logger"),)
+    assert clauses("use non-blocking a") == (("use", "non-blocking", "a"),)
+    assert classify("use a no-op b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+    assert classify("use non-blocking a", find, OPTIONS) == rule(preferred="a", specificity=1)
+    assert classify("use no-op a", find, OPTIONS) == rule(preferred="a", specificity=1)
+    assert classify("use a-no b", find, OPTIONS) == rule(preferred="b", specificity=1)
+    assert classify("use a no-no-no-b c", find, OPTIONS) == rule(preferred="ac", specificity=2)
+    # The words are not cues in any position, nor does a trailing hyphen join anything.
+    assert first_cue(clauses("no-op")[0]) is None
+    assert first_cue(clauses("non-blocking")[0]) is None
+    assert clauses("no- a") == (("no", "a"),)
+    assert classify("no- a", find, OPTIONS) == rule(prohibited="a", specificity=1)
+
+
+def test_item_4b_a_real_cue_still_works_next_to_a_hyphenated_word() -> None:
+    assert classify("never use no-op a", find, OPTIONS) == rule(prohibited="a", specificity=1)
+    assert classify("use a, no non-blocking b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+
+
+def test_item_4b_no_matter_is_never_a_cue() -> None:
+    assert clauses("use a no matter b") == (("use", "a", "no matter", "b"),)
+    assert classify("use a no matter b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+    assert classify("no matter a", find, OPTIONS) == rule(preferred="a", specificity=1)
+    assert first_cue(clauses("no matter")[0]) is None
+
+
+def test_item_4b_no_doubt_is_never_a_cue() -> None:
+    assert clauses("use a no doubt b") == (("use", "a", "no doubt", "b"),)
+    assert classify("use a no doubt b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+    assert classify("no doubt a", find, OPTIONS) == rule(preferred="a", specificity=1)
+    assert first_cue(clauses("no doubt")[0]) is None
+
+
+def test_item_4b_not_only_is_never_a_cue() -> None:
+    assert clauses("use a not only b") == (("use", "a", "not only", "b"),)
+    assert classify("use a not only b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+    assert classify("not only a", find, OPTIONS) == rule(preferred="a", specificity=1)
+    assert first_cue(clauses("not only")[0]) is None
+
+
+def test_item_4b_the_set_phrases_need_both_words_and_a_real_cue_after_them_still_works() -> None:
+    # Whole words only: these are not the set phrases, so "no" and "not" are cues again.
+    for text in ("no matterx a", "no matt a", "not onlyx a", "no doubtful a", "no a"):
+        assert classify(text, find, OPTIONS) == rule(prohibited="a", specificity=1), text
+    assert classify("no matter what, never a", find, OPTIONS) == rule(prohibited="a", specificity=1)
+    assert classify("not only a but not b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    # A set phrase at the end of a text has no second word to look at.
+    assert clauses("use a no") == (("use", "a", "no"),)
+
+
+def test_item_4c_over_and_a_bare_rather_are_not_cues_but_rather_than_is() -> None:
+    assert first_cue(("prefer", "a", "over", "b")) is None
+    assert first_cue(("rather", "a")) is None
+    assert classify("prefer a over b", find, OPTIONS) == rule(preferred="ab", specificity=2)
+    assert classify("rather a", find, OPTIONS) == rule(preferred="a", specificity=1)
+    assert classify("use a rather than b", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    assert clauses("use a rather") == (("use", "a", "rather"),)
+    assert clauses("use a rather thanx b") == (("use", "a", "rather", "thanx", "b"),)
+    assert "over" not in NEGATIONS
+    assert "rather" not in NEGATIONS
+    assert "dont" in NEGATIONS
 
 
 def test_first_cue_is_the_index_of_the_first_cue() -> None:

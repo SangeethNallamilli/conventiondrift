@@ -338,3 +338,27 @@ HOSTILE_RULES = {
 @pytest.mark.parametrize("kind", HOSTILE_RULES)
 def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
+
+
+def test_hyphenated_spellings_are_read_as_the_options_they_name() -> None:
+    # A hyphen joins words (I-10 item 4b), so "bare-except" is one word and is read as such.
+    assert match_rule("avoid bare-except.") == match(("bare-except",))
+    assert match_rule("never use bare-excepts.") == match(("bare-except",))
+    assert match_rule("never use broad-except.") == match(("broad-except",))
+    assert match_rule("never use generic-exceptions or bare-exception.") == match(
+        ("bare-except", "broad-except")
+    )
+    assert match_rule("no blanket-exception.") == match(("broad-except",))
+    assert match_rule("never use bare-nonsense.") is None
+
+
+def test_trailing_cue_reach_applies_to_exceptions_too() -> None:
+    assert match_rule("bare except is forbidden.") == match(("bare-except",))
+    assert match_rule("bare except is forbidden, use specific exceptions.") == match(
+        ("bare-except",)
+    )
+    assert match_rule("use specific exceptions, bare except is forbidden.") is None
+    assert match_rule("use specific exceptions; bare except is banned.") == match(("bare-except",))
+    assert match_rule("no-op handlers are fine, but never use bare except.") == match(
+        ("bare-except",)
+    )
