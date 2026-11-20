@@ -226,12 +226,19 @@ def test_a_noun_phrase_before_a_cue_or_after_a_bare_v_never_names_requests(sente
     assert match_rule(sentence) is None
 
 
-@pytest.mark.xfail(strict=True, reason="needs SE3's I-10 6(b) ban verbs in phrases.py")
-@pytest.mark.parametrize("sentence", ["always forbid requests.", "never ban requests."])
-def test_requests_after_a_ban_verb_is_the_library(sentence: str) -> None:
-    match_ = match_rule(sentence)
-    assert match_ is not None
-    assert "requests" in match_.prohibited
+@pytest.mark.parametrize(
+    ("sentence", "expected"),
+    [
+        # I-10 6(b): a ban verb is a prefix cue, so requests after it is at an anchor.
+        ("always forbid requests.", match((), ("requests",))),
+        # 6(b) double-negation guard ("never forbid print"): Not verifiable.
+        ("never ban requests.", None),
+    ],
+)
+def test_requests_after_a_ban_verb_is_the_library(
+    sentence: str, expected: RuleMatch | None
+) -> None:
+    assert match_rule(sentence) == expected
 
 
 def test_specificity_is_the_number_of_options_named() -> None:
