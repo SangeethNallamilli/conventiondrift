@@ -125,7 +125,7 @@ def test_valid_info_goes_after_the_fence(info: str) -> None:
 
 @pytest.mark.parametrize("info", ["Diff", "a b", "a\n", "x" * 33, "py`", "é", "a_b", "x\ny"])
 def test_bad_info_raises(info: str) -> None:
-    with pytest.raises(ValueError, match="info"):
+    with pytest.raises(ValueError, match=r"^invalid code block info string$"):
         md_codeblock(["a"], info)
 
 
