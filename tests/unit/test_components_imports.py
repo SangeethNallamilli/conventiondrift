@@ -1,11 +1,15 @@
 """Static check: ``components.py`` imports no implementation package (I-13 C6 item 5).
 
-The Protocols are the contract between components, so they may name only the shared types:
-``model`` and the ``Checker`` Protocol's own module. The types C6 hands out live in ``model``
+The Protocols are the contract between components, so they may name only the shared types in
+``model``. The ``Checker`` Protocol is defined in ``components`` (I-13 C6 item 8, moved by T-016),
+so importing ``components`` never loads a checker. The types C6 hands out live in ``model``
 with no re-export from ``rules``.
 """
 
 import ast
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +17,7 @@ import pytest
 from conventiondrift.rules import conflicts, extract, mapping
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "conventiondrift"
-ALLOWED = frozenset({"conventiondrift.model", "conventiondrift.checkers.base"})
+ALLOWED = frozenset({"conventiondrift.model"})
 MOVED = ("Extraction", "FileRules", "ExtractedRule", "ConflictIndex")
 
 
@@ -66,3 +70,24 @@ def test_model_does_not_import_the_rules_package() -> None:
 @pytest.mark.parametrize("name", MOVED)
 def test_the_moved_types_are_not_re_exported(module: object, name: str) -> None:
     assert name not in module.__all__  # type: ignore[attr-defined]
+
+
+def test_the_checker_protocol_is_defined_in_components_and_re_exported_by_base() -> None:
+    from conventiondrift import components
+    from conventiondrift.checkers import base
+
+    assert components.Checker.__module__ == "conventiondrift.components"
+    assert base.Checker is components.Checker
+    assert "Checker" in base.__all__
+
+
+def test_importing_components_loads_no_checker() -> None:
+    code = (
+        "import sys, conventiondrift.components\n"
+        "print(sorted(m for m in sys.modules if m.startswith('conventiondrift.checkers')))"
+    )
+    env = {**os.environ, "PYTHONPATH": str(SRC.parent)}
+    out = subprocess.run(  # noqa: S603 -- fixed argv, our own interpreter
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "[]"
