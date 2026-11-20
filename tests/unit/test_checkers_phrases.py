@@ -20,6 +20,7 @@ from conventiondrift.checkers.phrases import (
     TRAILING_PAIRS,
     TRAILING_WORDS,
     VERB_CUES,
+    Mention,
     _read,
     classify,
     clauses,
@@ -329,11 +330,13 @@ def test_a_mention_on_the_trailing_cue_itself_is_not_negated() -> None:
 
 
 def test_a_prefix_and_a_trailing_cue_together() -> None:
-    # "never a" reaches b and c after it; "c is banned" reaches a, b before it: all three.
-    assert classify("a never b c is banned", find, OPTIONS) is None
-    assert classify("a never b c is banned", find, frozenset("abcd")) == rule(
+    # "never" reaches b and c after it, "c is banned" reaches the words before it: all three.
+    assert classify("never a b c is banned", find, OPTIONS) is None
+    assert classify("never a b c is banned", find, frozenset("abcd")) == rule(
         prohibited="abc", specificity=3
     )
+    # With the cue between two mentions they are not one list (I-10 item 4a, contiguity guard).
+    assert classify("a never b c is banned", find, frozenset("abcd")) is None
 
 
 def test_stop_using_is_one_cue() -> None:
@@ -537,52 +540,55 @@ def test_clauses_run_in_linear_time_on_adversarial_text(hostile: str) -> None:
     assert best_time(partial(clauses, hostile)) < 5.0
 
 
+MERGED_PAIRS = "stop using a no matter a not only no doubt a rather than a "
+
 HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
-    # About n bytes each; every one puts ~n/2 mentions in one clause or in many clauses.
+    # About n bytes each. Every shape puts ~n/2 mentions or marks in one clause, or in many
+    # clauses, and each one stands for a code path that no other shape here reaches.
+    # ``classify`` reads the sentence with ``_read`` (what ``clauses`` is), so these also time
+    # the tokenizer and the clause cutter; ``clauses`` has its own list of texts above.
     "cue then many mentions": lambda n: "never " + "a " * (n // 2),
-    "no cue, many mentions": lambda n: "use " + "a " * (n // 2),
     "mentions with commas": lambda n: "never " + "a, " * (n // 3),
-    "mentions with or": lambda n: "never a" + " or a" * (n // 5),
     "a cue before every mention": lambda n: "never a " * (n // 8),
     "one mention per clause": lambda n: "never a. " * (n // 9),
     "instead of before every mention": lambda n: "use a instead of b " * (n // 19),
-    "mixed options": lambda n: "never a b c " * (n // 12),
     "dashes": lambda n: "never a - " * (n // 10),
-    "cues only": lambda n: "never " * (n // 6),
-    # CON-67: trailing cues, commas before a verb cue, call suffixes, "stop using".
+    # CON-67: trailing cues, commas before a verb cue, call suffixes, set phrases.
     "mentions then a trailing cue": lambda n: "a " * (n // 2) + "is banned",
     "a trailing cue after every mention": lambda n: "a is banned " * (n // 12),
-    "trailing cues only": lambda n: "not allowed " * (n // 12),
     "commas before a verb cue": lambda n: "never a, use " * (n // 13),
-    "commas before other words": lambda n: "never a, " * (n // 9),
-    "commas only": lambda n: "," * n,
-    "call suffixes": lambda n: "never a() " * (n // 10),
-    "unbalanced parentheses": lambda n: "never a( " * (n // 9),
-    "stop using before every mention": lambda n: "stop using a " * (n // 13),
-    # CON-67 round 1 (I-10 item 4): hyphens, set phrases, trailing cues with a verb cue.
-    "runs of no-": lambda n: "no-" * (n // 3),
-    "no-op before every mention": lambda n: "no-op a " * (n // 8),
-    "hyphen chain": lambda n: "a-" * (n // 2) + "b",
-    "hyphens and dots": lambda n: "a-b.c" * (n // 5),
-    "set phrases": lambda n: "no matter a " * (n // 12),
-    "not only and no doubt": lambda n: "not only no doubt a " * (n // 20),
-    "rather than before every mention": lambda n: "a rather than " * (n // 14),
+    "call suffixes and open parentheses": lambda n: "never a() a( " * (n // 13),
+    "merged pairs": lambda n: MERGED_PAIRS * (n // len(MERGED_PAIRS)),
+    "hyphen and dot chain": lambda n: "a.b-" * (n // 4) + "c",
+    "double hyphens": lambda n: "a--" * (n // 3),
     "a trailing cue with a verb cue": lambda n: "use " * (n // 4) + "a is forbidden",
-    "many trailing cues and mentions after": lambda n: "a is forbidden " * (n // 15),
     # CON-67 round 2 (comma guard): commas in a clause with a trailing cue.
     "mentions with commas then a trailing cue": lambda n: "a, " * (n // 3) + "is banned",
+    # CON-67 round 3 (contiguity guard): the one shape where the guard reads every gap.
+    "mentions joined by and, then a trailing cue": lambda n: "a and " * (n // 6) + "are banned",
     "commas only then a trailing cue": lambda n: ", " * (n // 2) + "a is banned",
-    "x commas then a mention and a trailing cue": lambda n: "x, " * (n // 3) + "a is banned",
     "one mention each side of many commas": lambda n: "a " + ", " * (n // 2) + "b is banned",
-    "double hyphens": lambda n: "a--" * (n // 3),
 }
+# Left out of the list above, each one the same path as one kept (the shapes of #58 and of the
+# first two rounds of #61; CI took over 10 minutes with them):
+# - "no cue, many mentions": "use " + 100,000 mentions is in ``test_one_clause_with_100_000_...``.
+# - "mentions with or", "mixed options", "commas before other words": plain words, as in
+#   "cue then many mentions" and "mentions with commas" (the last one was the same text).
+# - "cues only", "trailing cues only", "many trailing cues and mentions after": a run of cues in
+#   one clause, as in "a cue before every mention" and "a trailing cue after every mention".
+# - "commas only", "x commas then a mention and a trailing cue": the commas of "commas only then
+#   a trailing cue", with the same one mention after them.
+# - "call suffixes", "unbalanced parentheses": one text, "call suffixes and open parentheses".
+# - "stop using ...", "set phrases", "not only and no doubt", "rather than ...": one MERGED table
+#   lookup in ``_read``, all five pairs in "merged pairs".
+# - "runs of no-", "no-op before every mention", "hyphens and dots": one TOKEN word with
+#   ``[.-]`` repeats, as in "hyphen and dot chain" (and "no-op" is a plain word to everything
+#   after ``_read``).
 
 
 @pytest.mark.parametrize("kind", HOSTILE_SENTENCES)
 def test_classify_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
-    make = HOSTILE_SENTENCES[kind]
-    assert_linear(make, lambda text: classify(text, find, OPTIONS), label=kind)
-    assert_linear(make, clauses, label=kind)
+    assert_linear(HOSTILE_SENTENCES[kind], lambda text: classify(text, find, OPTIONS), label=kind)
 
 
 def test_one_clause_with_100_000_mentions_is_read_once() -> None:
@@ -830,6 +836,7 @@ def test_item_4a_comma_guard_four_options_for_an_http_client() -> None:
     for sentence in (
         "requests, urllib and aiohttp are banned.",
         "requests, urllib are forbidden.",
+        "requests, urllib and aiohttp are forbidden.",
         "httpx is fine, requests is banned.",
         "httpx is acceptable, requests is not allowed.",
         "requests, httpx and urllib and aiohttp are deprecated.",
@@ -859,6 +866,134 @@ def test_item_4a_print_requests_and_urllib_list_is_unreadable_when_all_three_are
     )
     assert classify("print is banned, use logging.", find_three, options) == RuleMatch(
         frozenset(), frozenset({"print"}), 1
+    )
+
+
+# --- I-10 item 4a, contiguity guard (CR1 round 3 on #61) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "httpx is fine and requests is forbidden.",
+        "httpx is fine or requests is banned.",
+        "httpx is fine nor requests is not allowed.",
+        "requests and the urllib library are banned.",  # a word between two mentions: accepted loss
+        "requests and also urllib are banned.",
+        "requests or maybe urllib or aiohttp are deprecated.",
+        "requests and urllib and, in tests, aiohttp are banned.",  # the commas are no excuse
+        "requests and `the` urllib are banned.",  # a backtick doesn't hide a word
+        "requests and urllib are fine and aiohttp is banned.",
+    ],
+)
+def test_item_4a_a_word_between_two_mentions_makes_the_list_unreadable(sentence: str) -> None:
+    assert classify(sentence, find_http, HTTP) is None, sentence
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("requests and urllib are banned.", {"requests", "urllib"}),
+        ("requests or urllib are banned.", {"requests", "urllib"}),
+        ("requests nor urllib are banned.", {"requests", "urllib"}),
+        ("requests and urllib or aiohttp are banned.", {"requests", "urllib", "aiohttp"}),
+        ("`requests` and `urllib` are forbidden.", {"requests", "urllib"}),
+        ("requests urllib are banned.", {"requests", "urllib"}),  # nothing between them
+        ("the requests library is banned.", {"requests"}),  # one mention: no gap to read
+        ("requests and urllib libraries are not allowed.", {"requests", "urllib"}),  # after
+        ("it is clear that requests and urllib are banned.", {"requests", "urllib"}),  # before
+    ],
+)
+def test_item_4a_a_list_of_mentions_with_only_connectors_between_them_maps(
+    sentence: str, prohibited: set[str]
+) -> None:
+    result = classify(sentence, find_http, HTTP)
+    assert result == RuleMatch(frozenset(), frozenset(prohibited), len(prohibited)), sentence
+
+
+def test_item_4a_contiguity_with_the_two_options_of_a_print_rule() -> None:
+    options = frozenset({"print", "requests", "urllib"})
+
+    def find_three(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((i, word) for i, word in enumerate(clause) if word in options)
+
+    assert classify("print and requests are banned.", find_three, options) == RuleMatch(
+        frozenset(), frozenset({"print", "requests"}), 2
+    )
+    assert classify("print and the requests library are banned.", find_three, options) is None
+
+
+def test_item_4a_contiguity_with_three_options_for_exceptions() -> None:
+    assert classify("bare and broad are banned.", find_exceptions, BARE_BROAD_SPECIFIC) == (
+        RuleMatch(frozenset(), frozenset({"bare", "broad"}), 2)
+    )
+    for sentence in (
+        "bare is acceptable and broad is forbidden.",
+        "bare is fine or broad is not allowed.",
+        "bare and the broad ones are banned.",
+    ):
+        assert classify(sentence, find_exceptions, BARE_BROAD_SPECIFIC) is None, sentence
+
+
+def test_item_4a_contiguity_is_only_read_in_a_clause_with_a_trailing_cue() -> None:
+    # A prefix cue reaches every mention in its clause, whatever lies between them.
+    assert classify("never use requests and the urllib library.", find_http, HTTP) == RuleMatch(
+        frozenset(), frozenset({"requests", "urllib"}), 2
+    )
+    # Another clause's words don't count: the guard looks inside one clause.
+    assert classify("requests is banned. urllib is fine.", find_http, HTTP) == RuleMatch(
+        frozenset({"urllib"}), frozenset({"requests"}), 2
+    )
+    assert classify("requests is banned; urllib is banned.", find_http, HTTP) == RuleMatch(
+        frozenset(), frozenset({"requests", "urllib"}), 2
+    )
+
+
+def find_phrases(clause: tuple[str, ...]) -> Iterator[Mention]:
+    """Two-word mentions that tell ``classify`` which words are theirs: "bare except" (the index
+    is its first word) and "catching exception" (the index is its last word)."""
+    for index, word in enumerate(clause):
+        if word == "bare" and clause[index + 1 : index + 2] == ("except",):
+            yield index, "bare", range(index, index + 2)
+        elif word == "exception" and clause[index - 1 : index] == ("catching",):
+            yield index, "broad", range(index - 1, index + 1)
+
+
+def find_phrases_without_spans(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+    return ((index, option) for index, option, *_ in find_phrases(clause))
+
+
+def test_item_4a_the_words_of_a_mention_are_not_words_between_mentions() -> None:
+    options = frozenset({"bare", "broad", "specific"})
+    expected = RuleMatch(frozenset(), frozenset({"bare", "broad"}), 2)
+    both = "bare except and catching exception are banned."
+    assert classify(both, find_phrases, options) == expected
+    assert classify("catching exception or bare except are banned.", find_phrases, options) == (
+        expected
+    )
+    # Told only the index of each mention, ``classify`` sees "except" and "catching" in the gap.
+    assert classify(both, find_phrases_without_spans, options) is None
+    # A word that is not part of either mention still breaks the list.
+    for sentence in (
+        "bare except and the catching exception are banned.",
+        "bare except or even catching exception are banned.",
+        "bare except is fine and catching exception is banned.",
+    ):
+        assert classify(sentence, find_phrases, options) is None, sentence
+
+
+def test_item_4a_the_order_the_finder_gives_mentions_in_does_not_matter() -> None:
+    options = frozenset({"a", "b", "c"})
+
+    def backwards(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return iter(sorted(find(clause), reverse=True))
+
+    assert classify("a and b are banned.", backwards, options) == rule(
+        prohibited="ab", specificity=2
+    )
+    assert classify("a x b are banned.", backwards, options) is None
+    assert classify("x a and b y are banned.", backwards, options) == rule(
+        prohibited="ab", specificity=2
     )
 
 

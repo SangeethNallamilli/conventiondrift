@@ -11,6 +11,9 @@ What is read as each option:
 * ``broad-except``: "catch Exception", "catching Exception", "except Exception",
   "broad / generic / blanket except or exception(s)", and "BaseException".
 
+A mention is made of all the words of its phrase ("bare except", "catching Exception"), which is
+what ``classify`` needs to tell a list of mentions from words between them.
+
 A hyphen joins words (``phrases.TOKEN``), so the hyphenated spellings "bare-except",
 "broad-except" and so on are one word each; they are read as the same options, as they were
 when a hyphen still split words (they are also the option ids and linter rule names).
@@ -19,7 +22,7 @@ when a hyphen still split words (they are also the option ids and linter rule na
 from collections.abc import Iterator
 from typing import Final
 
-from conventiondrift.checkers.phrases import classify
+from conventiondrift.checkers.phrases import Mention, classify
 from conventiondrift.model import RuleMatch
 
 __all__ = ["OPTIONS", "match_rule"]
@@ -36,20 +39,20 @@ _HYPHENATED: Final = {
 }
 
 
-def _find(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+def _find(clause: tuple[str, ...]) -> Iterator[Mention]:
     for index, word in enumerate(clause):
         before = clause[index - 1] if index else ""
         after = clause[index + 1] if index + 1 < len(clause) else ""
         if word == "bare" and after in _EXCEPT_WORDS:
-            yield index, "bare-except"
+            yield index, "bare-except", range(index, index + 2)
         elif word in _HYPHENATED:
             yield index, _HYPHENATED[word]
         elif word == "baseexception":
             yield index, "broad-except"
         elif word == "exception" and before in _CATCH_WORDS:
-            yield index, "broad-except"
+            yield index, "broad-except", range(index - 1, index + 1)
         elif word in _EXCEPT_WORDS and before in _BROAD_WORDS:
-            yield index, "broad-except"
+            yield index, "broad-except", range(index - 1, index + 1)
 
 
 def match_rule(normalized_text: str) -> RuleMatch | None:

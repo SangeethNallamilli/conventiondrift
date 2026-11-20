@@ -398,6 +398,67 @@ def test_f1_the_forms_without_a_surviving_comma_still_map(
     assert match_rule(sentence.lower()) == match(prohibited)
 
 
+# --- CON-67 round 3: the contiguity guard (CR1 on #61, I-10 item 4a) -------------------------
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Catching Exception is acceptable and bare except is forbidden.",
+        "Catching Exception is fine or bare except is not allowed.",
+        "Catching Exception is fine nor bare except is banned.",
+        "Bare except is fine and broad except is deprecated.",
+        "Bare except and the catching Exception clause are banned.",
+        "Bare except and also catching Exception are banned.",
+        # A word after or before a phrase isn't part of it, wherever the phrase stands:
+        "Bare except clauses and catching Exception are banned.",
+        "Catching Exception clauses and bare except are banned.",
+        "Broad except clauses and bare except are banned.",
+        "Bare except and the broad except are banned.",
+        "Bare except and the catching Exception are banned.",
+    ],
+)
+def test_round_3_a_word_between_two_mentions_in_a_trailing_cue_clause_is_not_verifiable(
+    sentence: str,
+) -> None:
+    assert match_rule(sentence.lower()) is None
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("Bare except and catching Exception are banned.", ("bare-except", "broad-except")),
+        ("Catching Exception or bare except is forbidden.", ("bare-except", "broad-except")),
+        ("Bare excepts or generic exceptions are deprecated.", ("bare-except", "broad-except")),
+        (
+            "`bare except` and `catching Exception` are not allowed.",
+            ("bare-except", "broad-except"),
+        ),
+        ("Bare-except nor blanket-exceptions are disallowed.", ("bare-except", "broad-except")),
+        ("Bare except and BaseException are prohibited.", ("bare-except", "broad-except")),
+        ("Generic exceptions and bare except are banned.", ("bare-except", "broad-except")),
+        ("Bare except or blanket exceptions are banned.", ("bare-except", "broad-except")),
+        ("Catching Exception nor bare excepts are banned.", ("bare-except", "broad-except")),
+        ("The broad except is banned.", ("broad-except",)),
+        (
+            "Bare except and catching Exception clauses are forbidden.",
+            ("bare-except", "broad-except"),
+        ),
+    ],
+)
+def test_round_3_a_phrase_with_its_own_words_and_connectors_between_them_still_maps(
+    sentence: str, prohibited: tuple[str, ...]
+) -> None:
+    # "bare except" and "catching Exception" are two words each; those are the mention's own.
+    assert match_rule(sentence.lower()) == match(prohibited)
+
+
+def test_round_3_with_a_prefix_cue_the_words_between_mentions_do_not_matter() -> None:
+    assert match_rule("never use a bare except or, worse, catching exception.") == match(
+        ("bare-except", "broad-except")
+    )
+
+
 @pytest.mark.parametrize(
     "sentence",
     [

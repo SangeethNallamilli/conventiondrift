@@ -31,7 +31,11 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
   whose comma (one that did not end the clause) has option mentions on both
   sides: "catching exception is fine, bare except is forbidden", and the list
   form "print, requests and urllib are banned" (coverage lost on purpose).
-  "print and requests are banned" has no comma and prohibits both.
+  "print and requests are banned" has no comma and prohibits both. So is a clause
+  whose mentions are not one unbroken list: only ``and``, ``or`` and ``nor``
+  (and commas, and backticks, which are not words) may sit between two mentions,
+  so "catching exception is fine and bare except is forbidden" and "print and the
+  requests library are banned" are not mapped either.
 * Words are joined by a hyphen into one word: "no-op" and "non-blocking" hold no
   cue. The phrases "no matter", "no doubt" and "not only" are never cues.
 * A clause ends at ``.``, ``;``, ``:``, ``(``, ``)``, a dash (an en or em dash,
@@ -62,7 +66,8 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
 * every option is preferred (every site would follow, so the rule would always
   hold; this is also what a cue that isn't read looks like); or
 * a clause with a trailing cue also holds a positive verb cue, an option
-  mentioned after the cue, or a comma with option mentions on both sides.
+  mentioned after the cue, a comma with option mentions on both sides, or
+  a word other than ``and``, ``or`` and ``nor`` between two mentions.
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -97,6 +102,7 @@ __all__ = [
     "TRAILING_WORDS",
     "VERB_CUES",
     "Finder",
+    "Mention",
     "classify",
     "clauses",
     "first_cue",
@@ -172,8 +178,15 @@ TRAILING_WORDS: Final = frozenset({"forbidden", "prohibited", "disallowed", "dep
 TRAILING_PAIRS: Final = frozenset({("is", "banned"), ("are", "banned"), ("not", "allowed")})
 """Two-word trailing cues; the cue is at the second word."""
 
-Finder = Callable[[tuple[str, ...]], Iterable[tuple[int, str]]]
-"""Gives the ``(word index, option)`` pairs one checker finds in a clause."""
+CONNECTORS: Final = frozenset({"and", "or", "nor"})
+"""The only words that may sit between two mentions in a clause with a trailing cue."""
+
+Mention = tuple[int, str] | tuple[int, str, range]
+"""``(word index, option)``, or with the words the mention is made of as a ``range`` (for
+"bare except" at index 0, ``range(0, 2)``). Without one, a mention is its one word."""
+
+Finder = Callable[[tuple[str, ...]], Iterable[Mention]]
+"""Gives the mentions one checker finds in a clause."""
 
 
 def _read(text: str) -> list[tuple[tuple[str, ...], tuple[int, ...]]]:
@@ -240,20 +253,46 @@ def _reached(cue: int | None, end: int | None, index: int) -> bool:
     return (cue is not None and cue < index) or (end is not None and index < end)
 
 
+def _span(mention: Mention) -> tuple[int, int]:
+    """The first word of a mention and the one after its last."""
+    if len(mention) == 3:
+        return mention[2].start, mention[2].stop
+    return mention[0], mention[0] + 1
+
+
+def _unbroken(clause: tuple[str, ...], mentions: list[Mention]) -> bool:
+    """Whether the mentions of ``clause`` form one list: every word from the first mention to the
+    last that is not part of a mention is one of ``CONNECTORS``. Each word is read once."""
+    spans = [_span(mention) for mention in mentions]
+    owned = {position for start, stop in spans for position in range(start, stop)}
+    low = min(start for start, _ in spans)
+    high = max(stop for _, stop in spans)
+    return all(
+        clause[position] in CONNECTORS for position in range(low, high) if position not in owned
+    )
+
+
 def _unreadable(
-    clause: tuple[str, ...], commas: tuple[int, ...], mentions: list[tuple[int, str]], end: int
+    clause: tuple[str, ...], commas: tuple[int, ...], mentions: list[Mention], end: int
 ) -> bool:
     """Whether a clause with a trailing cue at ``end`` can't be read (I-10, "Negation" item 4a):
-    it holds a positive verb cue anywhere, it mentions an option after the cue, or a comma that
-    did not end the clause has option mentions on both sides of it ("catching exception is fine,
-    bare except is forbidden"; also the list form "print, requests and urllib are banned")."""
+    it holds a positive verb cue anywhere, it mentions an option after the cue, a comma that
+    did not end the clause has option mentions on both sides of it ("catching exception is
+    fine, bare except is forbidden"; also the list form "print, requests and urllib are
+    banned"), or the mentions are not one unbroken list ("catching exception is fine and bare
+    except is forbidden", "print and the requests library are banned")."""
     if any(word in VERB_CUES for word in clause):
         return True
     if not mentions:
         return False
-    first = min(index for index, _ in mentions)
-    last = max(index for index, _ in mentions)
-    return last > end or any(first < comma <= last for comma in commas)
+    indexes = [mention[0] for mention in mentions]
+    first = min(indexes)
+    last = max(indexes)
+    return (
+        last > end
+        or any(first < comma <= last for comma in commas)
+        or not _unbroken(clause, mentions)
+    )
 
 
 def is_negated(clause: tuple[str, ...], index: int) -> bool:
@@ -273,7 +312,8 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
         mentions = list(find(clause))
         if end is not None and _unreadable(clause, commas, mentions, end):
             return None
-        for index, option in mentions:
+        for mention in mentions:
+            index, option = mention[0], mention[1]
             (prohibited if _reached(cue, end, index) else preferred).add(option)
     mentioned = preferred | prohibited
     if not mentioned or preferred & prohibited:
