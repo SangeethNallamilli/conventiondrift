@@ -673,3 +673,30 @@ def test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable() -> None:
     assert match_rule("prefer logging over print.") is None
     assert match_rule("use logging rather than print.") == match(("logging",), ("print",), 2)
     assert match_rule("dont use print.") == match((), ("print",), 1)
+
+
+# --- CON-67 round 2: the comma guard (CR1 F1 on #61, I-10 item 4a) --------------------------
+
+
+def test_f1_print_is_banned_forms_with_and_without_a_surviving_comma() -> None:
+    assert match_rule("print and requests are banned.") == match((), ("print",), 1)
+    assert match_rule("print is banned, use logging.") == match(("logging",), ("print",), 2)
+    assert match_rule("print or logging is banned, use x.") is None  # both prohibited: nothing left
+    # Logging alone sees one option here, so no comma has mentions on both sides. It is the
+    # checker that finds "requests" and "urllib" too (T-017) that makes this list form
+    # Not verifiable (tested at classify level in test_checkers_phrases.py).
+    assert match_rule("print, requests and urllib are banned.") == match((), ("print",), 1)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "print is fine, logging is banned.",  # mentions on both sides of the comma
+        "logging is acceptable, print is not allowed.",
+        "print, logging are deprecated.",
+    ],
+)
+def test_f1_a_comma_between_the_two_options_in_a_trailing_cue_clause_is_not_verifiable(
+    sentence: str,
+) -> None:
+    assert match_rule(sentence) is None

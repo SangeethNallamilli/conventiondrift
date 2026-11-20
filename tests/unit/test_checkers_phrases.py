@@ -20,6 +20,7 @@ from conventiondrift.checkers.phrases import (
     TRAILING_PAIRS,
     TRAILING_WORDS,
     VERB_CUES,
+    _read,
     classify,
     clauses,
     first_cue,
@@ -568,6 +569,12 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
     "rather than before every mention": lambda n: "a rather than " * (n // 14),
     "a trailing cue with a verb cue": lambda n: "use " * (n // 4) + "a is forbidden",
     "many trailing cues and mentions after": lambda n: "a is forbidden " * (n // 15),
+    # CON-67 round 2 (comma guard): commas in a clause with a trailing cue.
+    "mentions with commas then a trailing cue": lambda n: "a, " * (n // 3) + "is banned",
+    "commas only then a trailing cue": lambda n: ", " * (n // 2) + "a is banned",
+    "x commas then a mention and a trailing cue": lambda n: "x, " * (n // 3) + "a is banned",
+    "one mention each side of many commas": lambda n: "a " + ", " * (n // 2) + "b is banned",
+    "double hyphens": lambda n: "a--" * (n // 3),
 }
 
 
@@ -691,7 +698,7 @@ def test_item_4a_with_four_options_a_trailing_cue_with_a_verb_cue_is_unreadable(
     ("sentence", "expected"),
     [
         (
-            "requests, urllib and aiohttp are banned; use httpx.",
+            "requests and urllib and aiohttp are banned; use httpx.",
             RuleMatch(frozenset({"httpx"}), frozenset({"requests", "urllib", "aiohttp"}), 4),
         ),
         (
@@ -700,7 +707,7 @@ def test_item_4a_with_four_options_a_trailing_cue_with_a_verb_cue_is_unreadable(
         ),
         ("httpx is forbidden.", RuleMatch(frozenset(), frozenset({"httpx"}), 1)),
         (
-            "requests, urllib and aiohttp are forbidden.",
+            "requests and urllib and aiohttp are forbidden.",
             RuleMatch(frozenset(), frozenset({"requests", "urllib", "aiohttp"}), 3),
         ),
         (
@@ -713,6 +720,155 @@ def test_item_4a_with_four_options_a_readable_trailing_cue_prohibits_what_it_rea
     sentence: str, expected: RuleMatch
 ) -> None:
     assert classify(sentence, find_http, HTTP) == expected
+
+
+# --- I-10 item 4a, comma guard (CR1 F1 on #61) ---------------------------------------------------
+
+BARE_BROAD_SPECIFIC = frozenset({"bare", "broad", "specific"})
+
+
+def find_exceptions(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+    """A finder for a three-option checker: the options of ``exceptions``, one word each."""
+    for index, word in enumerate(clause):
+        if word in BARE_BROAD_SPECIFIC:
+            yield index, word
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "a, b is banned.",
+        "a, b are banned.",
+        "a, b and c are banned.",  # the list form (accepted coverage loss)
+        "a, b is forbidden",
+        "b is fine, a is not allowed.",
+        "a is fine, b is forbidden.",
+        "a is tolerated, b is deprecated.",
+        "a and b, c are prohibited.",
+        "a, a is banned.",  # the same option on both sides still counts
+        "a is acceptable, so b is banned.",
+        "a, x, b is banned.",
+        "a x, y b is disallowed.",
+    ],
+)
+def test_item_4a_a_comma_with_mentions_on_both_sides_in_a_trailing_cue_clause_is_unreadable(
+    sentence: str,
+) -> None:
+    assert classify(sentence, find, OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    ("sentence", "expected"),
+    [
+        ("a and b are banned.", rule(prohibited="ab", specificity=2)),
+        ("a or b is forbidden.", rule(prohibited="ab", specificity=2)),
+        ("a is banned, use b.", rule(preferred="b", prohibited="a", specificity=2)),
+        ("a is banned, always b.", rule(preferred="b", prohibited="a", specificity=2)),
+        # A comma with mentions on one side only does not matter ...
+        ("x, a is banned.", rule(prohibited="a", specificity=1)),
+        (", a is banned.", rule(prohibited="a", specificity=1)),
+        ("x y, a is banned.", rule(prohibited="a", specificity=1)),
+        ("a is banned, x", rule(prohibited="a", specificity=1)),
+        ("a x is banned, y z.", rule(prohibited="a", specificity=1)),
+        ("a, x is banned.", rule(prohibited="a", specificity=1)),
+        ("a and, x are banned.", rule(prohibited="a", specificity=1)),
+        # ... and so does one in a clause with no trailing cue, or in another clause.
+        ("use a, b.", rule(preferred="ab", specificity=2)),
+        ("never a, b.", rule(prohibited="ab", specificity=2)),
+        ("use a, b; c is banned.", rule(preferred="ab", prohibited="c", specificity=3)),
+        ("a, b. c is banned.", rule(preferred="ab", prohibited="c", specificity=3)),
+        ("a is fine; b is banned, x.", rule(preferred="a", prohibited="b", specificity=2)),
+    ],
+)
+def test_item_4a_the_comma_guard_leaves_these_readable(sentence: str, expected: RuleMatch) -> None:
+    assert classify(sentence, find, OPTIONS) == expected
+
+
+def test_item_4a_a_trailing_cue_clause_with_no_mention_is_just_ignored() -> None:
+    # Nothing to place, nothing to doubt: the other clauses decide.
+    assert classify("use a; everything else is banned.", find, OPTIONS) == rule(
+        preferred="a", specificity=1
+    )
+    assert classify("use a. x, y are forbidden.", find, OPTIONS) == rule(
+        preferred="a", specificity=1
+    )
+    assert classify("x is banned.", find, OPTIONS) is None  # nothing mentioned at all
+
+
+def test_item_4a_the_comma_guard_is_about_the_commas_that_survive_the_2b_split() -> None:
+    # "a is banned, use b": the comma before "use" ends the clause, so no comma is left in it.
+    assert clauses("a is banned, use b") == (("a", "is", "banned"), ("use", "b"))
+    assert classify("a is banned, use b", find, OPTIONS) == rule(
+        preferred="b", prohibited="a", specificity=2
+    )
+    # A comma that survives is the one before "b" here.
+    assert classify("a, b is banned, use c", find, OPTIONS) is None
+
+
+def test_item_4a_comma_guard_three_options_for_exceptions() -> None:
+    options = BARE_BROAD_SPECIFIC
+    for sentence in (
+        "broad is acceptable, bare is forbidden.",
+        "broad is fine, bare is not allowed.",
+        "specific is tolerated, bare is banned.",
+        "bare, broad and specific are banned.",
+        "bare, broad are deprecated.",
+    ):
+        assert classify(sentence, find_exceptions, options) is None, sentence
+    assert classify("bare and broad are banned.", find_exceptions, options) == RuleMatch(
+        frozenset(), frozenset({"bare", "broad"}), 2
+    )
+    assert classify("bare is banned, use specific.", find_exceptions, options) == RuleMatch(
+        frozenset({"specific"}), frozenset({"bare"}), 2
+    )
+    assert classify("bare is banned; broad is forbidden.", find_exceptions, options) == RuleMatch(
+        frozenset(), frozenset({"bare", "broad"}), 2
+    )
+
+
+def test_item_4a_comma_guard_four_options_for_an_http_client() -> None:
+    for sentence in (
+        "requests, urllib and aiohttp are banned.",
+        "requests, urllib are forbidden.",
+        "httpx is fine, requests is banned.",
+        "httpx is acceptable, requests is not allowed.",
+        "requests, httpx and urllib and aiohttp are deprecated.",
+        "requests, urllib and aiohttp are banned; use httpx.",  # the list form, lost on purpose
+    ):
+        assert classify(sentence, find_http, HTTP) is None, sentence
+    assert classify("requests and urllib are banned.", find_http, HTTP) == RuleMatch(
+        frozenset(), frozenset({"requests", "urllib"}), 2
+    )
+    assert classify("requests is banned, use httpx.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests"}), 2
+    )
+    assert classify("requests and urllib are banned; use httpx.", find_http, HTTP) == RuleMatch(
+        frozenset({"httpx"}), frozenset({"requests", "urllib"}), 3
+    )
+
+
+def test_item_4a_print_requests_and_urllib_list_is_unreadable_when_all_three_are_options() -> None:
+    options = frozenset({"print", "requests", "urllib"})
+
+    def find_three(clause: tuple[str, ...]) -> Iterator[tuple[int, str]]:
+        return ((i, word) for i, word in enumerate(clause) if word in options)
+
+    assert classify("print, requests and urllib are banned.", find_three, options) is None
+    assert classify("print and requests are banned.", find_three, options) == RuleMatch(
+        frozenset(), frozenset({"print", "requests"}), 2
+    )
+    assert classify("print is banned, use logging.", find_three, options) == RuleMatch(
+        frozenset(), frozenset({"print"}), 1
+    )
+
+
+def test_item_4a_the_comma_positions_are_word_counts_before_each_comma() -> None:
+    assert _read("a, b, c is banned") == [(("a", "b", "c", "is", "banned"), (1, 2))]
+    assert _read(", a,") == [(("a",), (0, 1))]
+    assert _read("a, use b, c") == [(("a",), ()), (("use", "b", "c"), (2,))]
+    assert _read("a, b; c, d") == [(("a", "b"), (1,)), (("c", "d"), (1,))]
+    assert _read("a, b. c") == [(("a", "b"), (1,)), (("c",), ())]
+    assert _read("") == []
 
 
 def test_item_4b_a_hyphen_joins_tokens_so_no_op_and_non_blocking_hold_no_cue() -> None:
@@ -728,6 +884,22 @@ def test_item_4b_a_hyphen_joins_tokens_so_no_op_and_non_blocking_hold_no_cue() -
     assert first_cue(clauses("non-blocking")[0]) is None
     assert clauses("no- a") == (("no", "a"),)
     assert classify("no- a", find, OPTIONS) == rule(prohibited="a", specificity=1)
+
+
+def test_item_4b_a_double_hyphen_never_joins_words_even_when_unspaced() -> None:
+    # CR1 S1: "--" ends a clause even with no space around it ("print--use").
+    assert clauses("print--use logging") == (("print",), ("use", "logging"))
+    assert clauses("a--b") == (("a",), ("b",))
+    assert clauses("a---b") == (("a",), ("b",))
+    assert clauses("never a--b") == (("never", "a"), ("b",))
+    assert classify("never a--use b", find, OPTIONS) == rule(
+        preferred="b", prohibited="a", specificity=2
+    )
+    assert classify("a--b is banned", find, OPTIONS) == rule(
+        preferred="a", prohibited="b", specificity=2
+    )
+    # A single hyphen between word characters still joins them.
+    assert clauses("a-b") == (("a-b",),)
 
 
 def test_item_4b_a_real_cue_still_works_next_to_a_hyphenated_word() -> None:

@@ -362,3 +362,52 @@ def test_trailing_cue_reach_applies_to_exceptions_too() -> None:
     assert match_rule("no-op handlers are fine, but never use bare except.") == match(
         ("bare-except",)
     )
+
+
+# --- CON-67 round 2: the comma guard (CR1 F1 on #61, I-10 item 4a) --------------------------
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Catching Exception is acceptable, bare except is forbidden.",
+        "Catching Exception is fine, bare except is not allowed.",
+        "Broad except is tolerated, bare except is banned.",
+        "Catching Exception is acceptable, bare except is deprecated.",
+        "Bare except, catching Exception and BaseException are banned.",  # list form
+    ],
+)
+def test_f1_a_comma_between_two_mentions_in_a_trailing_cue_clause_is_not_verifiable(
+    sentence: str,
+) -> None:
+    # Reading it as "prohibit both" would be wrong: the first half allows one of them.
+    assert match_rule(sentence.lower()) is None
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("Bare except and catching Exception are banned.", ("bare-except", "broad-except")),
+        ("Bare except is banned, use specific exceptions.", ("bare-except",)),
+        ("Bare except is forbidden.", ("bare-except",)),
+    ],
+)
+def test_f1_the_forms_without_a_surviving_comma_still_map(
+    sentence: str, prohibited: tuple[str, ...]
+) -> None:
+    assert match_rule(sentence.lower()) == match(prohibited)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Catching Exception is acceptable; bare except is forbidden.",
+        "Catching Exception is fine. Bare except is not allowed.",
+    ],
+)
+def test_f1_with_a_semicolon_or_full_stop_the_acceptance_is_a_preferred_mention(
+    sentence: str,
+) -> None:
+    # No comma is involved here. "acceptable" and "fine" are no cues, so catching Exception reads
+    # as preferred, and `exceptions` maps prohibitions only: Not verifiable.
+    assert match_rule(sentence.lower()) is None

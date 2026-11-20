@@ -27,7 +27,11 @@ Clause rules (INTERFACES I-10, "Negation in phrases.py"):
   an option after the trailing cue, the whole sentence is not mapped: "use
   logging, everything else is forbidden" and "use logging, it is forbidden to
   print" are Not verifiable, while "print is forbidden" prohibits print and
-  "print is forbidden, use logging" splits at the comma (below).
+  "print is forbidden, use logging" splits at the comma (below). So is a clause
+  whose comma (one that did not end the clause) has option mentions on both
+  sides: "catching exception is fine, bare except is forbidden", and the list
+  form "print, requests and urllib are banned" (coverage lost on purpose).
+  "print and requests are banned" has no comma and prohibits both.
 * Words are joined by a hyphen into one word: "no-op" and "non-blocking" hold no
   cue. The phrases "no matter", "no doubt" and "not only" are never cues.
 * A clause ends at ``.``, ``;``, ``:``, ``(``, ``)``, a dash (an en or em dash,
@@ -57,8 +61,8 @@ the rule Not verifiable, never a wrong verdict. That is the case when:
 * every option is prohibited (the rule would allow nothing); or
 * every option is preferred (every site would follow, so the rule would always
   hold; this is also what a cue that isn't read looks like); or
-* a clause with a trailing cue also holds a positive verb cue or an option
-  mentioned after the cue.
+* a clause with a trailing cue also holds a positive verb cue, an option
+  mentioned after the cue, or a comma with option mentions on both sides.
 
 Specificity is the number of distinct options the sentence mentions
 (``len(preferred | prohibited)``, binding for every checker, I-10). Two checkers
@@ -172,11 +176,13 @@ Finder = Callable[[tuple[str, ...]], Iterable[tuple[int, str]]]
 """Gives the ``(word index, option)`` pairs one checker finds in a clause."""
 
 
-def clauses(text: str) -> tuple[tuple[str, ...], ...]:
-    """The sentence as non-empty word lists, cut at the clause breaks above."""
+def _read(text: str) -> list[tuple[tuple[str, ...], tuple[int, ...]]]:
+    """The clauses of ``text`` with, for each, the commas that did not end it. A comma is its
+    number of words before it, so a word at an index below that is before the comma."""
     tokens = TOKEN.findall(CALL_SUFFIX.sub("", text.lower()))
-    found: list[tuple[str, ...]] = []
+    found: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
     current: list[str] = []
+    commas: list[int] = []
     index = 0
     while index < len(tokens):
         word = tokens[index]
@@ -186,6 +192,8 @@ def clauses(text: str) -> tuple[tuple[str, ...], ...]:
         is_break = word in BREAK_WORDS or word[0] in BREAK_MARKS
         if word == ",":
             is_break = bool(following) and following[0] in VERB_CUES
+            if not is_break:
+                commas.append(len(current))
         elif pair in MERGED:
             current.append(MERGED[pair])
             index += 1
@@ -193,14 +201,20 @@ def clauses(text: str) -> tuple[tuple[str, ...], ...]:
             current.append(word)
         if is_break:
             if current:
-                found.append(tuple(current))
-                current = []
+                found.append((tuple(current), tuple(commas)))
+            current = []
+            commas = []
             if word == "instead" and following == ["of"]:
                 current.append(INSTEAD_OF)
                 index += 1
     if current:
-        found.append(tuple(current))
-    return tuple(found)
+        found.append((tuple(current), tuple(commas)))
+    return found
+
+
+def clauses(text: str) -> tuple[tuple[str, ...], ...]:
+    """The sentence as non-empty word lists, cut at the clause breaks above."""
+    return tuple(words for words, _ in _read(text))
 
 
 def first_cue(clause: tuple[str, ...]) -> int | None:
@@ -226,10 +240,20 @@ def _reached(cue: int | None, end: int | None, index: int) -> bool:
     return (cue is not None and cue < index) or (end is not None and index < end)
 
 
-def _unreadable(clause: tuple[str, ...], mentions: list[tuple[int, str]], end: int) -> bool:
-    """Whether a clause with a trailing cue at ``end`` can't be read: it holds a positive verb
-    cue anywhere, or mentions an option after the cue (I-10, "Negation" item 4)."""
-    return any(word in VERB_CUES for word in clause) or any(index > end for index, _ in mentions)
+def _unreadable(
+    clause: tuple[str, ...], commas: tuple[int, ...], mentions: list[tuple[int, str]], end: int
+) -> bool:
+    """Whether a clause with a trailing cue at ``end`` can't be read (I-10, "Negation" item 4a):
+    it holds a positive verb cue anywhere, it mentions an option after the cue, or a comma that
+    did not end the clause has option mentions on both sides of it ("catching exception is fine,
+    bare except is forbidden"; also the list form "print, requests and urllib are banned")."""
+    if any(word in VERB_CUES for word in clause):
+        return True
+    if not mentions:
+        return False
+    first = min(index for index, _ in mentions)
+    last = max(index for index, _ in mentions)
+    return last > end or any(first < comma <= last for comma in commas)
 
 
 def is_negated(clause: tuple[str, ...], index: int) -> bool:
@@ -241,13 +265,13 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
     """The ``RuleMatch`` for ``text``, or None when it can't be read as a rule for ``options``."""
     preferred: set[str] = set()
     prohibited: set[str] = set()
-    for clause in clauses(text):
+    for clause, commas in _read(text):
         # The cues are found once per clause, not once per mention: a hostile sentence with
         # 100,000 mentions in one clause must not cost 100,000 scans (linear time, R2.5).
         cue = first_cue(clause)
         end = last_trailing_cue(clause)
         mentions = list(find(clause))
-        if end is not None and _unreadable(clause, mentions, end):
+        if end is not None and _unreadable(clause, commas, mentions, end):
             return None
         for index, option in mentions:
             (prohibited if _reached(cue, end, index) else preferred).add(option)
