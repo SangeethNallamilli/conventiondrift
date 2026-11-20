@@ -13,7 +13,8 @@ from conventiondrift.checkers import REGISTRY, registry
 def test_the_registry_is_a_fixed_tuple() -> None:
     # ADR-0003, DESIGN §6: no entry-point or plugin loading; checkers arrive with T-016..T-019.
     assert isinstance(REGISTRY, tuple)
-    assert registry() == {}
+    # T-016 registered exceptions and logging; the other six come with T-017 to T-019.
+    assert list(registry()) == ["exceptions", "logging"]
 
 
 def test_registry_is_read_only_keyed_by_id_and_sorted() -> None:
