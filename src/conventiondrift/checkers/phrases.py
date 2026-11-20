@@ -189,6 +189,9 @@ COMPARATIVES: Final = frozenset({"than", "vs", "versus"})
 """Words after which a named option makes the sentence unreadable, as after an ``over`` that no
 ``COMPARATIVE_VERBS`` word comes before ("rather than" is one word, a cue, and not ``than``)."""
 
+_COMPARED: Final = COMPARATIVES | {OVER}
+"""Every word ``_comparative`` looks at; ``classify`` skips it for a clause with none of them."""
+
 NEGATIONS: Final = frozenset(
     {
         "no",
@@ -316,6 +319,8 @@ def clauses(text: str) -> tuple[tuple[str, ...], ...]:
 def first_cue(clause: tuple[str, ...]) -> int | None:
     """The index of the first negation cue in ``clause``, or None when it has none. ``over`` is a
     cue when a ``COMPARATIVE_VERBS`` word comes before it in the clause (I-10 item 5d)."""
+    if NEGATIONS.isdisjoint(clause) and OVER not in clause:
+        return None
     verb = False
     for index, word in enumerate(clause):
         if word in NEGATIONS or (verb and word == OVER):
@@ -339,7 +344,10 @@ def _comparative(clause: tuple[str, ...], mentions: list[Mention]) -> bool:
 def _trailing_spans(clause: tuple[str, ...]) -> list[tuple[int, int]]:
     """The ``(first, last)`` word indexes of each trailing cue in ``clause``, in order: for each
     word that ends one, the longest cue that ends there. Each word is compared with at most
-    ``MAX_TRAILING`` slices of at most ``MAX_TRAILING`` words, so this is linear."""
+    ``MAX_TRAILING`` slices of at most ``MAX_TRAILING`` words, so this is linear. A clause
+    without any word a cue ends with (most of them) is ruled out by one set test."""
+    if _TRAILING_LAST.isdisjoint(clause):
+        return []
     spans: list[tuple[int, int]] = []
     for index, word in enumerate(clause):
         if word not in _TRAILING_LAST:
@@ -364,10 +372,12 @@ def _unreached(
     reaches none of ``mentions`` (I-10 item 5b, the unreached-cue guard). A cue reaches what
     comes after it, so the last one reaches the fewest mentions: when it reaches one, every
     earlier cue does too."""
+    start = max(mention[0] for mention in mentions)
+    if NEGATIONS.isdisjoint(clause[start:]):
+        return False
     inside = {position for first, last in spans for position in range(first, last + 1)}
     return any(
-        clause[index] in NEGATIONS and index not in inside
-        for index in range(max(mention[0] for mention in mentions), len(clause))
+        clause[index] in NEGATIONS and index not in inside for index in range(start, len(clause))
     )
 
 
@@ -438,7 +448,12 @@ def classify(text: str, find: Finder, options: frozenset[str]) -> RuleMatch | No
         mentions = list(find(clause))
         if end is not None and _unreadable(clause, commas, mentions, end):
             return None
-        if mentions and (_unreached(clause, spans, mentions) or _comparative(clause, mentions)):
+        # Each guard is skipped by one set test when the clause holds none of its words, which
+        # keeps the many-short-clauses texts cheap (R2.5 tests, CI time).
+        if mentions and (
+            (not NEGATIONS.isdisjoint(clause) and _unreached(clause, spans, mentions))
+            or (not _COMPARED.isdisjoint(clause) and _comparative(clause, mentions))
+        ):
             return None
         for mention in mentions:
             index, option = mention[0], mention[1]
