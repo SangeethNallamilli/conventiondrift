@@ -1,7 +1,8 @@
-"""T-023 unit and property tests for render/escape.py (critical module).
+"""T-023 / T-024 unit and property tests for render/escape.py (critical module).
 
-Covers DESIGN §3a, SECURITY-RULES R3.1, I-14, and the unit halves of
-AC-N3.10, AC-N3.13 and AC-E.17. Spec tests named ``test_ac_*`` belong to
+Covers DESIGN §3a, SECURITY-RULES R3.1, I-14, the unit halves of
+AC-N3.10, AC-N3.13 and AC-E.17, and the md_codeblock contract (CON-26
+option A, SC-2.58 / AC-F6.7). Spec tests named ``test_ac_*`` belong to
 the Test Engineer. This file does not use that prefix.
 """
 
@@ -13,13 +14,14 @@ import unicodedata
 from collections.abc import Callable
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 import conventiondrift.render.escape as esc
 from conventiondrift.render.escape import (
     md,
     md_cell,
+    md_codeblock,
     output_heredoc,
     sarif_text,
     workflow_cmd,
@@ -38,6 +40,8 @@ INJECT_RULE = (
     "::stop-commands::tok %0A::error::x %0D"
 )
 INJECT_PATH = "src/::warning::%0A.py"
+# AC-N3.13 / SC-2.52: the causing path also contains a ',' and a lone '%'.
+INJECT_PATH_SC252 = "src/::warning::%0A,b%.py"
 
 # One representative per character class the mappings care about.
 C0_NUL = "\x00"
@@ -99,6 +103,79 @@ def hidden_chars(text: str) -> list[str]:
     return [char for char in text if unicodedata.category(char) in _HIDDEN]
 
 
+# CON-26 / I-14 md_codeblock helpers, independent of the implementation.
+_MAX_CODEBLOCK_LINE = 1000
+_CUT_MARKER = " […{n} more chars]"
+_INFO_OK = re.compile(r"^[a-z0-9-]*$")
+# Every separator str.splitlines() recognizes (Python 3.11+ docs), as raw chars.
+_SPLITLINES_SEPARATORS = (
+    "\n",
+    "\r",
+    "\r\n",
+    "\v",
+    "\f",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+)
+# Inner lines of the AC-F6.7 approved snapshot (SC-2.58, drafts/pm/ac_f6_7.approved.md).
+_AC_F67_LINES = (
+    '\u26a0\ufe0f AGENTS.md line 9: "Use requests for HTTP calls"',
+    "   Before this PR: 3 of 40 call sites used requests",
+    "   After this PR:  0 of 40 (removed in src/api/client.py)",
+    "   Agents treat this file as an instruction and will likely",
+    "   reintroduce requests in future changes.",
+    "",
+    "   Suggested fix:",
+    "   - Use requests for HTTP calls",
+    "   + Use httpx for HTTP calls",
+)
+_AC_F67_APPROVED = (
+    "\U0001f9ed conventiondrift: this PR makes 1 agent rule stale\n"
+    "\n"
+    "```\n" + "\n".join(_AC_F67_LINES) + "\n```\n"
+    "\n"
+    "1 rule changed status \u00b7 8 unchanged \u00b7 details in the job summary\n"
+)
+
+
+def prepared_line(text: str) -> str:
+    """I-14 mapping, then the CON-26 1000-character cut and visible marker."""
+    mapped = visible(text)
+    if len(mapped) <= _MAX_CODEBLOCK_LINE:
+        return mapped
+    extra = len(mapped) - _MAX_CODEBLOCK_LINE
+    return mapped[:_MAX_CODEBLOCK_LINE] + _CUT_MARKER.format(n=extra)
+
+
+def parse_codeblock(out: str) -> tuple[str, str, list[str]]:
+    """Parse ``fence + info + newline + joined body + newline + fence`` (no trailing newline)."""
+    match = re.match(r"(`{3,})", out)
+    assert match is not None, f"missing opening fence: {out!r}"
+    fence = match.group(1)
+    rest = out[len(fence) :]
+    assert "\n" in rest, f"no newline after opening fence: {out!r}"
+    info, _, tail = rest.partition("\n")
+    closing = "\n" + fence
+    assert tail.endswith(closing), f"missing closing fence: {out!r}"
+    assert not out.endswith("\n"), f"trailing newline after closing fence: {out!r}"
+    body = tail[: -len(closing)]
+    return fence, info, body.split("\n")
+
+
+def codeblock_body(out: str) -> list[str]:
+    _fence, _info, body = parse_codeblock(out)
+    return body
+
+
+def hidden_chars_except_structural_newlines(out: str) -> list[str]:
+    """The contract formula uses LF between fences; those are the only Cc allowed."""
+    return hidden_chars(out.replace("\n", ""))
+
+
 def _unescaped_pipe_count(row: str) -> int:
     return sum(
         1
@@ -139,6 +216,31 @@ def test_md_hostile_rule_and_path_are_one_literal_code_span(text: str) -> None:
 )
 def test_md_exact(text: str, expected: str) -> None:
     assert md(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Interior "a" / "X" / NBSP are just unmapped content, not a special alphabet.
+        (" a ", "`  a  `"),
+        (" X ", "`  X  `"),
+        (" \u00a0 ", "`  \u00a0  `"),
+    ],
+    ids=["letter", "x", "nbsp"],
+)
+def test_md_pads_a_body_that_starts_and_ends_with_a_space(text: str, expected: str) -> None:
+    """Pin CommonMark padding for a verbatim inline code span.
+
+    INTERFACES.md names ``md`` a "Markdown inline code span". AC-N3.10 requires
+    the visible rendered text to be the original (unmapped) string verbatim;
+    I-14 / SC-2.51 keep every character that is not in the mapped categories
+    unchanged, including U+00A0 (NBSP). CommonMark strips exactly one U+0020
+    from each end of a span that starts and ends with a space and is not all
+    spaces, so the emitter must pad exactly one U+0020 on each side. NBSP is
+    not a CommonMark space, so a U+0020-NBSP-U+0020 body is not all spaces.
+    """
+    assert md(text) == expected
+    assert unspan(md(text)) == visible(text)
 
 
 def test_md_blank_line_cannot_break_out() -> None:
@@ -365,6 +467,7 @@ def test_zwj_emoji_shows_joiners_as_labels() -> None:
     assert workflow_cmd(ZWJ_EMOJI) == ZWJ_EMOJI_VISIBLE
     assert workflow_prop(ZWJ_EMOJI) == ZWJ_EMOJI_VISIBLE
     assert sarif_text(ZWJ_EMOJI) == ZWJ_EMOJI_VISIBLE
+    assert codeblock_body(md_codeblock([ZWJ_EMOJI])) == [ZWJ_EMOJI_VISIBLE]
 
 
 def test_lone_surrogates_do_not_crash() -> None:
@@ -375,6 +478,7 @@ def test_lone_surrogates_do_not_crash() -> None:
         assert workflow_prop(sample) == visible(sample)
         assert sarif_text(sample) == visible(sample)
         assert output_heredoc("report-path", sample).endswith("\n")
+        assert codeblock_body(md_codeblock([sample])) == [visible(sample)]
 
 
 def test_control_picture_boundaries() -> None:
@@ -436,13 +540,25 @@ def runner_unescape_prop(s: str) -> str:
     return runner_unescape_data(s.replace("%3A", ":").replace("%2C", ","))
 
 
-def test_injected_rule_and_path_form_one_annotation_line() -> None:
-    line = f"::warning file={workflow_prop(INJECT_PATH)},line=9::{workflow_cmd(INJECT_RULE)}"
+@pytest.mark.parametrize(
+    "path",
+    [INJECT_PATH, INJECT_PATH_SC252],
+    ids=["inject-path", "sc252-comma-and-lone-percent"],
+)
+def test_injected_rule_and_path_form_one_annotation_line(path: str) -> None:
+    # Gap 7 / SC-2.52: the combined annotation line must also survive ',' and a lone '%'.
+    line = f"::warning file={workflow_prop(path)},line=9::{workflow_cmd(INJECT_RULE)}"
     assert "\n" not in line and "\r" not in line
     m = re.fullmatch(r"::warning file=([^,:]*),line=9::(.*)", line)
     assert m, "properties must not be split by injected ':' or ','"
-    assert runner_unescape_prop(m.group(1)) == visible(INJECT_PATH)
+    assert runner_unescape_prop(m.group(1)) == visible(path)
     assert runner_unescape_data(m.group(2)) == visible(INJECT_RULE)
+    if path == INJECT_PATH_SC252:
+        assert "," in path
+        # A lone '%' remains after the '%0A' sequence is removed.
+        assert path.replace("%0A", "").count("%") >= 1
+        assert "%2C" in line  # comma is encoded, not a new property separator
+        assert "%25" in workflow_prop(path)  # lone '%' is encoded
 
 
 @settings(max_examples=500, derandomize=True)
@@ -752,6 +868,341 @@ def test_sarif_text_json_roundtrips_every_mapped_class() -> None:
     assert json.loads(json.dumps(payload, ensure_ascii=False)) == payload
 
 
+# ---- md_codeblock() ------------------------------------------------------------------
+
+
+def test_md_codeblock_empty_input_matches_contract_formula() -> None:
+    # fence + info + "\n" + "\n".join([]) + "\n" + fence, and no trailing newline.
+    assert md_codeblock([]) == "```\n\n```"
+    assert md_codeblock([], "") == "```\n\n```"
+    assert not md_codeblock([]).endswith("\n")
+
+
+def test_md_codeblock_one_empty_line_matches_empty_input() -> None:
+    # The contract formula yields the same bytes for no lines and one empty line.
+    assert md_codeblock([""]) == md_codeblock([]) == "```\n\n```"
+
+
+def test_md_codeblock_single_line_structure() -> None:
+    out = md_codeblock(["hello"])
+    assert out == "```\nhello\n```"
+    fence, info, body = parse_codeblock(out)
+    assert fence == "```" and info == "" and body == ["hello"]
+
+
+def test_md_codeblock_multiline_structure() -> None:
+    out = md_codeblock(["alpha", "beta", "gamma"])
+    assert out == "```\nalpha\nbeta\ngamma\n```"
+    assert parse_codeblock(out) == ("```", "", ["alpha", "beta", "gamma"])
+
+
+def test_md_codeblock_accepts_a_tuple_of_lines() -> None:
+    assert md_codeblock(("a", "b")) == md_codeblock(["a", "b"])
+
+
+@pytest.mark.parametrize(
+    ("lines", "fence_len"),
+    [
+        (["no ticks"], 3),
+        (["a`b"], 3),  # run of 1 -> max(3, 2) = 3
+        (["a``b"], 3),  # run of 2 -> max(3, 3) = 3
+        (["```"], 4),
+        (["````"], 5),
+        (["`" * 4], 5),
+        (["`" * 10], 11),
+        (["```x"], 4),  # run at start
+        (["x```"], 4),  # run at end
+        (["x```y"], 4),  # run in the middle
+        (["    ```"], 4),  # indented fence-looking line still escalates
+        (["` ```` ``"], 5),  # longest run on the line (4), not the first
+        (["a`b", "```", "x``y"], 4),  # longest across lines; runs do not merge
+        (["``", "``"], 3),  # two run-of-2 lines stay 3; they must not be joined
+    ],
+    ids=[
+        "none",
+        "run-1",
+        "run-2",
+        "run-3",
+        "run-4-literal",
+        "run-4",
+        "run-10",
+        "start",
+        "end",
+        "middle",
+        "indented-run-3",
+        "longest-of-several",
+        "across-lines",
+        "runs-do-not-merge-across-lines",
+    ],
+)
+def test_md_codeblock_fence_escalates_with_backtick_runs(lines: list[str], fence_len: int) -> None:
+    out = md_codeblock(lines)
+    fence, info, body = parse_codeblock(out)
+    assert info == ""
+    assert len(fence) == fence_len
+    assert fence == "`" * fence_len
+    assert body == [prepared_line(line) for line in lines]
+    for line in body:
+        for run in re.findall(r"`+", line):
+            assert len(run) < len(fence)
+
+
+def test_md_codeblock_tildes_do_not_affect_the_fence() -> None:
+    out = md_codeblock(["~~~", "~~~~ python", "  ~~~"])
+    fence, info, body = parse_codeblock(out)
+    assert fence == "```" and info == ""
+    assert body == ["~~~", "~~~~ python", "  ~~~"]
+
+
+def test_md_codeblock_markdown_payloads_are_left_literal() -> None:
+    lines = ["@user", "<img src=x>", "[x](y)", "#1"]
+    out = md_codeblock(lines)
+    assert parse_codeblock(out) == ("```", "", lines)
+    # GFM would act on these outside a fence; inside they must be unchanged.
+    assert "@user" in out and "<img src=x>" in out and "[x](y)" in out and "#1" in out
+
+
+def test_md_codeblock_lf_cr_and_u2028_stay_one_output_line() -> None:
+    lines = ["has\nlf", "has\rcr", "has\u2028sep"]
+    out = md_codeblock(lines)
+    fence, info, body = parse_codeblock(out)
+    assert fence == "```" and info == ""
+    assert body == ["has\u240alf", "has\u240dcr", "hasU+2028sep"]
+    assert len(out.splitlines()) == len(lines) + 2
+
+
+# SR conditions 1 and 2: each listed character, plus the splitlines invariant.
+_SR_INVISIBLE: list[tuple[str, str, str]] = [
+    ("VT", "\v", "\u240b"),
+    ("FF", "\f", "\u240c"),
+    ("ESC", "\x1b", "\u241b"),
+    ("FS", "\x1c", "\u241c"),
+    ("GS", "\x1d", "\u241d"),
+    ("RS", "\x1e", "\u241e"),
+    ("NEL", "\x85", "U+0085"),
+    ("LSEP", "\u2028", "U+2028"),
+    ("PSEP", "\u2029", "U+2029"),
+    ("LRE", "\u202a", "U+202A"),
+    ("RLE", "\u202b", "U+202B"),
+    ("PDF", "\u202c", "U+202C"),
+    ("LRO", "\u202d", "U+202D"),
+    ("RLO", "\u202e", "U+202E"),
+    ("LRI", "\u2066", "U+2066"),
+    ("RLI", "\u2067", "U+2067"),
+    ("FSI", "\u2068", "U+2068"),
+    ("PDI", "\u2069", "U+2069"),
+    ("ZWSP", "\u200b", "U+200B"),
+    ("ZWNJ", "\u200c", "U+200C"),
+    ("ZWJ", "\u200d", "U+200D"),
+    ("LRM", "\u200e", "U+200E"),
+    ("RLM", "\u200f", "U+200F"),
+    ("BOM", "\ufeff", "U+FEFF"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "sample", "mapped"),
+    _SR_INVISIBLE,
+    ids=[label for label, _sample, _mapped in _SR_INVISIBLE],
+)
+def test_md_codeblock_sr_invisible_chars_are_mapped(label: str, sample: str, mapped: str) -> None:
+    out = md_codeblock([f"A{sample}B"])
+    assert codeblock_body(out) == [f"A{mapped}B"]
+    assert hidden_chars_except_structural_newlines(out) == []
+
+
+def test_md_codeblock_splitlines_count_with_every_separator() -> None:
+    lines = [f"pre{sep}post" for sep in _SPLITLINES_SEPARATORS]
+    out = md_codeblock(lines)
+    assert len(out.splitlines()) == len(lines) + 2
+    assert codeblock_body(out) == [prepared_line(line) for line in lines]
+    assert hidden_chars_except_structural_newlines(out) == []
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_md_codeblock_per_character_class(label: str, sample: str, mapped: str) -> None:
+    out = md_codeblock([sample])
+    assert codeblock_body(out) == [mapped]
+    assert hidden_chars_except_structural_newlines(out) == []
+
+
+def test_md_codeblock_printable_and_injection_tokens_stay_verbatim() -> None:
+    lines = ["ünïcode ファイル :: %0A", "keep :: and %0A"]
+    assert codeblock_body(md_codeblock(lines)) == lines
+
+
+@pytest.mark.parametrize(
+    ("info", "lines"),
+    [
+        ("", ["plain"]),
+        ("python", ["x = 1"]),
+        ("diff", ["- a", "+ b"]),
+        ("markdown", ["# heading"]),
+        ("a-z0-9-", ["ok"]),
+        ("a" * 32, ["max"]),
+        ("-", ["hyphen-only"]),
+        ("0", ["digit-only"]),
+    ],
+)
+def test_md_codeblock_valid_info_is_echoed_only_on_the_opening_fence(
+    info: str, lines: list[str]
+) -> None:
+    out = md_codeblock(lines, info)
+    fence, got_info, body = parse_codeblock(out)
+    assert fence == "```"
+    assert got_info == info
+    assert body == lines
+    assert out.startswith(fence + info + "\n")
+    assert out.endswith("\n" + fence)
+    if info:
+        assert not out.endswith(fence + info)
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        "Python",
+        "c++",
+        "foo_bar",
+        "foo bar",
+        "foo\tbar",
+        "foo\nbar",
+        "foo\rbar",
+        "foo`bar",
+        "foo.bar",
+        " ",
+        "python ",
+        " python",
+        "a" * 33,
+        "a" * 32 + "-",
+        "~",
+        "text/plain",
+        "x" * 100,
+    ],
+    ids=[
+        "uppercase",
+        "plus",
+        "underscore",
+        "space",
+        "tab",
+        "newline",
+        "cr",
+        "backtick",
+        "dot",
+        "space-only",
+        "trailing-space",
+        "leading-space",
+        "33-chars",
+        "33-chars-hyphen",
+        "tilde",
+        "slash",
+        "100-chars",
+    ],
+)
+def test_md_codeblock_rejects_bad_info(info: str) -> None:
+    with pytest.raises(ValueError):
+        md_codeblock(["ok"], info)
+
+
+def test_md_codeblock_line_of_1000_chars_is_kept() -> None:
+    line = "a" * 1000
+    out = md_codeblock([line])
+    assert codeblock_body(out) == [line]
+    assert "\u2026" not in out
+    assert "more chars" not in out
+
+
+def test_md_codeblock_line_of_1001_chars_is_cut_with_marker() -> None:
+    line = "b" * 1001
+    out = md_codeblock([line])
+    expected = "b" * 1000 + _CUT_MARKER.format(n=1)
+    assert codeblock_body(out) == [expected]
+    assert expected.endswith(" [\u20261 more chars]")
+    assert "b" * 1001 not in out
+
+
+def test_md_codeblock_60000_backtick_line_fence_is_at_most_1001() -> None:
+    line = "`" * 60_000
+    out = md_codeblock([line])
+    fence, info, body = parse_codeblock(out)
+    assert info == ""
+    assert len(fence) == 1001
+    assert body == ["`" * 1000 + _CUT_MARKER.format(n=59_000)]
+    assert len(out.splitlines()) == 3  # opening, one body line, closing
+
+
+def test_md_codeblock_fence_is_computed_after_the_cut() -> None:
+    # 999 printable chars plus 50 backticks: a pre-cut fence would be 51 long.
+    line = "a" * 999 + "`" * 50
+    out = md_codeblock([line])
+    fence, _info, body = parse_codeblock(out)
+    assert body == ["a" * 999 + "`" + _CUT_MARKER.format(n=49)]
+    assert len(fence) == 3
+
+
+def test_md_codeblock_cut_happens_after_mapping() -> None:
+    # 200 * U+2028 -> 200 * "U+2028" = 1200 characters; the cut may split a label.
+    line = "\u2028" * 200
+    mapped = visible(line)
+    assert len(mapped) == 1200
+    out = md_codeblock([line])
+    assert codeblock_body(out) == [mapped[:1000] + _CUT_MARKER.format(n=200)]
+    # A cut-before-map implementation would keep 200 labels (1000 mapped chars
+    # would require ~167 original characters, not 200).
+    assert "U+2028" * 200 not in out
+
+
+def test_md_codeblock_each_long_line_is_cut_independently() -> None:
+    lines = ["x" * 1001, "ok", "y" * 1500]
+    out = md_codeblock(lines)
+    assert codeblock_body(out) == [prepared_line(line) for line in lines]
+
+
+def test_md_codeblock_ac_f67_fixture_block_is_byte_identical() -> None:
+    block = md_codeblock(list(_AC_F67_LINES))
+    assert block == "```\n" + "\n".join(_AC_F67_LINES) + "\n```"
+    snapshot = (
+        "\U0001f9ed conventiondrift: this PR makes 1 agent rule stale\n\n"
+        + block
+        + "\n\n"
+        + "1 rule changed status \u00b7 8 unchanged \u00b7 details in the job summary\n"
+    )
+    assert snapshot == _AC_F67_APPROVED
+    assert snapshot.encode("utf-8") == _AC_F67_APPROVED.encode("utf-8")
+
+
+@settings(max_examples=300, derandomize=True)
+@example([], "")
+@example(["hello"], "")
+@example(["```", "x`y"], "python")
+@example(["`" * 10], "diff")
+@example(["`" * 1001], "")
+@example(["a\n", "b\u2028c"], "")
+@given(
+    lines=st.lists(st.text(max_size=2000), max_size=8),
+    info=st.from_regex(r"^[a-z0-9-]{0,32}$", fullmatch=True),
+)
+def test_md_codeblock_roundtrip_property(lines: list[str], info: str) -> None:
+    out = md_codeblock(lines, info)
+    fence, got_info, _body = parse_codeblock(out)
+    prepared = [prepared_line(line) for line in lines]
+    longest = 0
+    for line in prepared:
+        for run in re.findall(r"`+", line):
+            longest = max(longest, len(run))
+    assert got_info == info
+    assert _INFO_OK.fullmatch(got_info)
+    assert len(got_info) <= 32
+    assert fence == "`" * max(3, longest + 1)
+    assert 3 <= len(fence) <= 1001
+    assert out == fence + info + "\n" + "\n".join(prepared) + "\n" + fence
+    assert hidden_chars_except_structural_newlines(out) == []
+    if lines:
+        assert len(out.splitlines()) == len(lines) + 2
+    else:
+        assert len(out.splitlines()) == 3
+
+
 # ---- module surface -------------------------------------------------------------------
 
 
@@ -759,8 +1210,10 @@ def test_public_surface_is_exactly_one_function_per_sink() -> None:
     assert sorted(esc.__all__) == [
         "md",
         "md_cell",
+        "md_codeblock",
         "output_heredoc",
         "sarif_text",
         "workflow_cmd",
         "workflow_prop",
     ]
+    assert esc.MAX_CODEBLOCK_LINE == 1000

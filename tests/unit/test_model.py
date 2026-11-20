@@ -1,6 +1,7 @@
 """Unit tests for the boundary types in conventiondrift.model (T-005; I-10, I-11, I-13)."""
 
 import dataclasses
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -12,13 +13,19 @@ from hypothesis import strategies as st
 
 from conventiondrift import model
 from conventiondrift.model import (
+    MAX_CONFLICT_WITH,
     Alternative,
     CausingFile,
     CheckerId,
     CheckerPolicy,
     Conflict,
+    ConflictIndex,
     Counts,
+    ExtractedRule,
+    Extraction,
     FileContext,
+    FileRules,
+    GroupKey,
     IgnoreEntry,
     InstructionFile,
     InternalError,
@@ -38,6 +45,7 @@ from conventiondrift.model import (
     Thresholds,
     Verdict,
     Window,
+    group_key_order,
 )
 
 CHECKER_IDS: tuple[CheckerId, ...] = get_args(CheckerId)
@@ -104,9 +112,39 @@ RULE_RESULT = RuleResult(
     base=None,
     head=SIDE,
     conflict_with=("CLAUDE.md:3",),
+    conflict_with_total=1,
+    conflict_incomplete=False,
     case="stale-rule-added",
     causing_files=(CausingFile(file="src/a.py", following_delta=-3, contradicting_delta=3),),
     suggestion=SUGGESTION,
+)
+EXTRACTED_RULE = ExtractedRule(
+    line=9, column=1, text="Use httpx.", normalized_text="use httpx.", shape="use", ignored=False
+)
+FILE_RULES = FileRules(
+    path="AGENTS.md",
+    rules=(EXTRACTED_RULE,),
+    unattached_markers=(30,),
+    candidates_dropped=0,
+    rules_dropped=0,
+)
+CONFLICT_INDEX = ConflictIndex(
+    ids=(("AGENTS.md:9",), ("CLAUDE.md:3",)),
+    keys=(
+        ("http-client", frozenset({"httpx"}), frozenset(), ""),
+        ("http-client", frozenset({"requests"}), frozenset(), ""),
+    ),
+    adjacent=((1,), (0,)),
+    incomplete_ids=frozenset({"CLAUDE.md:3"}),
+)
+EXTRACTION = Extraction(
+    rules=(RULE,),
+    conflicts=(Conflict(rules=("AGENTS.md:9", "CLAUDE.md:3"), checker="http-client"),),
+    files=(FILE_RULES,),
+    conflicts_dropped=0,
+    unattached_markers=(("AGENTS.md", 30),),
+    conflict_lookup=CONFLICT_INDEX,
+    notes=("conflict check stopped at the limit; 1 rule not fully checked",),
 )
 WINDOW = Window(
     end=datetime(2026, 11, 12, 9, 0, tzinfo=UTC), days=90, available=True, unavailable_reason=None
@@ -204,6 +242,27 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
         Conflict(rules=("AGENTS.md:3", "CLAUDE.md:3"), checker="http-client"),
         ("rules", "checker"),
     ),
+    "ExtractedRule": (
+        EXTRACTED_RULE,
+        ("line", "column", "text", "normalized_text", "shape", "ignored"),
+    ),
+    "FileRules": (
+        FILE_RULES,
+        ("path", "rules", "unattached_markers", "candidates_dropped", "rules_dropped"),
+    ),
+    "ConflictIndex": (CONFLICT_INDEX, ("ids", "keys", "adjacent", "incomplete_ids", "_by_rule")),
+    "Extraction": (
+        EXTRACTION,
+        (
+            "rules",
+            "conflicts",
+            "files",
+            "conflicts_dropped",
+            "unattached_markers",
+            "conflict_lookup",
+            "notes",
+        ),
+    ),
     "Counts": (SIDE.overall, ("following", "contradicting", "relevant")),
     "SiteResult": (SIDE.sites[0], ("site", "follows", "recent")),
     "SideResult": (
@@ -225,6 +284,8 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
             "base",
             "head",
             "conflict_with",
+            "conflict_with_total",
+            "conflict_incomplete",
             "case",
             "causing_files",
             "suggestion",
@@ -232,7 +293,17 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
     ),
     "Window": (WINDOW, ("end", "days", "available", "unavailable_reason")),
     "InternalError": (RESULT.internal_errors[0], ("component", "message")),
-    "ReportCounts": (RESULT.counts, ("stale", "new_stale", "rules_changed", "rules_unchanged")),
+    "ReportCounts": (
+        RESULT.counts,
+        (
+            "stale",
+            "new_stale",
+            "rules_changed",
+            "rules_unchanged",
+            "conflicts_unlisted",
+            "conflicts_incomplete",
+        ),
+    ),
     "Result": (
         RESULT,
         (
@@ -316,6 +387,16 @@ OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
     ("Policy", "markers"): {"markers": {}},
     ("Conflict", "rules"): {"rules": ("AGENTS.md:1", "AGENTS.md:2")},
     ("RuleResult", "head_rule"): {"head_rule": dataclasses.replace(RULE, line=10)},
+    ("RuleResult", "conflict_with"): {"conflict_with": ("CLAUDE.md:4",)},
+    ("RuleResult", "conflict_with_total"): {"conflict_with_total": 2},
+    ("ConflictIndex", "ids"): {"ids": (("AGENTS.md:9",), ("CLAUDE.md:4",))},
+    ("ConflictIndex", "keys"): {
+        "keys": (
+            ("http-client", frozenset({"httpx"}), frozenset(), ""),
+            ("http-client", frozenset({"urllib"}), frozenset(), ""),
+        )
+    },
+    ("ConflictIndex", "adjacent"): {"adjacent": ((), ())},
 }
 
 
@@ -323,6 +404,8 @@ OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
 def test_changing_a_field_breaks_equality(name: str) -> None:
     sample, fields = SAMPLES[name]
     for field in fields:
+        if field.startswith("_"):  # derived (ConflictIndex._by_rule): not a constructor input
+            continue
         changes = OVERRIDES.get((name, field), {field: _different(getattr(sample, field))})
         assert dataclasses.replace(sample, **changes) != sample, field
 
@@ -499,7 +582,7 @@ def test_policy_rejects_unsorted_marker_pairs(pairs: tuple[tuple[int, bool], ...
 @pytest.mark.parametrize("missing", CHECKER_IDS)
 def test_policy_rejects_a_missing_checker_id(missing: CheckerId) -> None:
     checkers = {cid: p for cid, p in POLICY.checkers.items() if cid != missing}
-    with pytest.raises(ValueError, match="exactly the 8 checker ids"):
+    with pytest.raises(ValueError, match=r"^Policy\.checkers must have exactly the 8 checker ids$"):
         dataclasses.replace(POLICY, checkers=checkers)
 
 
@@ -507,7 +590,7 @@ def test_policy_rejects_a_missing_checker_id(missing: CheckerId) -> None:
 def test_policy_rejects_an_extra_checker_key(extra: str) -> None:
     checkers: dict[Any, CheckerPolicy] = dict(POLICY.checkers)
     checkers[extra] = CheckerPolicy(enabled=True, script_paths=())
-    with pytest.raises(ValueError, match="exactly the 8 checker ids"):
+    with pytest.raises(ValueError, match=r"^Policy\.checkers must have exactly the 8 checker ids$"):
         dataclasses.replace(POLICY, checkers=checkers)
 
 
@@ -516,7 +599,7 @@ def test_policy_rejects_a_swapped_checker_key() -> None:
         cid: p for cid, p in POLICY.checkers.items() if cid != "money"
     }
     checkers["print"] = CheckerPolicy(enabled=False, script_paths=())
-    with pytest.raises(ValueError, match="exactly the 8 checker ids"):
+    with pytest.raises(ValueError, match=r"^Policy\.checkers must have exactly the 8 checker ids$"):
         dataclasses.replace(POLICY, checkers=checkers)
 
 
@@ -548,7 +631,7 @@ def test_window_end_may_be_none_or_aware() -> None:
 
 
 def test_window_rejects_naive_end() -> None:
-    with pytest.raises(ValueError, match="timezone-aware"):
+    with pytest.raises(ValueError, match=r"^Window\.end must be timezone-aware$"):
         dataclasses.replace(WINDOW, end=datetime(2026, 11, 12, 9, 0))
 
 
@@ -639,7 +722,9 @@ def test_rule_result_accepts_at_least_one_rule(
 
 
 def test_rule_result_rejects_neither_rule() -> None:
-    with pytest.raises(ValueError, match="at least one of base_rule/head_rule"):
+    with pytest.raises(
+        ValueError, match=r"^RuleResult must have at least one of base_rule/head_rule$"
+    ):
         dataclasses.replace(RULE_RESULT, head_rule=None, base_rule=None)
 
 
@@ -676,7 +761,9 @@ def test_rule_rejects_scope_dir_with_edge_slash(scope_dir: str) -> None:
 
 
 def test_rule_match_rejects_empty_preferred_and_prohibited() -> None:
-    with pytest.raises(ValueError, match="must not both be empty"):
+    with pytest.raises(
+        ValueError, match=r"^RuleMatch preferred and prohibited must not both be empty$"
+    ):
         RuleMatch(preferred=frozenset(), prohibited=frozenset(), specificity=1)
 
 
@@ -690,7 +777,7 @@ def test_rule_match_rejects_empty_preferred_and_prohibited() -> None:
 def test_rule_match_rejects_overlapping_preferred_and_prohibited(
     preferred: frozenset[str], prohibited: frozenset[str]
 ) -> None:
-    with pytest.raises(ValueError, match="must be disjoint"):
+    with pytest.raises(ValueError, match=r"^RuleMatch preferred and prohibited must be disjoint$"):
         RuleMatch(preferred=preferred, prohibited=prohibited, specificity=1)
 
 
@@ -828,9 +915,9 @@ def test_rule_match_rejects_non_frozensets_with_type_error(
 ) -> None:
     kwargs: dict[str, Any] = {"preferred": other, "prohibited": other, "specificity": 1}
     kwargs[field] = bad
-    with pytest.raises(TypeError, match="must be frozensets"):
+    with pytest.raises(TypeError, match=r"^RuleMatch preferred and prohibited must be frozensets$"):
         RuleMatch(**kwargs)
-    with pytest.raises(TypeError, match="must be frozensets"):
+    with pytest.raises(TypeError, match=r"^RuleMatch preferred and prohibited must be frozensets$"):
         dataclasses.replace(MATCH, **{field: bad})
 
 
@@ -892,3 +979,271 @@ def test_policy_accepts_named_tuple_pairs() -> None:
 
     policy = dataclasses.replace(POLICY, markers={"AGENTS.md": (Marker(3, True),)})
     assert policy.markers["AGENTS.md"] == ((3, True),)
+
+
+def test_report_counts_conflicts_unlisted_defaults_to_zero_and_is_never_negative() -> None:
+    # I-9 counts.conflicts_unlisted (I-13 "C6 conflict cap and rule ids"): additive, 0 when none.
+    assert (
+        ReportCounts(stale=0, new_stale=0, rules_changed=0, rules_unchanged=0).conflicts_unlisted
+        == 0
+    )
+    assert dataclasses.replace(RESULT.counts, conflicts_unlisted=7).conflicts_unlisted == 7
+    assert dataclasses.replace(RESULT.counts, conflicts_unlisted=0).conflicts_unlisted == 0
+    with pytest.raises(
+        ValueError, match=r"^ReportCounts\.conflicts_unlisted must not be negative$"
+    ):
+        dataclasses.replace(RESULT.counts, conflicts_unlisted=-1)
+
+
+def _result_with(**changes: Any) -> RuleResult:
+    return dataclasses.replace(RULE_RESULT, **changes)
+
+
+def test_rule_result_accepts_the_most_partners_and_any_larger_total() -> None:
+    ids = tuple(f"A.md:{n:02}" for n in range(MAX_CONFLICT_WITH))
+    assert _result_with(conflict_with=ids, conflict_with_total=len(ids)).conflict_with == ids
+    assert _result_with(conflict_with=ids, conflict_with_total=10_000).conflict_with_total == 10_000
+    assert _result_with(conflict_with=(), conflict_with_total=0).conflict_with == ()
+    assert _result_with(conflict_with=(), conflict_with_total=3, conflict_incomplete=True)
+
+
+def test_rule_result_rejects_more_than_the_most_partners() -> None:
+    ids = tuple(f"A.md:{n:02}" for n in range(MAX_CONFLICT_WITH + 1))
+    with pytest.raises(
+        ValueError, match=f"^RuleResult.conflict_with holds at most {MAX_CONFLICT_WITH} ids$"
+    ):
+        _result_with(conflict_with=ids, conflict_with_total=len(ids))
+
+
+def test_rule_result_rejects_a_total_below_the_partners_shown() -> None:
+    with pytest.raises(
+        ValueError, match=r"^RuleResult.conflict_with_total must be at least len\(conflict_with\)$"
+    ):
+        _result_with(conflict_with=("A.md:1", "A.md:2"), conflict_with_total=1)
+
+
+def test_rule_result_rejects_a_negative_total() -> None:
+    with pytest.raises(ValueError, match=r"^RuleResult\.conflict_with_total must not be negative$"):
+        _result_with(conflict_with=(), conflict_with_total=-1)
+
+
+@pytest.mark.parametrize("ids", [("B.md:1", "A.md:1"), ("A.md:1", "A.md:1")])
+def test_rule_result_rejects_partners_unsorted_or_repeated(ids: tuple[str, ...]) -> None:
+    with pytest.raises(
+        ValueError, match=r"^RuleResult\.conflict_with must be sorted with no duplicates$"
+    ):
+        _result_with(conflict_with=ids, conflict_with_total=len(ids))
+
+
+def test_report_counts_conflicts_incomplete_defaults_to_zero_and_is_never_negative() -> None:
+    plain = ReportCounts(stale=0, new_stale=0, rules_changed=0, rules_unchanged=0)
+    assert plain.conflicts_incomplete == 0
+    assert dataclasses.replace(RESULT.counts, conflicts_incomplete=4).conflicts_incomplete == 4
+    with pytest.raises(
+        ValueError, match=r"^ReportCounts\.conflicts_incomplete must not be negative$"
+    ):
+        dataclasses.replace(RESULT.counts, conflicts_incomplete=-1)
+
+
+# --- ConflictIndex (I-13 C6 items 5 and 6) ---------------------------------------------------
+
+
+def _group_key(name: str) -> GroupKey:
+    return ("http-client", frozenset({name}), frozenset(), "")
+
+
+def _index(
+    members: dict[str, tuple[str, ...]], edges: tuple[tuple[str, str], ...], incomplete: set[str]
+) -> ConflictIndex:
+    """Groups named by key, each holding its sorted ids; ``edges`` join two groups."""
+    names = sorted(members)
+    adjacent: list[list[int]] = [[] for _ in names]
+    for a, b in edges:
+        adjacent[names.index(a)].append(names.index(b))
+        adjacent[names.index(b)].append(names.index(a))
+    return ConflictIndex(
+        ids=tuple(members[n] for n in names),
+        keys=tuple(_group_key(n) for n in names),
+        adjacent=tuple(tuple(sorted(g)) for g in adjacent),
+        incomplete_ids=frozenset(incomplete),
+    )
+
+
+def test_the_empty_index_knows_nothing() -> None:
+    index = ConflictIndex()
+    assert (index.partners("A.md:1"), index.total("A.md:1")) == ((), 0)
+    assert not index.is_incomplete("A.md:1")
+    assert index.incomplete == 0
+
+
+def test_index_partners_total_and_incomplete() -> None:
+    index = _index(
+        {"x": ("A:1", "A:5"), "y": ("B:2",), "z": ("C:3", "C:4"), "w": ("D:1",)},
+        (("x", "y"), ("x", "z")),
+        {"D:1", "C:4"},
+    )
+    assert index.partners("A:1") == ("B:2", "C:3", "C:4")
+    assert index.partners("B:2") == ("A:1", "A:5")
+    assert [index.total(i) for i in ("A:1", "A:5", "B:2", "C:3", "C:4")] == [3, 3, 2, 2, 2]
+    assert (index.partners("D:1"), index.total("D:1")) == ((), 0)
+    assert [index.is_incomplete(i) for i in ("A:1", "C:4", "D:1")] == [False, True, True]
+    assert index.incomplete == 2
+
+
+def test_index_partners_are_capped_and_total_is_not() -> None:
+    many = tuple(f"B:{n:03}" for n in range(MAX_CONFLICT_WITH + 7))
+    index = _index({"x": ("A:1",), "y": many[:15], "z": many[15:]}, (("x", "y"), ("x", "z")), set())
+    assert index.partners("A:1") == many[:MAX_CONFLICT_WITH]
+    assert index.total("A:1") == len(many)
+    assert len(index.partners("B:000")) == 1
+
+
+def test_index_for_an_unknown_id_is_empty_even_beside_known_ones() -> None:
+    index = _index({"x": ("A:1",), "y": ("B:1",)}, (("x", "y"),), set())
+    assert (index.partners("nope"), index.total("nope")) == ((), 0)
+    assert not index.is_incomplete("nope")
+
+
+def test_index_is_a_value_type() -> None:
+    first = _index({"x": ("A:1",), "y": ("B:1",)}, (("x", "y"),), {"A:1"})
+    second = _index({"x": ("A:1",), "y": ("B:1",)}, (("x", "y"),), {"A:1"})
+    assert first is not second
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first != _index({"x": ("A:1",), "y": ("B:1",)}, (("x", "y"),), set())
+    assert first != _index({"x": ("A:1",), "y": ("B:1",)}, (), {"A:1"})
+    assert "_by_rule" not in repr(first)
+
+
+def test_index_rejects_lists_that_do_not_match_the_groups() -> None:
+    # Built from the sample's own parts: dropping the last entry of each list in turn.
+    good = CONFLICT_INDEX
+    for field in ("ids", "keys", "adjacent"):
+        short = {field: getattr(good, field)[:1]}
+        with pytest.raises(
+            ValueError,
+            match=r"^ConflictIndex\.ids, keys and adjacent must have one entry per group$",
+        ):
+            dataclasses.replace(good, **short)
+
+
+def _built(**changes: Any) -> ConflictIndex:
+    """A valid three-group index (``a`` conflicts with ``b`` and ``c``), with ``changes``."""
+    parts: dict[str, Any] = {
+        "ids": (("A:1", "A:2"), ("B:1",), ("C:1",)),
+        "keys": tuple(_group_key(n) for n in "abc"),
+        "adjacent": ((1, 2), (0,), (0,)),
+        "incomplete_ids": frozenset(),
+    }
+    return ConflictIndex(**{**parts, **changes})
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        (
+            {"ids": (("A:1", "A:2"), ("B:1",), ("A:2",))},
+            "ConflictIndex rule ids must be unique across groups",
+        ),
+        (
+            {"ids": (("A:2", "A:1"), ("B:1",), ("C:1",))},
+            "ConflictIndex group ids must be sorted with no duplicates",
+        ),
+        (
+            {"ids": (("A:1", "A:1"), ("B:1",), ("C:1",))},
+            "ConflictIndex group ids must be sorted with no duplicates",
+        ),
+        (
+            {"keys": tuple(_group_key(n) for n in "bac")},
+            "ConflictIndex groups must be in sorted key order",
+        ),
+        (
+            {"keys": tuple(_group_key(n) for n in "aac")},
+            "ConflictIndex groups must be in sorted key order",
+        ),
+        ({"adjacent": ((1, 2), (0,), (3,))}, "ConflictIndex adjacency index out of range"),
+        ({"adjacent": ((1, 2), (0,), (-1,))}, "ConflictIndex adjacency index out of range"),
+        ({"adjacent": ((1, 1, 2), (0,), (0,))}, "ConflictIndex adjacency must have no duplicates"),
+        ({"adjacent": ((1, 2), (0,), ())}, "ConflictIndex adjacency must be symmetric"),
+        ({"adjacent": ((1,), (0,), (0,))}, "ConflictIndex adjacency must be symmetric"),
+        (
+            {"adjacent": ((0, 1, 2), (0,), (0,))},
+            "ConflictIndex group must not conflict with itself",
+        ),
+    ],
+)
+def test_index_rejects_a_broken_structure(changes: dict[str, Any], message: str) -> None:
+    assert _built().total("A:1") == 2  # the unchanged parts are valid
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        _built(**changes)
+
+
+def test_index_group_order_follows_the_whole_key() -> None:
+    # Keys differ only in the checker, the preferred set, the prohibited set or the scope.
+    base: GroupKey = ("http-client", frozenset({"x"}), frozenset({"y"}), "a")
+    ordered: list[GroupKey] = [
+        base,
+        ("http-client", frozenset({"x"}), frozenset({"y"}), "b"),
+        ("http-client", frozenset({"x"}), frozenset({"z"}), "a"),
+        ("http-client", frozenset({"w", "x"}), frozenset({"y"}), "a"),
+        ("logging", frozenset({"x"}), frozenset({"y"}), "a"),
+    ]
+    ordered.sort(key=group_key_order)
+    assert (
+        ConflictIndex(
+            ids=tuple((f"r{n}",) for n in range(5)), keys=tuple(ordered), adjacent=((),) * 5
+        ).incomplete
+        == 0
+    )
+    assert group_key_order(ordered[0]) < group_key_order(ordered[-1])
+    with pytest.raises(ValueError, match="sorted key order"):
+        ConflictIndex(
+            ids=tuple((f"r{n}",) for n in range(5)),
+            keys=tuple(reversed(ordered)),
+            adjacent=((),) * 5,
+        )
+
+
+class _Counted(tuple):  # type: ignore[type-arg]
+    """A tuple that counts every access, to see whether queries touch the adjacency."""
+
+    reads = 0
+
+    def __getitem__(self, item: Any) -> Any:
+        _Counted.reads += 1
+        return super().__getitem__(item)
+
+    def __iter__(self) -> Any:
+        _Counted.reads += 1
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        _Counted.reads += 1
+        return super().__len__()
+
+
+def test_queries_never_touch_the_adjacency_after_the_index_is_built() -> None:
+    # I-13 C6 item 8.5: partners, total and is_incomplete are lookups, not per-call work.
+    ids = _Counted(_Counted(t) for t in (("A:1", "A:2"), ("B:1",), ("C:1",)))
+    adjacent = _Counted(_Counted(t) for t in ((1, 2), (0,), (0,)))
+    _Counted.reads = 0
+    index = ConflictIndex(
+        ids=ids,
+        keys=tuple(_group_key(n) for n in "abc"),
+        adjacent=adjacent,
+        incomplete_ids=frozenset({"C:1"}),
+    )
+    built = _Counted.reads
+    assert built > 0  # the counter sees the build (and so would see a per-query walk)
+    queried = ("A:1", "A:2", "B:1", "C:1", "nope")
+    for _ in range(20_000):
+        for rule_id in queried:
+            index.partners(rule_id)
+            index.total(rule_id)
+            index.is_incomplete(rule_id)
+    assert _Counted.reads == built
+
+
+def test_index_has_no_is_conflicting() -> None:
+    # The status is ``total(id) > 0`` (I-13 C6 item 7): one source, never a second one.
+    assert not hasattr(ConflictIndex, "is_conflicting")

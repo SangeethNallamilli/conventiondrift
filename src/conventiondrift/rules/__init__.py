@@ -2,5 +2,6 @@
 
 ``extract`` does segmenting, normalizing, shape recognition, the R2.6 caps and
 I-7 marker attachment (T-013). Checker mapping, duplicates and conflicts are
-T-015 and live in ``mapping`` and ``conflicts``.
+T-015 and live in ``mapping`` and ``conflicts``; ``mapping.extract_rules`` is the
+entry point that ties the pieces together (I-11 C6).
 """
