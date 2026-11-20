@@ -1306,6 +1306,8 @@ def test_item_5b_a_prefix_cue_that_reaches_no_mention_is_unreadable(text: str) -
         ("a is no longer permitted", rule(prohibited="a", specificity=1)),
         ("a shouldn't be used", rule(prohibited="a", specificity=1)),
         ("a must not be used, use b", rule(preferred="b", prohibited="a", specificity=2)),
+        # A real cue before the mention, and a cue word inside the trailing cue after it.
+        ("never a is not allowed", rule(prohibited="a", specificity=1)),
     ],
 )
 def test_item_5b_a_cue_that_reaches_a_mention_or_is_in_a_trailing_cue_maps(
