@@ -18,6 +18,7 @@ from conventiondrift.model import (
     InstructionFile,
     Policy,
     PyFile,
+    Rule,
     RuleMatch,
     Site,
     Thresholds,
@@ -83,34 +84,44 @@ def policy() -> Policy:
     )
 
 
+def extracted(text: str) -> list[Rule]:
+    """Every rule in an ``AGENTS.md`` with this text, as C6 extracts and maps it."""
+    file = InstructionFile("AGENTS.md", text.encode(), "", False)
+    return list(extract_rules([file], policy(), REGISTRY_UNDER_TEST).rules)
+
+
 def rules_of(text: str) -> list[tuple[int, str | None]]:
     """(line, checker id or None) for every rule in an ``AGENTS.md`` with this text."""
-    file = InstructionFile("AGENTS.md", text.encode(), "", False)
-    extraction = extract_rules([file], policy(), REGISTRY_UNDER_TEST)
-    return [(rule.line, rule.checker) for rule in extraction.rules]
+    return [(rule.line, rule.checker) for rule in extracted(text)]
 
 
 _T = TypeVar("_T")
 MIB = 1 << 20
-RATIO_FLOOR_S = 0.25
+RATIO_FLOOR_S = 1.0
 LINEAR_SIZES = (1 << 17, 1 << 18, 1 << 19, 1 << 20)
 """128 KiB up to 1 MiB, the instruction-file size cap (R2.3). A quadratic path takes minutes at
 the top and several seconds already at the bottom, so it fails at the first size."""
 
 
 def best_time(
-    func: Callable[[], object], repeat: int = 3, *, stop_above: float = float("inf")
+    func: Callable[[], object],
+    repeat: int = 3,
+    *,
+    stop_above: float = float("inf"),
+    stop_below: float = 0.0,
 ) -> float:
     """The fastest of ``repeat`` runs, as in the extraction tests: one slow run on a loaded
     runner doesn't count. A run slower than ``stop_above`` ends the repeats (it is far too
-    slow for noise, and a quadratic path would otherwise take three times as long to fail)."""
+    slow for noise, and a quadratic path would otherwise take three times as long to fail).
+    A run at or under ``stop_below`` ends them too: the best can only be lower, and the caller
+    asked for no more precision than that."""
     best = float("inf")
     for _ in range(repeat):
         start = time.perf_counter()
         func()
         elapsed = time.perf_counter() - start
         best = min(best, elapsed)
-        if elapsed > stop_above:
+        if elapsed > stop_above or elapsed <= stop_below:
             break
     return best
 
@@ -130,15 +141,25 @@ def assert_linear(
     quadratic path misses it at the smallest size.
 
     Doubling the size must also not much more than triple the time, but only once the
-    previous step took over ``RATIO_FLOOR_S``: below that, the times are a few milliseconds and
-    a scheduler hiccup or a cold cache moves the ratio far more than any algorithm (a Windows
-    runner saw 3.65x at 0.19 s to 0.69 s on linear code).
+    previous step took over ``RATIO_FLOOR_S`` (1 s, so in practice only for code that is already
+    far from linear): below that, scheduler and cache noise moves the ratio far more than any
+    algorithm does (a Windows runner saw 3.65x from 0.19 s to 0.69 s, and the guards test flaked
+    about 1 run in 12 under load at 0.26 s, on linear code). The 5 s cap at 1 MiB stays.
+
+    A first run of ``RATIO_FLOOR_S`` or less ends the repeats at that size, because the other
+    two could not change a verdict: the run is under the budget (at least 1 s), it is under any
+    ratio limit that applies (a ratio is only checked above the floor, and then against three
+    times a previous step over the floor), and the next size skips its ratio check either way,
+    since its ``previous`` is at most the floor with this run or with a faster best. Only a size
+    that takes over a second keeps the best of three.
     """
     previous = 0.0
     for n in sizes:
         data = make(n)
         budget = 1.0 + 4.0 * n / MIB
-        elapsed = best_time(partial(run, data), repeat=3, stop_above=5 * budget)
+        elapsed = best_time(
+            partial(run, data), repeat=3, stop_above=5 * budget, stop_below=RATIO_FLOOR_S
+        )
         assert elapsed < budget, (label, n, elapsed)
         if previous > RATIO_FLOOR_S:
             assert elapsed < 3 * previous + 0.05, (label, n, elapsed, previous)
@@ -153,6 +174,7 @@ __all__ = [
     "best_time",
     "counts",
     "default_is_script",
+    "extracted",
     "policy",
     "rules_of",
     "sites_of",

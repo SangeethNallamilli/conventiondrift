@@ -16,6 +16,7 @@ from checker_support import (
     assert_linear,
     best_time,
     counts,
+    extracted,
     rules_of,
     sites_of,
 )
@@ -84,7 +85,6 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("don't use print; use logging.", match(("logging",), ("print",), 2)),
         ("don't use print, instead use logging.", match(("logging",), ("print",), 2)),
         ("never use print or logging.warn.", match((), ("print",), 1)),
-        ("prefer logging over print.", match(("logging",), ("print",), 2)),
         ("use logging instead of print.", match(("logging",), ("print",), 2)),
         ("use logging rather than print.", match(("logging",), ("print",), 2)),
         ("use logging and never print.", match(("logging",), ("print",), 2)),
@@ -97,6 +97,18 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("use print() for debug output.", match(("print",), (), 1)),
         ("use print, not logging.", match(("print",), ("logging",), 2)),
         ("USE LOGGING, NOT PRINT.", match(("logging",), ("print",), 2)),
+        # CON-67: the wider cue list, trailing cues, commas before a verb cue, call suffixes.
+        ("use logging; no print.", match(("logging",), ("print",), 2)),
+        ("use logging (print is banned).", match(("logging",), ("print",), 2)),
+        ("don't print, use logging.", match(("logging",), ("print",), 2)),
+        ("never log with print, use logging.", match(("logging",), ("print",), 2)),
+        ("never use print() or requests().", match((), ("print",), 1)),
+        ("never use `print()` or `requests()`.", match((), ("print",), 1)),
+        ("no print, requests or urllib.", match((), ("print",), 1)),
+        ("stop using print, use logging.", match(("logging",), ("print",), 2)),
+        ("print is forbidden; use logging.", match(("logging",), ("print",), 2)),
+        ("use logging. print is deprecated.", match(("logging",), ("print",), 2)),
+        ("using print is disallowed.", match((), ("print",), 1)),
     ],
 )
 def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: RuleMatch) -> None:
@@ -116,12 +128,13 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         "use print and never print.",  # print both preferred and prohibited: unreadable
         "do not use print for logging.",  # every option prohibited: nothing is allowed
         "never use logging or print.",
-        "never log with print, use logging.",  # the negation runs on through the comma
-        "don't print, use logging.",
+        "never log with print, use logging, use print.",  # print is prohibited and preferred
+        "use logging, never print; use print.",
+        "no print, logging or requests.",  # a comma before a non-verb: both prohibited
         # Every option preferred: every site would follow, so the rule would always hold.
-        "use logging; no print.",
-        "use logging (print is banned).",
         "use the logger to print status messages.",
+        "use logging and print.",
+        "prefer logging over print.",  # I-10 item 4c: "over" is no cue, so both are preferred
     ],
 )
 def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
@@ -541,3 +554,149 @@ def test_the_handler_follows_the_file_it_is_given() -> None:
     assert list(handler(call.value, guarded)) == []
     assert [s.file for s in handler(call.value, plain)] == ["a.py"]
     assert list(handler(call.value, guarded)) == []
+
+
+# --- CON-67 / T-016a: no negated phrasing ever maps print as preferred ----------------------
+
+# AC-T016a.1: these five phrasings never map print as preferred. Each one maps to the logging
+# checker with print prohibited (and nothing preferred), or it is Not verifiable (None).
+CON_67_PHRASINGS = [
+    "No print.",
+    "print is banned.",
+    "Never use print.",
+    "print is not allowed.",
+    "Don't use print.",
+]
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "use logging, print is banned.",  # no break at a comma before a non-verb: both prohibited
+        "don't print, and use logging.",  # "and" is not a positive verb cue either
+    ],
+)
+def test_i10_leaves_these_commas_unbroken_so_the_rule_is_not_verifiable(sentence: str) -> None:
+    assert match_rule(sentence) is None
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_t016a_1_a_negated_print_never_maps_as_preferred(sentence: str) -> None:
+    found = match_rule(sentence.lower())
+    assert found is None or "print" not in found.preferred
+    assert found == match((), ("print",), 1)  # the mapping each of them gets now
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_t016a_1_holds_at_the_original_and_normalized_case_and_with_a_logging_clause(
+    sentence: str,
+) -> None:
+    assert match_rule(sentence.lower()) == match_rule(sentence.lower().rstrip("."))
+    with_logging = match_rule(f"use logging. {sentence.lower()}")
+    assert with_logging == match(("logging",), ("print",), 2)
+
+
+def test_t016a_1_in_an_agents_md_no_line_maps_print_as_preferred() -> None:
+
+    text = "\n".join(CON_67_PHRASINGS) + "\n"
+    rules = extracted(text)
+    # Only "Never use print." (line 3) and "Don't use print." (line 5) are rule shapes
+    # (rules/extract.py); the other three lines are not extracted as rules at all.
+    assert [(r.line, r.checker) for r in rules] == [(3, "logging"), (5, "logging")]
+    for rule in rules:
+        assert rule.match == match((), ("print",), 1)
+
+
+def test_t016a_1_the_registry_maps_each_phrasing_to_logging_with_print_prohibited() -> None:
+    for sentence in CON_67_PHRASINGS:
+        mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
+        assert mapped.checker == "logging", sentence
+        assert mapped.match == match((), ("print",), 1), sentence
+
+
+# --- CON-67 round 1 (CR1 on #61, I-10 "Negation" item 4) ------------------------------------
+
+# CR1's sentences: a trailing cue whose clause also holds a verb cue, or an option after the
+# cue, is not readable. None of them may prohibit logging or prefer print.
+CR1_TRAILING = [
+    "Use logging, everything else is forbidden.",
+    "Use logging, anything else is banned.",
+    "Use logging only, other approaches are not allowed.",
+    "Use logging for all output, other methods are deprecated.",
+    "Use logging, it is forbidden to print.",
+]
+
+
+@pytest.mark.parametrize("sentence", CR1_TRAILING)
+def test_item_4a_a_trailing_cue_with_a_verb_cue_is_not_verifiable(sentence: str) -> None:
+    # Not verifiable, so in particular it never prohibits logging and never prefers print.
+    assert match_rule(sentence.lower()) is None
+
+
+def test_item_4a_the_comma_and_the_semicolon_forms_of_print_is_banned() -> None:
+    # No break at a comma before a non-verb: the clause holds "use", so it is unreadable.
+    assert match_rule("use logging, print is banned.") is None
+    # The semicolon ends the clause, so print is banned on its own.
+    assert match_rule("use logging; print is banned.") == match(("logging",), ("print",), 2)
+    assert match_rule("print is forbidden.") == match((), ("print",), 1)
+    assert match_rule("print is forbidden, use logging.") == match(("logging",), ("print",), 2)
+
+
+def test_item_4b_no_op_and_non_blocking_are_not_cues() -> None:
+    # "no-op" is one word, not "no": it prohibits nothing by itself.
+    assert match_rule("use a no-op logger in tests.") == match(("logging",), (), 1)
+    assert match_rule("use no-op logging.") == match(("logging",), (), 1)
+    assert match_rule("use non-blocking logging.") == match(("logging",), (), 1)
+    assert match_rule("use a non-blocking logger, no-op in tests.") == match(("logging",), (), 1)
+    # What prohibits logging in "never use no-op logging." is the "never".
+    assert match_rule("never use no-op logging.") == match((), ("logging",), 1)
+    assert match_rule("never use non-blocking print.") == match((), ("print",), 1)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "use print, no matter the logging.",
+        "use print, no doubt about logging.",
+        "use logging, not only print.",
+    ],
+)
+def test_item_4b_no_matter_no_doubt_and_not_only_never_prohibit(sentence: str) -> None:
+    # Neither option is prohibited, so both are preferred: the all-preferred guard.
+    assert match_rule(sentence) is None
+    assert match_rule("use logging, no matter the format.") == match(("logging",), (), 1)
+    assert match_rule("use print, no doubt.") == match(("print",), (), 1)
+    assert match_rule("use logging not only for errors.") == match(("logging",), (), 1)
+
+
+def test_item_4c_prefer_over_prefers_both_so_it_is_not_verifiable() -> None:
+    assert match_rule("prefer logging over print.") is None
+    assert match_rule("use logging rather than print.") == match(("logging",), ("print",), 2)
+    assert match_rule("dont use print.") == match((), ("print",), 1)
+
+
+# --- CON-67 round 2: the comma guard (CR1 F1 on #61, I-10 item 4a) --------------------------
+
+
+def test_f1_print_is_banned_forms_with_and_without_a_surviving_comma() -> None:
+    assert match_rule("print and requests are banned.") == match((), ("print",), 1)
+    assert match_rule("print is banned, use logging.") == match(("logging",), ("print",), 2)
+    assert match_rule("print or logging is banned, use x.") is None  # both prohibited: nothing left
+    # Logging alone sees one option here, so no comma has mentions on both sides. It is the
+    # checker that finds "requests" and "urllib" too (T-017) that makes this list form
+    # Not verifiable (tested at classify level in test_checkers_phrases.py).
+    assert match_rule("print, requests and urllib are banned.") == match((), ("print",), 1)
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "print is fine, logging is banned.",  # mentions on both sides of the comma
+        "logging is acceptable, print is not allowed.",
+        "print, logging are deprecated.",
+    ],
+)
+def test_f1_a_comma_between_the_two_options_in_a_trailing_cue_clause_is_not_verifiable(
+    sentence: str,
+) -> None:
+    assert match_rule(sentence) is None

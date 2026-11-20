@@ -4,17 +4,27 @@ Covers AC-F3.7 and the exceptions half of AC-F2.5. Counts go through the real wa
 """
 
 import ast
+import itertools
+import random
 import textwrap
 
 import pytest
-from checker_support import assert_linear, counts, rules_of, sites_of
+from checker_support import (
+    REGISTRY_UNDER_TEST,
+    assert_linear,
+    counts,
+    extracted,
+    rules_of,
+    sites_of,
+)
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.exceptions import ExceptionsChecker
-from conventiondrift.checkers.exceptions.match import OPTIONS, match_rule
+from conventiondrift.checkers.exceptions.match import OPTIONS, _find, match_rule
 from conventiondrift.checkers.exceptions.sites import BROAD_NAMES, exception_sites
 from conventiondrift.checkers.walk import parse
 from conventiondrift.model import FileContext, RuleMatch, Site
+from conventiondrift.rules.mapping import map_rule
 
 NO_BARE_OR_BROAD = match_rule("do not use bare except or catch exception")
 
@@ -262,13 +272,62 @@ def test_the_handler_gives_nothing_for_a_node_that_is_not_a_handler() -> None:
 
 
 def test_a_later_always_is_not_a_cue_so_the_whole_sentence_prohibits_bare_except() -> None:
-    # CR1 on #58: "always" is not a cue (and "and" doesn't end the negation), so both halves
-    # read as forbidden and this maps to a prohibition of bare-except. Under the wider cue
-    # list of the follow-up PR the second half may become a request and the sentence unmapped;
-    # revisit this test then.
+    # Pinned in #58 and revisited in CON-67 (T-016a): the wider cue list and the comma rule
+    # (I-10) leave this answer as it was. "always" ends a clause only after a comma ("never use
+    # bare except, always use bare except" does read as prohibit then prefer), and "and" never
+    # ends one, so here the negation of "never" runs on to the end and both halves read as
+    # forbidden. A sentence that is self-contradictory anyway; its reading is a prohibition.
     assert match_rule("never use bare except and always use bare except.") == match(
         ("bare-except",)
     )
+    assert match_rule("never use bare except, always use bare except.") is None  # prohibit + prefer
+
+
+# CON-67 / AC-T016a.2: the five phrasings with "bare except" never map it as preferred.
+CON_67_PHRASINGS = [
+    "No bare except.",
+    "bare except is banned.",
+    "Never use bare except.",
+    "bare except is not allowed.",
+    "Don't use bare except.",
+]
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_t016a_2_a_negated_bare_except_never_maps_as_preferred(sentence: str) -> None:
+    found = match_rule(sentence.lower())
+    assert found is None or "bare-except" not in found.preferred
+    assert found == match(("bare-except",))
+
+
+@pytest.mark.parametrize("sentence", CON_67_PHRASINGS)
+def test_t016a_2_the_registry_maps_each_phrasing_to_exceptions(sentence: str) -> None:
+    mapped = map_rule(sentence.lower(), REGISTRY_UNDER_TEST)
+    assert mapped.checker == "exceptions"
+    assert mapped.match == match(("bare-except",))
+
+
+def test_t016a_2_in_an_agents_md_no_line_maps_bare_except_as_preferred() -> None:
+
+    text = "\n".join(CON_67_PHRASINGS) + "\n"
+    rules = extracted(text)
+    assert [(r.line, r.checker) for r in rules] == [(3, "exceptions"), (5, "exceptions")]
+    for rule in rules:
+        assert rule.match == match(("bare-except",))
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("never use bare except() or baseexception.", ("bare-except", "broad-except")),
+        ("don't use bare except, use specific exceptions.", ("bare-except",)),
+        ("stop using bare except.", ("bare-except",)),
+        ("bare except and catch exception are forbidden.", ("bare-except", "broad-except")),
+        ("catching exception is deprecated.", ("broad-except",)),
+    ],
+)
+def test_the_wider_cues_read_for_exceptions_too(sentence: str, prohibited: tuple[str, ...]) -> None:
+    assert match_rule(sentence) == match(prohibited)
 
 
 HOSTILE_RULES = {
@@ -281,3 +340,221 @@ HOSTILE_RULES = {
 @pytest.mark.parametrize("kind", HOSTILE_RULES)
 def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
+
+
+def test_hyphenated_spellings_are_read_as_the_options_they_name() -> None:
+    # A hyphen joins words (I-10 item 4b), so "bare-except" is one word and is read as such.
+    assert match_rule("avoid bare-except.") == match(("bare-except",))
+    assert match_rule("never use bare-excepts.") == match(("bare-except",))
+    assert match_rule("never use broad-except.") == match(("broad-except",))
+    assert match_rule("never use generic-exceptions or bare-exception.") == match(
+        ("bare-except", "broad-except")
+    )
+    assert match_rule("no blanket-exception.") == match(("broad-except",))
+    assert match_rule("never use bare-nonsense.") is None
+
+
+def test_trailing_cue_reach_applies_to_exceptions_too() -> None:
+    assert match_rule("bare except is forbidden.") == match(("bare-except",))
+    assert match_rule("bare except is forbidden, use specific exceptions.") == match(
+        ("bare-except",)
+    )
+    assert match_rule("use specific exceptions, bare except is forbidden.") is None
+    assert match_rule("use specific exceptions; bare except is banned.") == match(("bare-except",))
+    assert match_rule("no-op handlers are fine, but never use bare except.") == match(
+        ("bare-except",)
+    )
+
+
+# --- CON-67 round 2: the comma guard (CR1 F1 on #61, I-10 item 4a) --------------------------
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Catching Exception is acceptable, bare except is forbidden.",
+        "Catching Exception is fine, bare except is not allowed.",
+        "Broad except is tolerated, bare except is banned.",
+        "Catching Exception is acceptable, bare except is deprecated.",
+        "Bare except, catching Exception and BaseException are banned.",  # list form
+    ],
+)
+def test_f1_a_comma_between_two_mentions_in_a_trailing_cue_clause_is_not_verifiable(
+    sentence: str,
+) -> None:
+    # Reading it as "prohibit both" would be wrong: the first half allows one of them.
+    assert match_rule(sentence.lower()) is None
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("Bare except and catching Exception are banned.", ("bare-except", "broad-except")),
+        ("Bare except is banned, use specific exceptions.", ("bare-except",)),
+        ("Bare except is forbidden.", ("bare-except",)),
+    ],
+)
+def test_f1_the_forms_without_a_surviving_comma_still_map(
+    sentence: str, prohibited: tuple[str, ...]
+) -> None:
+    assert match_rule(sentence.lower()) == match(prohibited)
+
+
+# --- CON-67 round 3: the contiguity guard (CR1 on #61, I-10 item 4a) -------------------------
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Catching Exception is acceptable and bare except is forbidden.",
+        "Catching Exception is fine or bare except is not allowed.",
+        "Catching Exception is fine nor bare except is banned.",
+        "Bare except is fine and broad except is deprecated.",
+        "Bare except and the catching Exception clause are banned.",
+        "Bare except and also catching Exception are banned.",
+        # A word after or before a phrase isn't part of it, wherever the phrase stands:
+        "Bare except clauses and catching Exception are banned.",
+        "Catching Exception clauses and bare except are banned.",
+        "Broad except clauses and bare except are banned.",
+        "Bare except and the broad except are banned.",
+        "Bare except and the catching Exception are banned.",
+    ],
+)
+def test_round_3_a_word_between_two_mentions_in_a_trailing_cue_clause_is_not_verifiable(
+    sentence: str,
+) -> None:
+    assert match_rule(sentence.lower()) is None
+
+
+@pytest.mark.parametrize(
+    ("sentence", "prohibited"),
+    [
+        ("Bare except and catching Exception are banned.", ("bare-except", "broad-except")),
+        ("Catching Exception or bare except is forbidden.", ("bare-except", "broad-except")),
+        ("Bare excepts or generic exceptions are deprecated.", ("bare-except", "broad-except")),
+        (
+            "`bare except` and `catching Exception` are not allowed.",
+            ("bare-except", "broad-except"),
+        ),
+        ("Bare-except nor blanket-exceptions are disallowed.", ("bare-except", "broad-except")),
+        ("Bare except and BaseException are prohibited.", ("bare-except", "broad-except")),
+        ("Generic exceptions and bare except are banned.", ("bare-except", "broad-except")),
+        ("Bare except or blanket exceptions are banned.", ("bare-except", "broad-except")),
+        ("Catching Exception nor bare excepts are banned.", ("bare-except", "broad-except")),
+        ("The broad except is banned.", ("broad-except",)),
+        (
+            "Bare except and catching Exception clauses are forbidden.",
+            ("bare-except", "broad-except"),
+        ),
+    ],
+)
+def test_round_3_a_phrase_with_its_own_words_and_connectors_between_them_still_maps(
+    sentence: str, prohibited: tuple[str, ...]
+) -> None:
+    # "bare except" and "catching Exception" are two words each; those are the mention's own.
+    assert match_rule(sentence.lower()) == match(prohibited)
+
+
+def test_round_3_with_a_prefix_cue_the_words_between_mentions_do_not_matter() -> None:
+    assert match_rule("never use a bare except or, worse, catching exception.") == match(
+        ("bare-except", "broad-except")
+    )
+
+
+def test_round_3_a_second_phrase_that_would_share_a_word_is_not_a_second_mention() -> None:
+    # "except exception" would start inside "bare except": the first phrase is the mention.
+    assert match_rule("never use bare except exception.") == match(("bare-except",))
+    assert match_rule("broad except exception is banned.") == match(("broad-except",))
+    # Phrases that follow each other without sharing a word are both mentions.
+    assert match_rule("bare except catching exception are banned.") == match(
+        ("bare-except", "broad-except")
+    )
+    assert match_rule("catching exception bare except are banned.") == match(
+        ("bare-except", "broad-except")
+    )
+
+
+def test_round_3_cue_reach_is_the_same_for_a_phrase_that_starts_at_its_index() -> None:
+    # A prefix cue reaches a phrase that follows it, and a trailing cue one that precedes it, for
+    # each shape of phrase (the mention's index is its first word).
+    both = ("bare-except", "broad-except")
+    assert match_rule("never catching exception.") == match(("broad-except",))
+    assert match_rule("never use bare except or catching exception.") == match(both)
+    assert match_rule("never use catching exception, bare except.") == match(both)
+    assert match_rule("do not use broad except.") == match(("broad-except",))
+    assert match_rule("avoid generic exceptions and bare excepts.") == match(both)
+    assert match_rule("catching exception is banned.") == match(("broad-except",))
+    assert match_rule("broad excepts and bare except are not allowed.") == match(both)
+    assert match_rule("blanket exception is forbidden, use specific exceptions.") == match(
+        ("broad-except",)
+    )
+    # A phrase after the trailing cue, or one before a prefix cue, is not reached.
+    assert match_rule("bare except is banned catching exception") is None
+    assert match_rule("catching exception, never bare except.") is None  # preferred mention
+
+
+_WORDS = (
+    "bare except excepts exception exceptions catch catching catches broad generic blanket "
+    "baseexception bare-except broad-exceptions generic-except and or the x"
+).split()
+
+
+def _spans(clause: tuple[str, ...]) -> list[tuple[int, int, int]]:
+    """``(index, start, stop)`` of each mention ``_find`` gives, after checking its shape."""
+    found = []
+    for mention in _find(clause):
+        assert len(mention) == 3, (clause, mention)
+        index, _option, words = mention
+        assert words.step == 1 and len(words) >= 1, (clause, mention)
+        assert words.start == index, (clause, mention)  # a span starts at its index
+        assert 0 <= words.start and words.stop <= len(clause), (clause, mention)
+        found.append((index, words.start, words.stop))
+    for (_, _, stop), (_, start, _) in itertools.pairwise(found):
+        assert stop <= start, (clause, found)  # no two spans share a word, in order
+    return found
+
+
+def test_round_3_find_gives_spans_that_start_at_their_index_and_never_overlap() -> None:
+    # Every clause of up to four words, from the words the finder looks at and a few it doesn't.
+    count = 0
+    for size in range(1, 5):
+        for clause in itertools.product(_WORDS, repeat=size):
+            _spans(clause)
+            count += 1
+    assert count > 100_000
+    # Longer clauses: a seeded random sample, and the phrases that run into each other.
+    rng = random.Random(61)  # noqa: S311 - a fixed-seed test generator
+    for _ in range(20_000):
+        _spans(tuple(rng.choices(_WORDS, k=rng.randint(5, 14))))
+    for text in (
+        "bare except exception",
+        "broad except exception exception",
+        "catching exception except exception",
+        "bare except bare except bare except",
+        "catch catching exception exception",
+        "bare " * 50 + "except exception " * 50,
+    ):
+        _spans(tuple(text.split()))
+
+
+def test_round_3_find_spans_match_the_phrases() -> None:
+    assert _spans(("bare", "except")) == [(0, 0, 2)]
+    assert _spans(("x", "catching", "exception")) == [(1, 1, 3)]
+    assert _spans(("a", "broad", "excepts", "b")) == [(1, 1, 3)]
+    assert _spans(("bare-except",)) == [(0, 0, 1)]
+    assert _spans(("baseexception", "bare", "except")) == [(0, 0, 1), (1, 1, 3)]
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Catching Exception is acceptable; bare except is forbidden.",
+        "Catching Exception is fine. Bare except is not allowed.",
+    ],
+)
+def test_f1_with_a_semicolon_or_full_stop_the_acceptance_is_a_preferred_mention(
+    sentence: str,
+) -> None:
+    # No comma is involved here. "acceptable" and "fine" are no cues, so catching Exception reads
+    # as preferred, and `exceptions` maps prohibitions only: Not verifiable.
+    assert match_rule(sentence.lower()) is None
