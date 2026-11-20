@@ -1,6 +1,7 @@
 """C8 history: dates each site line by the first-parent commit that last changed it.
 
-DESIGN §10 S4 and §12 A-3 / A-5, INTERFACES I-11 C8, I-14 item 9, FEASIBILITY F-1.
+DESIGN §10 S4 and §12 A-3 / A-5, INTERFACES I-11 C8, I-14 (``History`` and the C8 rulings),
+FEASIBILITY F-1.
 C8 asks the git reader (C3) for the first-parent chain of a tip commit and for
 one newest-first patch stream, then maps each site line backward through the
 hunks. A line inside a hunk's ``+`` side takes that commit's date and stops
@@ -18,10 +19,12 @@ this equals a forward replay, and it lets the patch-byte cap stop cleanly.
   patch text are read, newest first. Lines not yet dated at a cap are not
   recent, and the result carries a note.
 * **Scan mode (A-3).** Files in ``scan_files`` are compared with their ``HEAD``
-  blob in Python: untracked lines are recent, changed lines are recent, and
-  unchanged lines are dated through ``HEAD``'s history. Past 5,000 lines on a
-  side, or once the 200,000,000 diff budget is spent, a changed file counts as
-  all recent. No git subcommand beyond the C3 methods is used.
+  blob in Python. C4 passes each tracked file's blob id and unchanged flag in
+  ``scan_tracked``; C8 never lists the tree or hashes. Untracked lines are
+  recent, changed lines are recent, and unchanged lines are dated through
+  ``HEAD``'s history. Past 5,000 lines on a side, a ``HEAD`` blob over C4's
+  per-file ``.py`` size limit, or once the 200,000,000 diff budget is spent, a
+  changed file counts as all recent. No git subcommand beyond the C3 methods is used.
 * **Failure.** Any C3 failure, and any patch text that does not parse, raises
   ``ComponentError("history")``; the caller shows recent as unavailable.
 
@@ -32,16 +35,16 @@ counts, so a content line that looks like a header is never read as one.
 """
 
 import difflib
-import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
-from conventiondrift.components import GitReaderProtocol, Side
+from conventiondrift.components import GitReaderProtocol
+from conventiondrift.discover.safefs import size_limit
 from conventiondrift.errors import ComponentError, FileSkipped, GitUnavailable
-from conventiondrift.model import PyFile, Window
+from conventiondrift.model import HistoryResult, PyFile, Side, TrackedState, Window
 
 __all__ = [
     "COMMIT_CAP",
@@ -50,8 +53,6 @@ __all__ = [
     "SCAN_DIFF_BUDGET",
     "SCAN_LINE_LIMIT",
     "GitHistory",
-    "HistoryResult",
-    "HistoryStats",
     "compute_recent",
 ]
 
@@ -69,17 +70,34 @@ SCAN_DIFF_BUDGET: Final = 200_000_000
 """A-3 condition 5: total of (HEAD lines x working-tree lines) over the files diffed."""
 
 COMMIT_CAP_NOTE: Final = (
-    "History was limited to the 10,000 newest commits, so recent adherence may be incomplete."
+    f"History was limited to the newest {COMMIT_CAP:,} commits, "
+    "so recent adherence may be incomplete."
 )
 PATCH_CAP_NOTE: Final = (
-    "History reading stopped at 256 MiB of patch text, so recent adherence may be incomplete."
+    f"History reading stopped at {PATCH_MAX_BYTES // 2**20} MiB of patch text, "
+    "so recent adherence may be incomplete."
 )
 SCAN_LINE_LIMIT_NOTE: Final = (
-    "Changed files with more than 5,000 lines were counted as all recent without a line diff."
+    f"Changed files over {SCAN_LINE_LIMIT:,} lines were treated as entirely recent "
+    "without a line diff, so recent adherence may be approximate."
 )
 SCAN_DIFF_BUDGET_NOTE: Final = (
-    "The line-diff budget was spent, so the remaining changed files were counted as all recent."
+    "The line-diff budget ran out, so the remaining changed files were treated as "
+    "entirely recent and recent adherence may be approximate."
 )
+
+
+def bare_cr_note(count: int) -> str:
+    """The note for ``count`` files whose lines git and Python number differently.
+
+    DRAFT wording in the D-PM-45 style, pending PM approval.
+    """
+    noun = "file has" if count == 1 else "files have"
+    return (
+        f"{count} {noun} bare carriage-return line endings, which git does not count as "
+        "line breaks, so recent adherence may be approximate for them."
+    )
+
 
 _FAILED: Final = "history could not be read"
 _MALFORMED: Final = "unexpected patch text from git"
@@ -100,29 +118,7 @@ _SIMPLE_ESCAPES: Final = {
     b'"': b'"',
     b"\\": b"\\",
 }
-_NON_REGULAR_MODES: Final = frozenset({"120000", "160000"})
-
-_Recent = frozenset[tuple[Side, str, int]]
-
-
-@dataclass(frozen=True, slots=True)
-class HistoryStats:
-    """Exact counters for the benchmark stats and tests (I-12, DESIGN §12 A-3)."""
-
-    commits_walked: int = 0
-    patch_bytes: int = 0
-    scan_all_recent_line_limit: int = 0
-    scan_all_recent_diff_budget: int = 0
-    scan_diff_work: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class HistoryResult:
-    """The recent set plus the cap notes and counters of one ``compute_recent`` call."""
-
-    recent: _Recent = frozenset()
-    notes: tuple[str, ...] = ()
-    stats: HistoryStats = field(default_factory=HistoryStats)
+_BARE_CR: Final = re.compile(rb"\r(?!\n)")
 
 
 def _unquote(token: bytes) -> bytes:
@@ -263,6 +259,8 @@ class _Replay:
         self._in_window = False
         self._section: _Section | None = None
         self._hunk_left = 0
+        self._hunk_file: str | None = None  # the tracked file the open hunk belongs to
+        self.bare_cr: set[str] = set()
 
     @property
     def done(self) -> bool:
@@ -278,6 +276,8 @@ class _Replay:
         if self._hunk_left:
             if not line.startswith(b"\\"):
                 self._hunk_left -= 1
+                if self._hunk_file is not None and b"\r" in line[:-1]:
+                    self.bare_cr.add(self._hunk_file)
             return
         if line.startswith(b"\x00"):
             self._start_commit(line)
@@ -311,12 +311,14 @@ class _Replay:
             old_count = 1 if match[2] is None else int(match[2])
             new_count = 1 if match[4] is None else int(match[4])
             self._hunk_left = old_count + new_count
+            self._hunk_file = None
             section.hunks = True
             if section.mapper is None and section.new in self._tracked:
                 sink = self.recent if self._in_window else None
                 section.mapper = _Mapper(self._tracked[section.new], sink)
             if section.mapper is not None:
                 section.mapper.hunk(old_count, int(match[3]), new_count)
+                self._hunk_file = section.mapper.tracked.file
         elif line.startswith(b"--- "):
             section.old = _git_path(line[4:], b"a/")
         elif line.startswith(b"+++ "):
@@ -359,7 +361,11 @@ def _since(end: datetime, days: int) -> datetime:
 
 
 def _segment(chain: Sequence[tuple[str, datetime]], start: datetime) -> tuple[int, bool]:
-    """How many chain commits to keep (S4), and whether the commit cap cut the walk short."""
+    """How many chain commits to keep (S4), and whether the chain may have been cut at the cap.
+
+    The flag is only a candidate: a chain of exactly ``COMMIT_CAP`` commits is cut
+    short only if its oldest commit has a parent (see ``_has_parent``).
+    """
     run = 0
     for position, (_, when) in enumerate(chain):
         run = run + 1 if when < start else 0
@@ -368,23 +374,33 @@ def _segment(chain: Sequence[tuple[str, datetime]], start: datetime) -> tuple[in
     return len(chain), len(chain) >= COMMIT_CAP
 
 
+def _has_parent(git: GitReaderProtocol, sha: str) -> bool:
+    """True if the first-parent chain goes past ``sha``.
+
+    I-14 asks for ``limit + 1`` commits so a chain of exactly the cap is not a cap hit.
+    The reader refuses a limit over ``COMMIT_CAP`` (``gitread.MAX_COUNT_CAP``), so the
+    extra commit is asked for as a chain of two that starts at the oldest commit read.
+    """
+    return len(git.first_parent_chain(sha, 2)) > 1
+
+
 def _walk(
     git: GitReaderProtocol,
     tip: str,
     wanted: Mapping[str, Sequence[int]],
     start: datetime,
     end: datetime,
-) -> tuple[set[tuple[str, int]], list[str], int, int]:
+) -> tuple[set[tuple[str, int]], list[str], set[str]]:
     """Date ``wanted`` (file -> tip lines) over the S4 segment ending at ``tip``.
 
-    Returns the recent (file, line) pairs, the cap notes, the commits kept and the
-    patch bytes read.
+    Returns the recent (file, line) pairs, the cap notes and the files in which a bare
+    carriage return was read.
     """
     chain = git.first_parent_chain(tip, COMMIT_CAP)
     keep, commit_capped = _segment(chain, start)
     notes: list[str] = []
     if not chain:
-        return set(), notes, 0, 0
+        return set(), notes, set()
     from_sha = chain[keep][0] if keep < len(chain) else None
     replay = _Replay(chain[:keep], wanted, start, end)
     stream = git.patches(from_sha, tip)
@@ -416,9 +432,9 @@ def _walk(
         stream.close()
     if cut and replay.undated:
         notes.append(PATCH_CAP_NOTE)
-    if commit_capped and replay.undated:
+    if commit_capped and replay.undated and _has_parent(git, chain[-1][0]):
         notes.append(COMMIT_CAP_NOTE)
-    return replay.recent, notes, keep, received
+    return replay.recent, notes, replay.bare_cr
 
 
 def _lines(data: bytes) -> list[bytes]:
@@ -429,15 +445,6 @@ def _lines(data: bytes) -> list[bytes]:
     return lines
 
 
-def _blob_oid(data: bytes, like: str) -> str:
-    """The git blob id of ``data`` in the hash family (SHA-1 or SHA-256) of ``like``."""
-    family = "sha256" if len(like) == 64 else "sha1"
-    digest = hashlib.new(family, usedforsecurity=False)
-    digest.update(b"blob %d\x00" % len(data))
-    digest.update(data)
-    return digest.hexdigest()
-
-
 @dataclass(slots=True)
 class _ScanPlan:
     """Scan-mode handling of the head side, computed before the history walk."""
@@ -445,21 +452,38 @@ class _ScanPlan:
     wanted: dict[str, list[int]] = field(default_factory=dict)
     to_work: dict[str, dict[int, int]] = field(default_factory=dict)
     recent: set[tuple[str, int]] = field(default_factory=set)
+    bare_cr: set[str] = field(default_factory=set)
     line_limit_files: int = 0
     budget_files: int = 0
     diff_work: int = 0
 
 
+def _head_lines(git: GitReaderProtocol, blob: str) -> list[bytes] | None:
+    """The ``HEAD`` blob's lines, or ``None`` if it is over C4's per-file ``.py`` limit.
+
+    The reader checks the blob's size before it reads the body and raises
+    ``FileSkipped`` for one over the limit, so a huge blob is never read.
+    """
+    try:
+        return _lines(git.blob(blob, size_limit("python")))
+    except FileSkipped:
+        return None
+
+
 def _scan_plan(
     git: GitReaderProtocol,
-    tip: str,
     head_sites: Mapping[str, frozenset[int]],
     scan_files: Sequence[PyFile],
+    scan_tracked: Mapping[str, TrackedState],
 ) -> _ScanPlan:
-    """A-3: split the head sites into dated-by-history, recent, and mapped-by-difflib."""
+    """A-3: split the head sites into dated-by-history, recent, and mapped-by-difflib.
+
+    C4 supplies the ``HEAD`` blob id and the unchanged flag of every tracked file in
+    ``scan_tracked``; a scan file without an entry is untracked. The tree is never
+    listed and nothing is hashed here.
+    """
     plan = _ScanPlan()
     working = {file.path: file.data for file in scan_files}
-    tree: dict[str, tuple[str, str, int | None]] | None = None
     exhausted = False
     for path in sorted(head_sites, key=lambda p: p.encode("utf-8", "surrogateescape")):
         lines = sorted(head_sites[path])
@@ -467,14 +491,13 @@ def _scan_plan(
         if data is None:
             plan.wanted[path] = lines
             continue
-        if tree is None:
-            tree = {entry[3]: (entry[0], entry[1], entry[2]) for entry in git.tree(tip)}
-        entry = tree.get(path)
-        if entry is None or entry[0] in _NON_REGULAR_MODES:
+        if _BARE_CR.search(data):
+            plan.bare_cr.add(path)
+        state = scan_tracked.get(path)
+        if state is None:
             plan.recent.update((path, line) for line in lines)
             continue
-        _, oid, size = entry
-        if _blob_oid(data, oid) == oid:
+        if state.unchanged:
             plan.wanted[path] = lines
             continue
         work_lines = _lines(data)
@@ -486,8 +509,8 @@ def _scan_plan(
             plan.budget_files += 1
             plan.recent.update((path, line) for line in lines)
             continue
-        head_lines = _lines(git.blob(oid, size if size is not None else len(data)))
-        if len(head_lines) > SCAN_LINE_LIMIT:
+        head_lines = _head_lines(git, state.head_blob)
+        if head_lines is None or len(head_lines) > SCAN_LINE_LIMIT:
             plan.line_limit_files += 1
             plan.recent.update((path, line) for line in lines)
             continue
@@ -519,84 +542,101 @@ def _map_unchanged(head_lines: list[bytes], work_lines: list[bytes]) -> dict[int
     return mapping
 
 
+def _tips_for(
+    sites: Mapping[Side, Mapping[str, frozenset[int]]],
+    tips: Mapping[Side, str],
+    scan_files: Sequence[PyFile],
+) -> dict[Side, str | None]:
+    """The commit each side with site lines analyzes; ``None`` is the reader's ``HEAD``.
+
+    Only scan mode (no tips, scan files) may leave the head side without a tip.
+    """
+    scan_mode = not tips and bool(scan_files)
+    found: dict[Side, str | None] = {}
+    for side in ("base", "head"):
+        if not any(sites.get(side, {}).values()):
+            continue
+        if side in tips:
+            found[side] = tips[side]
+        elif side == "head" and scan_mode:
+            found[side] = None
+        else:
+            raise ValueError(f"no tip commit was given for the {side} sites")
+    return found
+
+
 def _compute(
     git: GitReaderProtocol,
-    window: Window,
     end: datetime,
+    window: Window,
     sites: Mapping[Side, Mapping[str, frozenset[int]]],
+    needed: Mapping[Side, str | None],
     scan_files: Sequence[PyFile],
-    head_sha: str | None,
-    base_sha: str | None,
+    scan_tracked: Mapping[str, TrackedState],
 ) -> HistoryResult:
     start = _since(end, window.days)
     recent: set[tuple[Side, str, int]] = set()
     notes: list[str] = []
-    commits = patch_bytes = 0
+    bare_cr: set[str] = set()
     plan = _ScanPlan()
-    for side in ("base", "head"):
-        side_sites = sites.get(side, {})
-        if not any(side_sites.values()):
-            continue
-        if side == "base":
-            if base_sha is None:
-                raise ComponentError(_COMPONENT, "no base commit for the base sites")
-            tip = base_sha
-            wanted: Mapping[str, Sequence[int]] = {p: sorted(v) for p, v in side_sites.items()}
-        else:
-            tip = head_sha if head_sha is not None else git.resolve("HEAD")
-            if scan_files:
-                plan = _scan_plan(git, tip, side_sites, scan_files)
-                wanted = plan.wanted
-            else:
-                wanted = {p: sorted(v) for p, v in side_sites.items()}
+    for side, given in needed.items():
+        side_sites = sites[side]
+        tip = given if given is not None else git.resolve("HEAD")
+        wanted: Mapping[str, Sequence[int]] = {p: sorted(v) for p, v in side_sites.items()}
+        if side == "head" and scan_files:
+            plan = _scan_plan(git, side_sites, scan_files, scan_tracked)
+            wanted = plan.wanted
         if any(wanted.values()):
-            dated, side_notes, kept, read = _walk(git, tip, wanted, start, end)
+            dated, side_notes, side_cr = _walk(git, tip, wanted, start, end)
         else:
-            dated, side_notes, kept, read = set(), [], 0, 0
-        commits += kept
-        patch_bytes += read
+            dated, side_notes, side_cr = set(), [], set()
+        bare_cr |= side_cr
         notes.extend(n for n in side_notes if n not in notes)
         translate = plan.to_work if side == "head" else {}
         for path, line in dated:
             mapped = translate[path][line] if path in translate else line
             recent.add((side, path, mapped))
     recent.update(("head", path, line) for path, line in plan.recent)
+    bare_cr |= plan.bare_cr
     if plan.line_limit_files:
         notes.append(SCAN_LINE_LIMIT_NOTE)
     if plan.budget_files:
         notes.append(SCAN_DIFF_BUDGET_NOTE)
-    stats = HistoryStats(
-        commits_walked=commits,
-        patch_bytes=patch_bytes,
-        scan_all_recent_line_limit=plan.line_limit_files,
-        scan_all_recent_diff_budget=plan.budget_files,
-        scan_diff_work=plan.diff_work,
-    )
-    return HistoryResult(frozenset(recent), tuple(notes), stats)
+    if bare_cr:
+        notes.append(bare_cr_note(len(bare_cr)))
+    stats = {
+        "scan_all_recent_line_limit": plan.line_limit_files,
+        "scan_all_recent_diff_budget": plan.budget_files,
+        "scan_diff_work": plan.diff_work,
+    }
+    return HistoryResult(frozenset(recent), True, tuple(notes), stats)
 
 
 def compute_recent(
     git: GitReaderProtocol | None,
     window: Window,
     sites: Mapping[Side, Mapping[str, frozenset[int]]],
-    scan_files: Sequence[PyFile] = (),
     *,
-    head_sha: str | None = None,
-    base_sha: str | None = None,
+    tips: Mapping[Side, str] = {},
+    scan_files: Sequence[PyFile] = (),
+    scan_tracked: Mapping[str, TrackedState] = {},
 ) -> HistoryResult:
-    """The recent site lines per side, with the cap notes and counters.
+    """The recent site lines per side, with the notes and ``scan_*`` counters (I-14 ``History``).
 
-    ``head_sha`` and ``base_sha`` are the commits whose trees the site lines were
-    read from (the PR head and the merge base). ``head_sha=None`` means the
-    reader's ``HEAD`` (scan mode). The window must be available and have an end
-    and ``git`` must not be ``None``; otherwise recent is unavailable and the
-    result is empty without touching git. Any git failure, and any patch text
-    that cannot be read, raises ``ComponentError("history")``.
+    PR mode: ``tips`` has the commit each side's site lines were read from (base: the
+    merge base, head: the PR head). Scan mode: ``tips`` is empty, ``scan_files`` is the
+    working tree and the head side is dated from the reader's ``HEAD``. A side with
+    site lines and no tip is a caller bug and raises ``ValueError`` (checked first).
+
+    If ``git`` is ``None``, or the window is not available (or has no end), nothing
+    is read and the result is ``available=False`` with an empty set. Any git failure,
+    and any patch text that cannot be read, raises ``ComponentError("history")``.
     """
+    needed = _tips_for(sites, tips, scan_files)
     if git is None or not window.available or window.end is None:
-        return HistoryResult()
+        return HistoryResult(frozenset(), False, (), _no_stats())
     try:
-        return _compute(git, window, window.end, sites, scan_files, head_sha, base_sha)
+        return _compute(git, window.end, window, sites, needed, scan_files, scan_tracked)
     except ComponentError as exc:
         if exc.component == _COMPONENT:
             raise
@@ -605,36 +645,32 @@ def compute_recent(
         raise ComponentError(_COMPONENT, _FAILED) from exc
 
 
+def _no_stats() -> dict[str, int]:
+    return {
+        "scan_all_recent_line_limit": 0,
+        "scan_all_recent_diff_budget": 0,
+        "scan_diff_work": 0,
+    }
+
+
 class GitHistory:
-    """The production C8 (``Components.history``): ``History`` bound to its tip commits.
-
-    ``recent`` follows the I-14 ``History`` Protocol. The tip SHAs are not in that
-    signature, so T-028 passes them here: ``head_sha`` (the PR head; ``None`` means
-    the reader's ``HEAD``, for scan mode) and ``base_sha`` (the merge base, in
-    compare mode). After a call, ``notes`` and ``stats`` describe that call.
-    """
-
-    def __init__(self, head_sha: str | None = None, base_sha: str | None = None) -> None:
-        self._head_sha = head_sha
-        self._base_sha = base_sha
-        self.notes: tuple[str, ...] = ()
-        self.stats = HistoryStats()
+    """The production C8 (``Components.history``): the I-14 ``History`` Protocol, no state."""
 
     def recent(
         self,
         git: GitReaderProtocol | None,
         window: Window,
         sites: Mapping[Side, Mapping[str, frozenset[int]]],
+        *,
+        tips: Mapping[Side, str] = {},
         scan_files: Sequence[PyFile] = (),
-    ) -> _Recent:
-        self.notes, self.stats = (), HistoryStats()
-        result = compute_recent(
+        scan_tracked: Mapping[str, TrackedState] = {},
+    ) -> HistoryResult:
+        return compute_recent(
             git,
             window,
             sites,
-            scan_files,
-            head_sha=self._head_sha,
-            base_sha=self._base_sha,
+            tips=tips,
+            scan_files=scan_files,
+            scan_tracked=scan_tracked,
         )
-        self.notes, self.stats = result.notes, result.stats
-        return result.recent

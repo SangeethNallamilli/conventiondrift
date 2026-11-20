@@ -8,6 +8,7 @@ from collections.abc import Generator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
 from conventiondrift.components import ChangedFile, TreeEntry
+from conventiondrift.errors import ComponentError, FileSkipped
 from conventiondrift.model import Window
 
 END = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
@@ -110,7 +111,15 @@ class FakeGit:
 
     def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]:
         self.chain_calls.append((sha, limit))
-        return self.chains.get(sha, self.chain)
+        if limit > 10_000:  # the real reader refuses a limit over MAX_COUNT_CAP
+            raise ComponentError("gitread", "git --max-count over the cap")
+        chain = self.chains.get(sha)
+        if chain is None:
+            chain = self.chain
+            ids = [commit for commit, _ in chain]
+            if sha in ids:  # a chain that starts at an older commit, like rev-list would
+                chain = chain[ids.index(sha) :]
+        return list(chain)[:limit]
 
     def patches(self, from_sha: str | None, to_sha: str) -> Generator[bytes, None, None]:
         self.patch_calls.append((from_sha, to_sha))
@@ -130,6 +139,8 @@ class FakeGit:
 
     def blob(self, oid: str, max_bytes: int) -> bytes:
         self.blob_calls.append((oid, max_bytes))
+        if len(self.blobs[oid]) > max_bytes:  # the real reader checks the size before the body
+            raise FileSkipped("size limit")
         return self.blobs[oid]
 
     def changed_files(self, base: str, head: str) -> Sequence[ChangedFile]:

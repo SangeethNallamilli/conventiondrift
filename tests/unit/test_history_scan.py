@@ -16,9 +16,10 @@ from tests.fixtures.gitrepo import GitRepo
 
 from conventiondrift import history
 from conventiondrift.components import TreeEntry
+from conventiondrift.discover.safefs import FILE_MAX_BYTES
 from conventiondrift.gitread import GitReader
-from conventiondrift.history import HistoryResult, compute_recent
-from conventiondrift.model import PyFile, Window
+from conventiondrift.history import compute_recent
+from conventiondrift.model import HistoryResult, PyFile, TrackedState, Window
 
 TIP = sha(5)
 
@@ -36,18 +37,31 @@ def rows(*items: str) -> bytes:
     return "".join(f"{item}\n" for item in items).encode()
 
 
+def tracked_from(git: FakeGit, files: Mapping[str, bytes]) -> dict[str, TrackedState]:
+    """What C4 would pass: one entry per tracked file, ``unchanged`` from comparing blob ids."""
+    return {
+        path: TrackedState(oid, blob_id(files[path], "sha256" if len(oid) == 64 else "sha1") == oid)
+        for _, oid, _, path in git.entries
+        if path in files
+    }
+
+
 def scan(
     git: FakeGit,
     sites: Mapping[str, Sequence[int]],
     files: Mapping[str, bytes],
+    tracked: Mapping[str, TrackedState] | None = None,
 ) -> HistoryResult:
-    return compute_recent(
+    result = compute_recent(
         git,
         window(),
         {"head": {path: frozenset(lines) for path, lines in sites.items()}},
-        [PyFile(path, data) for path, data in files.items()],
-        head_sha=TIP,
+        scan_files=[PyFile(path, data) for path, data in files.items()],
+        scan_tracked=tracked_from(git, files) if tracked is None else tracked,
+        tips={"head": TIP},
     )
+    assert git.tree_calls == []  # C8 never lists the tree (I-14 ruling 3)
+    return result
 
 
 def recent_lines(result: HistoryResult, path: str) -> set[int]:
@@ -86,8 +100,8 @@ def test_changed_lines_are_recent_and_unchanged_lines_map_back_to_head() -> None
     result = scan(git, {"a.py": [1, 2, 3, 4, 5]}, {"a.py": work_data})
     # Working line 2 is new; working line 3 is HEAD line 2 (recent in history); others are old.
     assert recent_lines(result, "a.py") == {2, 3}
-    assert git.blob_calls == [(blob_id(head_data), len(head_data))]
-    assert result.stats.scan_diff_work == 4 * 5
+    assert git.blob_calls == [(blob_id(head_data), FILE_MAX_BYTES)]
+    assert result.stats["scan_diff_work"] == 4 * 5
 
 
 def test_replaced_lines_are_recent() -> None:
@@ -112,26 +126,28 @@ def test_a_changed_file_with_no_matching_line_is_all_recent_without_a_walk() -> 
     assert git.chain_calls == []
 
 
-@pytest.mark.parametrize("mode", ["120000", "160000"])
-def test_a_head_entry_that_is_not_a_regular_file_counts_as_untracked(mode: str) -> None:
-    data = rows("a")
-    git = FakeGit([(TIP, when(1000))], [], tree=[(mode, blob_id(data), None, "a.py")])
-    assert recent_lines(scan(git, {"a.py": [1]}, {"a.py": data}), "a.py") == {1}
+def test_a_tracked_file_is_trusted_as_c4_reports_it_and_never_rehashed() -> None:
+    # I-14 ruling 3: C4 owns the blob comparison. Contents that differ from the blob id are
+    # still "unchanged" when C4 says so, so C8 did not hash them.
+    git = FakeGit([(TIP, when(1))], [marker(TIP) + file_diff(b"a.py", hunk(2, 1, 2, 1))])
+    tracked = {"a.py": TrackedState("c" * 40, True)}
+    result = scan(git, {"a.py": [1, 2]}, {"a.py": rows("not", "the", "blob")}, tracked)
+    assert recent_lines(result, "a.py") == {2}
     assert git.blob_calls == []
+
+
+def test_a_file_without_a_tracked_entry_is_untracked_whatever_head_holds() -> None:
+    data = rows("a")
+    git = FakeGit([(TIP, when(1000))], [], tree=[entry("a.py", data)])
+    result = scan(git, {"a.py": [1]}, {"a.py": data}, tracked={})
+    assert recent_lines(result, "a.py") == {1}
+    assert git.chain_calls == [] and git.blob_calls == []
 
 
 def test_files_not_in_scan_files_use_plain_history() -> None:
     git = FakeGit([(TIP, when(1))], [marker(TIP) + file_diff(b"a.py", hunk(1, 0, 1, 1))])
     result = scan(git, {"a.py": [1]}, {"other.py": rows("x")})
     assert recent_lines(result, "a.py") == {1}
-    assert git.tree_calls == []  # no scan file had sites
-
-
-def test_the_head_tree_is_read_once_for_all_scan_files() -> None:
-    one, two = rows("a"), rows("b")
-    git = FakeGit([(TIP, when(1000))], [], tree=[entry("a.py", one), entry("b.py", two)])
-    scan(git, {"a.py": [1], "b.py": [1]}, {"a.py": one, "b.py": two})
-    assert git.tree_calls == [TIP]
 
 
 def test_a_tracked_file_may_be_changed_in_a_sha256_repository() -> None:
@@ -152,16 +168,50 @@ def test_a_tracked_file_may_be_changed_in_a_sha256_repository() -> None:
     assert unchanged.blob_calls == []
 
 
-def test_an_entry_without_a_size_reads_the_blob_up_to_the_working_size() -> None:
-    head_data, work_data = rows("a"), rows("b")
+def head_blob_case(size: int) -> tuple[FakeGit, bytes]:
+    head_data = b"h" * size  # one line, so only the byte limit can stop it
     git = FakeGit(
         [(TIP, when(1000))],
         [],
-        tree=[("100644", blob_id(head_data), None, "a.py")],
+        tree=[entry("a.py", head_data)],
         blobs={blob_id(head_data): head_data},
     )
-    scan(git, {"a.py": [1]}, {"a.py": work_data})
-    assert git.blob_calls == [(blob_id(head_data), len(work_data))]
+    return git, b"w" * 10
+
+
+def test_a_head_blob_over_the_py_size_limit_is_all_recent_and_never_read() -> None:
+    # I-14 ruling 4: C4's per-file .py limit, checked by the reader before the body is read.
+    git, work = head_blob_case(FILE_MAX_BYTES + 1)
+    result = scan(git, {"a.py": [1]}, {"a.py": work})
+    assert recent_lines(result, "a.py") == {1}
+    assert result.stats["scan_all_recent_line_limit"] == 1
+    assert result.stats["scan_all_recent_diff_budget"] == 0
+    assert result.stats["scan_diff_work"] == 0
+    assert result.notes == (history.SCAN_LINE_LIMIT_NOTE,)
+    assert git.blob_calls == [(blob_id(b"h" * (FILE_MAX_BYTES + 1)), FILE_MAX_BYTES)]
+    assert git.chain_calls == []
+
+
+def test_a_head_blob_exactly_at_the_py_size_limit_is_diffed() -> None:
+    git, work = head_blob_case(FILE_MAX_BYTES)
+    result = scan(git, {"a.py": [1]}, {"a.py": work})
+    assert recent_lines(result, "a.py") == {1}  # the one line changed
+    assert result.stats["scan_all_recent_line_limit"] == 0
+    assert result.stats["scan_diff_work"] == 1
+    assert result.notes == ()
+
+
+def test_several_oversize_blobs_each_count_once() -> None:
+    big = b"h" * (FILE_MAX_BYTES + 1)
+    git = FakeGit(
+        [(TIP, when(1000))],
+        [],
+        tree=[entry("a.py", big), entry("b.py", big + b"x")],
+        blobs={blob_id(big): big, blob_id(big + b"x"): big + b"x"},
+    )
+    result = scan(git, {"a.py": [1], "b.py": [1]}, {"a.py": b"1\n", "b.py": b"2\n"})
+    assert result.stats["scan_all_recent_line_limit"] == 2
+    assert result.notes == (history.SCAN_LINE_LIMIT_NOTE,)  # one note per run
 
 
 def test_a_binary_looking_file_without_newlines_is_one_line() -> None:
@@ -179,7 +229,7 @@ def test_empty_files_diff_at_no_cost() -> None:
     git = FakeGit([(TIP, when(1000))], [], tree=[entry("a.py", b"")], blobs={blob_id(b""): b""})
     result = scan(git, {"a.py": [1]}, {"a.py": rows("x")})
     assert recent_lines(result, "a.py") == {1}
-    assert result.stats.scan_diff_work == 0
+    assert result.stats["scan_diff_work"] == 0
 
 
 def test_the_line_diff_does_not_junk_popular_lines() -> None:
@@ -211,8 +261,8 @@ def test_a_working_file_over_the_line_limit_is_all_recent(monkeypatch: pytest.Mo
     )
     result = scan(git, {"a.py": [1, 2]}, {"a.py": rows("a", "b", "c", "d")})
     assert recent_lines(result, "a.py") == {1, 2}
-    assert result.stats.scan_all_recent_line_limit == 1
-    assert result.stats.scan_diff_work == 0
+    assert result.stats["scan_all_recent_line_limit"] == 1
+    assert result.stats["scan_diff_work"] == 0
     assert git.blob_calls == []  # the HEAD blob is not even read
     assert result.notes == (history.SCAN_LINE_LIMIT_NOTE,)
 
@@ -228,7 +278,7 @@ def test_a_head_blob_over_the_line_limit_is_all_recent(monkeypatch: pytest.Monke
     )
     result = scan(git, {"a.py": [1, 2]}, {"a.py": rows("a", "x")})
     assert recent_lines(result, "a.py") == {1, 2}
-    assert result.stats.scan_all_recent_line_limit == 1
+    assert result.stats["scan_all_recent_line_limit"] == 1
     assert len(git.blob_calls) == 1
 
 
@@ -243,7 +293,7 @@ def test_exactly_the_line_limit_is_still_diffed(monkeypatch: pytest.MonkeyPatch)
     )
     result = scan(git, {"a.py": [1, 2, 3]}, {"a.py": rows("a", "b", "x")})
     assert recent_lines(result, "a.py") == {3}
-    assert result.stats.scan_all_recent_line_limit == 0
+    assert result.stats["scan_all_recent_line_limit"] == 0
     assert result.notes == ()
 
 
@@ -274,8 +324,8 @@ def test_the_diff_budget_is_spent_in_path_order_and_stays_spent(
     assert recent_lines(result, "a.py") == {2}
     assert recent_lines(result, "m.py") == {1, 2, 3}
     assert recent_lines(result, "z.py") == {1}
-    assert result.stats.scan_diff_work == 4
-    assert result.stats.scan_all_recent_diff_budget == 2
+    assert result.stats["scan_diff_work"] == 4
+    assert result.stats["scan_all_recent_diff_budget"] == 2
     assert result.notes == (history.SCAN_DIFF_BUDGET_NOTE,)
     assert len(git.blob_calls) == 2  # z.py's blob is never read once the budget is spent
 
@@ -287,8 +337,8 @@ def test_a_file_that_uses_exactly_the_remaining_budget_is_diffed(
     git, files = budget_git({"a.py": (rows("a", "b", "c"), rows("a", "b", "x"))})
     result = scan(git, {"a.py": [1, 2, 3]}, files)
     assert recent_lines(result, "a.py") == {3}
-    assert result.stats.scan_diff_work == 9
-    assert result.stats.scan_all_recent_diff_budget == 0
+    assert result.stats["scan_diff_work"] == 9
+    assert result.stats["scan_all_recent_diff_budget"] == 0
 
 
 def test_paths_are_ordered_by_their_utf8_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -296,8 +346,8 @@ def test_paths_are_ordered_by_their_utf8_bytes(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(history, "SCAN_DIFF_BUDGET", 1)
     git, files = budget_git({"é.py": (rows("c"), rows("b")), "z.py": (rows("a"), rows("b"))})
     result = scan(git, {"é.py": [1], "z.py": [1]}, files)
-    assert result.stats.scan_diff_work == 1
-    assert result.stats.scan_all_recent_diff_budget == 1
+    assert result.stats["scan_diff_work"] == 1
+    assert result.stats["scan_all_recent_diff_budget"] == 1
     assert [call[0] for call in git.blob_calls] == [blob_id(rows("a")), blob_id(rows("c"))]
 
 
@@ -311,9 +361,65 @@ def test_line_limit_files_do_not_spend_the_budget(monkeypatch: pytest.MonkeyPatc
         }
     )
     result = scan(git, {"a.py": [1, 2, 3], "b.py": [1, 2]}, files)
-    assert result.stats.scan_all_recent_line_limit == 1
-    assert result.stats.scan_all_recent_diff_budget == 0
+    assert result.stats["scan_all_recent_line_limit"] == 1
+    assert result.stats["scan_all_recent_diff_budget"] == 0
     assert recent_lines(result, "b.py") == {2}
+
+
+def test_every_note_in_one_run_comes_in_a_fixed_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    # commit cap, then line limit, diff budget, and bare CR last.
+    monkeypatch.setattr(history, "SCAN_LINE_LIMIT", 3)
+    monkeypatch.setattr(history, "SCAN_DIFF_BUDGET", 1)
+    contents = {
+        "a.py": (rows("a"), rows("a", "b", "c", "d")),  # over the line limit
+        "b.py": (rows("a"), b"b\rc\n"),  # costs 1, bare CR, fits the budget
+        "c.py": (rows("a"), rows("b")),  # budget spent
+        "u.py": (rows("a"), rows("b")),  # tracked below, also over budget
+    }
+    git, files = budget_git(contents)
+    git.chain = [(sha(i), when(0.5)) for i in range(1, history.COMMIT_CAP + 2)]
+    sites = {path: [1] for path in files} | {"keep.py": [1]}
+    result = compute_recent(
+        git,
+        window(),
+        {"head": {path: frozenset(lines) for path, lines in sites.items()}},
+        scan_files=[PyFile(path, data) for path, data in files.items()],
+        scan_tracked=tracked_from(git, files),
+        tips={"head": sha(1)},
+    )
+    assert result.notes[:3] == (
+        history.COMMIT_CAP_NOTE,
+        history.SCAN_LINE_LIMIT_NOTE,
+        history.SCAN_DIFF_BUDGET_NOTE,
+    )
+    assert result.notes[3:] == (history.bare_cr_note(1),)
+
+
+def test_a_bare_cr_scan_file_is_noted_untracked_or_not_and_never_crashes() -> None:
+    git = FakeGit([(TIP, when(1000))], [])
+    files = {"a.py": b"x\ry\r", "b.py": b"p\nq\n", "c.py": b"u\r\nv\r\n"}
+    result = scan(git, {"a.py": [1, 2], "b.py": [1], "c.py": [1]}, files, tracked={})
+    assert result.notes == (history.bare_cr_note(1),)  # CRLF in c.py is not a bare CR
+    assert recent_lines(result, "a.py") == {1, 2}
+
+
+def test_a_bare_cr_file_without_site_lines_is_not_counted() -> None:
+    git = FakeGit([(TIP, when(1000))], [])
+    result = scan(git, {"b.py": [1]}, {"a.py": b"x\ry\r", "b.py": b"p\n"}, tracked={})
+    assert result.notes == ()
+
+
+def test_a_bare_cr_blob_changed_in_the_working_tree_is_diffed_without_a_crash() -> None:
+    head_data, work_data = b"a\rb\n", b"a\rc\n"
+    git = FakeGit(
+        [(TIP, when(1000))],
+        [],
+        tree=[entry("a.py", head_data)],
+        blobs={blob_id(head_data): head_data},
+    )
+    result = scan(git, {"a.py": [1]}, {"a.py": work_data})
+    assert recent_lines(result, "a.py") == {1}
+    assert result.notes == (history.bare_cr_note(1),)
 
 
 # ---------------------------------------------------------------- real git
@@ -335,11 +441,19 @@ def real_scan(repo: GitRepo, sites: dict[str, Sequence[int]]) -> set[tuple[str, 
             for path in sites
             if (repo.path / path).exists()
         ]
+        tracked: dict[str, TrackedState] = {}
+        for file in files:  # what C4 computes: ls-tree id against the working-tree blob hash
+            listed = repo.git("ls-tree", "HEAD", "--", file.path).split()
+            if listed:
+                tracked[file.path] = TrackedState(
+                    listed[2], repo.git("hash-object", "--", file.path) == listed[2]
+                )
         result = compute_recent(
             reader,
             Window(end=anchor, days=90, available=True, unavailable_reason=None),
             {"head": {path: frozenset(lines) for path, lines in sites.items()}},
-            files,
+            scan_files=files,
+            scan_tracked=tracked,
         )
     finally:
         reader.close()

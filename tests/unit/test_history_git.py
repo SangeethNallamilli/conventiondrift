@@ -17,9 +17,10 @@ from tests.fixtures.gitrepo import GitRepo, recent_lines
 from conventiondrift import history
 from conventiondrift.gitread import GitReader
 from conventiondrift.history import compute_recent
-from conventiondrift.model import Window
+from conventiondrift.model import PyFile, Side, TrackedState, Window
 
 UTC = dt.UTC
+Sites = dict[Side, dict[str, frozenset[int]]]
 DAY0 = dt.datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
 
 
@@ -75,7 +76,7 @@ def recent_by_file(
         reader,
         win(repo.commit_date(tip), days),
         {"head": sites if sites is not None else every_line(repo, tip)},
-        head_sha=tip,
+        tips={"head": tip},
     )
     out: dict[str, set[int]] = {}
     for side, path, line in result.recent:
@@ -200,9 +201,8 @@ def test_the_walk_stops_after_the_pre_window_run_and_still_matches(
         reader,
         win(repo.commit_date(git_tip)),
         {"head": every_line(repo)},
-        head_sha=git_tip,
+        tips={"head": git_tip},
     )
-    assert result.stats.commits_walked == 4  # the tip and the 3 consecutive old commits
     assert {(p, n) for _, p, n in result.recent} == {("a.py", 8)}
     assert result.notes == ()
 
@@ -322,8 +322,7 @@ def test_base_and_head_are_dated_from_their_own_commits_with_one_window(
         reader,
         win(anchor),
         {"base": {"a.py": frozenset(range(1, 11))}, "head": {"a.py": frozenset(range(1, 11))}},
-        head_sha=head,
-        base_sha=fork,
+        tips={"head": head, "base": fork},
     )
     assert result.recent == {("head", "a.py", 4)}
 
@@ -336,15 +335,120 @@ def test_an_unknown_tip_is_a_history_error(repo: GitRepo, reader: GitReader) -> 
 
     repo.commit_files("a", {"a.py": numbered(3)}, date=day(0))
     with pytest.raises(ComponentError) as raised:
-        compute_recent(reader, win(day(0)), {"head": {"a.py": frozenset({1})}}, head_sha="ab" * 20)
+        compute_recent(
+            reader, win(day(0)), {"head": {"a.py": frozenset({1})}}, tips={"head": "ab" * 20}
+        )
     assert raised.value.component == "history"
     assert raised.value.message == "history could not be read"
 
 
-def test_head_none_uses_the_checked_out_commit(repo: GitRepo, reader: GitReader) -> None:
+def test_scan_mode_uses_the_checked_out_commit(repo: GitRepo, reader: GitReader) -> None:
     repo.commit_files("a", {"a.py": numbered(3)}, date=day(0))
     repo.commit_files("b", {"a.py": numbered(3).replace("l2", "B2")}, date=day(300))
+    blob = repo.git("rev-parse", "HEAD:a.py")
     result = compute_recent(
-        reader, win(repo.commit_date("HEAD")), {"head": {"a.py": frozenset({1, 2})}}
+        reader,
+        win(repo.commit_date("HEAD")),
+        {"head": {"a.py": frozenset({1, 2})}},
+        scan_files=[PyFile("a.py", repo.path.joinpath("a.py").read_bytes())],
+        scan_tracked={"a.py": TrackedState(blob, True)},
     )
     assert result.recent == {("head", "a.py", 2)}
+    assert result.available
+
+
+# ---------------------------------------------------------------- the commit cap on a real reader
+
+
+def import_chain(repo: GitRepo, count: int) -> str:
+    """``count`` first-parent commits, all dated at one instant, made with ``fast-import``."""
+    stamp = int(DAY0.timestamp())
+    parts: list[bytes] = []
+    for n in range(1, count + 1):
+        message = f"c{n}".encode()
+        parts.append(
+            b"commit refs/heads/chain\nmark :%d\ncommitter T <t@example.com> %d +0000\n"
+            b"data %d\n%s\n" % (n, stamp, len(message), message)
+        )
+        if n > 1:
+            parts.append(b"from :%d\n" % (n - 1))
+        for name, body in ([("a.py", b"a\nb\n")] if n == 1 else []) + [("f.py", b"%d\n" % n)]:
+            parts.append(b"M 100644 inline %s\ndata %d\n%s\n" % (name.encode(), len(body), body))
+    repo.git("fast-import", "--quiet", stdin_data=b"".join(parts))
+    return repo.rev_parse("chain")
+
+
+@pytest.mark.parametrize(
+    ("count", "note"),
+    [(history.COMMIT_CAP - 1, False), (history.COMMIT_CAP, False), (history.COMMIT_CAP + 1, True)],
+)
+def test_the_commit_cap_on_a_real_chain_needs_a_commit_past_the_cap(
+    repo: GitRepo, reader: GitReader, count: int, note: bool
+) -> None:
+    # I-14 ruling 6d. Line 99 never exists, so it stays undated and only the cap decides the note.
+    tip = import_chain(repo, count)
+    result = compute_recent(
+        reader, win(DAY0), {"head": {"a.py": frozenset({99})}}, tips={"head": tip}
+    )
+    assert result.notes == ((history.COMMIT_CAP_NOTE,) if note else ())
+    assert result.recent == frozenset() and result.available
+
+
+def test_the_commit_cap_leaves_a_line_in_the_oldest_commit_undated_only_past_the_cap(
+    repo: GitRepo, reader: GitReader
+) -> None:
+    tip = import_chain(repo, history.COMMIT_CAP + 1)
+    sites: Sites = {"head": {"a.py": frozenset({1, 2})}}
+    result = compute_recent(reader, win(DAY0), sites, tips={"head": tip})
+    assert result.recent == frozenset()  # the commit that wrote a.py is the 10,001st
+    assert result.notes == (history.COMMIT_CAP_NOTE,)
+    exact = compute_recent(reader, win(DAY0), sites, tips={"head": repo.rev_parse("chain~1")})
+    assert exact.recent == {("head", "a.py", 1), ("head", "a.py", 2)} and exact.notes == ()
+
+
+# ---------------------------------------------------------------- bare CR and size on a real reader
+
+
+def test_a_bare_cr_file_never_crashes_and_is_noted_once(repo: GitRepo, reader: GitReader) -> None:
+    # I-14 ruling 6c: git does not break lines at a lone CR; C8 dates by its own newlines.
+    repo.commit_files("one", {"a.py": b"a\rb\rc\n", "b.py": b"x\r\ny\n"}, date=day(0))
+    repo.commit_files("two", {"a.py": b"a\rB\rc\n", "b.py": b"x\r\nY\n"}, date=day(250))
+    tip = repo.rev_parse("HEAD")
+    sites: Sites = {"head": {"a.py": frozenset({1}), "b.py": frozenset({1, 2})}}
+    result = compute_recent(reader, win(repo.commit_date(tip)), sites, tips={"head": tip})
+    assert result.recent == {("head", "a.py", 1), ("head", "b.py", 2)}
+    assert result.notes == (history.bare_cr_note(1),)  # b.py's CRLF lines are not bare CR
+
+
+def test_a_head_blob_over_the_size_limit_is_all_recent_on_a_real_reader(
+    repo: GitRepo, reader: GitReader
+) -> None:
+    from conventiondrift.discover.safefs import FILE_MAX_BYTES
+
+    big = "#" * (FILE_MAX_BYTES + 1) + "\n"
+    repo.commit_files("big", {"a.py": big}, date=day(0))
+    repo.write("a.py", "changed\n")
+    blob = repo.git("rev-parse", "HEAD:a.py")
+    result = compute_recent(
+        reader,
+        win(repo.commit_date("HEAD")),
+        {"head": {"a.py": frozenset({1})}},
+        scan_files=[PyFile("a.py", b"changed\n")],
+        scan_tracked={"a.py": TrackedState(blob, False)},
+    )
+    assert result.recent == {("head", "a.py", 1)}
+    assert result.stats["scan_all_recent_line_limit"] == 1
+    assert result.notes == (history.SCAN_LINE_LIMIT_NOTE,)
+
+
+def test_the_reader_refuses_a_chain_limit_over_the_cap_so_c8_probes_instead(
+    repo: GitRepo, reader: GitReader
+) -> None:
+    # C8 cannot ask for ``limit + 1`` (I-14 ruling 6d): gitread allows at most COMMIT_CAP.
+    from conventiondrift.errors import ComponentError
+
+    repo.commit_files("a", {"a.py": numbered(1)}, date=day(0))
+    tip = repo.rev_parse("HEAD")
+    assert len(reader.first_parent_chain(tip, history.COMMIT_CAP)) == 1
+    with pytest.raises(ComponentError):
+        reader.first_parent_chain(tip, history.COMMIT_CAP + 1)

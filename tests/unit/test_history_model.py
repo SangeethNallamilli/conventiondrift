@@ -129,5 +129,5 @@ def test_backward_mapping_equals_forward_replay(seed: random.Random, commits: in
         if start <= dates[line] <= end
     }
     git = FakeGit(chain, patches)
-    result = compute_recent(git, window(90), {"head": {path: sites}}, head_sha=chain[0][0])
+    result = compute_recent(git, window(90), {"head": {path: sites}}, tips={"head": chain[0][0]})
     assert result.recent == expected

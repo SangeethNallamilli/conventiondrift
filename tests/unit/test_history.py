@@ -19,13 +19,17 @@ from conventiondrift.history import (
     PATCH_MAX_BYTES,
     PRE_WINDOW_RUN,
     GitHistory,
-    HistoryResult,
-    HistoryStats,
+    bare_cr_note,
     compute_recent,
 )
-from conventiondrift.model import Window
+from conventiondrift.model import HistoryResult, PyFile, TrackedState, Window
 
 HEAD = sha(1)
+NO_STATS = {
+    "scan_all_recent_line_limit": 0,
+    "scan_all_recent_diff_budget": 0,
+    "scan_diff_work": 0,
+}
 Sites = dict[Side, dict[str, frozenset[int]]]
 
 
@@ -41,7 +45,7 @@ def recent_of(
     days: int = 90,
 ) -> frozenset[tuple[str, str, int]]:
     git = FakeGit(chain, patches)
-    return compute_recent(git, window(days), sites, head_sha=HEAD).recent
+    return compute_recent(git, window(days), sites, tips={"head": HEAD}).recent
 
 
 def one_commit(
@@ -64,9 +68,38 @@ def test_caps_match_the_design_and_the_reader() -> None:
     assert history.SCAN_DIFF_BUDGET == 200_000_000
 
 
+def test_the_notes_use_the_pm_approved_wording() -> None:
+    # D-PM-45: the numbers come from the cap constants.
+    assert history.COMMIT_CAP_NOTE == (
+        "History was limited to the newest 10,000 commits, so recent adherence may be incomplete."
+    )
+    assert history.PATCH_CAP_NOTE == (
+        "History reading stopped at 256 MiB of patch text, so recent adherence may be incomplete."
+    )
+    assert history.SCAN_LINE_LIMIT_NOTE == (
+        "Changed files over 5,000 lines were treated as entirely recent without a line diff, "
+        "so recent adherence may be approximate."
+    )
+    assert history.SCAN_DIFF_BUDGET_NOTE == (
+        "The line-diff budget ran out, so the remaining changed files were treated as entirely "
+        "recent and recent adherence may be approximate."
+    )
+
+
+def test_the_bare_cr_note_gives_the_count() -> None:
+    assert bare_cr_note(1) == (
+        "1 file has bare carriage-return line endings, which git does not count as line breaks, "
+        "so recent adherence may be approximate for them."
+    )
+    assert bare_cr_note(3).startswith("3 files have bare carriage-return line endings")
+
+
 def test_git_history_satisfies_the_history_protocol() -> None:
     component: History = GitHistory()
-    assert component.recent(None, window(), {"head": {"a.py": lines(1)}}) == frozenset()
+    got = component.recent(
+        None, window(), {"head": {"a.py": lines(1)}}, scan_files=[PyFile("a.py", b"")]
+    )
+    assert got.recent == frozenset() and not got.available
 
 
 def test_the_real_reader_type_is_accepted() -> None:
@@ -87,37 +120,110 @@ def test_the_real_reader_type_is_accepted() -> None:
 )
 def test_an_unavailable_window_is_empty_and_never_touches_git(bad: Window) -> None:
     git = FakeGit([(HEAD, END)], [marker(HEAD)])
-    result = compute_recent(git, bad, {"head": {"a.py": lines(1)}}, head_sha=HEAD)
-    assert result == HistoryResult()
+    result = compute_recent(git, bad, {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
+    assert result == HistoryResult(frozenset(), False, (), NO_STATS)
     assert git.chain_calls == [] and git.patch_calls == []
 
 
-def test_no_reader_means_no_recent_lines() -> None:
-    # A-3: with no HEAD commit, recent is unavailable (the caller's window says so).
-    assert compute_recent(None, window(), {"head": {"a.py": lines(1)}}).recent == frozenset()
+def test_no_reader_means_recent_is_unavailable() -> None:
+    # I-14 ruling 5: with no HEAD commit, available is False and the set is empty.
+    result = compute_recent(None, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
+    assert result == HistoryResult(frozenset(), False, (), NO_STATS)
+
+
+def test_an_available_result_says_so_and_carries_every_counter() -> None:
+    chain, patches = one_commit(1, file_diff(b"a.py", hunk(1, 0, 1, 1)))
+    result = compute_recent(
+        FakeGit(chain, patches), window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD}
+    )
+    assert result.available and result.notes == () and dict(result.stats) == NO_STATS
 
 
 def test_no_site_lines_means_no_git_calls() -> None:
     git = FakeGit([(HEAD, END)], [marker(HEAD)])
     sites: Sites = {"head": {}, "base": {"a.py": frozenset()}}
-    assert compute_recent(git, window(), sites, head_sha=HEAD).recent == frozenset()
+    assert compute_recent(git, window(), sites, tips={"head": HEAD}).recent == frozenset()
     assert git.chain_calls == []
 
 
-def test_base_sites_without_a_base_commit_are_an_internal_error() -> None:
+@pytest.mark.parametrize(
+    ("sites", "tips"),
+    [
+        ({"base": {"a.py": lines(1)}}, {"head": HEAD}),  # base sites, no base tip
+        ({"head": {"a.py": lines(1)}}, {"base": HEAD}),  # head sites, no head tip
+        ({"head": {"a.py": lines(1)}}, {}),  # no tips and no scan files: not scan mode
+        ({"base": {"a.py": lines(1)}, "head": {"b.py": lines(1)}}, {"head": HEAD}),
+    ],
+)
+def test_a_side_with_site_lines_and_no_tip_is_a_value_error(
+    sites: Sites, tips: dict[Side, str]
+) -> None:
+    # I-14 ruling 1: a caller bug, raised before anything is read.
     git = FakeGit([(HEAD, END)], [marker(HEAD)])
-    with pytest.raises(ComponentError) as raised:
-        compute_recent(git, window(), {"base": {"a.py": lines(1)}}, head_sha=HEAD)
-    assert raised.value.component == "history"
+    with pytest.raises(ValueError, match="no tip commit"):
+        compute_recent(git, window(), sites, tips=tips)
+    assert git.chain_calls == []
 
 
-def test_head_none_resolves_head_through_the_reader() -> None:
-    # Scan mode (S3): the reader's HEAD is the tip.
+def test_a_missing_tip_is_a_value_error_even_when_recent_is_unavailable() -> None:
+    bad = Window(end=None, days=90, available=False, unavailable_reason="no history")
+    with pytest.raises(ValueError, match="no tip commit"):
+        compute_recent(FakeGit(), bad, {"head": {"a.py": lines(1)}})
+
+
+def test_a_side_with_no_site_lines_needs_no_tip() -> None:
+    git = FakeGit([(HEAD, END)], [marker(HEAD)])
+    sites: Sites = {"base": {"a.py": frozenset()}, "head": {}}
+    assert compute_recent(git, window(), sites).available
+
+
+def test_scan_mode_resolves_head_through_the_reader() -> None:
+    # Scan mode (S3, I-14): no tips, scan files, and the reader's HEAD is the tip.
     git = FakeGit(
         [(sha(7), END)], [marker(sha(7)) + file_diff(b"a.py", hunk(1, 0, 1, 1))], head=sha(7)
     )
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}})
+    tracked = {"a.py": TrackedState("c" * 40, True)}
+    result = compute_recent(
+        git,
+        window(),
+        {"head": {"a.py": lines(1)}},
+        scan_files=[PyFile("a.py", b"x\n")],
+        scan_tracked=tracked,
+    )
     assert result.recent == {("head", "a.py", 1)}
+    assert git.chain_calls == [(sha(7), COMMIT_CAP)]
+
+
+@pytest.mark.parametrize(
+    ("sites", "tips"),
+    [
+        ({"base": {"a.py": lines(1)}}, {}),  # scan mode has no base side
+        ({"head": {"a.py": lines(1)}}, {"base": HEAD}),  # tips given: PR mode, so head needs one
+    ],
+)
+def test_scan_files_do_not_stand_in_for_a_missing_tip(sites: Sites, tips: dict[Side, str]) -> None:
+    with pytest.raises(ValueError, match="no tip commit"):
+        compute_recent(
+            FakeGit([(HEAD, END)], [marker(HEAD)]),
+            window(),
+            sites,
+            tips=tips,
+            scan_files=[PyFile("a.py", b"x\n")],
+        )
+
+
+def test_a_given_head_tip_is_used_even_with_scan_files() -> None:
+    git = FakeGit(
+        [(sha(7), END)], [marker(sha(7)) + file_diff(b"a.py", hunk(1, 0, 1, 1))], head=sha(9)
+    )
+    compute_recent(
+        git,
+        window(),
+        {"head": {"a.py": lines(1)}},
+        tips={"head": sha(7)},
+        scan_files=[PyFile("a.py", b"x\n")],
+        scan_tracked={"a.py": TrackedState("c" * 40, True)},
+    )
     assert git.chain_calls == [(sha(7), COMMIT_CAP)]
 
 
@@ -154,7 +260,9 @@ def test_a_window_end_before_the_year_one_does_not_overflow() -> None:
     early = datetime(1, 1, 2, tzinfo=UTC)
     chain = [(HEAD, early)]
     git = FakeGit(chain, [marker(HEAD) + file_diff(b"a.py", hunk(1, 0, 1, 1))])
-    result = compute_recent(git, window(3650, early), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    result = compute_recent(
+        git, window(3650, early), {"head": {"a.py": lines(1)}}, tips={"head": HEAD}
+    )
     assert result.recent == {("head", "a.py", 1)}
 
 
@@ -167,7 +275,7 @@ def test_a_forged_1971_anchor_completes() -> None:
 
 
 def compute_recent_with(git: FakeGit, win: Window, sites: Sites) -> frozenset[tuple[str, str, int]]:
-    return compute_recent(git, win, sites, head_sha=HEAD).recent
+    return compute_recent(git, win, sites, tips={"head": HEAD}).recent
 
 
 def test_only_lines_inside_the_plus_side_are_dated_by_a_commit() -> None:
@@ -221,12 +329,10 @@ def test_each_side_is_dated_from_its_own_tip_with_one_window() -> None:
         git,
         window(),
         {"head": {"a.py": lines(1)}, "base": {"a.py": lines(1)}},
-        head_sha=head_sha,
-        base_sha=base_sha,
+        tips={"head": head_sha, "base": base_sha},
     )
     assert result.recent == {("head", "a.py", 1)}
     assert [call[0] for call in git.chain_calls] == [base_sha, head_sha]
-    assert result.stats.commits_walked == 2
 
 
 # ---------------------------------------------------------------- hunk arithmetic
@@ -322,7 +428,7 @@ def test_a_file_created_in_a_commit_dates_all_its_lines_and_stops() -> None:
         b"a.py", hunk(0, 0, 1, 3), old=b"/dev/null", header=b"new file mode 100644\n"
     )
     git = FakeGit(chain, [marker(sha(1)) + created + marker(sha(2)), b"never read"])
-    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 2, 3, 4)}}, head_sha=HEAD)
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 2, 3, 4)}}, tips={"head": HEAD})
     # Line 4 does not exist in the created file: it cannot be traced further, so the walk is over.
     assert got.recent == {("head", "a.py", n) for n in (1, 2, 3)}
     assert git.consumed == 1 and git.closed == 1
@@ -382,7 +488,7 @@ def test_a_rename_onto_a_tracked_path_is_an_internal_error() -> None:
             FakeGit(chain, patches),
             window(),
             {"head": {"a.py": lines(2), "b.py": lines(1)}},
-            head_sha=HEAD,
+            tips={"head": HEAD},
         )
     assert raised.value.component == "history"
 
@@ -462,7 +568,7 @@ def test_markers_and_headers_split_across_chunks_parse_the_same(size: int) -> No
         + file_diff(b"a.py", hunk(1, 0, 1, 9))
     )
     git = FakeGit(chain, split_every(text, size))
-    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 2, 3, 4)}}, head_sha=HEAD)
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 2, 3, 4)}}, tips={"head": HEAD})
     assert got.recent == {("head", "a.py", 2), ("head", "a.py", 3)}
 
 
@@ -470,7 +576,7 @@ def test_a_final_line_without_a_newline_is_read() -> None:
     chain = [(sha(1), when(1))]
     text = marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 1)).rstrip(b"\n")
     got = compute_recent(
-        FakeGit(chain, [text]), window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD
+        FakeGit(chain, [text]), window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD}
     )
     assert got.recent == {("head", "a.py", 1)}
 
@@ -480,7 +586,7 @@ def test_the_commit_marker_may_be_a_sha256_object_name() -> None:
     chain = [(big, when(1))]
     text = b"\x00" + big.encode() + b"\n" + file_diff(b"a.py", hunk(1, 0, 1, 1))
     got = compute_recent(
-        FakeGit(chain, [text]), window(), {"head": {"a.py": lines(1)}}, head_sha=big
+        FakeGit(chain, [text]), window(), {"head": {"a.py": lines(1)}}, tips={"head": big}
     )
     assert got.recent == {("head", "a.py", 1)}
 
@@ -517,7 +623,7 @@ def test_quoted_and_spaced_paths_are_read_back_exactly(token: bytes, path: str) 
         FakeGit(chain, [marker(sha(1)) + section]),
         window(),
         {"head": {path: lines(1)}},
-        head_sha=HEAD,
+        tips={"head": HEAD},
     )
     assert got.recent == {("head", path, 1)}
 
@@ -551,7 +657,7 @@ def test_quoted_rename_lines_are_unquoted() -> None:
 def test_unreadable_patch_text_is_an_internal_error(broken: bytes) -> None:
     git = FakeGit([(sha(1), when(1))], [marker(sha(1)) + broken])
     with pytest.raises(ComponentError) as raised:
-        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert raised.value.component == "history"
     assert git.closed == 1
 
@@ -568,7 +674,7 @@ def test_unreadable_patch_text_is_an_internal_error(broken: bytes) -> None:
 def test_commit_markers_must_follow_the_chain(stream: list[bytes]) -> None:
     git = FakeGit([(sha(1), when(1)), (sha(2), when(2))], stream)
     with pytest.raises(ComponentError):
-        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
 
 
 def test_a_stream_that_ends_inside_a_hunk_is_an_internal_error() -> None:
@@ -577,7 +683,7 @@ def test_a_stream_that_ends_inside_a_hunk_is_an_internal_error() -> None:
         [marker(sha(1)) + b"diff --git x y\n--- a/a.py\n+++ b/a.py\n@@ -1,0 +1,3 @@\n+one\n"],
     )
     with pytest.raises(ComponentError):
-        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
 
 
 def test_text_outside_any_section_is_ignored() -> None:
@@ -589,7 +695,7 @@ def test_text_outside_any_section_is_ignored() -> None:
 def test_an_empty_chain_has_no_recent_lines() -> None:
     git = FakeGit([], [])
     assert (
-        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD).recent
+        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD}).recent
         == frozenset()
     )
     assert git.patch_calls == []
@@ -605,9 +711,8 @@ def long_chain(count: int, date_for: Callable[[int], datetime]) -> list[tuple[st
 def test_the_walk_stops_after_200_consecutive_pre_window_commits() -> None:
     chain = long_chain(300, lambda i: when(0 if i == 0 else 100 + i))
     git = FakeGit(chain, [marker(HEAD)])
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     # Commit 0 is in the window; commits 1..200 are the 200 consecutive old ones.
-    assert result.stats.commits_walked == 201
     assert git.patch_calls == [(chain[201][0], HEAD)]
     assert result.notes == ()
 
@@ -622,9 +727,9 @@ def test_an_in_window_or_future_commit_resets_the_run() -> None:
 
     chain = long_chain(600, date)
     git = FakeGit(chain, [])
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     # Runs: 0..149 (150), then 151..339 (189), then 341.. -> the 200th is index 540.
-    assert result.stats.commits_walked == 541
+    assert git.patch_calls == [(chain[541][0], HEAD)]
 
 
 def test_a_commit_dated_exactly_at_the_window_start_is_not_pre_window(
@@ -634,33 +739,78 @@ def test_a_commit_dated_exactly_at_the_window_start_is_not_pre_window(
     dates = [when(0), when(100), when(90), when(100), when(100), when(100)]
     chain = [(sha(i + 1), date) for i, date in enumerate(dates)]
     git = FakeGit(chain, [])
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     # "Before the window start" is strict: the commit at day 90 resets the run.
-    assert result.stats.commits_walked == 5
+    assert git.patch_calls == [(chain[5][0], HEAD)]
 
 
 def test_199_old_commits_do_not_stop_the_walk() -> None:
     chain = long_chain(199, lambda i: when(100 + i))
     git = FakeGit(chain, [])
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
-    assert result.stats.commits_walked == 199
+    compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert git.patch_calls == [(None, HEAD)]  # the segment reaches the root
 
 
-def test_reaching_the_commit_cap_adds_a_note_when_lines_are_undated() -> None:
+def sites_a() -> Sites:
+    return {"head": {"a.py": lines(1)}}
+
+
+@pytest.mark.parametrize(
+    ("count", "note"),
+    [(COMMIT_CAP - 1, False), (COMMIT_CAP, False), (COMMIT_CAP + 1, True), (COMMIT_CAP + 5, True)],
+)
+def test_the_commit_cap_note_needs_a_commit_past_the_cap(count: int, note: bool) -> None:
+    # I-14 ruling 6d: a chain of exactly 10,000 is not a cap hit; one more commit is.
+    chain = long_chain(count, lambda i: when(i / 1000))
+    git = FakeGit(chain, [])
+    result = compute_recent(git, window(), sites_a(), tips={"head": HEAD})
+    assert result.notes == ((history.COMMIT_CAP_NOTE,) if note else ())
+    assert git.chain_calls[0] == (HEAD, COMMIT_CAP)  # never asks the reader for more than its cap
+    assert max(limit for _, limit in git.chain_calls) <= COMMIT_CAP
+
+
+def test_a_chain_of_exactly_the_cap_asks_for_the_commit_after_the_oldest() -> None:
     chain = long_chain(COMMIT_CAP, lambda i: when(i / 1000))
     git = FakeGit(chain, [])
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
-    assert result.notes == (history.COMMIT_CAP_NOTE,)
-    assert result.stats.commits_walked == COMMIT_CAP
+    compute_recent(git, window(), sites_a(), tips={"head": HEAD})
+    assert git.chain_calls == [(HEAD, COMMIT_CAP), (chain[-1][0], 2)]
+    assert git.patch_calls == [(None, HEAD)]
+
+
+def test_the_commit_cap_probe_is_not_made_when_every_line_was_dated() -> None:
+    chain = long_chain(COMMIT_CAP + 1, lambda i: when(i / 1000))
+    patches = [marker(HEAD) + file_diff(b"a.py", hunk(1, 0, 1, 1))]
+    git = FakeGit(chain, patches)
+    result = compute_recent(git, window(), sites_a(), tips={"head": HEAD})
+    assert result.notes == () and result.recent == {("head", "a.py", 1)}
     assert git.chain_calls == [(HEAD, COMMIT_CAP)]
 
 
+def test_a_chain_cut_at_the_cap_reads_the_first_10000_commits_only() -> None:
+    chain = long_chain(COMMIT_CAP + 1, lambda i: when(i / 1000))
+    git = FakeGit(chain, [])
+    compute_recent(git, window(), sites_a(), tips={"head": HEAD})
+    assert git.patch_calls == [(None, HEAD)]  # the reader's own --max-count bounds the stream
+
+
+def test_a_failing_cap_probe_is_an_internal_error() -> None:
+    class NoProbe(FakeGit):
+        def first_parent_chain(self, sha: str, limit: int) -> Sequence[tuple[str, datetime]]:
+            if limit == 2:
+                raise GitUnavailable()
+            return super().first_parent_chain(sha, limit)
+
+    git = NoProbe(long_chain(COMMIT_CAP, lambda i: when(i / 1000)), [])
+    with pytest.raises(ComponentError) as raised:
+        compute_recent(git, window(), sites_a(), tips={"head": HEAD})
+    assert raised.value.component == "history"
+
+
 def test_no_commit_cap_note_when_every_line_was_dated() -> None:
-    chain = long_chain(COMMIT_CAP, lambda i: when(i / 1000))
+    chain = long_chain(COMMIT_CAP + 1, lambda i: when(i / 1000))
     patches = [marker(HEAD) + file_diff(b"a.py", hunk(1, 0, 1, 1))]
     git = FakeGit(chain, patches)
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert result.notes == ()
     assert result.recent == {("head", "a.py", 1)}
 
@@ -668,7 +818,7 @@ def test_no_commit_cap_note_when_every_line_was_dated() -> None:
 def test_the_200_run_ending_exactly_at_the_cap_is_not_a_cap_hit() -> None:
     chain = long_chain(COMMIT_CAP, lambda i: when(100 + i) if i >= COMMIT_CAP - 200 else when(1))
     git = FakeGit(chain, [])
-    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    result = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert result.notes == ()
 
 
@@ -691,12 +841,11 @@ def test_the_patch_cap_stops_reading_closes_the_stream_and_notes_it(
         git,
         window(),
         {"head": {"a.py": lines(1, 2), "b.py": lines(1)}},
-        head_sha=HEAD,
+        tips={"head": HEAD},
     )
     assert got.recent == {("head", "a.py", 1)}
     assert got.notes == (history.PATCH_CAP_NOTE,)
     assert git.consumed == 2 and git.closed == 1
-    assert got.stats.patch_bytes == len(first) + len(marker(oldest)) + 400
 
 
 def test_hunks_read_before_the_patch_cap_still_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -705,7 +854,7 @@ def test_hunks_read_before_the_patch_cap_still_count(monkeypatch: pytest.MonkeyP
     cut_at = text.index(b"@@ -5")
     monkeypatch.setattr(history, "PATCH_MAX_BYTES", cut_at)
     git = FakeGit([(sha(1), when(1))], [text[:cut_at], text[cut_at:]])
-    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 6)}}, head_sha=HEAD)
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 6)}}, tips={"head": HEAD})
     assert got.recent == {("head", "a.py", 1)}
     assert got.notes == (history.PATCH_CAP_NOTE,)
     assert git.consumed == 1 and git.closed == 1
@@ -718,7 +867,7 @@ def test_a_hunk_header_cut_in_half_by_the_patch_cap_is_not_read(
     cut_at = text.index(b"@@ -1") + 5
     monkeypatch.setattr(history, "PATCH_MAX_BYTES", cut_at)
     git = FakeGit([(sha(1), when(1))], [text[:cut_at], text[cut_at:]])
-    got = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert got.recent == frozenset()
     assert got.notes == (history.PATCH_CAP_NOTE,)
 
@@ -729,7 +878,7 @@ def test_hunks_that_overlap_are_an_internal_error() -> None:
         [marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 5), hunk(1, 1, 4, 1))],
     )
     with pytest.raises(ComponentError):
-        compute_recent(git, window(), {"head": {"a.py": lines(1, 4)}}, head_sha=HEAD)
+        compute_recent(git, window(), {"head": {"a.py": lines(1, 4)}}, tips={"head": HEAD})
 
 
 def test_hunks_that_go_backwards_are_an_internal_error() -> None:
@@ -738,7 +887,7 @@ def test_hunks_that_go_backwards_are_an_internal_error() -> None:
         [marker(sha(1)) + file_diff(b"a.py", hunk(9, 0, 10, 1), hunk(1, 0, 1, 1))],
     )
     with pytest.raises(ComponentError):
-        compute_recent(git, window(), {"head": {"a.py": lines(1, 10)}}, head_sha=HEAD)
+        compute_recent(git, window(), {"head": {"a.py": lines(1, 10)}}, tips={"head": HEAD})
 
 
 def test_hitting_the_cap_with_nothing_left_to_date_has_no_note(
@@ -748,7 +897,7 @@ def test_hitting_the_cap_with_nothing_left_to_date_has_no_note(
     chain = [(sha(1), when(1)), (sha(2), when(2))]
     first = marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 1))
     git = FakeGit(chain, [first + marker(sha(2)), b"never read"])
-    got = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert got.notes == ()
     assert git.closed == 1
 
@@ -757,7 +906,7 @@ def test_reading_stops_as_soon_as_every_line_is_dated() -> None:
     chain = [(sha(1), when(1)), (sha(2), when(2))]
     chunks = [marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 1)) + marker(sha(2)), b"more"]
     git = FakeGit(chain, chunks)
-    got = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert got.recent == {("head", "a.py", 1)}
     assert git.consumed == 1 and git.closed == 1
 
@@ -788,7 +937,7 @@ class _Raises(FakeGit):
 def test_reader_failures_become_a_history_component_error(error: BaseException) -> None:
     # I-11 C8 / DESIGN §4: a history failure shows recent as unavailable.
     with pytest.raises(ComponentError) as raised:
-        compute_recent(_Raises(error), window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+        compute_recent(_Raises(error), window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert raised.value.component == "history"
     assert raised.value.__cause__ is error
     assert "gitread" not in raised.value.message
@@ -797,14 +946,17 @@ def test_reader_failures_become_a_history_component_error(error: BaseException) 
 def test_a_history_error_passes_through_unchanged() -> None:
     error = ComponentError("history", "x")
     with pytest.raises(ComponentError) as raised:
-        compute_recent(_Raises(error), window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+        compute_recent(_Raises(error), window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert raised.value is error
 
 
 def test_other_errors_are_not_swallowed() -> None:
     with pytest.raises(KeyboardInterrupt):
         compute_recent(
-            _Raises(KeyboardInterrupt()), window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD
+            _Raises(KeyboardInterrupt()),
+            window(),
+            {"head": {"a.py": lines(1)}},
+            tips={"head": HEAD},
         )
 
 
@@ -819,7 +971,7 @@ def test_the_patch_stream_is_closed_when_reading_fails_midway() -> None:
 
     git = Failing([(sha(1), when(1))], [])
     with pytest.raises(ComponentError) as raised:
-        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, head_sha=HEAD)
+        compute_recent(git, window(), {"head": {"a.py": lines(1)}}, tips={"head": HEAD})
     assert raised.value.component == "history"
     assert git.closed == 1
 
@@ -827,38 +979,82 @@ def test_the_patch_stream_is_closed_when_reading_fails_midway() -> None:
 # ---------------------------------------------------------------- GitHistory
 
 
-def test_git_history_binds_the_tips_and_reports_notes_and_stats() -> None:
-    chain = long_chain(COMMIT_CAP, lambda i: when(i / 1000))
-    git = FakeGit(chain, [])
-    component = GitHistory(head_sha=HEAD)
-    assert (component.notes, component.stats) == ((), HistoryStats())
-    assert component.recent(git, window(), {"head": {"a.py": lines(1)}}) == frozenset()
-    assert component.notes == (history.COMMIT_CAP_NOTE,)
-    assert component.stats.commits_walked == COMMIT_CAP
+def test_git_history_keeps_no_state_between_calls() -> None:
+    component = GitHistory()
+    chain = long_chain(COMMIT_CAP + 1, lambda i: when(i / 1000))
+    first = component.recent(FakeGit(chain, []), window(), sites_a(), tips={"head": HEAD})
+    second = component.recent(FakeGit(chain[:3], []), window(), sites_a(), tips={"head": HEAD})
+    assert first.notes == (history.COMMIT_CAP_NOTE,) and second.notes == ()
+    assert not hasattr(component, "notes") and not hasattr(component, "stats")
+    assert vars(component) == {}
 
 
-def test_git_history_resets_its_report_on_every_call() -> None:
-    chain = long_chain(COMMIT_CAP, lambda i: when(i / 1000))
-    git = FakeGit(chain, [])
-    component = GitHistory(head_sha=HEAD)
-    component.recent(git, window(), {"head": {"a.py": lines(1)}})
-    component.recent(
-        git, Window(end=None, days=90, available=False, unavailable_reason="no history"), {}
-    )
-    assert (component.notes, component.stats) == ((), HistoryStats())
-
-
-def test_git_history_passes_the_base_commit() -> None:
+def test_git_history_takes_the_tips_in_the_call() -> None:
     head_sha, base_sha = sha(1), sha(2)
     git = FakeGit(
         patches_for={base_sha: [marker(base_sha) + file_diff(b"a.py", hunk(1, 0, 1, 1))]},
         chains={base_sha: [(base_sha, when(1))]},
     )
-    component = GitHistory(head_sha=head_sha, base_sha=base_sha)
-    assert component.recent(git, window(), {"base": {"a.py": lines(1)}}) == {("base", "a.py", 1)}
+    got = GitHistory().recent(
+        git, window(), {"base": {"a.py": lines(1)}}, tips={"head": head_sha, "base": base_sha}
+    )
+    assert got.recent == {("base", "a.py", 1)}
 
 
 def test_results_are_immutable() -> None:
-    result = HistoryResult()
+    result = HistoryResult(frozenset(), True, (), NO_STATS)
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.notes = ("x",)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        result.stats["scan_diff_work"] = 1  # type: ignore[index]
+
+
+# ---------------------------------------------------------------- bare CR (I-14 ruling 6c)
+
+
+def cr_hunk(
+    old_start: int, old_count: int, new_start: int, new_count: int, content: bytes
+) -> bytes:
+    """A hunk whose ``+`` lines are ``content`` (each line without its newline)."""
+    head = hunk(old_start, old_count, new_start, new_count).split(b"\n", 1)[0]
+    return (
+        head
+        + b"\n"
+        + b"".join(b"-old line\n" for _ in range(old_count))
+        + (b"".join(b"+" + row + b"\n" for row in content.split(b"\n")[:new_count]))
+    )
+
+
+def test_a_bare_cr_in_a_tracked_files_hunks_is_noted_once_with_the_count() -> None:
+    sections = (
+        file_diff(b"a.py", cr_hunk(1, 0, 1, 2, b"x\ry\nz")),  # bare CR inside a line
+        file_diff(b"b.py", cr_hunk(1, 0, 1, 2, b"x\r\nz\r\r\nq")),  # CRLF endings and a CR CR LF
+        file_diff(b"c.py", cr_hunk(1, 0, 1, 1, b"plain")),
+        file_diff(b"untracked.py", cr_hunk(1, 0, 1, 1, b"u\rv")),  # nothing tracked: not read
+    )
+    git = FakeGit([(HEAD, when(1))], [marker(HEAD) + b"".join(sections)])
+    sites: Sites = {"head": {"a.py": lines(1, 2), "b.py": lines(1, 2), "c.py": lines(1)}}
+    result = compute_recent(git, window(), sites, tips={"head": HEAD})
+    assert result.notes == (bare_cr_note(2),)  # a.py and b.py ("z\r\r" has a bare CR)
+    assert ("head", "a.py", 1) in result.recent  # dated by its newlines, no crash
+
+
+def test_a_file_with_only_crlf_endings_is_not_noted() -> None:
+    chain, patches = one_commit(1, file_diff(b"a.py", cr_hunk(1, 0, 1, 2, b"x\r\ny\r")))
+    result = compute_recent(FakeGit(chain, patches), window(), sites_a(), tips={"head": HEAD})
+    assert result.notes == ()
+
+
+def test_one_bare_cr_file_read_on_both_sides_counts_once() -> None:
+    both = marker(sha(1)) + file_diff(b"a.py", cr_hunk(1, 0, 1, 1, b"x\ry"))
+    git = FakeGit(
+        patches_for={sha(1): [both], sha(2): [both.replace(sha(1).encode(), sha(2).encode())]},
+        chains={sha(1): [(sha(1), when(1))], sha(2): [(sha(2), when(1))]},
+    )
+    result = compute_recent(
+        git,
+        window(),
+        {"head": {"a.py": lines(1)}, "base": {"a.py": lines(1)}},
+        tips={"head": sha(1), "base": sha(2)},
+    )
+    assert result.notes == (bare_cr_note(1),)
