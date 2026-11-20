@@ -142,20 +142,54 @@ def test_time_spent_by_the_consumer_counts(repo: Path, monkeypatch: pytest.Monke
 # --- the same rule against real processes (short real sleeps only) -------------
 
 
-def _slow_git(chunks: int, gap: float) -> str:
+def _slow_git(chunks: int, gap: float, ready: Path | None = None) -> str:
+    # Optional ready file: the child creates it as soon as the interpreter is
+    # up, before the first sleep, so the test can arm the short deadline only
+    # after start-up (CON-14: a cold macOS python can eat a 0.7 s budget).
+    notice = f"open({str(ready)!r}, 'w').write('1')\n" if ready is not None else ""
     return (
-        "import sys, time\n"
-        f"for i in range({chunks}):\n"
+        "import sys, time\n" + notice + f"for i in range({chunks}):\n"
         f"    time.sleep({gap}); sys.stdout.write('c%d;' % i); sys.stdout.flush()\n"
     )
 
 
-def _real_start(monkeypatch: pytest.MonkeyPatch, script: str) -> list[Any]:
+def _short_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Apply the 0.7 s overall deadline only after the child is already running.
+
+    ``_stream_patches`` snapshots ``GIT_TIMEOUT_SECONDS`` after ``_start_batch``
+    returns. A child's interpreter start-up on a slow runner (CON-14: macOS
+    nightly 44706120232, test-macos 3.13) must not count against that budget:
+    the product default (60 s) applies during start-up.
+    """
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.7)
+
+
+def _wait_ready(path: Path, timeout: float = 30.0) -> None:
+    for _ in _polls(timeout):
+        if path.exists():
+            return
+    raise AssertionError(f"child python was not ready within {timeout}s")
+
+
+def _real_start(
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    ready: Path | None = None,
+    armed: list[float] | None = None,
+) -> list[Any]:
     real = gitread._start_batch
     started: list[Any] = []
 
     def start(argv: list[str], **kwargs: Any) -> Any:
         started.append(real([sys.executable, "-c", script], **kwargs))
+        if ready is not None:
+            # Product default still applies during start-up. Arm 0.7 s only
+            # once the child is running, and before this returns, so
+            # _stream_patches snapshots the short deadline after ready.
+            _wait_ready(ready)
+            _short_timeout(monkeypatch)
+            if armed is not None:
+                armed.append(time.monotonic())
         return started[-1]
 
     monkeypatch.setattr(gitread, "_start_batch", start)
@@ -163,17 +197,19 @@ def _real_start(monkeypatch: pytest.MonkeyPatch, script: str) -> list[Any]:
 
 
 def test_real_slow_chunks_time_out_on_the_overall_deadline(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # 10 chunks 0.2 s apart (each well under the 0.7 s timeout; 2 s in all).
-    started = _real_start(monkeypatch, _slow_git(10, 0.2))
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.7)
+    # Arm 0.7 s only after the child is running so interpreter start-up does
+    # not eat the budget (CON-14: nightly 44706120232, test-macos 3.13, 0 chunks).
+    ready = tmp_path / "ready"
+    armed: list[float] = []
+    started = _real_start(monkeypatch, _slow_git(10, 0.2, ready), ready, armed)
     got = b""
-    begin = time.monotonic()
     with pytest.raises(ComponentError, match=r"git log timed out"):
         for chunk in GitReader(repo).patches(SHA, SHA2):
             got += chunk
-    assert time.monotonic() - begin < 1.7
+    assert armed and time.monotonic() - armed[0] < 1.7
     assert 0 < got.count(b";") < 10
     assert started[0]._proc.returncode is not None  # killed and reaped
 
