@@ -218,6 +218,31 @@ def test_md_exact(text: str, expected: str) -> None:
     assert md(text) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Interior "a" / "X" / NBSP are just unmapped content, not a special alphabet.
+        (" a ", "`  a  `"),
+        (" X ", "`  X  `"),
+        (" \u00a0 ", "`  \u00a0  `"),
+    ],
+    ids=["letter", "x", "nbsp"],
+)
+def test_md_pads_a_body_that_starts_and_ends_with_a_space(text: str, expected: str) -> None:
+    """Pin CommonMark padding for a verbatim inline code span.
+
+    INTERFACES.md names ``md`` a "Markdown inline code span". AC-N3.10 requires
+    the visible rendered text to be the original (unmapped) string verbatim;
+    I-14 / SC-2.51 keep every character that is not in the mapped categories
+    unchanged, including U+00A0 (NBSP). CommonMark strips exactly one U+0020
+    from each end of a span that starts and ends with a space and is not all
+    spaces, so the emitter must pad exactly one U+0020 on each side. NBSP is
+    not a CommonMark space, so a U+0020-NBSP-U+0020 body is not all spaces.
+    """
+    assert md(text) == expected
+    assert unspan(md(text)) == visible(text)
+
+
 def test_md_blank_line_cannot_break_out() -> None:
     out = md("ok\n\n# heading\n\n<script>x</script>")
     assert "\n" not in out
