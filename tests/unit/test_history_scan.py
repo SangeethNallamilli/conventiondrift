@@ -370,22 +370,24 @@ def test_the_diff_budget_is_spent_in_path_order_and_stays_spent(
     monkeypatch.setattr(history, "SCAN_DIFF_BUDGET", 10)
     git, files = budget_git(
         {
-            "z.py": (rows("1"), rows("2")),  # cost 1, but sorts last
+            "z.py": (rows("1"), rows("2")),  # cost 1, but sorts after m.py
+            "zz.py": (rows("1"), rows("3")),  # and one more after it
             "m.py": (rows("a", "b", "c"), rows("a", "b", "x")),  # cost 9
             "a.py": (rows("a", "b"), rows("a", "y")),  # cost 4, diffed first
         }
     )
     sites = {path: list(range(1, len(work.splitlines()) + 1)) for path, work in files.items()}
     result = scan(git, sites, files)
-    # a.py (4) is diffed; m.py (4 + 9 = 13 > 10) exhausts the budget; z.py would fit but stays
-    # all recent.
+    # a.py (4) is diffed; m.py (4 + 9 = 13 > 10) exhausts the budget; z.py and zz.py would fit
+    # but stay all recent.
     assert recent_lines(result, "a.py") == {2}
     assert recent_lines(result, "m.py") == {1, 2, 3}
     assert recent_lines(result, "z.py") == {1}
+    assert recent_lines(result, "zz.py") == {1}
     assert result.stats["scan_diff_work"] == 4
-    assert result.stats["scan_all_recent_diff_budget"] == 2
+    assert result.stats["scan_all_recent_diff_budget"] == 3
     assert result.notes == (history.SCAN_DIFF_BUDGET_NOTE,)
-    assert len(git.blob_calls) == 2  # z.py's blob is never read once the budget is spent
+    assert len(git.blob_calls) == 2  # no blob is read once the budget is spent
 
 
 def test_a_file_that_uses_exactly_the_remaining_budget_is_diffed(
