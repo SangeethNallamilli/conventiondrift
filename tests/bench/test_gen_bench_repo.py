@@ -368,3 +368,92 @@ def test_b10k_same_seed_identical_manifest_and_refs(b10k_pair: tuple) -> None:
     assert _git(a, "for-each-ref") == _git(b, "for-each-ref")
     assert ma["composition"]["refs"] == mb["composition"]["refs"]
     assert _git(a, "rev-parse", "main^{tree}") == _git(b, "rev-parse", "main^{tree}")
+
+
+# ------------------------------------------------------------- A-3 #7 near-cap overlay
+_DIR_FD = os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd
+
+
+def _bare_checkout(tmp_path: Path) -> Path:
+    repo = tmp_path / "r"
+    (repo / ".git" / "info").mkdir(parents=True)
+    (repo / "keep.py").write_bytes(b"")
+    return repo
+
+
+def _listed(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if ".git" not in p.parts)
+
+
+@pytest.mark.parametrize("pattern_set", ["te", "cr", "sr", "cr-deep"])
+def test_near_cap_overlay_writes_2000_patterns_in_two_files(
+    pattern_set: str, tmp_path: Path
+) -> None:
+    """DESIGN A-3 #4/#7: 2,000 patterns (the cap), 1,000 per file, each under 64 KiB."""
+    gen = benchlib.load_generator()
+    repo = _bare_checkout(tmp_path)
+    levels = 60 if _DIR_FD else 0
+    info = gen.write_near_cap(repo, pattern_set, untracked_py=200, deep_levels=levels)
+    files = [repo / ".gitignore", repo / ".git" / "info" / "exclude"]
+    counts = [len(f.read_text(encoding="utf-8").splitlines()) for f in files]
+    assert counts == [1_000, 1_000]
+    assert all(f.stat().st_size < 64 * 1024 for f in files)
+    assert info["patterns"] == 2_000
+    assert info["untracked_py"] == 200 + ((levels + 1) * 3 if levels else 0)
+    if levels:
+        assert info["deep_depth"] == 62  # inside the 64 cap (A-3 #3)
+        assert 11_000 <= info["deep_max_path"] <= 13_000  # about 12k characters
+    assert info["ignored_py"] == []
+
+
+def test_near_cap_python_overlay_is_the_stock_template(tmp_path: Path) -> None:
+    gen = benchlib.load_generator()
+    repo = _bare_checkout(tmp_path)
+    info = gen.write_near_cap(repo, "python", walk_target=18 * 200 + 1)
+    stock = gen.PYTHON_GITIGNORE.read_text(encoding="utf-8")
+    assert hashlib.sha256(stock.split("\n\n", 1)[1].encode()).hexdigest() == (
+        "8fe7404f26a2e8f0e52705c80563152d8a5b9ef15663053c4e408aa027f1545f"
+    )  # github/gitignore Python.gitignore, unmodified below the provenance header
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == stock
+    assert (repo / ".git" / "info" / "exclude").read_bytes() == b""
+    assert info["patterns"] == 97
+    assert info["untracked_py"] == 600
+    assert len(info["ignored_py"]) == 4  # packages 0 and 100
+    # Listed walk entries (names the walk lists, not inside __pycache__/ or build/):
+    # .gitignore, keep.py, near_cap, s0, pkg0-pkg3, then per package its folder, 3 .py, 13 .txt and
+    # __pycache__, and build + local_settings.py in packages 0 and 100.
+    listed = [p for p in _listed(repo) if "__pycache__/" not in p and "/build/" not in p]
+    assert len(listed) == 1 + 1 + 1 + 1 + 4 + 200 * 18 + 2 * 2
+
+
+def test_near_cap_clear_removes_the_overlay_even_past_path_max(tmp_path: Path) -> None:
+    gen = benchlib.load_generator()
+    repo = _bare_checkout(tmp_path)
+    levels = 60 if _DIR_FD else 0
+    info = gen.write_near_cap(repo, "cr-deep", untracked_py=100, deep_levels=levels)
+    if levels:
+        assert info["deep_max_path"] > 4096
+    gen.clear_near_cap(repo)
+    assert _listed(repo) == ["keep.py"]
+    assert not (repo / ".git" / "info" / "exclude").exists()
+
+
+def test_near_cap_cli_rejects_an_unknown_set(tmp_path: Path) -> None:
+    proc = subprocess.run(  # noqa: S603 - argv list, no shell
+        [
+            sys.executable,
+            str(GEN),
+            "--profile",
+            "b10k",
+            "--seed",
+            "1",
+            "--out",
+            str(tmp_path),
+            "--near-cap",
+            "nope",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert proc.returncode == 2
+    assert b"invalid choice" in proc.stderr

@@ -14,6 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = REPO_ROOT / "tools" / "gen_bench_repo.py"
@@ -296,5 +297,97 @@ def write_results(profile: str, head_ref: str, manifest: dict, runs: list[Run]) 
         "stages": [stage_seconds(r.stats) for r in runs if r.stats],
     }
     (Path(dest) / f"{profile}-{head_ref}.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+# ------------------------------------------------------------- A-3 #7 near-cap discovery
+# DESIGN A-3 #7: "a repo near every cap finishes inside the B10k stage budget"; DESIGN §5:
+# discovery 4 s on B10k. D-TL-71 (3): the A-3 #7 limit is the absolute 4 s, not 125%.
+# D-TL-73: only the stage time is asserted, never the match budget's internals.
+NEAR_CAP_DISCOVER_S = 4.0
+NEAR_CAP_SETS = ("te", "cr", "sr", "cr-deep")  # gen_bench_repo.NEAR_CAP_SETS
+NEAR_CAP_PYTHON = "python"
+
+
+def load_generator() -> Any:
+    """tools/gen_bench_repo.py as a module (it is a script, not a package)."""
+    spec = importlib.util.spec_from_file_location("gen_bench_repo", GENERATOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("gen_bench_repo", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@dataclass
+class DiscoverRun:
+    seconds: float  # the discovery stage: HEAD tree read, walk, .gitignore, file reads
+    py_paths: frozenset[str]
+    notes: tuple[str, ...]
+    walk_limit_skips: int
+    stats: dict[str, int]
+
+
+def tracked_py_paths(repo: Path) -> frozenset[str]:
+    """The `.py` files C4 finds in HEAD's tree (commit mode), not timed."""
+    from conventiondrift.core import BasePhaseDone
+    from conventiondrift.discover import discover_tree
+    from conventiondrift.gitread import GitReader
+
+    git = GitReader(repo)
+    try:
+        found = discover_tree(BasePhaseDone(base_config_known=True), git, git.resolve("HEAD"))
+    finally:
+        git.close()
+    return frozenset(f.path for f in found.py_files)
+
+
+def time_scan_discovery(repo: Path) -> DiscoverRun:
+    """One scan-mode discovery stage on the checkout at `repo`, timed end to end.
+
+    The CLI has no scan mode or `--stats-out` "discover" stage yet (T-031/T-033), so
+    this times C3 + C4 in process: open the reader, resolve HEAD, `discover_worktree`.
+    When the CLI reports the stage, this should read `stages.discover` instead."""
+    from conventiondrift.core import BasePhaseDone
+    from conventiondrift.discover.safefs import REASON_WALK_LIMIT
+    from conventiondrift.discover.scan import discover_worktree
+    from conventiondrift.gitread import GitReader
+
+    started = time.perf_counter()
+    git = GitReader(repo)
+    try:
+        head = git.resolve("HEAD")
+        found = discover_worktree(BasePhaseDone(base_config_known=True), repo, git, head)
+    finally:
+        git.close()
+    seconds = time.perf_counter() - started
+    return DiscoverRun(
+        seconds=seconds,
+        py_paths=frozenset(f.path for f in found.discovery.py_files),
+        notes=tuple(found.discovery.notes),
+        walk_limit_skips=sum(1 for s in found.discovery.skipped if s.reason == REASON_WALK_LIMIT),
+        stats=dict(found.stats),
+    )
+
+
+def write_near_cap_results(pattern_set: str, manifest: dict, info: dict, runs: list) -> None:
+    """Near-cap timings next to the CLI results (CD_BENCH_RESULTS), with seed and hash."""
+    dest = os.environ.get("CD_BENCH_RESULTS")
+    if not dest:
+        return
+    Path(dest).mkdir(parents=True, exist_ok=True)
+    payload = {
+        "profile": "b10k",
+        "case": f"a3-7-near-cap-{pattern_set}",
+        "seed": manifest["seed"],
+        "script_sha256": manifest["script_sha256"],
+        "overlay": {k: v for k, v in info.items() if k != "ignored_py"},
+        "discover_s": [round(r.seconds, 3) for r in runs],
+        "median_s": round(statistics.median(r.seconds for r in runs), 3),
+        "budget_s": NEAR_CAP_DISCOVER_S,
+        "walk_entries": [r.stats.get("scan_walk_entries") for r in runs],
+    }
+    (Path(dest) / f"b10k-a3-7-near-cap-{pattern_set}.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
