@@ -12,6 +12,7 @@ from conventiondrift.discover.entrypoints import (
     LOCKFILE_NAMES,
     MANIFEST_NAMES,
     REASON_MANIFEST_PARSE,
+    _mapping,
     entry_points_from_scripts,
     manifest_kind,
     project_dir,
@@ -71,6 +72,12 @@ def test_each_inventory_name_is_a_manifest(path: str) -> None:
         assert manifest_kind(path) == "lockfile"
     else:
         assert manifest_kind(path) == "manifest"
+
+
+def test_manifest_kind_uses_only_the_final_component() -> None:
+    # A first-slash split would mis-classify a lock two folders down.
+    assert manifest_kind("pkg/app/uv.lock") == "lockfile"
+    assert manifest_kind("pkg/app/pyproject.toml") == "manifest"
 
 
 @pytest.mark.parametrize(
@@ -395,6 +402,31 @@ def test_toml_script_parsing_is_linear_up_to_the_1_mib_cap() -> None:
         return len(refs)
 
     assert_linear(make, run_it, sizes=LINEAR_SIZES, label="toml-scripts")
+
+
+def test_invalid_module_object_refs_are_not_resolved() -> None:
+    py_paths = frozenset({"cli.py", "pkg/cli.py"})
+    assert (
+        entry_points_from_scripts(
+            [":main", ".:main", "pkg-name:main", "123bad:main", "pkg.:main"],
+            py_paths,
+            "pyproject.toml",
+        )
+        == frozenset()
+    )
+
+
+def test_a_mapping_guard_ignores_a_non_table() -> None:
+    # tomllib always yields a dict; the helper still rejects a non-table value.
+    assert _mapping(1, "project") == {}
+    assert _mapping("tool", "poetry") == {}
+
+
+def test_an_unsupported_manifest_path_is_skipped_and_not_kept() -> None:
+    files = {"AGENTS.md": b"r", "CON/uv.lock": b"v\n", "a.py": PY}
+    found = run(files)
+    assert found.manifest_files == ()
+    assert found.skipped == (SkippedFile("CON/uv.lock", "unsupported path"),)
 
 
 def test_the_phase_token_is_still_required() -> None:
