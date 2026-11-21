@@ -26,6 +26,7 @@ from conventiondrift.model import (
     FileContext,
     FileRules,
     GroupKey,
+    HistoryResult,
     IgnoreEntry,
     InstructionFile,
     InternalError,
@@ -43,6 +44,7 @@ from conventiondrift.model import (
     SkippedFile,
     Suggestion,
     Thresholds,
+    TrackedState,
     Verdict,
     Window,
     group_key_order,
@@ -292,6 +294,16 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
         ),
     ),
     "Window": (WINDOW, ("end", "days", "available", "unavailable_reason")),
+    "TrackedState": (TrackedState(head_blob="c" * 40, unchanged=True), ("head_blob", "unchanged")),
+    "HistoryResult": (
+        HistoryResult(
+            recent=frozenset({("head", "a.py", 3)}),
+            available=True,
+            notes=("a note",),
+            stats={"scan_diff_work": 4},
+        ),
+        ("recent", "available", "notes", "stats"),
+    ),
     "InternalError": (RESULT.internal_errors[0], ("component", "message")),
     "ReportCounts": (
         RESULT.counts,
@@ -325,9 +337,9 @@ SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
         ),
     ),
 }
-# Policy and Result are frozen but unhashable by design (I-13, code review A1);
-# every other type is hashable.
-UNHASHABLE = {"Policy", "Result"}
+# Policy and Result are frozen but unhashable by design (I-13, code review A1), and so is
+# HistoryResult, which holds a mapping (I-14); every other type is hashable.
+UNHASHABLE = {"Policy", "Result", "HistoryResult"}
 
 
 def test_every_model_dataclass_has_a_sample() -> None:
@@ -397,6 +409,7 @@ OVERRIDES: dict[tuple[str, str], dict[str, Any]] = {
         )
     },
     ("ConflictIndex", "adjacent"): {"adjacent": ((), ())},
+    ("HistoryResult", "stats"): {"stats": {"scan_diff_work": 5}},
 }
 
 
@@ -429,7 +442,17 @@ def _different(value: Any) -> Any:
 
 
 def test_unhashable_types_declare_hash_none() -> None:
-    assert all(cls.__hash__ is None for cls in (Policy, Result))
+    assert all(cls.__hash__ is None for cls in (Policy, Result, HistoryResult))
+
+
+def test_history_result_stats_are_read_only_and_copied() -> None:
+    source = {"scan_diff_work": 4}
+    result = HistoryResult(frozenset(), True, (), source)
+    assert isinstance(result.stats, MappingProxyType)
+    source["scan_diff_work"] = 9
+    assert result.stats == {"scan_diff_work": 4}
+    with pytest.raises(TypeError):
+        result.stats["scan_diff_work"] = 1  # type: ignore[index]
 
 
 def test_policy_mappings_are_read_only() -> None:

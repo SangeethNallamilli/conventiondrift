@@ -29,11 +29,14 @@ from conventiondrift.model import (
     CheckerPolicy,
     ConflictIndex,
     Extraction,
+    HistoryResult,
     InstructionFile,
     Policy,
+    PyFile,
     ReportCounts,
     Result,
     Thresholds,
+    TrackedState,
     Window,
 )
 
@@ -91,9 +94,16 @@ class _History:
         git: GitReaderProtocol | None,
         window: Window,
         sites: Mapping[Side, Mapping[str, frozenset[int]]],
-        scan_files: Sequence[object] = (),
-    ) -> frozenset[tuple[Side, str, int]]:
-        return frozenset(("head", f, n) for f, lines in sites["head"].items() for n in lines)
+        *,
+        tips: Mapping[Side, str] = {},
+        scan_files: Sequence[PyFile] = (),
+        scan_tracked: Mapping[str, TrackedState] = {},
+        max_file_bytes: int | None = None,
+    ) -> HistoryResult:
+        recent: frozenset[tuple[Side, str, int]] = frozenset(
+            ("head", f, n) for f, lines in sites["head"].items() for n in lines
+        )
+        return HistoryResult(recent, True, (), {})
 
 
 class _Client:
@@ -198,7 +208,10 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
         ("git", POS, NO),
         ("window", POS, NO),
         ("sites", POS, NO),
-        ("scan_files", POS, ()),
+        ("tips", KW, {}),
+        ("scan_files", KW, ()),
+        ("scan_tracked", KW, {}),
+        ("max_file_bytes", KW, None),
     ),
     (Renderer, "render"): (("result", POS, NO), ("previous_comment", KW, NO)),
     (GitHubClient, "publish"): (
@@ -260,9 +273,8 @@ def test_components_take_factories_and_stand_ins() -> None:
     assert git.changed_files("a", "b") == [("M", None, "a.py")]
     window = Window(end=None, days=90, available=False, unavailable_reason="no history")
     assert components.history is not None
-    assert components.history.recent(git, window, {"head": {"a.py": frozenset({2})}}) == frozenset(
-        {("head", "a.py", 2)}
-    )
+    got = components.history.recent(git, window, {"head": {"a.py": frozenset({2})}})
+    assert got.recent == frozenset({("head", "a.py", 2)}) and got.available
     assert components.github_client is not None
     client = components.github_client("http://127.0.0.1:8080", "fake-token")
     assert client.publish(

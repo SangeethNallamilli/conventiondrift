@@ -16,16 +16,20 @@ from conventiondrift.model import (
     CheckerId,
     Extraction,
     FileContext,
+    HistoryResult,
     InstructionFile,
     Policy,
     PyFile,
     Result,
     RuleMatch,
     Site,
+    TrackedState,
     Window,
 )
+from conventiondrift.model import (
+    Side as Side,
+)
 
-Side = Literal["base", "head"]
 TreeEntry = tuple[str, str, int | None, str]
 """(mode, oid, size, path); size is None for gitlinks."""
 ChangedFile = tuple[str, str | None, str]
@@ -100,15 +104,26 @@ class Extractor(Protocol):
 
 
 class History(Protocol):
-    """C8, recent-line dating. In scan mode ``git`` is the HEAD reader (None without a HEAD)."""
+    """C8, recent-line dating (I-14).
+
+    PR mode: ``tips`` has the commit each side analyzes (base: merge base, head: PR head).
+    Scan mode: ``git`` is the HEAD reader (None without a HEAD), ``tips`` is empty,
+    ``scan_files`` are the working-tree files and ``scan_tracked`` has one entry per
+    tracked scan file, from C4 (A-3). ``max_file_bytes`` is the size limit for a
+    ``HEAD`` blob C8 reads (``None``: C4's per-file ``.py`` limit).
+    """
 
     def recent(
         self,
         git: GitReaderProtocol | None,
         window: Window,
         sites: Mapping[Side, Mapping[str, frozenset[int]]],
+        *,
+        tips: Mapping[Side, str] = {},
         scan_files: Sequence[PyFile] = (),
-    ) -> frozenset[tuple[Side, str, int]]: ...
+        scan_tracked: Mapping[str, TrackedState] = {},
+        max_file_bytes: int | None = None,
+    ) -> HistoryResult: ...
 
 
 @dataclass(frozen=True, slots=True)
