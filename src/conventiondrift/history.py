@@ -284,6 +284,8 @@ class _Replay:
         if line.startswith(b"\x00"):
             self._start_commit(line)
         elif line.startswith(b"diff --git "):
+            if self._last < 0:  # every diff belongs to a commit, and its marker comes first
+                raise ComponentError(_COMPONENT, _MALFORMED)
             self._finish_section()
             self._section = _Section()
         elif self._section is not None:

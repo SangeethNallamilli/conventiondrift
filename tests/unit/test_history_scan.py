@@ -542,3 +542,38 @@ def test_real_repository_scan_dates_unchanged_lines_through_head(repo: GitRepo) 
     repo.commit_files("recent", {"a.py": "a\nb\nC\nd\n"}, date=day0 + dt.timedelta(days=300))
     repo.write("a.py", "new\na\nb\nC\nd\n")  # one line added on top: HEAD line 3 is now line 4
     assert real_scan(repo, {"a.py": [1, 2, 3, 4, 5]}) == {("a.py", 1), ("a.py", 4)}
+
+
+def test_every_kind_of_scan_file_in_one_run_is_handled_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One file of each kind, in path order, so no kind can end the run early, and two of
+    # every counted kind, so each counter adds up.
+    monkeypatch.setattr(history, "SCAN_LINE_LIMIT", 3)
+    contents = {
+        "c.py": (rows("a"), rows("a", "b", "c", "d")),  # working file over the line limit
+        "d.py": (rows("a"), rows("a", "b", "c", "d")),  # and another
+        "e.py": (rows("a", "b", "c", "d"), rows("a", "x")),  # HEAD blob over the line limit
+        "f.py": (rows("a", "b", "c", "d"), rows("a", "x")),  # and another
+        "g.py": (rows("a", "b"), b"a\nx\ry\n"),  # diffed (cost 4), bare CR
+        "h.py": (rows("a", "b", "c"), rows("a", "z")),  # diffed (cost 6)
+    }
+    git, files = budget_git(contents)
+    git.chain = [(TIP, when(1))]
+    git.chunks = [marker(TIP) + file_diff(b"a.py", hunk(1, 0, 1, 1))]
+    files["b.py"] = b"u\rv\n"  # untracked, bare CR
+    sites = {"a.py": [1], "b.py": [1]} | {path: [1, 2] for path in contents}
+    result = scan(git, sites, files)
+    assert result.recent == {
+        ("head", "a.py", 1),  # not a scan file: dated by history
+        ("head", "b.py", 1),
+        *(("head", f"{name}.py", line) for name in "cdef" for line in (1, 2)),
+        ("head", "g.py", 2),
+        ("head", "h.py", 2),
+    }
+    assert dict(result.stats) == {
+        "scan_all_recent_line_limit": 4,
+        "scan_all_recent_diff_budget": 0,
+        "scan_diff_work": 4 + 6,
+    }
+    assert result.notes == (history.SCAN_LINE_LIMIT_NOTE, history.bare_cr_note(2))
