@@ -34,8 +34,11 @@ load order. Both are counted for the I-12 ``gitignore_*`` counters and notes.
 
 Match budget (A-3 condition 7, #76 B2 and M-76-1, D-TL-69): the pattern cap limits how
 many patterns there are, not how long they take, and patterns the index can't narrow
-are tried on every path. So all matching in one scan shares
-:data:`GITIGNORE_MATCH_BUDGET` steps. Every path check, file or folder (a folder's
+are tried on every path. So all matching in one scan shares one budget:
+:data:`GITIGNORE_MATCH_BUDGET` steps, plus :data:`GITIGNORE_MATCH_ALLOWANCE` more for
+each path checked so far (D-TL-73), so a stock ``.gitignore`` never runs out however
+many paths the walk has, while 2,000 hostile patterns run it out within a few dozen
+paths. Every path check, file or folder (a folder's
 verdict is paid once, when it is first worked out and cached), pays four steps, one
 per path component (the path is split once), two per index lookup, two per pattern
 tried, one per component each time the path is cut to a ``.gitignore``'s folder (once
@@ -55,6 +58,7 @@ from typing import Final
 from conventiondrift.discover.globmatch import Glob, compile_glob
 
 __all__ = [
+    "GITIGNORE_MATCH_ALLOWANCE",
     "GITIGNORE_MATCH_BUDGET",
     "GITIGNORE_MAX_BYTES",
     "GITIGNORE_MAX_PATTERNS",
@@ -64,10 +68,14 @@ __all__ = [
 
 GITIGNORE_MAX_BYTES: Final = 65_536  # A-3 condition 4: 64 KiB per file
 GITIGNORE_MAX_PATTERNS: Final = 2_000  # A-3 condition 4: patterns in total, all files
-# A-3 condition 7: match steps per scan, all paths. A step costs about 70-200 ns, so this
-# is under 1 s of matching for the worst pattern sets measured for #76 (TE, CR and SR
-# shapes); GitHub's Python .gitignore over 20,000 files uses about 40% of it.
-GITIGNORE_MATCH_BUDGET: Final = 5_000_000
+# A-3 condition 7 (#76, D-TL-69, D-TL-73): match steps per scan, plus an allowance per
+# path checked. A step costs about 70-200 ns, so the base is about 0.5 s of matching,
+# which is all 2,000 hostile patterns get (they run it out within a few dozen paths).
+# The allowance is more than one check with GitHub's Python .gitignore costs at any
+# depth up to the 64-folder cap with names up to 100 characters (about 80-350 steps),
+# so that file never runs out below the 500,000-entry walk cap.
+GITIGNORE_MATCH_BUDGET: Final = 3_000_000
+GITIGNORE_MATCH_ALLOWANCE: Final = 384
 
 _BOM: Final = "\ufeff"
 _SPECIAL: Final = frozenset("*?[\\")  # anything in a segment that is not plain text
@@ -143,7 +151,8 @@ class IgnoreRules:
         self._lengths: dict[str, set[int]] = {"name": set(), "prefix": set(), "suffix": set()}
         self._anywhere: list[int] = []  # rules tried on every path
         self._folders: dict[str, bool] = {}
-        self._work = 0  # match steps spent, against GITIGNORE_MATCH_BUDGET
+        self._work = 0  # match steps spent, against the budget
+        self._checks = 0  # paths checked before the budget ran out, for the allowance
         self.loaded = 0
         self.skipped = 0
         self.unchecked = 0  # paths answered "not ignored" because the budget was spent
@@ -188,7 +197,11 @@ class IgnoreRules:
     @property
     def exhausted(self) -> bool:
         """True once the match budget is spent: nothing more is ignored."""
-        return self._work > GITIGNORE_MATCH_BUDGET
+        return self._work > self._budget()
+
+    def _budget(self) -> int:
+        # Paths are counted only until the budget runs out, so once spent it stays spent.
+        return GITIGNORE_MATCH_BUDGET + GITIGNORE_MATCH_ALLOWANCE * self._checks
 
     def _verdict(self, path: str, is_dir: bool) -> bool:
         """The last matching pattern decides; a path no pattern matches is not ignored.
@@ -215,7 +228,7 @@ class IgnoreRules:
                 rel = below[base] = parts[depth:] if inside else None
             if rel is None:
                 continue
-            matched, steps = glob.match_parts(rel, is_dir, GITIGNORE_MATCH_BUDGET - self._work)
+            matched, steps = glob.match_parts(rel, is_dir, self._budget() - self._work)
             self._work += steps
             if self.exhausted:
                 return False
@@ -235,8 +248,10 @@ class IgnoreRules:
         once the match budget is spent (counted in :attr:`unchecked`)."""
         if not self._rules:
             return False
-        if not self.exhausted and self._check(path, is_dir):
-            return True
+        if not self.exhausted:
+            self._checks += 1
+            if self._check(path, is_dir):
+                return True
         if self.exhausted:
             self.unchecked += 1
         return False

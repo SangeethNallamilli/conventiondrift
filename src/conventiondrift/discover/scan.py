@@ -40,6 +40,7 @@ from conventiondrift.core import BasePhaseDone
 from conventiondrift.defaults import DEFAULT_EXCLUDES
 from conventiondrift.discover import Discovery, TreeReader, discover_tree, safefs
 from conventiondrift.discover.gitignore import (
+    GITIGNORE_MATCH_ALLOWANCE,
     GITIGNORE_MATCH_BUDGET,
     GITIGNORE_MAX_BYTES,
     GITIGNORE_MAX_PATTERNS,
@@ -142,7 +143,8 @@ def _note_match_budget(unchecked: int) -> str:
         else f"the last {unchecked:,} paths were not checked against .gitignore, "
         "so none of them was left out"
     )
-    return f".gitignore matching used up its budget of {GITIGNORE_MATCH_BUDGET:,} steps; {rest}"
+    budget = f"{GITIGNORE_MATCH_BUDGET:,} steps plus {GITIGNORE_MATCH_ALLOWANCE:,} per path checked"
+    return f".gitignore matching used up its budget ({budget}); {rest}"
 
 
 class _ScanFilter:

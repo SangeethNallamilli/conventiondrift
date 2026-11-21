@@ -463,8 +463,9 @@ def test_the_pattern_cap_is_a_note_and_counted(tmp_path: Path) -> None:
 
 
 def _budget(monkeypatch: pytest.MonkeyPatch, steps: int) -> None:
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", steps)
-    monkeypatch.setattr(scan, "GITIGNORE_MATCH_BUDGET", steps)
+    for module in (gitignore, scan):
+        monkeypatch.setattr(module, "GITIGNORE_MATCH_BUDGET", steps)
+        monkeypatch.setattr(module, "GITIGNORE_MATCH_ALLOWANCE", 0)
 
 
 def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
@@ -478,7 +479,8 @@ def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
     result = run(tmp_path)
     assert py_paths(result) == ["a.py", "z3.py", "z4.py", "z5.py"]
     assert result.discovery.notes == (
-        ".gitignore matching used up its budget of 60 steps; the last 3 paths were not "
+        ".gitignore matching used up its budget (60 steps plus 0 per path checked); "
+        "the last 3 paths were not "
         "checked against .gitignore, so none of them was left out",
     )
     assert list(result.stats) == [  # no new I-12 counter
@@ -498,7 +500,8 @@ def test_the_match_budget_note_for_one_path(
     result = run(tmp_path)
     assert py_paths(result) == ["z3.py"]
     assert result.discovery.notes == (
-        ".gitignore matching used up its budget of 60 steps; the last path was not "
+        ".gitignore matching used up its budget (60 steps plus 0 per path checked); "
+        "the last path was not "
         "checked against .gitignore, so it was not left out",
     )
 

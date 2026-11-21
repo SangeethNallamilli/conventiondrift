@@ -374,8 +374,14 @@ def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
 # ------------------------------------------------------------------ match budget (#76 B2)
 
 
+def _budget(monkeypatch: pytest.MonkeyPatch, steps: int, allowance: int = 0) -> None:
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", steps)
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_ALLOWANCE", allowance)
+
+
 def test_the_match_budget_is_the_chosen_value() -> None:
-    assert gitignore.GITIGNORE_MATCH_BUDGET == 5_000_000
+    assert gitignore.GITIGNORE_MATCH_BUDGET == 3_000_000
+    assert gitignore.GITIGNORE_MATCH_ALLOWANCE == 384
 
 
 def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
@@ -394,7 +400,7 @@ def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
 def test_the_budget_runs_out_and_nothing_more_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 40)
+    _budget(monkeypatch, 40)
     loaded = rules(("", b"*.py\n"))  # each check: 4 + 1 + 2 + 2 + 2 + 7 = 18
     assert [loaded.ignored(p) for p in ("a.py", "b.py")] == [True, True]
     assert (loaded._work, loaded.exhausted, loaded.unchecked) == (36, False, 0)
@@ -406,7 +412,7 @@ def test_the_budget_runs_out_and_nothing_more_is_ignored(
 
 
 def test_exactly_the_budget_is_not_spent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 36)
+    _budget(monkeypatch, 36)
     loaded = rules(("", b"*.py\n"))
     assert loaded.ignored("a.py") and loaded.ignored("b.py")
     assert (loaded._work, loaded.exhausted, loaded.unchecked) == (36, False, 0)
@@ -416,7 +422,7 @@ def test_exactly_the_budget_is_not_spent(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_the_budget_is_shared_by_every_gitignore_file(monkeypatch: pytest.MonkeyPatch) -> None:
     # One scan, one budget: adding a nested .gitignore does not start a new one.
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 50)
+    _budget(monkeypatch, 50)
     loaded = rules(("", b"*.py\n"))
     assert loaded.ignored("a.py") and loaded.ignored("b.py")
     assert loaded._work == 36
@@ -430,18 +436,18 @@ def test_the_budget_is_shared_by_every_gitignore_file(monkeypatch: pytest.Monkey
 
 def test_running_out_on_a_folder_leaves_the_path_in(monkeypatch: pytest.MonkeyPatch) -> None:
     # "a" costs 10; "a/b" would be ignored by "b/" but its check takes the work to 26.
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 25)
+    _budget(monkeypatch, 25)
     loaded = rules(("", b"*.py\nb/\n"))
     assert not loaded.ignored("a/b/x.py")
     assert (loaded._work, loaded.exhausted, loaded.unchecked) == (26, True, 1)
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 26)
+    _budget(monkeypatch, 26)
     loaded = rules(("", b"*.py\nb/\n"))
     assert loaded.ignored("a/b/x.py")
     assert (loaded._work, loaded.unchecked) == (26, 0)
 
 
 def test_one_long_match_stops_at_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 1_000)
+    _budget(monkeypatch, 1_000)
     loaded = rules(("", ("*a" * 40 + "[b]").encode()))  # tried on every path
     assert not loaded.ignored("a" * 400)  # 4 + 1 + 2 + 2 + 802 match steps
     assert (loaded._work, loaded.exhausted) == (811, False)
@@ -474,7 +480,7 @@ def test_long_paths_pay_for_their_components() -> None:
 def test_hostile_pattern_sets_spend_the_budget(
     pattern: bytes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 1_000_000)
+    _budget(monkeypatch, 1_000_000)
     loaded = IgnoreRules()
     loaded.add("", b"keep.py\n")
     loaded.add("", b"".join(pattern % i for i in range(1_999)))
@@ -488,18 +494,182 @@ def test_hostile_pattern_sets_spend_the_budget(
     assert loaded._work < 1_000_000 + 10  # a check stops within a few steps of the end
 
 
-def test_a_normal_gitignore_uses_little_of_the_budget() -> None:
-    # Common Python .gitignore lines over 20,000 files: about a fifth of the budget.
-    loaded = rules(
-        (
-            "",
-            b"__pycache__/\n*.py[cod]\n*$py.class\n*.so\n.Python\nbuild/\ndist/\n"
-            b"*.egg-info/\n.eggs/\n*.egg\n.tox/\n.coverage\n.coverage.*\nhtmlcov/\n"
-            b".pytest_cache/\n.mypy_cache/\n.env\n.venv\nenv/\nvenv/\n*.log\n*.mo\n"
-            b"*.pot\ndocs/_build/\n.ipynb_checkpoints\n*.sage.py\n.idea/\n.DS_Store\n",
-        )
-    )
-    for i in range(20_000):
-        assert not loaded.ignored(f"src/p{i % 40}/s{i % 9}/mod_{i}.py")
-    assert not loaded.exhausted
-    assert loaded._work < gitignore.GITIGNORE_MATCH_BUDGET // 4
+def test_the_allowance_grows_with_each_path_checked(monkeypatch: pytest.MonkeyPatch) -> None:
+    _budget(monkeypatch, 0, 18)  # each "*.py" check costs 18
+    loaded = rules(("", b"*.py\n"))
+    assert all(loaded.ignored("m.py") for _ in range(1_000))  # files are not cached
+    assert (loaded._work, loaded.exhausted) == (18_000, False)
+    _budget(monkeypatch, 0, 17)
+    loaded = rules(("", b"*.py\n"))
+    assert not loaded.ignored("m.py")
+    assert loaded.exhausted
+
+
+def test_unused_allowance_carries_over(monkeypatch: pytest.MonkeyPatch) -> None:
+    _budget(monkeypatch, 0, 18)
+    loaded = rules(("", b"*.py\n"))
+    assert not any(loaded.ignored(f"m{i}.txt") for i in range(10))  # 7 each: nothing to try
+    assert loaded._work == 70
+    assert loaded.ignored("a/b/c/d/e/f/g/m.py")  # 32, plus 70 for its seven folders
+    assert (loaded._work, loaded.exhausted) == (172, False)  # 18 * 11 = 198 allowed
+    _budget(monkeypatch, 0, 18)
+    fresh = rules(("", b"*.py\n"))
+    assert not fresh.ignored("a/b/c/d/e/f/g/m.py")  # 102 is more than 18 on its own
+    assert fresh.exhausted
+
+
+def test_a_spent_budget_stays_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _budget(monkeypatch, 0, 17)
+    loaded = rules(("", b"*.py\n"))
+    assert not loaded.ignored("a.py")
+    assert [loaded.ignored(f"{i}.txt") for i in range(100)] == [False] * 100
+    assert (loaded.exhausted, loaded.unchecked, loaded._checks) == (True, 101, 1)
+
+
+# GitHub's Python.gitignore (github/gitignore 7705c2c, CC0), its pattern lines in order.
+_STOCK_PYTHON = (
+    "__pycache__/",
+    "*.py[codz]",
+    "*$py.class",
+    "*.so",
+    ".Python",
+    "build/",
+    "develop-eggs/",
+    "dist/",
+    "downloads/",
+    "eggs/",
+    ".eggs/",
+    "lib/",
+    "lib64/",
+    "parts/",
+    "sdist/",
+    "var/",
+    "wheels/",
+    "share/python-wheels/",
+    "*.egg-info/",
+    ".installed.cfg",
+    "*.egg",
+    "MANIFEST",
+    "*.manifest",
+    "*.spec",
+    "pip-log.txt",
+    "pip-delete-this-directory.txt",
+    "htmlcov/",
+    ".tox/",
+    ".nox/",
+    ".coverage",
+    ".coverage.*",
+    ".cache",
+    "nosetests.xml",
+    "coverage.xml",
+    "*.cover",
+    "*.py.cover",
+    "*.lcov",
+    ".hypothesis/",
+    ".pytest_cache/",
+    "cover/",
+    "*.mo",
+    "*.pot",
+    "*.log",
+    "local_settings.py",
+    "db.sqlite3",
+    "db.sqlite3-journal",
+    "instance/",
+    ".webassets-cache",
+    ".scrapy",
+    "docs/_build/",
+    ".pybuilder/",
+    "target/",
+    ".ipynb_checkpoints",
+    "profile_default/",
+    "ipython_config.py",
+    ".pdm-python",
+    ".pdm-build/",
+    ".pixi/*",
+    "!.pixi/config.toml",
+    "__pypackages__/",
+    "celerybeat-schedule*",
+    "celerybeat.pid",
+    "*.rdb",
+    "*.aof",
+    "*.pid",
+    "mnesia/",
+    "rabbitmq/",
+    "rabbitmq-data/",
+    "activemq-data/",
+    "*.sage.py",
+    ".env",
+    ".envrc",
+    ".venv",
+    "env/",
+    "venv/",
+    "ENV/",
+    "env.bak/",
+    "venv.bak/",
+    "conda-meta/",
+    ".spyderproject",
+    ".spyproject",
+    ".ropeproject",
+    "/site",
+    ".mypy_cache/",
+    ".dmypy.json",
+    "dmypy.json",
+    ".pyre/",
+    ".pytype/",
+    "cython_debug/",
+    ".abstra/",
+    "tempCodeRunnerFile.py",
+    ".ruff_cache/",
+    ".pypirc",
+    "marimo/_static/",
+    "marimo/_lsp/",
+    "__marimo__/",
+    ".streamlit/secrets.toml",
+)
+
+
+def _stock_rules() -> IgnoreRules:
+    return rules(("", "\n".join(_STOCK_PYTHON).encode()))
+
+
+@pytest.mark.parametrize("depth", [1, 8, 32, 64])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "m.py",
+        "a" * 100,
+        "module_name_" * 8 + "long.py",
+        "x" * 96 + ".pyc",
+        "a.b." * 25,
+        "__pycache__",
+        ".env",
+        "pkg.egg-info",
+    ],
+)
+def test_one_stock_python_check_costs_less_than_the_allowance(depth: int, name: str) -> None:
+    path = "/".join(["pkg"] * (depth - 1) + [name])
+    for is_dir in (False, True):
+        loaded = _stock_rules()
+        loaded._verdict(path, is_dir)
+        assert loaded._work <= gitignore.GITIGNORE_MATCH_ALLOWANCE, (path, is_dir)
+
+
+def test_the_stock_python_gitignore_never_runs_out_below_the_walk_cap() -> None:
+    # D-TL-73: a synthetic walk of 500,000 entries (the A-3 walk cap): folders are
+    # checked before what is in them, as the walk does, with files of common kinds.
+    loaded = _stock_rules()
+    assert len(_STOCK_PYTHON) == loaded.loaded == 97
+    kinds = ("mod_{}.py", "test_{}.py", "{}.pyc", "README_{}.md", "data_{}.json", ".env{}")
+    entries = 0
+    ignored = 0
+    for top in range(50):
+        for sub in range(100):
+            folder = f"src{top}/pkg_{sub % 7}/sub{sub}"
+            loaded.ignored(folder, is_dir=True)
+            entries += 1
+            for i in range(99):
+                ignored += loaded.ignored(f"{folder}/{kinds[i % 6].format(i)}")
+                entries += 1
+    assert entries == 500_000
+    assert not loaded.exhausted and loaded.unchecked == 0
+    assert ignored == 50 * 100 * 17  # the .pyc files
