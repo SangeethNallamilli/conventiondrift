@@ -153,15 +153,15 @@ def _slow_git(chunks: int, gap: float, ready: Path | None = None) -> str:
     )
 
 
-def _short_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Apply the 0.7 s overall deadline only after the child is already running.
+def _short_timeout(monkeypatch: pytest.MonkeyPatch, seconds: float = 0.7) -> None:
+    """Apply a short overall deadline only after the child is already running.
 
     ``_stream_patches`` snapshots ``GIT_TIMEOUT_SECONDS`` after ``_start_batch``
     returns. A child's interpreter start-up on a slow runner (CON-14: macOS
     nightly 44706120232, test-macos 3.13) must not count against that budget:
     the product default (60 s) applies during start-up.
     """
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.7)
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", seconds)
 
 
 def _wait_ready(path: Path, timeout: float = 30.0) -> None:
@@ -176,6 +176,7 @@ def _real_start(
     script: str,
     ready: Path | None = None,
     armed: list[float] | None = None,
+    timeout: float = 0.7,
 ) -> list[Any]:
     real = gitread._start_batch
     started: list[Any] = []
@@ -183,11 +184,11 @@ def _real_start(
     def start(argv: list[str], **kwargs: Any) -> Any:
         started.append(real([sys.executable, "-c", script], **kwargs))
         if ready is not None:
-            # Product default still applies during start-up. Arm 0.7 s only
-            # once the child is running, and before this returns, so
-            # _stream_patches snapshots the short deadline after ready.
+            # Product default still applies during start-up. Arm the short
+            # deadline only once the child is running, and before this returns,
+            # so _stream_patches snapshots it after ready.
             _wait_ready(ready)
-            _short_timeout(monkeypatch)
+            _short_timeout(monkeypatch, timeout)
             if armed is not None:
                 armed.append(time.monotonic())
         return started[-1]
@@ -217,15 +218,20 @@ def test_real_slow_chunks_time_out_on_the_overall_deadline(
 def test_running_out_kills_the_whole_tree(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Arm 0.8 s only once the child has started the grandchild and written its
+    # pid, so the child's interpreter start-up does not eat the budget (CON-14,
+    # D-TL-61: a start-up over 0.8 s killed the tree before grandchild.pid
+    # existed, and read_text raised FileNotFoundError).
     pidfile = tmp_path / "grandchild.pid"
+    ready = tmp_path / "ready"
     script = (
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
         f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+        f"open({str(ready)!r}, 'w').write('1')\n"
         "sys.stdout.write('x'); sys.stdout.flush(); time.sleep(60)\n"
     )
-    _real_start(monkeypatch, script)
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.8)
+    _real_start(monkeypatch, script, ready, timeout=0.8)
     with pytest.raises(ComponentError) as info:
         list(GitReader(repo).patches(SHA, SHA2))
     assert (info.value.component, info.value.message) == ("gitread", "git log timed out")
