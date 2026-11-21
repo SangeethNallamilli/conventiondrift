@@ -447,11 +447,14 @@ def test_a_pyproject_nested_about_1000_deep_is_skipped_not_raised(
 
 
 def _int_str_digit_limit() -> int:
-    """0 when the interpreter has no limit or the limit is disabled."""
-    getter = getattr(sys, "get_int_max_str_digits", None)
-    if getter is None:
-        return 0
-    return int(getter())
+    """The running interpreter's int-to-str digit limit (D-TL-25, D-TL-67).
+
+    Every supported Python (requires-python >= 3.11) has one, so there is no fallback; it is
+    only 0 when ``PYTHONINTMAXSTRDIGITS=0`` turns it off, which the suite does not support.
+    """
+    limit = sys.get_int_max_str_digits()
+    assert limit > 0, "run the tests with the default int-to-str digit limit"
+    return limit
 
 
 def _assert_huge_int_pyproject_never_escapes(text: str, *, expect_skip: bool) -> None:
@@ -471,11 +474,9 @@ def _assert_huge_int_pyproject_never_escapes(text: str, *, expect_skip: bool) ->
 
 def test_a_pyproject_with_an_integer_over_the_digit_limit_is_skipped_not_raised() -> None:
     # D-TL-25: the digit count is taken from the running interpreter's limit, not a magic 4301.
-    limit = _int_str_digit_limit()
-    digits = limit + 1 if limit > 0 else 4301
     _assert_huge_int_pyproject_never_escapes(
-        "k = " + "9" * digits + "\n",
-        expect_skip=limit > 0,
+        "k = " + "9" * (_int_str_digit_limit() + 1) + "\n",
+        expect_skip=True,
     )
 
 
@@ -483,7 +484,7 @@ def test_a_pyproject_with_a_5000_digit_integer_is_skipped_not_raised() -> None:
     limit = _int_str_digit_limit()
     _assert_huge_int_pyproject_never_escapes(
         "version = " + "1" * 5000 + "\n",
-        expect_skip=0 < limit < 5000,
+        expect_skip=limit < 5000,
     )
 
 
