@@ -91,14 +91,16 @@ def repo(tmp_path: Path) -> Iterator[GitRepo]:
 
 
 def test_needs_the_phase_token(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match="BasePhaseDone"):
+    message = "^discover_worktree needs the BasePhaseDone token as its first argument$"
+    with pytest.raises(TypeError, match=message):
         discover_worktree(object(), tmp_path)  # type: ignore[arg-type]
 
 
 def test_git_and_head_sha_come_together(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="both"):
+    message = "^discover_worktree needs both git and head_sha, or neither$"
+    with pytest.raises(ValueError, match=message):
         discover_worktree(PHASE, tmp_path, Head([]))
-    with pytest.raises(ValueError, match="both"):
+    with pytest.raises(ValueError, match=message):
         discover_worktree(PHASE, tmp_path, None, "f" * 40)
 
 
@@ -133,6 +135,7 @@ def test_an_object_id_that_is_not_a_git_hash_is_a_discover_error(tmp_path: Path,
     with pytest.raises(ComponentError) as caught:
         run(tmp_path, Head([("100644", oid, 1, "a.py")]))
     assert caught.value.component == "discover"
+    assert caught.value.message == "HEAD listed an object id that is not a git hash"
     assert str(tmp_path) not in str(caught.value)
 
 
@@ -197,6 +200,14 @@ def test_a_symlinked_python_file_in_scope_is_reported(tmp_path: Path) -> None:
     assert result.discovery.skipped == (SkippedFile("l.py", "symlink"),)  # ruling 6
 
 
+def test_an_empty_file_fits_a_zero_byte_limit(tmp_path: Path) -> None:
+    # Walk entries carry no size, so the limit is checked on the open file only.
+    write(tmp_path, {"RULES.md": "", "a.py": ""})
+    result = run(tmp_path, paths=["RULES.md"], max_file_bytes=0)
+    assert py_paths(result) == ["a.py"]
+    assert result.discovery.skipped == ()
+
+
 def test_files_are_read_with_the_size_limit(tmp_path: Path) -> None:
     write(tmp_path, {"AGENTS.md": "- Use x.\n", "a.py": "x = 1\n" * 10, "b.py": "x\n"})
     result = run(tmp_path, max_file_bytes=10)
@@ -235,6 +246,22 @@ def test_walk_limit_folders_are_merged_in_path_order(
     assert result.stats["scan_walk_skipped"] == 3
 
 
+@pytest.mark.skipif(not POSIX, reason="names that are not UTF-8 are POSIX only")
+def test_walk_limits_sort_with_names_that_are_not_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(safefs, "WALK_MAX_DEPTH", 1)
+    write(tmp_path, {"AGENTS.md": AGENTS, "a/deep/x.py": "", "z/deep/y.py": ""})
+    with open(os.path.join(os.fsencode(tmp_path), b"m\xff.py"), "wb"):
+        pass
+    result = run(tmp_path)
+    assert result.discovery.skipped == (
+        SkippedFile("a/deep", "walk limit"),
+        SkippedFile("mU+DCFF.py", "unsupported path"),
+        SkippedFile("z/deep", "walk limit"),
+    )
+
+
 def test_the_walk_tree_reader_never_reads_a_hard_excluded_path(tmp_path: Path) -> None:
     write(tmp_path, {".git/x.py": "x = 1\n"})
     reader = scan._WalkTree(tmp_path, [], [])
@@ -259,30 +286,41 @@ def test_gitignore_drops_untracked_files(tmp_path: Path) -> None:
         tmp_path,
         {
             "AGENTS.md": AGENTS,
-            ".gitignore": "ignored.py\nbuild/\n",
+            ".gitignore": "ignored.py\nscratch/\n",
             "ignored.py": "",
             "kept.py": "",
-            "build/out.py": "",
+            "scratch/out.py": "",
             "sub/.gitignore": "local.py\n",
             "sub/local.py": "",
             "local.py": "",
+            "zz/local.py": "",  # walked after sub/.gitignore is loaded
         },
     )
     result = run(tmp_path)
-    assert py_paths(result) == ["kept.py", "local.py"]
+    assert py_paths(result) == ["kept.py", "local.py", "zz/local.py"]
     assert result.stats["gitignore_patterns_loaded"] == 3
 
 
 def test_an_ignored_folder_is_not_entered(tmp_path: Path) -> None:
-    write(tmp_path, {".gitignore": "build/\n", "build/a/b.py": "", "x.py": ""})
+    # scratch/ is not a default exclude, so only .gitignore keeps the walk out of it.
+    write(tmp_path, {".gitignore": "scratch/\n", "scratch/a/b.py": "", "x.py": ""})
     result = run(tmp_path)
-    assert result.stats["scan_walk_entries"] == 3  # .gitignore, build, x.py
+    assert result.stats["scan_walk_entries"] == 3  # .gitignore, scratch, x.py
 
 
 def test_ignored_special_files_and_links_are_not_reported(tmp_path: Path) -> None:
     write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "*.py\n", "t.txt": ""})
     symlink("t.txt", tmp_path / "l.py")
     assert run(tmp_path).discovery.skipped == ()
+
+
+def test_folders_above_a_tracked_file_are_entered(tmp_path: Path) -> None:
+    write(
+        tmp_path,
+        {"AGENTS.md": AGENTS, ".gitignore": "mid/\n", "a/mid/c/t.py": "", "a/mid/c/u.py": ""},
+    )
+    result = run(tmp_path, tracked(tmp_path, "a/mid/c/t.py"))
+    assert py_paths(result) == ["a/mid/c/t.py"]
 
 
 def test_tracked_files_are_kept_even_when_ignored(tmp_path: Path) -> None:
@@ -316,17 +354,24 @@ def test_paths_entries_are_never_dropped(tmp_path: Path) -> None:
 
 
 def test_a_bad_paths_entry_is_still_reported(tmp_path: Path) -> None:
-    write(tmp_path, {"AGENTS.md": AGENTS})
-    result = run(tmp_path, paths=["../x.md", "AGENTS.md"])
+    write(tmp_path, {".gitignore": "hidden/\n", "hidden/RULES.md": AGENTS})
+    result = run(tmp_path, paths=["../x.md", "hidden/RULES.md"])
     assert result.discovery.skipped == (SkippedFile("../x.md", "outside repository"),)
+    assert [f.path for f in result.discovery.instruction_files] == ["hidden/RULES.md"]
 
 
 def test_an_ignored_pyvenv_cfg_still_marks_a_venv(tmp_path: Path) -> None:
     write(
         tmp_path,
-        {"AGENTS.md": AGENTS, ".gitignore": "pyvenv.cfg\n", "env/pyvenv.cfg": "", "env/m.py": ""},
+        {
+            "AGENTS.md": AGENTS,
+            ".gitignore": "pyvenv.cfg\n",
+            "x/env/pyvenv.cfg": "",
+            "x/env/m.py": "",
+            "y.py": "",
+        },
     )
-    assert py_paths(run(tmp_path)) == []
+    assert py_paths(run(tmp_path)) == ["y.py"]
 
 
 def test_info_exclude_is_used_first(tmp_path: Path) -> None:

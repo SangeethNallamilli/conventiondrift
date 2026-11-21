@@ -81,10 +81,25 @@ def test_bom_before_a_comment_leaves_a_comment() -> None:
         (b"a\\", "a\\"),
         (b"a\\\\ ", "a\\\\"),
         (b"\\ ", "\\ "),
+        (b"a\\\\\\ ", "a\\\\\\ "),
+        (b"a\\\\\\  ", "a\\\\\\ "),
+        (b"a\t ", "a\t"),
+        (b"a\\ b ", "a\\ b"),
+        (b"aX ", "aX"),
     ],
 )
 def test_trailing_spaces_are_dropped_unless_escaped(line: bytes, pattern: str) -> None:
     assert gitignore_patterns(line) == [pattern]
+
+
+def test_a_pattern_ending_in_a_lone_backslash_never_matches() -> None:
+    loaded = rules(("", b"a\\\nb\\\\\\\nc\\\\\n"))
+    assert (loaded.loaded, loaded.skipped) == (3, 0)  # counted toward the cap
+    assert not loaded.ignored("a\\")
+    assert not loaded.ignored("a")
+    assert not loaded.ignored("b\\")
+    assert not loaded.ignored("b\\\\")
+    assert loaded.ignored("c\\")
 
 
 def test_a_line_of_spaces_is_not_a_pattern() -> None:
@@ -133,6 +148,29 @@ def test_nothing_under_an_ignored_folder_comes_back() -> None:
     assert loaded.ignored("build/deep/keep.py")
 
 
+def test_every_folder_above_a_path_is_checked() -> None:
+    # Only the middle folder is ignored; the file itself is re-included by name.
+    loaded = rules(("", b"mid/\n!x.py\n"))
+    assert loaded.ignored("a/mid/c/x.py")
+    assert loaded.ignored("a/b/mid/c/d/x.py")
+    assert not loaded.ignored("a/b/c/x.py")
+
+
+def test_each_folder_verdict_is_worked_out_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    loaded = rules(("", b"*.tmp\n"))
+    seen: list[str] = []
+    real = loaded._verdict
+
+    def spy(path: str, is_dir: bool) -> bool:
+        seen.append(path)
+        return real(path, is_dir)
+
+    monkeypatch.setattr(loaded, "_verdict", spy)
+    assert not loaded.ignored("a/b/x.py")
+    assert not loaded.ignored("a/b/y.py")
+    assert seen == ["a", "a/b", "a/b/x.py", "a/b/y.py"]
+
+
 def test_a_folder_only_pattern_never_matches_a_file() -> None:
     loaded = rules(("", b"build/\n"))
     assert not loaded.ignored("build")
@@ -174,6 +212,13 @@ def test_a_file_with_no_patterns_changes_nothing() -> None:
         ("\\*x", "*x", True),
         ("\\*x", "ax", False),
         ("*\\x", "ax", True),
+        ("*a*b", "zab", True),
+        ("?a?bc", "xaybc", True),
+        ("?a?bc", "xaybd", False),
+        ("*a*b", "zba", False),
+        ("a?b*", "axbz", True),
+        ("ab*cd", "abzzcd", True),
+        ("dirX/", "dirX", False),
         ("*", "anything", True),
         ("**/m", "a/b/m", True),
         ("a/**", "a/b", True),
@@ -200,6 +245,26 @@ def test_lookup_keeps_load_order_across_kinds() -> None:
     assert not loaded.ignored("m.py")
     loaded.add("", b"m.py\n")
     assert loaded.ignored("m.py")
+
+
+def test_only_patterns_that_can_match_are_tried() -> None:
+    loaded = rules(
+        ("", b"foo\n*.pyc\ngen_*\n*\nab*cd\n[ab]x\ndirX/\n*a*b\n\\*q\n"),
+    )
+    # 0 foo (name), 1 *.pyc (end), 2 gen_* (start), 3 * (everywhere), 4 ab*cd (start,
+    # the longer text wins a tie), 5 [ab]x (everywhere), 6 dirX/ (name dirX),
+    # 7 *a*b (end b), 8 \*q (everywhere: an escape is not plain text)
+    assert loaded._candidates("a/foo") == [8, 5, 3, 0]
+    assert loaded._candidates("m.pyc") == [8, 5, 3, 1]
+    assert loaded._candidates("xpyc") == [8, 5, 3]
+    assert loaded._candidates("gen_1") == [8, 5, 3, 2]
+    assert loaded._candidates("abzz") == [8, 5, 4, 3]
+    assert loaded._candidates("zzcd") == [8, 5, 3]
+    assert loaded._candidates("q/dirX") == [8, 6, 5, 3]
+    assert loaded._candidates("zab") == [8, 7, 5, 3]
+    assert loaded._candidates("b") == [8, 7, 5, 3]
+    assert loaded._candidates("gen_") == [8, 5, 3, 2]
+    assert loaded._candidates("p") == [8, 5, 3]
 
 
 # ------------------------------------------------------------------ caps

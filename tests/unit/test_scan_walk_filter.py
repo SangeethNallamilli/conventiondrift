@@ -54,7 +54,7 @@ class Recorder:
         self.calls.append(("enter", folder, *sorted(names)))
 
     def drop(self, path: str, is_dir: bool) -> bool:
-        self.calls.append(("drop", path, "dir" if is_dir else "file"))
+        self.calls.append(("drop", path, {True: "dir", False: "file"}[is_dir]))
         return path in self.to_drop
 
 
@@ -67,7 +67,7 @@ def test_without_a_filter_nothing_changes(tmp_path: Path, strategy: str) -> None
 
 
 def test_enter_sees_each_folder_before_its_entries(tmp_path: Path, strategy: str) -> None:
-    make(tmp_path, "a.py", "b/c.py")
+    make(tmp_path, "a.py", "b/c.py", "b/d/e.py")
     (tmp_path / ".git").mkdir()
     rec = Recorder()
     walk_worktree(tmp_path, walk_filter=rec)
@@ -75,8 +75,11 @@ def test_enter_sees_each_folder_before_its_entries(tmp_path: Path, strategy: str
         ("enter", "", ".git", "a.py", "b"),  # hard-excluded names are seen, never offered
         ("drop", "a.py", "file"),
         ("drop", "b", "dir"),
-        ("enter", "b", "c.py"),
+        ("enter", "b", "c.py", "d"),
         ("drop", "b/c.py", "file"),
+        ("drop", "b/d", "dir"),
+        ("enter", "b/d", "e.py"),
+        ("drop", "b/d/e.py", "file"),
     ]
 
 
@@ -184,7 +187,7 @@ def test_a_junction_git_folder_is_never_followed(
 ) -> None:
     (tmp_path / ".git" / "info").mkdir(parents=True)
     (tmp_path / ".git" / "info" / "exclude").write_bytes(b"*.tmp\n")
-    monkeypatch.setattr(d, "_is_reparse_point", lambda st: True)
+    monkeypatch.setattr(d, "_is_reparse_point", lambda st: isinstance(st, os.stat_result))
     assert read_git_info_exclude(tmp_path, 65_536) is None
 
 

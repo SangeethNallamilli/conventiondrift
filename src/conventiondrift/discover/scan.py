@@ -57,19 +57,10 @@ if TYPE_CHECKING:
     from conventiondrift.components import TreeEntry
 
 __all__ = [
-    "STAT_KEYS",
     "ScanDiscovery",
     "discover_worktree",
     "git_blob_id",
 ]
-
-# INTERFACES I-12: the scan-walk counters C4 owns, in schema order.
-STAT_KEYS: Final = (
-    "scan_walk_entries",
-    "scan_walk_skipped",
-    "gitignore_patterns_loaded",
-    "gitignore_patterns_skipped",
-)
 
 _GITLINK: Final = "160000"
 _REGULAR_MODES: Final = frozenset({"100644", "100755", "100664"})  # as discover_tree reads
@@ -107,7 +98,9 @@ class ScanDiscovery:
       follow the ``paths`` notes in ``discovery.notes``.
     * ``scan_tracked``: I-14. One entry per kept ``.py`` file that is tracked at
       ``HEAD``, keyed by path; untracked files are absent. Empty without ``HEAD``.
-    * ``stats``: the I-12 counters in :data:`STAT_KEYS`, exact for a given tree.
+    * ``stats``: the I-12 counters C4 owns, in schema order (``scan_walk_entries``,
+      ``scan_walk_skipped``, ``gitignore_patterns_loaded``,
+      ``gitignore_patterns_skipped``), exact for a given tree.
     """
 
     discovery: Discovery
@@ -287,9 +280,12 @@ def discover_worktree(
     """
     if not isinstance(phase, BasePhaseDone):
         raise TypeError("discover_worktree needs the BasePhaseDone token as its first argument")
-    if (git is None) != (head_sha is None):
-        raise ValueError("discover_worktree needs both git and head_sha, or neither")
-    head = _head_files(git, head_sha) if git is not None and head_sha is not None else {}
+    if git is None or head_sha is None:
+        if git is not None or head_sha is not None:
+            raise ValueError("discover_worktree needs both git and head_sha, or neither")
+        head: dict[str, TreeEntry] = {}
+    else:
+        head = _head_files(git, head_sha)
     gitlinks = frozenset(p for p, e in head.items() if e[0] == _GITLINK)
     walk_filter = _ScanFilter(
         root,
@@ -333,11 +329,10 @@ def discover_worktree(
         mode, oid = entry[0], entry[1]
         same = mode in _REGULAR_MODES and git_blob_id(py.data, len(oid)) == oid
         tracked[py.path] = TrackedState(oid, same)
-    stats = dict(
-        zip(
-            STAT_KEYS,
-            (walk.entries, len(walk.skipped), rules.loaded, rules.skipped),
-            strict=True,
-        )
-    )
+    stats = {  # I-12 schema order
+        "scan_walk_entries": walk.entries,
+        "scan_walk_skipped": len(walk.skipped),
+        "gitignore_patterns_loaded": rules.loaded,
+        "gitignore_patterns_skipped": rules.skipped,
+    }
     return ScanDiscovery(discovery, MappingProxyType(tracked), MappingProxyType(stats))

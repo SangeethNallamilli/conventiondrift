@@ -12,7 +12,9 @@ Line rules follow git's ``dir.c`` (``add_patterns_from_buffer`` and
 * a UTF-8 BOM at the start of the file is dropped;
 * lines end at ``\\n``, and one ``\\r`` before it is dropped;
 * blank lines and lines starting with ``#`` are not patterns (``\\#`` is a literal ``#``);
-* trailing spaces are dropped unless the last one is escaped with ``\\``.
+* trailing spaces are dropped unless the last one is escaped with ``\\``;
+* a pattern that ends in an unescaped ``\\`` is counted but never matches (git's
+  ``wildmatch`` rejects it; ``compile_glob`` alone would match a literal ``\\``).
 
 Matching is :mod:`conventiondrift.discover.globmatch` (linear time, no regular
 expressions). Precedence is git's: the last matching pattern wins, a deeper
@@ -49,7 +51,6 @@ GITIGNORE_MAX_PATTERNS: Final = 2_000  # A-3 condition 4: patterns in total, all
 
 _BOM: Final = "\ufeff"
 _SPECIAL: Final = frozenset("*?[\\")  # anything in a segment that is not plain text
-_STARS: Final = frozenset("*?")
 
 
 def _index_key(pattern: str) -> tuple[str, str] | None:
@@ -60,13 +61,12 @@ def _index_key(pattern: str) -> tuple[str, str] | None:
     """
     body = pattern[1:] if pattern.startswith("!") else pattern
     last = body.rstrip("/").rpartition("/")[2]
-    cut = next((i for i, char in enumerate(last) if char in _SPECIAL), -1)
-    if cut < 0:
+    if not _SPECIAL.intersection(last):
         return ("name", last)
-    prefix = last[:cut]
+    prefix = last[: next(i for i, char in enumerate(last) if char in _SPECIAL)]
     suffix = ""
-    if not {"[", "\\"}.intersection(last):  # only * and ?: the text after the last one
-        suffix = last[max(i for i, char in enumerate(last) if char in _STARS) + 1 :]
+    if "[" not in last and "\\" not in last:  # only * and ?: the text after the last one
+        suffix = last[max(last.rfind("*"), last.rfind("?")) + 1 :]
     if prefix and len(prefix) >= len(suffix):
         return ("prefix", prefix)
     if suffix:
@@ -75,21 +75,15 @@ def _index_key(pattern: str) -> tuple[str, str] | None:
 
 
 def _trim_trailing_spaces(line: str) -> str:
-    """Git's ``trim_trailing_spaces``: drop the trailing run of unescaped spaces."""
-    last_space = -1
-    pos = 0
-    while pos < len(line):
-        char = line[pos]
-        if char == " ":
-            if last_space < 0:
-                last_space = pos
-        elif char == "\\":
-            pos += 1  # the escaped character, if any, ends the run
-            last_space = -1
-        else:
-            last_space = -1
-        pos += 1
-    return line if last_space < 0 else line[:last_space]
+    """Git's ``trim_trailing_spaces``: drop the trailing run of spaces, except that a
+    space escaped by an unescaped ``\\`` is kept, with nothing after it."""
+    kept = line.rstrip(" ")
+    if len(kept) == len(line):
+        return line
+    backslashes = len(kept) - len(kept.rstrip("\\"))
+    if backslashes % 2:  # an odd run of backslashes escapes the first space
+        return line[: len(kept) + 1]
+    return kept
 
 
 def gitignore_patterns(data: bytes) -> list[str]:
@@ -123,11 +117,9 @@ class IgnoreRules:
 
     def __init__(self) -> None:
         self._rules: list[tuple[str, Glob]] = []  # (base folder, pattern), load order
-        self._by_name: dict[str, list[int]] = {}  # last component -> rule positions
-        self._by_prefix: dict[str, list[int]] = {}  # start of the last component -> ...
-        self._by_suffix: dict[str, list[int]] = {}  # end of the last component -> ...
-        self._prefix_lengths: set[int] = set()
-        self._suffix_lengths: set[int] = set()
+        # _index_key kind -> plain text -> rule positions; and the text lengths per kind
+        self._lookup: dict[str, dict[str, list[int]]] = {"name": {}, "prefix": {}, "suffix": {}}
+        self._lengths: dict[str, set[int]] = {"name": set(), "prefix": set(), "suffix": set()}
         self._anywhere: list[int] = []  # rules tried on every path
         self._folders: dict[str, bool] = {}
         self.loaded = 0
@@ -140,6 +132,8 @@ class IgnoreRules:
                 self.skipped += 1
                 continue
             self.loaded += 1
+            if (len(pattern) - len(pattern.rstrip("\\"))) % 2:
+                continue  # ends in an unescaped "\\": git counts it but it never matches
             self._index(len(self._rules), pattern)
             self._rules.append((base, compile_glob(pattern)))
         self._folders.clear()  # a cached folder verdict may change with new patterns
@@ -148,26 +142,23 @@ class IgnoreRules:
         key = _index_key(pattern)
         if key is None:
             self._anywhere.append(position)
-        elif key[0] == "name":
-            self._by_name.setdefault(key[1], []).append(position)
-        elif key[0] == "prefix":
-            self._by_prefix.setdefault(key[1], []).append(position)
-            self._prefix_lengths.add(len(key[1]))
-        else:
-            self._by_suffix.setdefault(key[1], []).append(position)
-            self._suffix_lengths.add(len(key[1]))
+            return
+        kind, text = key
+        self._lookup[kind].setdefault(text, []).append(position)
+        self._lengths[kind].add(len(text))
 
     def _candidates(self, path: str) -> list[int]:
         """Positions of the rules that can match ``path``, last loaded first."""
         name = path.rpartition("/")[2]
-        found = [*self._anywhere, *self._by_name.get(name, ())]
-        for length in self._prefix_lengths:
-            found.extend(self._by_prefix.get(name[:length], ()))
-        for length in self._suffix_lengths:
-            if length <= len(name):
-                found.extend(self._by_suffix.get(name[len(name) - length :], ()))
-        found.sort(reverse=True)
-        return found
+        found = {*self._anywhere, *self._lookup["name"].get(name, ())}
+        by_prefix, by_suffix = self._lookup["prefix"], self._lookup["suffix"]
+        # A length longer than the name slices the whole name, which can find a shorter
+        # key again; the set keeps each rule once.
+        for length in self._lengths["prefix"]:
+            found.update(by_prefix.get(name[:length], ()))
+        for length in self._lengths["suffix"]:
+            found.update(by_suffix.get(name[-length:], ()))
+        return sorted(found, reverse=True)
 
     def _verdict(self, path: str, is_dir: bool) -> bool:
         """The last matching pattern decides; a path no pattern matches is not ignored."""
