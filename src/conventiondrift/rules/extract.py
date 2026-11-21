@@ -31,7 +31,7 @@ duplicates and conflicts are T-015, not this module.
 """
 
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Final, NamedTuple
@@ -182,24 +182,39 @@ def _is_break(content: str) -> bool:
 class _Line(NamedTuple):
     """One line of a bullet or paragraph: ``content`` is what is split into sentences.
 
-    It is ``raw`` with each marker replaced by one space, minus its first ``skip``
-    characters (the bullet).
+    It is the line as written with each marker replaced by one space, minus its first
+    ``skip`` characters (the bullet). ``marks`` is ``_marks`` of the line as written,
+    computed once per line.
     """
 
     number: int
     content: str
-    raw: str
     skip: int
+    marks: tuple[int, ...]
 
 
-def _raw_index(raw: str, index: int) -> int:
-    """Where ``index`` in ``raw`` with each marker replaced by one space is in ``raw`` itself."""
-    shift = 0
+def _marks(raw: str) -> tuple[int, ...]:
+    """Where each marker of ``raw`` starts in ``raw`` with each marker replaced by one space.
+
+    One left-to-right pass over the line, non-overlapping like ``str.replace``: the k-th
+    marker found at ``p`` in ``raw`` starts at ``p - k * (len(MARKER) - 1)``. The result is
+    strictly increasing.
+    """
+    marks: list[int] = []
     position = raw.find(MARKER)
-    while position >= 0 and position - shift < index:
-        shift += len(MARKER) - 1
+    while position >= 0:
+        marks.append(position - len(marks) * (len(MARKER) - 1))
         position = raw.find(MARKER, position + len(MARKER))
-    return index + shift
+    return tuple(marks)
+
+
+def _raw_index(marks: tuple[int, ...], index: int) -> int:
+    """Where ``index`` in the line with each marker replaced by one space is in the line itself.
+
+    ``marks`` is ``_marks`` of that line. Each marker that starts before ``index`` adds
+    ``len(MARKER) - 1``; a bisect counts them, so the line is never searched again.
+    """
+    return index + bisect_left(marks, index) * (len(MARKER) - 1)
 
 
 def _is_vs(text: str, period: int) -> bool:
@@ -247,7 +262,7 @@ def _sentences(block: Sequence[_Line]) -> Iterator[Candidate]:
         yield Candidate(
             line=entry.number,
             text=" ".join(text[start:index].split()),
-            column=_raw_index(entry.raw, within) + 1,
+            column=_raw_index(entry.marks, within) + 1,
         )
 
 
@@ -276,6 +291,7 @@ def segment(path: str, text: str) -> Iterator[Candidate]:
             fence = opened
             continue
         content = raw.replace(MARKER, " ")
+        marks = _marks(raw)
         if not content.strip() or _is_break(content) or _HEADING.match(content):
             yield from _sentences(block)
             block = []
@@ -283,9 +299,9 @@ def segment(path: str, text: str) -> Iterator[Candidate]:
         bullet = _BULLET.match(content)
         if bullet is not None:
             yield from _sentences(block)
-            block = [_Line(number, content[bullet.end() :], raw, bullet.end())]
+            block = [_Line(number, content[bullet.end() :], bullet.end(), marks)]
             continue
-        block.append(_Line(number, content, raw, 0))
+        block.append(_Line(number, content, 0, marks))
     yield from _sentences(block)
 
 
