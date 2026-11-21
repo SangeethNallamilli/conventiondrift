@@ -1,0 +1,306 @@
+"""T-010b part 2 unit tests: ``.gitignore`` lines, precedence and the pattern cap
+(DESIGN §12 A-3 condition 4, ``discover/gitignore.py``).
+
+The expected verdicts of the git cases come from ``git check-ignore`` on a real
+repository (``test_verdicts_agree_with_git_check_ignore``), so the parser is held to
+git rather than to our reading of ``gitignore(5)``.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from tests.fixtures.gitrepo import GitRepo
+
+from conventiondrift.discover import gitignore
+from conventiondrift.discover.gitignore import IgnoreRules, gitignore_patterns
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Iterator[GitRepo]:
+    fixture = GitRepo.init(tmp_path / "repo")
+    yield fixture
+    fixture.remove()
+
+
+def rules(*files: tuple[str, bytes]) -> IgnoreRules:
+    loaded = IgnoreRules()
+    for base, data in files:
+        loaded.add(base, data)
+    return loaded
+
+
+# ------------------------------------------------------------------ line rules
+
+
+def test_caps_are_the_design_values() -> None:
+    assert gitignore.GITIGNORE_MAX_BYTES == 65_536
+    assert gitignore.GITIGNORE_MAX_PATTERNS == 2_000
+
+
+def test_blank_lines_and_comments_are_not_patterns() -> None:
+    assert gitignore_patterns(b"\n#c\n  \n\n#\na\n") == ["a"]
+
+
+def test_escaped_hash_and_bang_are_patterns() -> None:
+    assert gitignore_patterns(b"\\#h\n\\!n\n") == ["\\#h", "\\!n"]
+
+
+def test_crlf_lines_lose_the_cr() -> None:
+    assert gitignore_patterns(b"a\r\nb\r\n") == ["a", "b"]
+
+
+def test_only_one_cr_before_the_newline_is_dropped() -> None:
+    assert gitignore_patterns(b"a\r\r\n") == ["a\r"]
+
+
+def test_last_line_without_newline_is_read() -> None:
+    assert gitignore_patterns(b"a\nb") == ["a", "b"]
+
+
+def test_bom_is_dropped_only_at_the_start() -> None:
+    assert gitignore_patterns(b"\xef\xbb\xbfa\n\xef\xbb\xbfb\n") == ["a", "\ufeffb"]
+
+
+def test_bom_before_a_comment_leaves_a_comment() -> None:
+    assert gitignore_patterns(b"\xef\xbb\xbf#c\n") == []
+
+
+@pytest.mark.parametrize(
+    ("line", "pattern"),
+    [
+        (b"a  ", "a"),
+        (b"a \r", "a"),
+        (b"a\\ ", "a\\ "),
+        (b"a\\  ", "a\\ "),
+        (b"a b ", "a b"),
+        (b"a\t", "a\t"),
+        (b"a\\", "a\\"),
+        (b"a\\\\ ", "a\\\\"),
+        (b"\\ ", "\\ "),
+    ],
+)
+def test_trailing_spaces_are_dropped_unless_escaped(line: bytes, pattern: str) -> None:
+    assert gitignore_patterns(line) == [pattern]
+
+
+def test_a_line_of_spaces_is_not_a_pattern() -> None:
+    assert gitignore_patterns(b"   \n") == []
+
+
+def test_bytes_that_are_not_utf8_are_kept() -> None:
+    assert gitignore_patterns(b"\xff.py\n") == ["\udcff.py"]
+
+
+# ------------------------------------------------------------------ precedence
+
+
+def test_no_rules_ignore_nothing() -> None:
+    assert not IgnoreRules().ignored("a/b.py")
+
+
+def test_last_matching_pattern_wins() -> None:
+    loaded = rules(("", b"*.py\n!keep.py\n"))
+    assert loaded.ignored("x.py")
+    assert not loaded.ignored("keep.py")
+    assert rules(("", b"!keep.py\n*.py\n")).ignored("keep.py")
+
+
+def test_a_nested_file_applies_only_under_its_folder() -> None:
+    loaded = rules(("a", b"x.py\n/y.py\n"))
+    assert loaded.ignored("a/x.py")
+    assert loaded.ignored("a/b/x.py")
+    assert loaded.ignored("a/y.py")
+    assert not loaded.ignored("a/b/y.py")
+    assert not loaded.ignored("x.py")
+    assert not loaded.ignored("ab/x.py")
+    assert not loaded.ignored("a")
+
+
+def test_a_deeper_file_overrides_a_shallower_one() -> None:
+    loaded = rules(("", b"*.py\n"), ("a", b"!*.py\n"))
+    assert not loaded.ignored("a/x.py")
+    assert loaded.ignored("b/x.py")
+
+
+def test_nothing_under_an_ignored_folder_comes_back() -> None:
+    loaded = rules(("", b"build/\n!build/keep.py\n"))
+    assert loaded.ignored("build", is_dir=True)
+    assert loaded.ignored("build/keep.py")
+    assert loaded.ignored("build/deep/keep.py")
+
+
+def test_a_folder_only_pattern_never_matches_a_file() -> None:
+    loaded = rules(("", b"build/\n"))
+    assert not loaded.ignored("build")
+    assert loaded.ignored("build", is_dir=True)
+
+
+def test_adding_patterns_drops_cached_folder_verdicts() -> None:
+    loaded = rules(("", b"x\n"))
+    assert not loaded.ignored("a/b.py")  # caches folder "a" as not ignored
+    loaded.add("", b"a/\n")
+    assert loaded.ignored("a/b.py")
+
+
+def test_a_file_with_no_patterns_changes_nothing() -> None:
+    loaded = rules(("", b"*.py\n"), ("a", b"# nothing\n"))
+    assert loaded.ignored("a/x.py")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "ignored"),
+    [
+        ("gen_*", "d/gen_1", True),
+        ("gen_*", "d/xgen_1", False),
+        ("gen_*", "ge", False),
+        ("*.pyc", "d/m.pyc", True),
+        ("*.pyc", "d/m.pyc.bak", False),
+        ("*.pyc", ".pyc", True),
+        ("*.pyc", "pyc", False),
+        ("a?c", "abc", True),
+        ("a?c", "bbc", False),
+        ("a*bc", "abc", True),
+        ("a*bc", "ab", False),
+        ("ab*c", "abxyc", True),
+        ("ab*c", "abxy", False),
+        ("[ab]x", "bx", True),
+        ("[ab]x", "cx", False),
+        ("x[ab]", "xa", True),
+        ("x[ab]", "ya", False),
+        ("\\*x", "*x", True),
+        ("\\*x", "ax", False),
+        ("*\\x", "ax", True),
+        ("*", "anything", True),
+        ("**/m", "a/b/m", True),
+        ("a/**", "a/b", True),
+        ("d/", "x/d", False),
+        ("!", "x", False),
+    ],
+)
+def test_each_pattern_shape_matches_as_it_should(pattern: str, path: str, ignored: bool) -> None:
+    # Covers every lookup the speed-up uses (name, start, end, tried everywhere).
+    assert rules(("", pattern.encode())).ignored(path) is ignored
+
+
+def test_lookup_keeps_load_order_across_kinds() -> None:
+    # A name pattern, then an end pattern, then a start pattern, then one tried
+    # everywhere: each later one overrides the earlier for the same path.
+    loaded = IgnoreRules()
+    loaded.add("", b"m.py\n")
+    assert loaded.ignored("m.py")
+    loaded.add("", b"!*.py\n")
+    assert not loaded.ignored("m.py")
+    loaded.add("", b"m*\n")
+    assert loaded.ignored("m.py")
+    loaded.add("", b"![lm].py\n")
+    assert not loaded.ignored("m.py")
+    loaded.add("", b"m.py\n")
+    assert loaded.ignored("m.py")
+
+
+# ------------------------------------------------------------------ caps
+
+
+def test_the_pattern_cap_counts_in_load_order_across_files() -> None:
+    loaded = IgnoreRules()
+    loaded.add("", b"".join(b"p%d\n" % i for i in range(1_999)))
+    loaded.add("a", b"first\nsecond\nthird\n")
+    assert (loaded.loaded, loaded.skipped) == (2_000, 2)
+    assert loaded.ignored("a/first")
+    assert not loaded.ignored("a/second")
+    assert not loaded.ignored("a/third")
+
+
+def test_exactly_the_cap_skips_nothing() -> None:
+    loaded = rules(("", b"".join(b"p%d\n" % i for i in range(2_000))))
+    assert (loaded.loaded, loaded.skipped) == (2_000, 0)
+    assert loaded.ignored("p1999")
+
+
+def test_comments_and_blank_lines_do_not_count() -> None:
+    loaded = rules(("", b"#c\n\n   \na\n"))
+    assert (loaded.loaded, loaded.skipped) == (1, 0)
+
+
+# ------------------------------------------------------------------ against git
+
+_GIT_CASES: dict[str, bytes] = {
+    ".gitignore": (
+        b"\xef\xbb\xbf*.log\r\n"
+        b"!keep.log\n"
+        b"build/\n"
+        b"!build/keep.py\n"
+        b"\\#hash\n"
+        b"\\!bang\n"
+        b"trail   \n"
+        b"esc\\ \n"
+        b"/rooted\n"
+        b"**/deep/x\n"
+        b"sub/*.tmp\n"
+        b"gen_*\n"
+        b"\xef\xbb\xbflate\n"
+    ),
+    "sub/.gitignore": b"!a.log\nlocal\n/only_here\n",
+    "other/.gitignore": b"*\n!*.py\n!*/\n",
+}
+_GIT_PATHS = (
+    "a.log",
+    "keep.log",
+    "sub/a.log",
+    "sub/b.log",
+    "build/keep.py",
+    "build/x.py",
+    "#hash",
+    "!bang",
+    "trail",
+    "trail   ",
+    "esc ",
+    "esc",
+    "rooted",
+    "sub/rooted",
+    "sub/local",
+    "local",
+    "sub/only_here",
+    "sub/deeper/only_here",
+    "q/deep/x",
+    "sub/t.tmp",
+    "sub/in/t.tmp",
+    "gen_1",
+    "sub/gen_2",
+    "late",
+    "\ufefflate",
+    "other/x.txt",
+    "other/x.py",
+    "other/in/y.py",
+    "other/in/y.txt",
+)
+
+
+def _git_ignored(repo: GitRepo, path: str) -> bool:
+    proc = subprocess.run(  # noqa: S603 - argv list, no shell
+        ["git", "check-ignore", "-q", "--no-index", "--", path],  # noqa: S607
+        cwd=repo.path,
+        env=repo.env(),
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode in (0, 1), proc.stderr
+    return proc.returncode == 0
+
+
+def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
+    for rel, data in _GIT_CASES.items():
+        target = repo.path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    loaded = IgnoreRules()
+    for rel in sorted(_GIT_CASES, key=lambda r: r.count("/")):  # parents first, like the walk
+        loaded.add(rel.rpartition("/")[0], _GIT_CASES[rel])
+    expected = {path: _git_ignored(repo, path) for path in _GIT_PATHS}
+    assert {path: loaded.ignored(path) for path in _GIT_PATHS} == expected
+    # The fixture must exercise both answers, or it proves nothing.
+    assert set(expected.values()) == {True, False}
