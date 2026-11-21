@@ -34,7 +34,7 @@ pattern, match nothing, and the rest of the segment is not scanned.
 from __future__ import annotations
 
 from bisect import bisect_right
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Final
 
 __all__ = ["Glob", "GlobSet", "compile_glob"]
@@ -207,12 +207,20 @@ class Glob:
         stops and answers ``False``, so one call never does much more than ``limit``
         steps. The ``.gitignore`` match budget counts these steps (#76 B2, M-76-1).
         """
-        if (self.dir_only and not is_dir) or not path:
+        if not path:
+            return False, 1
+        return self.match_parts(path.split("/"), is_dir, limit)
+
+    def match_parts(self, parts: Sequence[str], is_dir: bool, limit: int) -> tuple[bool, int]:
+        """:meth:`match_counted` on a path already split on ``/`` (one or more non-empty
+        components). The steps don't depend on how long the path is, only on what is
+        compared, so a caller that splits a path once can try many patterns on it.
+        """
+        if self.dir_only and not is_dir:
             return False, 1
         if self._last is not None:
-            got = _segment_matches(self._last, path.rpartition("/")[2], limit - 1)
+            got = _segment_matches(self._last, parts[-1], limit - 1)
             return got > 0, 1 + abs(got)
-        parts = path.split("/")
         segs = self._segments
         s = p = 0
         star_s = star_p = -1

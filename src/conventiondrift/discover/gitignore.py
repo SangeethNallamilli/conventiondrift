@@ -36,9 +36,12 @@ Match budget (A-3 condition 7, #76 B2 and M-76-1, D-TL-69): the pattern cap limi
 many patterns there are, not how long they take, and patterns the index can't narrow
 are tried on every path. So all matching in one scan shares
 :data:`GITIGNORE_MATCH_BUDGET` steps. Every path check, file or folder (a folder's
-verdict is paid once, when it is first worked out and cached), pays four steps, two
-per index lookup and two per pattern tried, plus the steps
-:meth:`~conventiondrift.discover.globmatch.Glob.match_counted` reports. A match stops
+verdict is paid once, when it is first worked out and cached), pays four steps, one
+per path component (the path is split once), two per index lookup, two per pattern
+tried, one per component each time the path is cut to a ``.gitignore``'s folder (once
+per folder per check), plus the steps
+:meth:`~conventiondrift.discover.globmatch.Glob.match_parts` reports. So a long path
+costs its length once per check, not once per pattern (#76 CR B2). A match stops
 as soon as it would pass the budget. Once the budget is spent, ``.gitignore`` is not
 used for the rest of the walk: the path being checked and every later one are not
 ignored, so the scan reads more, never less, as with the other caps.
@@ -133,7 +136,8 @@ class IgnoreRules:
     """
 
     def __init__(self) -> None:
-        self._rules: list[tuple[str, Glob]] = []  # (base folder, pattern), load order
+        # (base folder, its components, pattern), in load order
+        self._rules: list[tuple[str, tuple[str, ...], Glob]] = []
         # _index_key kind -> plain text -> rule positions; and the text lengths per kind
         self._lookup: dict[str, dict[str, list[int]]] = {"name": {}, "prefix": {}, "suffix": {}}
         self._lengths: dict[str, set[int]] = {"name": set(), "prefix": set(), "suffix": set()}
@@ -154,7 +158,9 @@ class IgnoreRules:
             if (len(pattern) - len(pattern.rstrip("\\"))) % 2:
                 continue  # ends in an unescaped "\\": git counts it but it never matches
             self._index(len(self._rules), pattern)
-            self._rules.append((base, compile_glob(pattern)))
+            self._rules.append(
+                (base, tuple(base.split("/")) if base else (), compile_glob(pattern))
+            )
         self._folders.clear()  # a cached folder verdict may change with new patterns
 
     def _index(self, position: int, pattern: str) -> None:
@@ -186,20 +192,30 @@ class IgnoreRules:
 
     def _verdict(self, path: str, is_dir: bool) -> bool:
         """The last matching pattern decides; a path no pattern matches is not ignored.
-        Every step is paid from the match budget; if it runs out, ``False``."""
-        # A check costs about four steps to start and two per index lookup (a slice and
-        # a dict lookup), measured against match steps for #76.
-        self._work += 4 + 2 * sum(map(len, self._lengths.values()))
+        Every step is paid from the match budget; if it runs out, ``False``.
+
+        The path is split once, and cut to each ``.gitignore`` folder once, so a try
+        costs the same however long the path is; the split and the cuts are paid one
+        step per component (#76 CR B2).
+        """
+        parts = path.split("/")
+        # A check costs about four steps to start, one per component split and two per
+        # index lookup (a slice and a dict lookup), measured against match steps for #76.
+        self._work += 4 + len(parts) + 2 * sum(map(len, self._lengths.values()))
+        below: dict[str, list[str] | None] = {}  # base folder -> path components under it
         for position in self._candidates(path):
             self._work += 2  # a try costs about two match steps before matching starts
-            base, glob = self._rules[position]
-            if not base:
-                rel = path
-            elif path.startswith(base) and path[len(base) : len(base) + 1] == "/":
-                rel = path[len(base) + 1 :]
+            base, base_parts, glob = self._rules[position]
+            if base in below:
+                rel = below[base]
             else:
+                self._work += 1 + len(parts)
+                depth = len(base_parts)
+                inside = depth < len(parts) and tuple(parts[:depth]) == base_parts
+                rel = below[base] = parts[depth:] if inside else None
+            if rel is None:
                 continue
-            matched, steps = glob.match_counted(rel, is_dir, GITIGNORE_MATCH_BUDGET - self._work)
+            matched, steps = glob.match_parts(rel, is_dir, GITIGNORE_MATCH_BUDGET - self._work)
             self._work += steps
             if self.exhausted:
                 return False

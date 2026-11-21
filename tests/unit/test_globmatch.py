@@ -303,3 +303,27 @@ def test_a_match_that_needs_more_than_its_limit_does_not_match() -> None:
 def test_match_reads_a_path_as_a_file_unless_told() -> None:
     assert not compile_glob("d/").match("d")
     assert compile_glob("d/").match("d", True)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "is_dir"),
+    [
+        ("a/*/c", "a/b/c", True),
+        ("*.py", "x/m.py", False),
+        ("a/", "a", False),
+        ("a/b", "a/c", False),
+    ],
+)
+def test_match_parts_is_match_counted_on_a_split_path(
+    pattern: str, path: str, is_dir: bool
+) -> None:
+    glob = compile_glob(pattern)
+    expected = glob.match_counted(path, is_dir, _NO_LIMIT)
+    assert glob.match_parts(path.split("/"), is_dir, _NO_LIMIT) == expected
+
+
+def test_match_parts_steps_do_not_grow_with_path_length() -> None:
+    glob = compile_glob("[x]/[y]*")
+    deep = ["n" * 200] * 60 + ["b.py"]
+    assert glob.match_parts(["a", "b.py"], False, _NO_LIMIT) == (False, 4)
+    assert glob.match_parts(deep, False, _NO_LIMIT) == (False, 4)

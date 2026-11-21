@@ -381,70 +381,86 @@ def test_the_match_budget_is_the_chosen_value() -> None:
 def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
     loaded = rules(("", b"*.py\nb/\n"))  # two lookups: an end of length 3, a name of 1
     assert loaded.ignored("x.py")
-    assert loaded._work == 17  # 4 + 2 * 2 lookups + 2 for the try + 7 match steps
+    # 4 + 1 component split + 2 * 2 lookups + 2 for the try + 2 to cut the path to the
+    # root .gitignore's folder (1 + 1 component) + 7 match steps
+    assert loaded._work == 20
     loaded = rules(("", b"*.py\nb/\n"))
     assert loaded.ignored("a/x.py")
-    assert loaded._work == 25  # the folder "a" (8, nothing to try) and the file (17)
+    assert loaded._work == 31  # the folder "a" (9, nothing to try) and the file (22)
     assert loaded.ignored("a/y.py")
-    assert loaded._work == 42  # the cached folder verdict is not paid again
+    assert loaded._work == 53  # the cached folder verdict is not paid again
 
 
 def test_the_budget_runs_out_and_nothing_more_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 40)
-    loaded = rules(("", b"*.py\n"))  # each check: 4 + 2 + 2 + 7 = 15
+    loaded = rules(("", b"*.py\n"))  # each check: 4 + 1 + 2 + 2 + 2 + 7 = 18
     assert [loaded.ignored(p) for p in ("a.py", "b.py")] == [True, True]
-    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (30, False, 0)
-    assert not loaded.ignored("c.py")  # runs out inside the match: 30 + 8 + 3
-    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (41, True, 1)
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (36, False, 0)
+    assert not loaded.ignored("c.py")  # runs out before the match: 36 + 11 + 2
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (49, True, 1)
     assert not loaded.ignored("d.py")
     assert not loaded.ignored("e/f.py", is_dir=True)
-    assert (loaded._work, loaded.unchecked) == (41, 3)  # no more work once spent
+    assert (loaded._work, loaded.unchecked) == (49, 3)  # no more work once spent
 
 
 def test_exactly_the_budget_is_not_spent(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 30)
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 36)
     loaded = rules(("", b"*.py\n"))
     assert loaded.ignored("a.py") and loaded.ignored("b.py")
-    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (30, False, 0)
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (36, False, 0)
     assert not loaded.ignored("c.py")
     assert loaded.exhausted
 
 
 def test_the_budget_is_shared_by_every_gitignore_file(monkeypatch: pytest.MonkeyPatch) -> None:
     # One scan, one budget: adding a nested .gitignore does not start a new one.
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 40)
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 50)
     loaded = rules(("", b"*.py\n"))
     assert loaded.ignored("a.py") and loaded.ignored("b.py")
-    assert loaded._work == 30
+    assert loaded._work == 36
     loaded.add("sub", b"*.txt\n")
-    assert not loaded.ignored("sub/c.py")  # its 25 steps would make 55 > 40
+    assert not loaded.ignored("sub/c.py")  # its 31 steps would make 67 > 50
     assert (loaded.exhausted, loaded.unchecked) == (True, 1)
     alone = rules(("", b"*.py\n"), ("sub", b"*.txt\n"))
     assert alone.ignored("sub/c.py")
-    assert alone._work == 25
+    assert alone._work == 31
 
 
 def test_running_out_on_a_folder_leaves_the_path_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    # "a" costs 8; "a/b" would be ignored by "b/" but its check takes the work to 20.
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 19)
+    # "a" costs 10; "a/b" would be ignored by "b/" but its check takes the work to 26.
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 25)
     loaded = rules(("", b"*.py\nb/\n"))
     assert not loaded.ignored("a/b/x.py")
-    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (20, True, 1)
-    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 20)
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (26, True, 1)
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 26)
     loaded = rules(("", b"*.py\nb/\n"))
     assert loaded.ignored("a/b/x.py")
-    assert (loaded._work, loaded.unchecked) == (20, 0)
+    assert (loaded._work, loaded.unchecked) == (26, 0)
 
 
 def test_one_long_match_stops_at_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 1_000)
     loaded = rules(("", ("*a" * 40 + "[b]").encode()))  # tried on every path
-    assert not loaded.ignored("a" * 400)  # 4 + 2 + 802 match steps
-    assert (loaded._work, loaded.exhausted) == (808, False)
-    assert not loaded.ignored("a" * 400)  # stopped after 186 of its 802 steps
+    assert not loaded.ignored("a" * 400)  # 4 + 1 + 2 + 2 + 802 match steps
+    assert (loaded._work, loaded.exhausted) == (811, False)
+    assert not loaded.ignored("a" * 400)  # stopped after 181 of its 802 steps
     assert (loaded._work, loaded.exhausted, loaded.unchecked) == (1_001, True, 1)
+
+
+def test_long_paths_pay_for_their_components() -> None:
+    # #76 CR B2: a path is split and cut once per check, and that is paid per component,
+    # so a deep path costs more than a short one with the same patterns and name.
+    def work(path: str) -> int:
+        loaded = rules(("", b"".join(b"[x]/[y]%d*\n" % i for i in range(10))))
+        assert not loaded._verdict(path, False)
+        return loaded._work
+
+    short = work("a/b.py")
+    deep = work("/".join(["n" * 200] * 60) + "/b.py")
+    assert short == 4 + 2 + 10 * 2 + (1 + 2) + 10 * 4  # each match: [x] fails on "a" in 4
+    assert deep == short + 59 + 59  # 59 more components split, and 59 more cut
 
 
 @pytest.mark.parametrize(

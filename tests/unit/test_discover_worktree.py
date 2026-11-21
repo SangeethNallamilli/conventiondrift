@@ -470,8 +470,8 @@ def _budget(monkeypatch: pytest.MonkeyPatch, steps: int) -> None:
 def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Walk order: .gitignore, AGENTS.md, a.py (6 steps each), then z1.py ... (16 each):
-    # z3.py would take the work from 50 to 66.
+    # Walk order: .gitignore, AGENTS.md, a.py (7 steps each), then z1.py ... (19 each):
+    # z3.py would take the work from 59 to 78.
     _budget(monkeypatch, 60)
     names = ["a.py", "z1.py", "z2.py", "z3.py", "z4.py", "z5.py"]
     write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "z*\n", **dict.fromkeys(names, "")})
@@ -492,13 +492,13 @@ def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
 def test_the_match_budget_note_for_one_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _budget(monkeypatch, 50)  # .gitignore and AGENTS.md 12, z1.py and z2.py 32, z3.py 16
+    _budget(monkeypatch, 60)  # .gitignore and AGENTS.md 14, z1.py and z2.py 38, z3.py 19
     write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "z*\n", "z1.py": "", "z2.py": ""})
     write(tmp_path, {"z3.py": ""})
     result = run(tmp_path)
     assert py_paths(result) == ["z3.py"]
     assert result.discovery.notes == (
-        ".gitignore matching used up its budget of 50 steps; the last path was not "
+        ".gitignore matching used up its budget of 60 steps; the last path was not "
         "checked against .gitignore, so it was not left out",
     )
 
@@ -788,4 +788,58 @@ def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
     )
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert [n for n in result.discovery.notes if "budget" in n]
+
+
+_DEEP_FOLDERS = 58  # with b<n>/leaf<n>/mod_<n>.py: 61 components, inside the 64 cap
+_DEEP_FILES = 2_000  # enough paths to run the budget out
+
+
+def _deep_tree(root: Path) -> None:
+    """2,000 files under 58 folders of 200 characters each: paths of about 11,700
+    characters, built with ``dir_fd`` because they are longer than ``PATH_MAX``."""
+    write(root, {"AGENTS.md": AGENTS})
+    (root / ".git" / "info").mkdir(parents=True)
+    fd = os.open(root, os.O_RDONLY)
+    try:
+        for k in range(_DEEP_FOLDERS):
+            name = f"{k:02d}" + "n" * 198
+            os.mkdir(name, dir_fd=fd)
+            inner = os.open(name, os.O_RDONLY, dir_fd=fd)
+            os.close(fd)
+            fd = inner
+        for b in range(4):
+            os.mkdir(f"b{b}", dir_fd=fd)
+        for d in range(20):
+            leaf = f"b{d % 4}/leaf{d}"
+            os.mkdir(leaf, dir_fd=fd)
+            for f in range(_DEEP_FILES // 20):
+                os.close(os.open(f"{leaf}/mod_{f}.py", os.O_CREAT | os.O_WRONLY, dir_fd=fd))
+    finally:
+        os.close(fd)
+
+
+# #76 CR B2 (D-TL-72 margin): the budget pays for path length, so 2,000 patterns tried on
+# very long paths also add at most _MATCH_OVERHEAD_MAX_S. POSIX only: the tree is built
+# with dir_fd, and Windows needs long-path support for paths this long.
+@pytest.mark.timing
+@pytest.mark.skipif(not POSIX, reason="the deep tree is built with dir_fd (POSIX only)")
+def test_hostile_patterns_add_little_on_very_long_paths(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    root = tmp_path_factory.mktemp("deep")
+    _deep_tree(root)
+    _set_patterns(root, [])
+    baseline, result = _best_of_3(root)
+    assert len(py_paths(result)) == _DEEP_FILES
+    assert max(len(p) for p in py_paths(result)) > 11_000
+    assert result.discovery.notes == ()
+    _set_patterns(root, ["[x]/[y]*\n"] * _HOSTILE_LINES)
+    best, result = _best_of_3(root)
+    overhead = best - baseline
+    assert overhead <= _MATCH_OVERHEAD_MAX_S, (
+        f"hostile {best:.2f} s, no patterns {baseline:.2f} s: +{overhead:.2f} s"
+    )
+    assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
+    assert len(py_paths(result)) == _DEEP_FILES
     assert [n for n in result.discovery.notes if "budget" in n]
