@@ -116,14 +116,33 @@ def _fake(monkeypatch: pytest.MonkeyPatch, *outputs: tuple[int, bytes]) -> list[
     return calls
 
 
-def _fake_batch(monkeypatch: pytest.MonkeyPatch, script: str) -> list[list[str]]:
-    """Make every long-lived git a Python process running ``script`` (stdin -> stdout)."""
+def _fake_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    ready: Path | None = None,
+    timeout: float | None = None,
+) -> list[list[str]]:
+    """Make every long-lived git a Python process running ``script`` (stdin -> stdout).
+
+    With ``ready``, wait (bounded) until the child has created that file, then set
+    ``GIT_TIMEOUT_SECONDS`` to ``timeout`` before returning, so a slow interpreter
+    start-up does not count against a deadline that starts at spawn (CON-14, D-TL-61).
+    """
     real_start = gitread._start_batch
     started: list[list[str]] = []
 
     def start(argv: list[str], **kwargs: Any) -> Any:
         started.append(list(argv))
-        return real_start([sys.executable, "-c", script], **kwargs)
+        process = real_start([sys.executable, "-c", script], **kwargs)
+        if ready is not None:
+            for _ in range(600):  # 30 s in 0.05 s steps
+                if ready.exists():
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("fake git was not ready within 30 s")
+            monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", timeout)
+        return process
 
     monkeypatch.setattr(gitread, "_start_batch", start)
     return started
@@ -915,14 +934,19 @@ def test_patches_waiting_too_long_for_a_chunk_is_a_component_error(
 
 
 def test_patches_waiting_too_long_for_the_exit_is_a_component_error(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The 0.5 s deadline starts at spawn; arm it only once the child is up, so
+    # interpreter start-up cannot time out the first chunk (CON-14, D-TL-61).
+    ready = tmp_path / "ready"
     _fake_batch(
         monkeypatch,
-        "import os, sys, time\nsys.stdout.write('x'); sys.stdout.flush()\n"
+        f"import os, sys, time\nopen({str(ready)!r}, 'w').write('1')\n"
+        "sys.stdout.write('x'); sys.stdout.flush()\n"
         "os.close(1); time.sleep(60)",
+        ready,
+        0.5,
     )
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
     stream = GitReader(repo).patches(SHA, SHA2)
     assert next(stream) == b"x"
     with pytest.raises(ComponentError, match="git log timed out"):
