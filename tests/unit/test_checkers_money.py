@@ -301,7 +301,14 @@ def test_recognized_values_on_money_names_are_sites(code: str, option: str) -> N
         "d['price'] = 9.99",
         "price, cost = 1, 2",
         "charge(**{'price': 5})",
+        "charge(price=True)",
+        "charge(name=5)",
         "price: int",
+        "price: int = True",
+        "name: int = 5",
+        "price += True",
+        "(price := True)",
+        "(name := 5)",
     ],
 )
 def test_other_values_and_unnamed_targets_are_not_sites(code: str) -> None:
