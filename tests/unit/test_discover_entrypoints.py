@@ -25,8 +25,14 @@ from conventiondrift.discover.entrypoints import (
 from conventiondrift.discover.entrypoints import (
     is_manifest_name as entrypoints_is_manifest_name,
 )
-from conventiondrift.discover.safefs import FILE_MAX_BYTES
-from conventiondrift.model import ManifestFile, SkippedFile
+from conventiondrift.discover.safefs import (
+    FILE_MAX_BYTES,
+    REASON_BINARY,
+    REASON_NOT_DECODABLE,
+    REASON_SIZE,
+    REASON_SYMLINK,
+)
+from conventiondrift.model import ManifestFile, SkippedFile, SkipReason
 
 # The inventory pinned so a silent edit of the constant fails (D-TL-25).
 _MANIFEST_NAMES = frozenset(
@@ -322,6 +328,25 @@ def test_an_oversize_or_binary_or_symlink_manifest_is_skipped_with_its_reason() 
     assert "uv.lock" not in git.blobs
 
 
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        (("120000", b"target"), REASON_SYMLINK),
+        (b"x" * (FILE_MAX_BYTES + 1), REASON_SIZE),
+        (b"a\x00b", REASON_BINARY),
+        ("caf\u00e9\n".encode("latin-1"), REASON_NOT_DECODABLE),
+    ],
+    ids=["symlink", "size-limit", "binary", "latin-1"],
+)
+def test_a_setup_py_read_failure_is_skipped_once(
+    payload: bytes | tuple[str, bytes], reason: SkipReason
+) -> None:
+    found = run({"AGENTS.md": b"r", "setup.py": payload, "a.py": PY})
+    assert found.skipped == (SkippedFile("setup.py", reason),)
+    assert found.manifest_files == ()
+    assert "setup.py" not in names(found)[1]
+
+
 def test_a_deep_in_scope_manifest_is_walk_limit_and_is_never_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -418,6 +443,47 @@ def test_a_pyproject_nested_about_1000_deep_is_skipped_not_raised(
 ) -> None:
     for depth in _depths_for(builder):
         _assert_nested_pyproject_never_escapes(builder(depth))
+
+
+def _int_str_digit_limit() -> int:
+    """0 when the interpreter has no limit or the limit is disabled."""
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    if getter is None:
+        return 0
+    return int(getter())
+
+
+def _assert_huge_int_pyproject_never_escapes(text: str, *, expect_skip: bool) -> None:
+    """An oversized integer is a parse-error skip when the digit limit is active, never a raise."""
+    result = scripts_from_toml(text)
+    found = run({"AGENTS.md": b"r", "pyproject.toml": text.encode(), "a.py": PY})
+    if expect_skip:
+        assert result is False
+        assert found.skipped == (SkippedFile("pyproject.toml", REASON_MANIFEST_PARSE),)
+        assert found.manifest_files == ()
+        assert found.entry_points == frozenset()
+        return
+    assert result == []
+    assert found.skipped == ()
+    assert [m.path for m in found.manifest_files] == ["pyproject.toml"]
+
+
+def test_a_pyproject_with_an_integer_over_the_digit_limit_is_skipped_not_raised() -> None:
+    # D-TL-25: the digit count is taken from the running interpreter's limit, not a magic 4301.
+    limit = _int_str_digit_limit()
+    digits = limit + 1 if limit > 0 else 4301
+    _assert_huge_int_pyproject_never_escapes(
+        "k = " + "9" * digits + "\n",
+        expect_skip=limit > 0,
+    )
+
+
+def test_a_pyproject_with_a_5000_digit_integer_is_skipped_not_raised() -> None:
+    limit = _int_str_digit_limit()
+    _assert_huge_int_pyproject_never_escapes(
+        "version = " + "1" * 5000 + "\n",
+        expect_skip=0 < limit < 5000,
+    )
 
 
 def test_entry_points_from_scripts_skips_unresolvable_refs() -> None:

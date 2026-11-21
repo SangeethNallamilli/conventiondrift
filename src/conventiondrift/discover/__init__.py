@@ -233,8 +233,13 @@ def discover_tree(
     # The walker's rule (T-010b): a folder is entered if it is at most WALK_MAX_DEPTH
     # components deep, so a file path may have WALK_MAX_DEPTH + 1 components. Read per call.
     max_folder_depth = safefs.WALK_MAX_DEPTH
+    skip_paths: set[str] = set()
 
     def skip(path: str, reason: SkipReason) -> None:
+        # setup.py is both a manifest and a .py file (I-9, D-TL-65 #5): record one skip.
+        if path in skip_paths:
+            return
+        skip_paths.add(path)
         skipped.append(SkippedFile(path, reason))
 
     # Deeper paths are set aside before any matching (SR M-50-1) and never read.

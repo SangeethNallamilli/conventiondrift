@@ -76,11 +76,13 @@ def scripts_from_toml(text: str) -> list[str] | Literal[False]:
 
     A well-formed document that has no scripts, or that has a table whose values are not
     refs, yields an empty list: only a ``tomllib`` failure is a parse error. A document
-    nested deeply enough to make ``tomllib`` raise ``RecursionError`` is also unreadable.
+    nested deeply enough to make ``tomllib`` raise ``RecursionError``, or an integer
+    whose digits exceed the interpreter's conversion limit (``ValueError``), is also
+    unreadable. ``TOMLDecodeError`` is a ``ValueError`` subclass, so both are caught.
     """
     try:
         doc = tomllib.loads(text)
-    except (tomllib.TOMLDecodeError, RecursionError):
+    except (ValueError, RecursionError):
         return False
     refs: list[str] = []
     refs.extend(_table_refs(_mapping(doc, "project"), "scripts"))
