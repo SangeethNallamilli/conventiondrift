@@ -185,16 +185,16 @@ def test_the_registry_maps_the_canonical_file_to_its_checkers_ac_f2_5() -> None:
             "Use uv for dependencies.",
         ]
     )
-    # All eight are rules at lines 1-8; the other four checkers arrive with T-018 and T-019, so
-    # until then only these four lines are mapped, each to its own checker.
+    # All eight are rules at lines 1-8; the remaining two checkers arrive with T-019, so
+    # only these six lines are mapped, each to its own checker.
     assert rules_of(text) == [
         (1, "logging"),
         (2, "http-client"),
-        (3, None),
+        (3, "test-framework"),
         (4, None),
         (5, "string-format"),
         (6, "exceptions"),
-        (7, None),
+        (7, "type-hints"),
         (8, None),
     ]
 
