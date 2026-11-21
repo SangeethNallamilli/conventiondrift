@@ -247,6 +247,9 @@ def test_walk_limit_folders_are_merged_in_path_order(
 
 
 @pytest.mark.skipif(not POSIX, reason="names that are not UTF-8 are POSIX only")
+@pytest.mark.skipif(
+    sys.platform == "darwin", reason="APFS rejects non-UTF-8 file names (EILSEQ, errno 92)"
+)
 def test_walk_limits_sort_with_names_that_are_not_utf8(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
