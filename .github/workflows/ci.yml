@@ -179,7 +179,8 @@ jobs:
     name: test (${{ matrix.os }}, ${{ matrix.python-version }})
     needs: [lockfile]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # D-TL-58a (2026-11-20): Windows legs get 25 min; Ubuntu stays at 15.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
     permissions:
       contents: read
     strategy:
@@ -298,7 +299,8 @@ jobs:
     name: test-macos (${{ matrix.python-version }})
     needs: [lockfile]
     runs-on: macos-latest
-    timeout-minutes: 10
+    # D-TL-58a (2026-11-20): raised from 10 to 25 min.
+    timeout-minutes: 25
     permissions:
       contents: read
     strategy:
