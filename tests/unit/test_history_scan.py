@@ -551,6 +551,7 @@ def test_every_kind_of_scan_file_in_one_run_is_handled_and_counted(
     # every counted kind, so each counter adds up.
     monkeypatch.setattr(history, "SCAN_LINE_LIMIT", 3)
     contents = {
+        "bb.py": (rows("a", "b"), rows("a", "b")),  # unchanged: dated by history
         "c.py": (rows("a"), rows("a", "b", "c", "d")),  # working file over the line limit
         "d.py": (rows("a"), rows("a", "b", "c", "d")),  # and another
         "e.py": (rows("a", "b", "c", "d"), rows("a", "x")),  # HEAD blob over the line limit
@@ -577,3 +578,17 @@ def test_every_kind_of_scan_file_in_one_run_is_handled_and_counted(
         "scan_diff_work": 4 + 6,
     }
     assert result.notes == (history.SCAN_LINE_LIMIT_NOTE, history.bare_cr_note(2))
+
+
+def test_paths_that_are_not_utf8_sort_by_their_original_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # C4 keeps undecodable bytes with surrogateescape: b"\xff" sorts after b"\xee\x80\x80"
+    # ("\ue000") as bytes, though "\udcff" sorts before "\ue000" as text.
+    monkeypatch.setattr(history, "SCAN_DIFF_BUDGET", 1)
+    raw, private = "\udcff.py", "\ue000.py"
+    git, files = budget_git({raw: (rows("c"), rows("b")), private: (rows("a"), rows("b"))})
+    result = scan(git, {raw: [1], private: [1]}, files)
+    assert result.stats["scan_diff_work"] == 1
+    assert result.stats["scan_all_recent_diff_budget"] == 1
+    assert [call[0] for call in git.blob_calls] == [blob_id(rows("a")), blob_id(rows("c"))]
