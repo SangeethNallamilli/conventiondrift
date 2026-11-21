@@ -253,6 +253,7 @@ _NO_LIMIT = 1 << 40
         ("a", "a", False, (True, 2)),  # one segment: only the last component, 1 step
         ("**/x", "a/b/x", False, (True, 2)),  # the same shape written with "**/"
         ("*.py", "x/m.py", False, (True, 7)),  # 6 steps inside "m.py": *, back up, 4 chars
+        ("a*", "x/a", False, (True, 3)),  # the trailing "*" matches nothing: no step
         ("[q]1", "q1", False, (True, 4)),
         ("[q]1", "q1/x", False, (False, 3)),
         ("a/b", "a/c", False, (False, 5)),
@@ -297,3 +298,8 @@ def test_a_match_that_needs_more_than_its_limit_does_not_match() -> None:
     assert glob.match_counted("a/b/c", False, _NO_LIMIT) == (True, 9)
     assert glob.match_counted("a/b/c", False, 8) == (True, 9)  # the last step may pass it
     assert glob.match_counted("a/b/c", False, 5) == (False, 6)  # stopped inside "*"
+
+
+def test_match_reads_a_path_as_a_file_unless_told() -> None:
+    assert not compile_glob("d/").match("d")
+    assert compile_glob("d/").match("d", True)
