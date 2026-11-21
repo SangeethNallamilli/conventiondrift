@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sys
+import tomllib
+from collections.abc import Callable
+
 import pytest
 from checker_support import LINEAR_SIZES, assert_linear
 from test_discover_tree import PHASE, PY, SHA, FakeGit, names, run
@@ -356,6 +360,64 @@ def test_scripts_from_toml_returns_false_only_for_unreadable_toml() -> None:
     assert scripts_from_toml("[project.scripts\n") is False
     assert scripts_from_toml("[project]\nname = 1\n") == []
     assert scripts_from_toml('[project.scripts]\ncli = "pkg.cli:main"\n') == ["pkg.cli:main"]
+
+
+_NESTED_DEPTH = 1000
+
+
+def _nested_array_toml(depth: int) -> str:
+    return "k = " + "[" * depth + "1" + "]" * depth + "\n"
+
+
+def _nested_inline_table_toml(depth: int) -> str:
+    return "k = " + "{a=" * depth + "1" + "}" * depth + "\n"
+
+
+def _tomllib_raises_recursion(text: str) -> bool:
+    try:
+        tomllib.loads(text)
+    except RecursionError:
+        return True
+    except tomllib.TOMLDecodeError:
+        return False
+    return False
+
+
+def _depths_for(builder: Callable[[int], str]) -> tuple[int, ...]:
+    """About 1000, plus a deeper depth if this tomllib does not recurse at 1000."""
+    depths = [_NESTED_DEPTH]
+    if not _tomllib_raises_recursion(builder(_NESTED_DEPTH)):
+        for depth in (sys.getrecursionlimit() + 200, sys.getrecursionlimit() * 2, 5000):
+            if depth != _NESTED_DEPTH and _tomllib_raises_recursion(builder(depth)):
+                depths.append(depth)
+                break
+    return tuple(depths)
+
+
+def _assert_nested_pyproject_never_escapes(text: str) -> None:
+    """A deeply nested document is a parse-error skip when tomllib recurses, and never raises."""
+    result = scripts_from_toml(text)
+    found = run({"AGENTS.md": b"r", "pyproject.toml": text.encode(), "a.py": PY})
+    if result is False:
+        assert found.skipped == (SkippedFile("pyproject.toml", REASON_MANIFEST_PARSE),)
+        assert found.manifest_files == ()
+        assert found.entry_points == frozenset()
+        return
+    assert result == []
+    assert found.skipped == ()
+    assert [m.path for m in found.manifest_files] == ["pyproject.toml"]
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [_nested_array_toml, _nested_inline_table_toml],
+    ids=["arrays", "inline-tables"],
+)
+def test_a_pyproject_nested_about_1000_deep_is_skipped_not_raised(
+    builder: Callable[[int], str],
+) -> None:
+    for depth in _depths_for(builder):
+        _assert_nested_pyproject_never_escapes(builder(depth))
 
 
 def test_entry_points_from_scripts_skips_unresolvable_refs() -> None:

@@ -75,11 +75,12 @@ def scripts_from_toml(text: str) -> list[str] | Literal[False]:
     """The ``module:object`` refs in the two A-4 tables, or False when the TOML is unreadable.
 
     A well-formed document that has no scripts, or that has a table whose values are not
-    refs, yields an empty list: only a ``tomllib`` failure is a parse error.
+    refs, yields an empty list: only a ``tomllib`` failure is a parse error. A document
+    nested deeply enough to make ``tomllib`` raise ``RecursionError`` is also unreadable.
     """
     try:
         doc = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
+    except (tomllib.TOMLDecodeError, RecursionError):
         return False
     refs: list[str] = []
     refs.extend(_table_refs(_mapping(doc, "project"), "scripts"))
