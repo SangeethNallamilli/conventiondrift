@@ -19,7 +19,10 @@ entries) turns an untrusted repo-relative path into bytes or text:
   ``node_modules`` (SC-2.43, SR N4), applied to repo-relative components only;
   :func:`read_unless_hard_excluded` applies it before a named read (T-010b).
 * :func:`walk_worktree` - the scan-mode working-tree walk: no symlinks followed,
-  hard-excluded names never listed or entered, walk caps (DESIGN §12 A-3 #1-#3).
+  hard-excluded names never listed or entered, walk caps (DESIGN §12 A-3 #1-#3),
+  and an optional :class:`WalkFilter` for excludes and ``.gitignore`` (T-010b).
+* :func:`read_git_info_exclude` - the one read under ``.git``: ``.git/info/exclude``
+  (I-13 scan-walk ruling 4).
 
 Every problem with a file is a normal outcome: :class:`FileSkipped` with one
 of the I-9 ``skipped_files`` reasons. Nothing here runs git.
@@ -34,8 +37,9 @@ import os
 import re
 import stat
 import tokenize
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Final, Literal, Protocol
 
 from conventiondrift.errors import ComponentError, FileSkipped
 from conventiondrift.model import SkippedFile, SkipReason
@@ -60,6 +64,7 @@ __all__ = [
     "EntryKind",
     "FileKind",
     "PathOrigin",
+    "WalkFilter",
     "WalkResult",
     "check_size",
     "decode_text",
@@ -67,6 +72,7 @@ __all__ = [
     "escape_unsupported_path",
     "has_hard_excluded_component",
     "is_hard_excluded",
+    "read_git_info_exclude",
     "read_unless_hard_excluded",
     "size_limit",
     "validate_relpath",
@@ -599,6 +605,38 @@ def read_unless_hard_excluded(
     return _read_worktree_file(root, rel, kind, max_file_bytes=max_file_bytes, origin=origin)
 
 
+def read_git_info_exclude(root: str | os.PathLike[str], max_bytes: int) -> bytes | None:
+    """``.git/info/exclude`` under ``root``: the only file under ``.git`` C4 reads
+    (I-13 scan-walk ruling 4, DESIGN §12 A-3 condition 4).
+
+    ``None`` without reading anything unless ``.git`` at the root is a real folder by
+    ``lstat``: a symlink, junction, gitlink file or nothing at all is ``None``. The
+    file itself is read like any other worktree file (no symlinked ``info`` folder
+    or file, regular files only, at most ``max_bytes``), so a refusal is
+    :class:`FileSkipped` with the usual reason, ``"size limit"`` included.
+    """
+    try:
+        st = os.lstat(os.path.join(os.path.realpath(root), ".git"))
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or _is_reparse_point(st):
+        return None
+    return _read_worktree_file(
+        root, ".git/info/exclude", "instruction", max_file_bytes=max_bytes, origin="tree"
+    )
+
+
+class WalkFilter(Protocol):
+    """What :func:`walk_worktree` asks while it walks (T-010b: excludes and ``.gitignore``)."""
+
+    def enter(self, folder: str, names: Sequence[str]) -> None:
+        """Called once per listed folder (``""`` is the root) before any of its
+        entries is judged, with the names it holds, hard-excluded ones included."""
+
+    def drop(self, path: str, is_dir: bool) -> bool:
+        """True to leave ``path`` out of the walk entirely: not reported, not entered."""
+
+
 @dataclass(frozen=True, slots=True)
 class WalkResult:
     """What :func:`walk_worktree` found. Paths are repo-relative POSIX strings."""
@@ -608,7 +646,9 @@ class WalkResult:
     entries: int  # names listed, for the I-12 ``scan_walk_entries`` counter
 
 
-def walk_worktree(root: str | os.PathLike[str]) -> WalkResult:
+def walk_worktree(
+    root: str | os.PathLike[str], *, walk_filter: WalkFilter | None = None
+) -> WalkResult:
     """List every regular file under ``root`` for scan mode (DESIGN §12 A-3).
 
     * Hard-excluded names (I-5) are dropped by name before they are ``lstat``-ed,
@@ -630,10 +670,15 @@ def walk_worktree(root: str | os.PathLike[str]) -> WalkResult:
       is :class:`SkippedFile` with the I-14 ``U+XXXX`` path and
       ``"unsupported path"`` (I-13 ruling 3, SR N1).
 
-    Effective excludes and ``.gitignore`` are not applied here; callers filter.
+    * ``walk_filter``, if given, sees each folder's names before its entries are
+      judged and can drop any entry that is not hard-excluded, by path: a dropped
+      folder is not entered and nothing below it is reported, and a dropped
+      symlink, special file, bad name or deep folder is not reported (I-13 ruling
+      6). An entry whose ``lstat`` failed, or whose name failed validation, is
+      offered as a file. Without a filter every entry is kept.
     """
     try:
-        walk = _Walk(os.path.realpath(root))
+        walk = _Walk(os.path.realpath(root), walk_filter)
         walk.folder([], None)
     except OSError:
         raise ComponentError("discover", _ROOT_UNLISTABLE) from None
@@ -649,8 +694,9 @@ def _skip_reason(exc: FileSkipped | OSError) -> SkipReason:
 
 
 class _Walk:
-    def __init__(self, root_real: str) -> None:
+    def __init__(self, root_real: str, walk_filter: WalkFilter | None = None) -> None:
         self.root = root_real
+        self.filter = walk_filter
         self.files: list[str] = []
         self.skipped: list[SkippedFile] = []
         self.entries = 0
@@ -702,6 +748,8 @@ class _Walk:
             self.spent = True
             self.skip(parts, REASON_WALK_LIMIT)
             return
+        if self.filter is not None:
+            self.filter.enter("/".join(parts), names)
         for name in sorted(names, key=os.fsencode):
             self.entry(parts, name, handle)
 
@@ -744,9 +792,12 @@ class _Walk:
             else:
                 st = os.lstat(os.path.join(handle, name))
         except (FileSkipped, OSError) as exc:
-            self.skip(child, _skip_reason(exc))
+            if not self.dropped(child, is_dir=False):
+                self.skip(child, _skip_reason(exc))
             return
         kind = entry_kind(st.st_mode)
+        if self.dropped(child, is_dir=kind == "dir"):
+            return
         if kind == "symlink" or _is_reparse_point(st):
             self.skip(child, REASON_SYMLINK)
         elif kind == "file":
@@ -757,3 +808,6 @@ class _Walk:
             self.skip(child, REASON_WALK_LIMIT)
         else:
             self.folder(child, handle if isinstance(handle, int) else None)
+
+    def dropped(self, child: list[str], *, is_dir: bool) -> bool:
+        return self.filter is not None and self.filter.drop("/".join(child), is_dir)
