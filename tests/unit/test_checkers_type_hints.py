@@ -12,7 +12,13 @@ from checker_support import assert_linear, counts, rules_of, sites_of
 
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.checkers.type_hints import TypeHintsChecker
-from conventiondrift.checkers.type_hints.match import HINT_WORDS, HYPHENATED, OPTIONS, match_rule
+from conventiondrift.checkers.type_hints.match import (
+    HINT_WORDS,
+    HYPHENATED,
+    OPTIONS,
+    SCOPE_WORDS,
+    match_rule,
+)
 from conventiondrift.checkers.type_hints.sites import IGNORED_FIRST, is_annotated, type_hint_sites
 from conventiondrift.checkers.walk import parse
 from conventiondrift.model import FileContext, RuleMatch, Site
@@ -136,6 +142,92 @@ def test_it_takes_only_line_7_of_the_canonical_sentences_ac_f2_5() -> None:
 
 def test_the_registry_maps_the_type_hints_rule_to_type_hints() -> None:
     assert rules_of("Always use type hints.") == [(1, "type-hints")]
+
+
+# D-TL-63 list, pinned so a silent edit of the constant fails (D-TL-25).
+_SCOPE_WORDS = frozenset(
+    {
+        "public",
+        "private",
+        "internal",
+        "exported",
+        "api",
+        "apis",
+        "interface",
+        "interfaces",
+        "endpoint",
+        "endpoints",
+        "new",
+        "test",
+        "tests",
+        "script",
+        "scripts",
+        "library",
+        "libraries",
+    }
+)
+_UNSCOPED_WORDS = (
+    "function",
+    "functions",
+    "method",
+    "methods",
+    "class",
+    "classes",
+    "code",
+    "module",
+    "modules",
+    "package",
+    "packages",
+    "all",
+    "every",
+)
+
+
+def test_the_scope_words_are_the_d_tl_63_list() -> None:
+    assert SCOPE_WORDS == _SCOPE_WORDS
+
+
+@pytest.mark.parametrize("word", sorted(SCOPE_WORDS))
+def test_a_scope_word_makes_a_type_hints_rule_not_verifiable(word: str) -> None:
+    # Negatives are built from the pinned list, which equals the code constant (D-TL-25).
+    assert match_rule(f"use type hints in {word}.") is None
+    assert rules_of(f"Use type hints in {word}.") == [(1, None)]
+
+
+def test_named_scoped_type_hints_rules_are_not_mapped() -> None:
+    assert match_rule("use type hints in public apis.") is None
+    assert match_rule("add type hints to new code.") is None
+    assert rules_of("Use type hints in public APIs.") == [(1, None)]
+    # "Add ..." is not an extract shape, so it is not a rule; match_rule still
+    # returns None, and a same-scope imperative does not map either.
+    assert rules_of("Add type hints to new code.") == []
+    assert rules_of("Use type hints in new code.") == [(1, None)]
+
+
+def test_unscoped_type_hints_rules_still_map() -> None:
+    assert match_rule("always use type hints.") == ANNOTATED
+    assert match_rule("use type hints in every module.") == ANNOTATED
+    assert rules_of("Always use type hints.") == [(1, "type-hints")]
+    assert rules_of("Use type hints in every module.") == [(1, "type-hints")]
+
+
+@pytest.mark.parametrize("word", _UNSCOPED_WORDS)
+def test_deliberately_unscoped_words_still_map(word: str) -> None:
+    assert match_rule(f"use type hints in {word}.") == ANNOTATED
+    assert rules_of(f"Use type hints in {word}.") == [(1, "type-hints")]
+
+
+def test_the_scope_words_are_whole_words() -> None:
+    # Same mechanism as string_format: membership in phrases.clauses tokens, not substrings.
+    # "newline"/"testing" contain "new"/"test" but are different words, so they still map.
+    assert match_rule("use type hints in newline.") == ANNOTATED
+    assert match_rule("use type hints in testing.") == ANNOTATED
+    assert match_rule("use type hints in newest code.") == ANNOTATED
+    assert match_rule("use type hints publicly.") == ANNOTATED
+
+
+def test_a_scope_word_in_any_clause_is_enough() -> None:
+    assert match_rule("always use type hints; keep them on public apis.") is None
 
 
 # --- sites: AC-F3.8 -------------------------------------------------------------------------
@@ -272,6 +364,7 @@ HOSTILE_RULES = {
 }
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("kind", HOSTILE_RULES)
 def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)

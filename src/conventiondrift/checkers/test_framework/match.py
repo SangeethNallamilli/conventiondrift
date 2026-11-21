@@ -3,8 +3,8 @@
 A rule is about the test framework when its sentence names ``pytest`` (or ``py.test``) or
 ``unittest`` (or ``unittest.TestCase``); the polarity of each mention comes from
 ``phrases.classify``. So "Use pytest, not unittest." prefers pytest and forbids unittest, and
-"Avoid unittest." only forbids unittest. "Prefer pytest over unittest." names both as preferred,
-which ``classify`` turns into Not verifiable (I-10 "Negation in phrases.py" 4(c)).
+"Avoid unittest." only forbids unittest. "Prefer pytest over unittest." prefers pytest and
+forbids unittest (I-10 item 5d: ``over`` is a reverse cue after a comparative verb).
 """
 
 from collections.abc import Iterator

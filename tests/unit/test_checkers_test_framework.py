@@ -79,6 +79,8 @@ def test_the_checker_matches_through_its_module_function() -> None:
         ("unittest is deprecated; use pytest.", match(("pytest",), ("unittest",))),
         ("use unittest, not pytest.", match(("unittest",), ("pytest",))),
         ("USE PYTEST, NOT UNITTEST.", match(("pytest",), ("unittest",))),
+        # I-10 item 5d / AC-F2.3 line 2: "over" after a comparative verb prohibits what follows.
+        ("prefer pytest over unittest.", match(("pytest",), ("unittest",))),
     ],
 )
 def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: RuleMatch) -> None:
@@ -97,9 +99,6 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         "use unittest.mock for fakes.",
         "never use pytest or unittest.",  # every option prohibited: nothing is allowed
         "use pytest and unittest.",  # every option preferred: the rule would always hold
-        # I-10 item 4(c): "over" is no cue, so both are preferred (AC-F2.3 line 2; see the
-        # T-018 notes for the open question).
-        "prefer pytest over unittest.",
         "use pytest; never use pytest.",  # pytest both preferred and prohibited
     ],
 )
@@ -129,6 +128,7 @@ def test_it_takes_only_line_3_of_the_canonical_sentences_ac_f2_5() -> None:
 
 def test_the_registry_maps_the_pytest_rule_to_test_framework() -> None:
     assert rules_of("Use pytest, not unittest.") == [(1, "test-framework")]
+    assert rules_of("Prefer pytest over unittest.") == [(1, "test-framework")]
 
 
 # --- sites: AC-F3.4 -------------------------------------------------------------------------
@@ -324,6 +324,7 @@ HOSTILE_RULES = {
 }
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("kind", HOSTILE_RULES)
 def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_RULES[kind], matcher.match_rule, label=kind)
