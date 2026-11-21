@@ -12,7 +12,8 @@ the rest of A-3 while the walk runs:
 * folders that are submodules at ``HEAD`` (mode ``160000``) are not entered;
 * untracked paths that ``.gitignore`` ignores are left out (see
   :mod:`conventiondrift.discover.gitignore`). Files tracked at ``HEAD``, ``paths``
-  entries and ``pyvenv.cfg`` files are never left out by ``.gitignore``.
+  entries and ``pyvenv.cfg`` files are never left out by ``.gitignore``. Once the
+  ``.gitignore`` match budget is spent, nothing more is left out by it, with a note.
 
 The kept files then go through the same rules as a commit tree (S6 patterns and
 scopes, ``paths``, excludes, the generated-file header, R2.6 caps, I-13 ruling 6),
@@ -39,6 +40,7 @@ from conventiondrift.core import BasePhaseDone
 from conventiondrift.defaults import DEFAULT_EXCLUDES
 from conventiondrift.discover import Discovery, TreeReader, discover_tree, safefs
 from conventiondrift.discover.gitignore import (
+    GITIGNORE_MATCH_BUDGET,
     GITIGNORE_MAX_BYTES,
     GITIGNORE_MAX_PATTERNS,
     IgnoreRules,
@@ -94,8 +96,8 @@ class ScanDiscovery:
 
     * ``discovery``: the same result :func:`discover_tree` gives for a commit, for the
       working tree. Walk-limit folders are in ``discovery.skipped``, with their
-      path-byte order kept; notes about ``.gitignore`` files and the pattern cap
-      follow the ``paths`` notes in ``discovery.notes``.
+      path-byte order kept; notes about ``.gitignore`` files, the pattern cap and the
+      match budget follow the ``paths`` notes in ``discovery.notes``.
     * ``scan_tracked``: I-14. One entry per kept ``.py`` file that is tracked at
       ``HEAD``, keyed by path; untracked files are absent. Empty without ``HEAD``.
     * ``stats``: the I-12 counters C4 owns, in schema order (``scan_walk_entries``,
@@ -131,6 +133,16 @@ def _note_pattern_cap(skipped: int) -> str:
         f"only the first {GITIGNORE_MAX_PATTERNS:,} .gitignore patterns were used; "
         f"{skipped:,} more {noun} not"
     )
+
+
+def _note_match_budget(unchecked: int) -> str:
+    rest = (
+        "the last path was not checked against .gitignore, so it was not left out"
+        if unchecked == 1
+        else f"the last {unchecked:,} paths were not checked against .gitignore, "
+        "so none of them was left out"
+    )
+    return f".gitignore matching used up its budget of {GITIGNORE_MATCH_BUDGET:,} steps; {rest}"
 
 
 class _ScanFilter:
@@ -310,6 +322,8 @@ def discover_worktree(
     notes = [*found.notes, *map(_note_oversize, walk_filter.oversize)]
     if rules.skipped:
         notes.append(_note_pattern_cap(rules.skipped))
+    if rules.unchecked:
+        notes.append(_note_match_budget(rules.unchecked))
     skipped = sorted(
         (*found.skipped, *limits), key=lambda s: s.path.encode("utf-8", "surrogateescape")
     )

@@ -31,6 +31,18 @@ are tried on every path. The answer is the same as trying every pattern (``Glob.
 Caps (A-3 condition 4): a ``.gitignore`` over :data:`GITIGNORE_MAX_BYTES` is not
 read, and at most :data:`GITIGNORE_MAX_PATTERNS` patterns are used in total, in
 load order. Both are counted for the I-12 ``gitignore_*`` counters and notes.
+
+Match budget (A-3 condition 7, #76 B2 and M-76-1, D-TL-69): the pattern cap limits how
+many patterns there are, not how long they take, and patterns the index can't narrow
+are tried on every path. So all matching in one scan shares
+:data:`GITIGNORE_MATCH_BUDGET` steps. Every path check, file or folder (a folder's
+verdict is paid once, when it is first worked out and cached), pays four steps, two
+per index lookup and two per pattern tried, plus the steps
+:meth:`~conventiondrift.discover.globmatch.Glob.match_counted` reports. A match stops
+as soon as it would pass the budget. Once the budget is spent, ``.gitignore`` is not
+used for the rest of the walk: the path being checked and every later one are not
+ignored, so the scan reads more, never less, as with the other caps.
+:attr:`IgnoreRules.unchecked` counts those paths for the scan note.
 """
 
 from __future__ import annotations
@@ -40,6 +52,7 @@ from typing import Final
 from conventiondrift.discover.globmatch import Glob, compile_glob
 
 __all__ = [
+    "GITIGNORE_MATCH_BUDGET",
     "GITIGNORE_MAX_BYTES",
     "GITIGNORE_MAX_PATTERNS",
     "IgnoreRules",
@@ -48,6 +61,10 @@ __all__ = [
 
 GITIGNORE_MAX_BYTES: Final = 65_536  # A-3 condition 4: 64 KiB per file
 GITIGNORE_MAX_PATTERNS: Final = 2_000  # A-3 condition 4: patterns in total, all files
+# A-3 condition 7: match steps per scan, all paths. A step costs about 70-200 ns, so this
+# is under 1 s of matching for the worst pattern sets measured for #76 (TE, CR and SR
+# shapes); GitHub's Python .gitignore over 20,000 files uses about 40% of it.
+GITIGNORE_MATCH_BUDGET: Final = 5_000_000
 
 _BOM: Final = "\ufeff"
 _SPECIAL: Final = frozenset("*?[\\")  # anything in a segment that is not plain text
@@ -122,8 +139,10 @@ class IgnoreRules:
         self._lengths: dict[str, set[int]] = {"name": set(), "prefix": set(), "suffix": set()}
         self._anywhere: list[int] = []  # rules tried on every path
         self._folders: dict[str, bool] = {}
+        self._work = 0  # match steps spent, against GITIGNORE_MATCH_BUDGET
         self.loaded = 0
         self.skipped = 0
+        self.unchecked = 0  # paths answered "not ignored" because the budget was spent
 
     def add(self, base: str, data: bytes) -> None:
         """Add the patterns of the ``.gitignore`` in folder ``base`` (``""`` is the root)."""
@@ -160,9 +179,19 @@ class IgnoreRules:
             found.update(by_suffix.get(name[-length:], ()))
         return sorted(found, reverse=True)
 
+    @property
+    def exhausted(self) -> bool:
+        """True once the match budget is spent: nothing more is ignored."""
+        return self._work > GITIGNORE_MATCH_BUDGET
+
     def _verdict(self, path: str, is_dir: bool) -> bool:
-        """The last matching pattern decides; a path no pattern matches is not ignored."""
+        """The last matching pattern decides; a path no pattern matches is not ignored.
+        Every step is paid from the match budget; if it runs out, ``False``."""
+        # A check costs about four steps to start and two per index lookup (a slice and
+        # a dict lookup), measured against match steps for #76.
+        self._work += 4 + 2 * sum(map(len, self._lengths.values()))
         for position in self._candidates(path):
+            self._work += 2  # a try costs about two match steps before matching starts
             base, glob = self._rules[position]
             if not base:
                 rel = path
@@ -170,7 +199,11 @@ class IgnoreRules:
                 rel = path[len(base) + 1 :]
             else:
                 continue
-            if glob.match(rel, is_dir):
+            matched, steps = glob.match_counted(rel, is_dir, GITIGNORE_MATCH_BUDGET - self._work)
+            self._work += steps
+            if self.exhausted:
+                return False
+            if matched:
                 return not glob.negated
         return False
 
@@ -182,12 +215,22 @@ class IgnoreRules:
         return cached
 
     def ignored(self, path: str, is_dir: bool = False) -> bool:
-        """True if ``path``, or a folder above it, is ignored."""
+        """True if ``path``, or a folder above it, is ignored. ``False`` for every path
+        once the match budget is spent (counted in :attr:`unchecked`)."""
         if not self._rules:
             return False
+        if not self.exhausted and self._check(path, is_dir):
+            return True
+        if self.exhausted:
+            self.unchecked += 1
+        return False
+
+    def _check(self, path: str, is_dir: bool) -> bool:
         end = path.find("/")
         while end != -1:  # prefixes are sliced from the path, never rejoined
             if self._folder_ignored(path[:end]):
                 return True
+            if self.exhausted:
+                return False
             end = path.find("/", end + 1)
         return self._verdict(path, is_dir)

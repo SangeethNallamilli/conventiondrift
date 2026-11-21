@@ -369,3 +369,107 @@ def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
     assert {path: loaded.ignored(path) for path in _GIT_PATHS} == expected
     # The fixture must exercise both answers, or it proves nothing.
     assert set(expected.values()) == {True, False}
+
+
+# ------------------------------------------------------------------ match budget (#76 B2)
+
+
+def test_the_match_budget_is_the_chosen_value() -> None:
+    assert gitignore.GITIGNORE_MATCH_BUDGET == 5_000_000
+
+
+def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
+    loaded = rules(("", b"*.py\nb/\n"))  # two lookups: an end of length 3, a name of 1
+    assert loaded.ignored("x.py")
+    assert loaded._work == 17  # 4 + 2 * 2 lookups + 2 for the try + 7 match steps
+    loaded = rules(("", b"*.py\nb/\n"))
+    assert loaded.ignored("a/x.py")
+    assert loaded._work == 25  # the folder "a" (8, nothing to try) and the file (17)
+    assert loaded.ignored("a/y.py")
+    assert loaded._work == 42  # the cached folder verdict is not paid again
+
+
+def test_the_budget_runs_out_and_nothing_more_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 40)
+    loaded = rules(("", b"*.py\n"))  # each check: 4 + 2 + 2 + 7 = 15
+    assert [loaded.ignored(p) for p in ("a.py", "b.py")] == [True, True]
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (30, False, 0)
+    assert not loaded.ignored("c.py")  # runs out inside the match: 30 + 8 + 3
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (41, True, 1)
+    assert not loaded.ignored("d.py")
+    assert not loaded.ignored("e/f.py", is_dir=True)
+    assert (loaded._work, loaded.unchecked) == (41, 3)  # no more work once spent
+
+
+def test_exactly_the_budget_is_not_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 30)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored("a.py") and loaded.ignored("b.py")
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (30, False, 0)
+    assert not loaded.ignored("c.py")
+    assert loaded.exhausted
+
+
+def test_running_out_on_a_folder_leaves_the_path_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    # "a" costs 8; "a/b" would be ignored by "b/" but its check takes the work to 20.
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 19)
+    loaded = rules(("", b"*.py\nb/\n"))
+    assert not loaded.ignored("a/b/x.py")
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (20, True, 1)
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 20)
+    loaded = rules(("", b"*.py\nb/\n"))
+    assert loaded.ignored("a/b/x.py")
+    assert (loaded._work, loaded.unchecked) == (20, 0)
+
+
+def test_one_long_match_stops_at_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 1_000)
+    loaded = rules(("", ("*a" * 40 + "[b]").encode()))  # tried on every path
+    assert not loaded.ignored("a" * 400)  # 4 + 2 + 802 match steps
+    assert (loaded._work, loaded.exhausted) == (808, False)
+    assert not loaded.ignored("a" * 400)  # stopped after 186 of its 802 steps
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (1_001, True, 1)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        b"[q]%d\n",  # TE: one class, tried on every path
+        b"[x]*%d*q/\n",  # CR: folder-only, tried on every folder
+        b"**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q%d\n",  # SR: deep "**"
+    ],
+)
+def test_hostile_pattern_sets_spend_the_budget(
+    pattern: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 1_000_000)
+    loaded = IgnoreRules()
+    loaded.add("", b"keep.py\n")
+    loaded.add("", b"".join(pattern % i for i in range(1_999)))
+    assert loaded.loaded == 2_000
+    paths = [f"d{i}/e/f/g/h/keep.py" for i in range(200)]  # 6 checks each, none cached
+    verdicts = [loaded.ignored(p) for p in paths]
+    assert loaded.exhausted
+    spent = verdicts.index(False)
+    assert spent > 0 and not any(verdicts[spent:])  # ignored, then never again
+    assert loaded.unchecked == len(paths) - spent
+    assert loaded._work < 1_000_000 + 10  # a check stops within a few steps of the end
+
+
+def test_a_normal_gitignore_uses_little_of_the_budget() -> None:
+    # Common Python .gitignore lines over 20,000 files: about a fifth of the budget.
+    loaded = rules(
+        (
+            "",
+            b"__pycache__/\n*.py[cod]\n*$py.class\n*.so\n.Python\nbuild/\ndist/\n"
+            b"*.egg-info/\n.eggs/\n*.egg\n.tox/\n.coverage\n.coverage.*\nhtmlcov/\n"
+            b".pytest_cache/\n.mypy_cache/\n.env\n.venv\nenv/\nvenv/\n*.log\n*.mo\n"
+            b"*.pot\ndocs/_build/\n.ipynb_checkpoints\n*.sage.py\n.idea/\n.DS_Store\n",
+        )
+    )
+    for i in range(20_000):
+        assert not loaded.ignored(f"src/p{i % 40}/s{i % 9}/mod_{i}.py")
+    assert not loaded.exhausted
+    assert loaded._work < gitignore.GITIGNORE_MATCH_BUDGET // 4

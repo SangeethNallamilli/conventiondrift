@@ -8,6 +8,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from tests.fixtures.gitrepo import GitRepo
 
 import conventiondrift.discover.safefs as safefs
 from conventiondrift.core import BasePhaseDone
-from conventiondrift.discover import discover_tree, scan
+from conventiondrift.discover import discover_tree, gitignore, scan
 from conventiondrift.discover.globmatch import GlobSet
 from conventiondrift.discover.scan import ScanDiscovery, discover_worktree, git_blob_id
 from conventiondrift.errors import ComponentError, FileSkipped
@@ -461,6 +462,57 @@ def test_the_pattern_cap_is_a_note_and_counted(tmp_path: Path) -> None:
     assert result.stats["gitignore_patterns_skipped"] == 2
 
 
+def _budget(monkeypatch: pytest.MonkeyPatch, steps: int) -> None:
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", steps)
+    monkeypatch.setattr(scan, "GITIGNORE_MATCH_BUDGET", steps)
+
+
+def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Walk order: .gitignore, AGENTS.md, a.py (6 steps each), then z1.py ... (16 each):
+    # z3.py would take the work from 50 to 66.
+    _budget(monkeypatch, 60)
+    names = ["a.py", "z1.py", "z2.py", "z3.py", "z4.py", "z5.py"]
+    write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "z*\n", **dict.fromkeys(names, "")})
+    result = run(tmp_path)
+    assert py_paths(result) == ["a.py", "z3.py", "z4.py", "z5.py"]
+    assert result.discovery.notes == (
+        ".gitignore matching used up its budget of 60 steps; the last 3 paths were not "
+        "checked against .gitignore, so none of them was left out",
+    )
+    assert list(result.stats) == [  # no new I-12 counter
+        "scan_walk_entries",
+        "scan_walk_skipped",
+        "gitignore_patterns_loaded",
+        "gitignore_patterns_skipped",
+    ]
+
+
+def test_the_match_budget_note_for_one_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _budget(monkeypatch, 50)  # .gitignore and AGENTS.md 12, z1.py and z2.py 32, z3.py 16
+    write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "z*\n", "z1.py": "", "z2.py": ""})
+    write(tmp_path, {"z3.py": ""})
+    result = run(tmp_path)
+    assert py_paths(result) == ["z3.py"]
+    assert result.discovery.notes == (
+        ".gitignore matching used up its budget of 50 steps; the last path was not "
+        "checked against .gitignore, so it was not left out",
+    )
+
+
+def test_a_normal_repo_gets_no_budget_note(tmp_path: Path) -> None:
+    files: dict[str, str | bytes] = {f"pkg{i % 20}/m{i}.py": "" for i in range(2_000)}
+    files.update({f"pkg{i}/__pycache__/m.pyc": "" for i in range(20)})
+    ignore = "__pycache__/\n*.py[cod]\nbuild/\ndist/\n*.egg-info/\n.venv\n*.log\n"
+    write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": ignore, "build/x.py": "", **files})
+    result = run(tmp_path)
+    assert len(py_paths(result)) == 2_000  # build/x.py and the .pyc files are left out
+    assert result.discovery.notes == ()
+
+
 def test_the_gitignore_reader_never_reads_under_a_hard_excluded_folder(tmp_path: Path) -> None:
     write(tmp_path, {".git/.gitignore": "*\n"})
     walk_filter = scan._ScanFilter(
@@ -658,3 +710,49 @@ def test_stats_are_exact_and_in_schema_order(tmp_path: Path) -> None:
         ("gitignore_patterns_skipped", 0),
     ]
     assert result.discovery.skipped == ()  # the symlink would not be analyzed (ruling 6)
+
+
+# ------------------------------------------------------------------ A-3 condition 7
+
+_NEAR_CAP_FILES = 20_000
+
+
+@pytest.fixture(scope="module")
+def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """20,000 files in 200 folders six deep, as in a large B10k-sized checkout."""
+    root = tmp_path_factory.mktemp("near_cap")
+    write(root, {"AGENTS.md": AGENTS})
+    for d in range(200):
+        folder = root.joinpath(*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}")
+        folder.mkdir(parents=True)
+        for f in range(_NEAR_CAP_FILES // 200):
+            (folder / f"mod_{f}.py").write_bytes(b"")
+    (root / ".git" / "info").mkdir(parents=True)
+    return root
+
+
+# A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with 2,000 patterns the
+# index can't narrow, is discovered inside the B10k discovery budget (DESIGN §5, 4 s).
+# Each set runs the budget out, so the time includes reaching it.
+@pytest.mark.timing
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[q]{}",  # TE
+        "[x]*{}*q/",  # CR
+        "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}",  # SR, deep "**"
+    ],
+)
+def test_a_repo_near_the_caps_is_discovered_inside_the_stage_budget(
+    near_cap_tree: Path, line: str
+) -> None:
+    lines = [line.format(i) + "\n" for i in range(2_000)]  # two files, each under 64 KiB
+    (near_cap_tree / ".git" / "info" / "exclude").write_text("".join(lines[:1_000]))
+    (near_cap_tree / ".gitignore").write_text("".join(lines[1_000:]))
+    started = time.perf_counter()
+    result = run(near_cap_tree)
+    elapsed = time.perf_counter() - started
+    assert result.stats["gitignore_patterns_loaded"] == 2_000
+    assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert [n for n in result.discovery.notes if "budget" in n]
+    assert elapsed < 4.0, f"discovery took {elapsed:.2f} s"
