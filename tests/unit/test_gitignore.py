@@ -412,6 +412,20 @@ def test_exactly_the_budget_is_not_spent(monkeypatch: pytest.MonkeyPatch) -> Non
     assert loaded.exhausted
 
 
+def test_the_budget_is_shared_by_every_gitignore_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    # One scan, one budget: adding a nested .gitignore does not start a new one.
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 40)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored("a.py") and loaded.ignored("b.py")
+    assert loaded._work == 30
+    loaded.add("sub", b"*.txt\n")
+    assert not loaded.ignored("sub/c.py")  # its 25 steps would make 55 > 40
+    assert (loaded.exhausted, loaded.unchecked) == (True, 1)
+    alone = rules(("", b"*.py\n"), ("sub", b"*.txt\n"))
+    assert alone.ignored("sub/c.py")
+    assert alone._work == 25
+
+
 def test_running_out_on_a_folder_leaves_the_path_in(monkeypatch: pytest.MonkeyPatch) -> None:
     # "a" costs 8; "a/b" would be ignored by "b/" but its check takes the work to 20.
     monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", 19)

@@ -731,9 +731,43 @@ def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return root
 
 
+# D-TL-72: hostile patterns may add at most this much to discovery of the same tree. The
+# absolute 4 s B10k discovery budget (DESIGN §5) moves to the B10k benchmark job: on
+# slower runners the file reads alone take longer than 4 s, and they are not what A-3 #7
+# bounds here.
+_MATCH_OVERHEAD_MAX_S = 1.0
+_HOSTILE_LINES = 2_000
+
+
+def _set_patterns(root: Path, lines: Sequence[str]) -> None:
+    """The same two files every run (only their content changes), each under 64 KiB."""
+    (root / ".git" / "info" / "exclude").write_text("".join(lines[: len(lines) // 2]))
+    (root / ".gitignore").write_text("".join(lines[len(lines) // 2 :]))
+
+
+def _best_of_3(root: Path) -> tuple[float, ScanDiscovery]:
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        result = run(root)
+        best = min(best, time.perf_counter() - started)
+    return best, result
+
+
+@pytest.fixture(scope="module")
+def near_cap_baseline(near_cap_tree: Path) -> float:
+    """Best of 3 discoveries of the tree with both pattern files present but empty."""
+    _set_patterns(near_cap_tree, [])
+    best, result = _best_of_3(near_cap_tree)
+    assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert result.discovery.notes == ()
+    return best
+
+
 # A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with 2,000 patterns the
-# index can't narrow, is discovered inside the B10k discovery budget (DESIGN §5, 4 s).
-# Each set runs the budget out, so the time includes reaching it.
+# index can't narrow, costs at most _MATCH_OVERHEAD_MAX_S more to discover than the same
+# tree with no patterns (best of 3 each). Each set runs the budget out, so the time
+# includes reaching it.
 @pytest.mark.timing
 @pytest.mark.parametrize(
     "line",
@@ -743,16 +777,15 @@ def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}",  # SR, deep "**"
     ],
 )
-def test_a_repo_near_the_caps_is_discovered_inside_the_stage_budget(
-    near_cap_tree: Path, line: str
+def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
+    near_cap_tree: Path, near_cap_baseline: float, line: str
 ) -> None:
-    lines = [line.format(i) + "\n" for i in range(2_000)]  # two files, each under 64 KiB
-    (near_cap_tree / ".git" / "info" / "exclude").write_text("".join(lines[:1_000]))
-    (near_cap_tree / ".gitignore").write_text("".join(lines[1_000:]))
-    started = time.perf_counter()
-    result = run(near_cap_tree)
-    elapsed = time.perf_counter() - started
-    assert result.stats["gitignore_patterns_loaded"] == 2_000
+    _set_patterns(near_cap_tree, [line.format(i) + "\n" for i in range(_HOSTILE_LINES)])
+    best, result = _best_of_3(near_cap_tree)
+    overhead = best - near_cap_baseline
+    assert overhead <= _MATCH_OVERHEAD_MAX_S, (
+        f"hostile {best:.2f} s, no patterns {near_cap_baseline:.2f} s: +{overhead:.2f} s"
+    )
+    assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _NEAR_CAP_FILES
     assert [n for n in result.discovery.notes if "budget" in n]
-    assert elapsed < 4.0, f"discovery took {elapsed:.2f} s"
