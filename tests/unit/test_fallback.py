@@ -707,3 +707,180 @@ def test_a_created_summary_file_gets_the_same_mode_as_before(tmp_path: Path) -> 
     finally:
         os.umask(old)
     assert stat.S_IMODE(summary.stat().st_mode) == 0o666
+
+
+# --- without O_NOFOLLOW: the lstat check before the open (SR ruling for Windows) ------------
+
+
+@pytest.fixture
+def no_nofollow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the platform's ``O_NOFOLLOW`` out of the open flags, as on Windows."""
+    monkeypatch.setattr(fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~fallback._NOFOLLOW)
+
+
+class _LstatSpy:
+    """Records ``os.lstat`` calls on one path and can fake their result; other paths are real."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        path: Path,
+        result: object = None,
+        error: OSError | None = None,
+    ) -> None:
+        self.calls: list[str] = []
+        real_lstat = os.lstat
+
+        def lstat(target: str) -> object:
+            if str(target) != str(path):
+                return real_lstat(target)
+            self.calls.append(str(target))
+            if error is not None:
+                raise error
+            return real_lstat(target) if result is None else result
+
+        monkeypatch.setattr(os, "lstat", lstat)
+
+
+def _fake_lstat(attributes: int) -> object:
+    class Result:
+        st_mode = stat.S_IFREG | 0o644
+        st_file_attributes = attributes
+
+    return Result()
+
+
+def test_the_reparse_point_bit_is_the_windows_one() -> None:
+    assert fallback._REPARSE_POINT == stat.FILE_ATTRIBUTE_REPARSE_POINT == 0x400
+    assert fallback._NOFOLLOW == getattr(os, "O_NOFOLLOW", 0)
+
+
+@pytest.mark.skipif(not getattr(os, "O_NOFOLLOW", 0), reason="no O_NOFOLLOW on this platform")
+def test_with_o_nofollow_there_is_no_lstat_before_the_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    summary = tmp_path / "summary.md"
+    spy = _LstatSpy(monkeypatch, summary)
+    assert _refused(summary) == ""
+    assert spy.calls == []
+
+
+@pytest.mark.usefixtures("no_nofollow")
+@pytest.mark.parametrize("target_exists", [True, False], ids=["target", "dangling"])
+def test_without_o_nofollow_a_symlink_is_refused_before_the_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target_exists: bool
+) -> None:
+    target = tmp_path / "target.md"
+    if target_exists:
+        target.write_text("kept\n", encoding="utf-8")
+    link = tmp_path / "summary.md"
+    try:
+        link.symlink_to(target)
+    except OSError:  # pragma: no cover - symlinks not allowed here
+        pytest.skip("symlinks are not available")
+    lstat_spy = _LstatSpy(monkeypatch, link)
+    spy = _Spy(monkeypatch)
+    assert _refused(link) == _fallback_output()
+    assert lstat_spy.calls == [str(link)]
+    assert spy.opened == []
+    if target_exists:
+        assert target.read_text(encoding="utf-8") == "kept\n"
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_without_o_nofollow_a_reparse_point_is_refused_before_the_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    summary = tmp_path / "summary.md"
+    summary.write_bytes(b"")
+    _LstatSpy(monkeypatch, summary, result=_fake_lstat(fallback._REPARSE_POINT))
+    spy = _Spy(monkeypatch)
+    assert _refused(summary) == _fallback_output()
+    assert spy.opened == []
+    assert summary.read_bytes() == b""
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_without_o_nofollow_other_file_attributes_still_append(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    summary = tmp_path / "summary.md"
+    summary.write_text("before\n", encoding="utf-8")
+    others = ~fallback._REPARSE_POINT & 0xFFFF
+    spy = _LstatSpy(monkeypatch, summary, result=_fake_lstat(others))
+    assert _refused(summary) == ""
+    assert spy.calls == [str(summary)]
+    assert summary.read_text(encoding="utf-8") == "before\n" + action_section([_error()])
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_without_o_nofollow_a_regular_file_is_still_appended(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    summary = tmp_path / "summary.md"
+    summary.write_text("before\n", encoding="utf-8")
+    spy = _LstatSpy(monkeypatch, summary)
+    assert _refused(summary) == ""
+    assert spy.calls == [str(summary)]
+    assert summary.read_text(encoding="utf-8") == "before\n" + action_section([_error()])
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_without_o_nofollow_a_missing_file_is_still_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    summary = tmp_path / "new.md"
+    spy = _LstatSpy(monkeypatch, summary)
+    assert _refused(summary) == ""
+    assert spy.calls == [str(summary)]
+    assert stat.S_ISREG(summary.lstat().st_mode)
+    assert summary.read_text(encoding="utf-8") == action_section([_error()])
+
+
+@pytest.mark.usefixtures("no_nofollow")
+@pytest.mark.parametrize("errno_name", ["EACCES", "ELOOP", "ENAMETOOLONG", "ENOTDIR"])
+def test_without_o_nofollow_an_lstat_error_refuses_without_the_path_or_the_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, errno_name: str
+) -> None:
+    import errno as errno_module
+
+    code = getattr(errno_module, errno_name)
+    summary = tmp_path / f"{PLANTED.split()[0]}.md"
+    text = f"{errno_name}: {os.strerror(code)} {summary}"
+    _LstatSpy(monkeypatch, summary, error=OSError(code, text, str(summary)))
+    spy = _Spy(monkeypatch)
+    out = _refused(summary)
+    assert out == _fallback_output()
+    for part in (str(summary), summary.name, text, os.strerror(code)):
+        assert part not in out
+    assert spy.opened == []
+    assert not summary.exists()
+
+
+@pytest.mark.usefixtures("no_nofollow")
+@pytest.mark.parametrize("mode", [stat.S_IFDIR | 0o755, stat.S_IFIFO | 0o644])
+def test_without_o_nofollow_fstat_still_refuses_a_non_regular_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: int
+) -> None:
+    summary = tmp_path / "summary.md"
+    summary.write_bytes(b"")
+    lstat_spy = _LstatSpy(monkeypatch, summary)
+    spy = _Spy(monkeypatch)
+    real_fstat = os.fstat
+
+    def faked(fd: int) -> os.stat_result:
+        real = real_fstat(fd)
+        return os.stat_result((mode, *real[1:])) if fd in spy.opened else real
+
+    monkeypatch.setattr(os, "fstat", faked)
+    assert _refused(summary) == _fallback_output()
+    assert lstat_spy.calls == [str(summary)]
+    assert spy.opened and spy.closed == spy.opened
+    assert summary.read_bytes() == b""
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_without_o_nofollow_a_real_directory_is_refused(tmp_path: Path) -> None:
+    assert _refused(tmp_path) == _fallback_output()

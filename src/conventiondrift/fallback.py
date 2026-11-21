@@ -10,8 +10,9 @@ it imports nothing from ``render`` except ``render/escape.py`` (A-8).
   component escaped by ``md()``. It is never silent (I-14 "Fallback writer details" 2): if the
   variable is unset or empty, or the append raises ``OSError``, the CLI stderr lines are
   written instead. The file is opened without following a symlink and must be a regular file
-  (SR ruling); if it is refused, a fixed warning naming neither the path nor the OS error comes
-  first.
+  (SR ruling); where ``O_NOFOLLOW`` is missing (Windows), an ``lstat`` before the open refuses
+  a symlink or reparse point instead. If it is refused, a fixed warning naming neither the
+  path nor the OS error comes first.
 * **CLI:** one line per error on stderr,
   ``conventiondrift: internal error in <component>: <message>``. The summary file is not
   touched, because ``GITHUB_*`` variables can also be set when the CLI runs in CI.
@@ -90,11 +91,14 @@ def cli_lines(errors: Sequence[InternalError]) -> list[str]:
     return out
 
 
+_NOFOLLOW: Final[int] = getattr(os, "O_NOFOLLOW", 0)
+_REPARSE_POINT: Final[int] = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
 SUMMARY_OPEN_FLAGS: Final = (
     os.O_WRONLY
     | os.O_APPEND
     | os.O_CREAT
-    | getattr(os, "O_NOFOLLOW", 0)
+    | _NOFOLLOW
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_BINARY", 0)
@@ -112,12 +116,33 @@ SUMMARY_REFUSED: Final = (
 """The warning when the summary file is refused or can't be written; never the path or OS text."""
 
 
+def _no_link_before_open(path: str) -> bool:
+    """False if ``path`` must be refused before the open (SR ruling for Windows).
+
+    Only where ``SUMMARY_OPEN_FLAGS`` has no ``O_NOFOLLOW``: ``lstat`` the path; a missing file is
+    created as before, any other error refuses, and so does a symlink or a reparse point.
+    """
+    if SUMMARY_OPEN_FLAGS & _NOFOLLOW:
+        return True
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return False
+    return not getattr(st, "st_file_attributes", 0) & _REPARSE_POINT
+
+
 def _append_to_summary(path: str, errors: Sequence[InternalError]) -> bool:
     """Append the section to ``path``; False if it was refused (the caller then uses stderr).
 
     The file must open with ``SUMMARY_OPEN_FLAGS`` and ``fstat`` as a regular file (SR ruling);
-    the descriptor is always closed.
+    the descriptor is always closed. Without ``O_NOFOLLOW``, ``_no_link_before_open`` runs first.
     """
+    if not _no_link_before_open(path):
+        return False
     try:
         fd = os.open(path, SUMMARY_OPEN_FLAGS, 0o666)
     except OSError:
