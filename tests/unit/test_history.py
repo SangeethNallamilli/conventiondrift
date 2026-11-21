@@ -687,7 +687,7 @@ def test_unreadable_patch_text_is_an_internal_error(broken: bytes) -> None:
 _AFTER_HUNK_VALUE = {b"--- ": b"a/b.py", b"+++ ": b"b/b.py"}
 
 
-@pytest.mark.parametrize("prefix", history._SECTION_HEADERS)
+@pytest.mark.parametrize("prefix", [b"--- ", b"+++ ", b"rename from ", b"rename to "])
 def test_a_file_name_line_after_a_hunk_is_an_internal_error(prefix: bytes) -> None:
     # Git writes names before the first hunk; a later one would re-point mapped lines.
     late = prefix + _AFTER_HUNK_VALUE.get(prefix, b"b.py") + b"\n"
