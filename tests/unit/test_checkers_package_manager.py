@@ -181,7 +181,13 @@ def test_f3_9_a_single_managers_files_follow_its_rule(path: str, option: str) ->
 
 @pytest.mark.parametrize(
     "path",
-    ["requirements.txt", "requirements-dev.txt", "requirements_test.txt", "sub/requirements.txt"],
+    [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "requirements_test.txt",
+        "sub/requirements.txt",
+        "a/b/requirements.txt",  # only the final component is the name
+    ],
 )
 def test_every_requirements_txt_is_a_pip_site(path: str) -> None:
     assert sites({path: b"httpx\n"}) == [Site(path, 1, 0, REQUIREMENTS_OPTION)]
