@@ -4,8 +4,9 @@ SECURITY-RULES R2 treats every instruction file as hostile, and R2.6 requires bo
 An instruction file may be up to 1 MiB (R2.3) and may be a single physical line. These tests
 time ``extract_file`` (segmenting, normalizing, recognizing, the R2.6 caps and I-7 marker
 attachment) on one line of up to 1 MiB made of very short sentences, with and without I-7
-markers, using the repo's shared ``assert_linear`` (1.0 s + 4.0 s/MiB absolute budget at each
-size, best of three, and the doubling-ratio check once a step takes over 1 s).
+markers, CRLF line ends and bare CRs inside the line, using the repo's shared
+``assert_linear`` (1.0 s + 4.0 s/MiB absolute budget at each size, best of three, and the
+doubling-ratio check once a step takes over 1 s).
 
 The shapes are the ones that split into many candidate sentences, so the per-sentence cost is
 what gets measured (``tests/unit/test_rules_extract_vs.py`` uses shapes that never end a
@@ -41,19 +42,26 @@ def _marker_mid(n: int) -> str:
 
 # Each maker returns one physical line of at most n characters (all ASCII, so also n bytes).
 SHAPES: dict[str, Callable[[int], str]] = {
+    # The SR / KT-ARCHITECT §5.1 shapes.
     "dot-space": lambda n: _line(n, ". "),
     "a-dot": lambda n: _line(n, "a. "),
     "vs-dot-dot": lambda n: _line(n, "vs.. "),
     "xvs-dot": lambda n: _line(n, "xvs. "),
-    "rule-sentences": lambda n: _line(n, "Use a. "),
     "bullet": lambda n: _line(n, "a. ", head="- "),
+    "rule-sentences": lambda n: _line(n, "Use a. "),
+    # I-7 markers on the line.
     "marker-at-start": lambda n: _line(n, "a. ", head=I7_MARKER + " "),
     "marker-mid-line": _marker_mid,
     "marker-at-end": lambda n: _line(n, "Use a. ", tail=I7_MARKER + "\n"),
-    "marker-at-end-crlf": lambda n: _line(n, "Use a. ", tail=I7_MARKER + "\r\n"),
     "many-markers": lambda n: _line(n, "a. " + I7_MARKER + " "),
     "marker-glued-to-each-rule": lambda n: _line(n, I7_MARKER + "Use a. "),
     "bullet-many-markers": lambda n: _line(n, "Use a. " + I7_MARKER + " ", head="- "),
+    # CR: a CRLF line end, and bare CRs inside the line (only LF and CRLF end a line).
+    "a-dot-crlf": lambda n: _line(n, "a. ", tail="\r\n"),
+    "marker-at-end-crlf": lambda n: _line(n, "Use a. ", tail=I7_MARKER + "\r\n"),
+    "many-markers-crlf": lambda n: _line(n, "a. " + I7_MARKER + " ", tail="\r\n"),
+    "bare-cr-separated": lambda n: _line(n, "a.\r", tail="\r\n"),
+    "bare-cr-many-markers": lambda n: _line(n, "a.\r" + I7_MARKER + "\r", tail="\r\n"),
 }
 
 
@@ -68,7 +76,7 @@ def test_sec_t09_shapes_are_one_line_of_many_sentences(shape: str) -> None:
     n = 1 << 14
     text = SHAPES[shape](n)
     assert len(text) <= n
-    assert text.count("\n") == 1 and text.endswith("\n")
+    assert text.count("\n") == 1 and text.endswith("\n")  # one physical line (LF or CRLF end)
     assert sum(1 for _ in segment("AGENTS.md", text)) >= n // 64
 
 
