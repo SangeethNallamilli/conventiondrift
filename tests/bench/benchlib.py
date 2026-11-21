@@ -306,7 +306,7 @@ def write_results(profile: str, head_ref: str, manifest: dict, runs: list[Run]) 
 # discovery 4 s on B10k. D-TL-71 (3): the A-3 #7 limit is the absolute 4 s, not 125%.
 # D-TL-73: only the stage time is asserted, never the match budget's internals.
 NEAR_CAP_DISCOVER_S = 4.0
-NEAR_CAP_SETS = ("te", "cr", "sr", "cr-deep")  # gen_bench_repo.NEAR_CAP_SETS
+NEAR_CAP_SETS = ("te", "cr", "sr", "cr-deep", "cr-k90")  # gen_bench_repo.NEAR_CAP_SETS
 NEAR_CAP_PYTHON = "python"
 
 

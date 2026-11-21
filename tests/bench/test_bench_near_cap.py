@@ -6,8 +6,9 @@ seeded B10k checkout (10,000 tracked `.py` files) gets the `gen_bench_repo --nea
 overlay: 10,000 untracked `.py` files six deep, a deep tree at depth 62 with paths of
 about 12k characters, and 2,000 patterns (the A-3 #4 cap) that the rule index can't
 narrow, in `.git/info/exclude` and `.gitignore`. Sets: TE `[q]N`, CR `[x]*N*q/`, SR
-seven `**` segments, and CR's deep-path set (2,000 x `[x]/[y]*`). None of them matches
-any file, so every file must still be found.
+seven `**` segments, CR's deep-path set (2,000 x `[x]/[y]*`), and (D-TL-74) 90 x
+`[x]*N*q`, a mid-size set that stays under the per-path allowance and so is matched on
+every path. None of them matches any file, so every file must still be found.
 
 Only the stage time and the found files are asserted, never the match budget's
 internals (D-TL-73). The stock-Python case puts GitHub's `Python.gitignore` on a tree
@@ -65,7 +66,7 @@ def test_a3_7_b10k_near_cap_discovery_stage_under_4s(
 ) -> None:
     repo, manifest, tracked = b10k
     info = _overlay(repo, pattern_set)
-    assert info["patterns"] == 2_000
+    assert info["patterns"] == (90 if pattern_set == "cr-k90" else 2_000)
     assert 60 <= info["deep_depth"] <= 64 and 11_000 <= info["deep_max_path"] <= 13_000, info
     expected = len(tracked) + info["untracked_py"]
     runs = [benchlib.time_scan_discovery(repo) for _ in range(benchlib.RUNS)]
@@ -74,7 +75,7 @@ def test_a3_7_b10k_near_cap_discovery_stage_under_4s(
     for n, run in enumerate(runs):
         if run.seconds >= benchlib.NEAR_CAP_DISCOVER_S:
             problems.append(f"run {n}: discovery {run.seconds:.2f} s >= 4 s (DESIGN §5, A-3 #7)")
-        if run.stats["gitignore_patterns_loaded"] != 2_000:
+        if run.stats["gitignore_patterns_loaded"] != info["patterns"]:
             problems.append(f"run {n}: {run.stats['gitignore_patterns_loaded']} patterns loaded")
         if run.walk_limit_skips:
             problems.append(f"run {n}: {run.walk_limit_skips} walk-limit skips below the caps")

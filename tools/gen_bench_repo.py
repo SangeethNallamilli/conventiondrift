@@ -15,7 +15,7 @@ amended by SC-2.32 (D-PM-13's text still says 4 KiB; SC-2.32 made it 16 KiB):
 
 Usage:
     gen_bench_repo.py --profile b10k|b500 --seed N --out DIR [--manifest PATH]
-    gen_bench_repo.py --profile b10k --seed N --out DIR --near-cap te|cr|sr|cr-deep|python
+    gen_bench_repo.py --profile b10k --seed N --out DIR --near-cap te|cr|sr|cr-deep|cr-k90|python
 
 `--near-cap` writes the DESIGN A-3 #7 overlay (`write_near_cap`) into the existing
 checkout at DIR instead of generating: untracked files and `.gitignore` /
@@ -849,7 +849,9 @@ NEAR_CAP_SETS = {
     "cr": "[x]*{i}*q/",  # CR: folder-only, leading bracket and two stars
     "sr": "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{i}",  # SR: seven "**" segments
     "cr-deep": "[x]/[y]*",  # CR deep-path set: 2,000 times, run over ~12k-char paths
+    "cr-k90": "[x]*{i}*q",  # D-TL-74: 90 patterns, under the per-path allowance (no note)
 }
+NEAR_CAP_COUNTS = {"cr-k90": 90}  # patterns per set; the rest use NEAR_CAP_PATTERNS
 NEAR_CAP_PYTHON = "python"  # GitHub's stock Python.gitignore near the 500k walk cap
 PYTHON_GITIGNORE = Path(__file__).resolve().parent / "bench_data" / "Python.gitignore"
 UNTRACKED_PY = 10_000  # the B10k figure again, untracked: every one is matched
@@ -961,8 +963,9 @@ def write_near_cap(
             "deep_max_path": 0,
         }
     line = NEAR_CAP_SETS[pattern_set]
-    lines = [line.format(i=i) + "\n" for i in range(NEAR_CAP_PATTERNS)]
-    half = NEAR_CAP_PATTERNS // 2
+    count = NEAR_CAP_COUNTS.get(pattern_set, NEAR_CAP_PATTERNS)
+    lines = [line.format(i=i) + "\n" for i in range(count)]
+    half = count // 2
     (out / ".git" / "info" / "exclude").write_text("".join(lines[:half]), encoding="utf-8")
     (out / ".gitignore").write_text("".join(lines[half:]), encoding="utf-8")
     per = max(1, untracked_py // UNTRACKED_FOLDERS)
@@ -977,7 +980,7 @@ def write_near_cap(
     kept += deep
     return {
         "set": pattern_set,
-        "patterns": NEAR_CAP_PATTERNS,
+        "patterns": count,
         "untracked_py": len(kept),
         "ignored_py": [],
         "deep_depth": deep_levels + 2 if deep_levels else 0,
