@@ -1,5 +1,6 @@
-"""C4 discover (DESIGN §12 A-1, §10 S6, T-010a): instruction files and Python files
-in a commit's tree.
+"""C4 discover (DESIGN §12 A-1, §10 S6, A-4, T-010a, T-010c): instruction files,
+Python files, package-manager manifests and console-script entry points in a
+commit's tree.
 
 The path and file-read primitives live in :mod:`conventiondrift.discover.safefs` and the
 gitignore-style matcher in :mod:`conventiondrift.discover.globmatch`. :func:`discover_tree`
@@ -10,13 +11,20 @@ and ``.git/`` is never read (SEC-T10, SC-2.43). Problems with a file are
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
 from conventiondrift.core import BasePhaseDone
 from conventiondrift.defaults import DEFAULT_EXCLUDES
 from conventiondrift.discover import safefs
+from conventiondrift.discover.entrypoints import (
+    REASON_MANIFEST_PARSE,
+    entry_points_from_scripts,
+    is_manifest_name,
+    manifest_kind,
+    scripts_from_toml,
+)
 from conventiondrift.discover.globmatch import GlobSet, compile_glob
 from conventiondrift.discover.safefs import (
     REASON_WALK_LIMIT,
@@ -43,6 +51,7 @@ __all__ = [
     "discover_tree",
     "instruction_scope",
     "is_generated",
+    "is_manifest_name",
 ]
 
 MAX_INSTRUCTION_FILES: Final = 200  # R2.6
@@ -109,8 +118,8 @@ class Discovery:
 
     instruction_files: tuple[InstructionFile, ...]
     py_files: tuple[PyFile, ...]
-    manifest_files: tuple[ManifestFile, ...]  # empty until T-010c (A-4)
-    entry_points: frozenset[str]  # empty until T-010c (A-4)
+    manifest_files: tuple[ManifestFile, ...]  # A-4 package-manager names, in scope
+    entry_points: frozenset[str]  # discovered .py paths of console scripts (A-4)
     skipped: tuple[SkippedFile, ...]
     notes: tuple[str, ...]  # summary notes: "`x` is always excluded", "`x` was not found"
 
@@ -185,7 +194,7 @@ def discover_tree(
     paths: Sequence[str] | None = None,
     max_file_bytes: int | None = None,
 ) -> Discovery:
-    """List instruction files and Python files in scope at commit ``sha`` (DESIGN §10 S6).
+    """List instruction files, Python files and manifests in scope at commit ``sha``.
 
     ``phase`` is the SR-015 token: the base config load has already run (I-13 C4 rulings).
 
@@ -200,15 +209,18 @@ def discover_tree(
       other scopes to the whole repo (A-6). Named files are not subject to ``excludes``;
       one that is hard-excluded, or missing from the tree (SC-2.54), is dropped with a
       note, not a ``SkippedFile``, and a missing one never falls back to auto-detection.
-    * A ``.py`` file is kept only if some kept instruction file's scope contains it.
+    * A ``.py`` file or a package-manager manifest (A-4) is kept only if some kept
+      instruction file's scope contains it. A manifest belongs to its folder, the
+      same as a ``.py`` file. ``setup.py`` / ``setup.cfg`` are stored as text only.
     * At most ``MAX_INSTRUCTION_FILES`` and ``MAX_PY_FILES`` files are read, first by path
       bytes (A-5), so the kept set is never larger; the rest are ``"cap exceeded"`` and are
       never read. A file dropped after its read, such as a generated one, still used a slot.
     * A file whose folder is deeper than ``safefs.WALK_MAX_DEPTH`` components (so a path of
       more than ``WALK_MAX_DEPTH + 1`` components), the scan-mode walker's rule, is never
       read or fully matched (SR M-50-1). It is ``"walk limit"`` only if it would otherwise
-      be analyzed (I-13 ruling 6): an instruction-file pattern, or a ``.py`` in scope, that
-      the excludes do not drop, judged on its first ``WALK_MAX_DEPTH + 1`` levels. A named
+      be analyzed (I-13 ruling 6): an instruction-file pattern, a ``.py`` in scope, or a
+      manifest name in scope, that the excludes do not drop, judged on its first
+      ``WALK_MAX_DEPTH + 1`` levels. A named
       ``paths`` entry in the tree is ``"walk limit"``; a missing one is "not found".
     * Symlinks, special files and bad names are reported only when the file would
       otherwise be analyzed (I-13 ruling 6).
@@ -303,7 +315,11 @@ def discover_tree(
 
     scopes = frozenset(f.scope_dir for f in instructions)
     for path in deep:
-        if path.endswith(".py") and path not in named_deep and _in_scope(path, scopes):
+        if (
+            path not in named_deep
+            and _in_scope(path, scopes)
+            and (path.endswith(".py") or is_manifest_name(path))
+        ):
             if deep_wanted(path):
                 skip(escape_unsupported_path(path), REASON_WALK_LIMIT)
     pys: list[PyFile] = []
@@ -325,11 +341,46 @@ def discover_tree(
                 skip(path, got)
             elif not is_generated(got[1]):
                 pys.append(PyFile(path, got[0]))
+    manifests, entry_points = _manifests(
+        by_path, scopes, wanted, usable, reader, skip, frozenset(p.path for p in pys)
+    )
     return Discovery(
         tuple(instructions),
         tuple(pys),
-        (),
-        frozenset(),
+        tuple(manifests),
+        entry_points,
         tuple(sorted(skipped, key=lambda s: _sort_key(s.path))),
         tuple(notes),
     )
+
+
+def _manifests(
+    by_path: dict[str, TreeEntry],
+    scopes: frozenset[str],
+    wanted: Callable[[str], bool],
+    usable: Callable[[str], bool],
+    reader: _Reader,
+    skip: Callable[[str, SkipReason], None],
+    py_paths: frozenset[str],
+) -> tuple[list[ManifestFile], frozenset[str]]:
+    """Kept manifests in path-byte order, plus console-script paths from well-formed TOML."""
+    manifests: list[ManifestFile] = []
+    points: set[str] = set()
+    for path in by_path:
+        if not is_manifest_name(path) or not _in_scope(path, scopes) or not wanted(path):
+            continue
+        if not usable(path):
+            continue
+        got = reader.read(by_path[path], manifest_kind(path))
+        if not isinstance(got, tuple):
+            skip(path, got)
+            continue
+        data, text = got
+        if path.rsplit("/", 1)[-1] == "pyproject.toml":
+            refs = scripts_from_toml(text)
+            if refs is False:
+                skip(path, REASON_MANIFEST_PARSE)
+                continue
+            points.update(entry_points_from_scripts(refs, py_paths, path))
+        manifests.append(ManifestFile(path, data))
+    return manifests, frozenset(points)
