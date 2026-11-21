@@ -90,7 +90,7 @@ SCAN_DIFF_BUDGET_NOTE: Final = (
 def bare_cr_note(count: int) -> str:
     """The note for ``count`` files whose lines git and Python number differently.
 
-    DRAFT wording in the D-PM-45 style, pending PM approval.
+    Wording from the D-PM-45 amendment (note 5), singular and plural.
     """
     noun, pronoun = ("file has", "it") if count == 1 else ("files have", "them")
     return (
@@ -119,6 +119,8 @@ _SIMPLE_ESCAPES: Final = {
     b"\\": b"\\",
 }
 _BARE_CR: Final = re.compile(rb"\r(?!\n)")
+_SECTION_HEADERS: Final = (b"--- ", b"+++ ", b"rename from ", b"rename to ")
+"""The file-name lines of a section, which git writes before its first hunk."""
 
 
 def _unquote(token: bytes) -> bytes:
@@ -319,6 +321,10 @@ class _Replay:
             if section.mapper is not None:
                 section.mapper.hunk(old_count, int(match[3]), new_count)
                 self._hunk_file = section.mapper.tracked.file
+        elif section.hunks and line.startswith(_SECTION_HEADERS):
+            # Git writes a section's file names before its first hunk. A name after a
+            # hunk would re-point lines that were already mapped.
+            raise ComponentError(_COMPONENT, _MALFORMED)
         elif line.startswith(b"--- "):
             section.old = _git_path(line[4:], b"a/")
         elif line.startswith(b"+++ "):

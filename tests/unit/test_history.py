@@ -671,6 +671,30 @@ def test_unreadable_patch_text_is_an_internal_error(broken: bytes) -> None:
     assert git.closed == 1
 
 
+_AFTER_HUNK_VALUE = {b"--- ": b"a/b.py", b"+++ ": b"b/b.py"}
+
+
+@pytest.mark.parametrize("prefix", history._SECTION_HEADERS)
+def test_a_file_name_line_after_a_hunk_is_an_internal_error(prefix: bytes) -> None:
+    # Git writes names before the first hunk; a later one would re-point mapped lines.
+    late = prefix + _AFTER_HUNK_VALUE.get(prefix, b"b.py") + b"\n"
+    git = FakeGit(
+        [(sha(1), when(1))], [marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 1)) + late]
+    )
+    with pytest.raises(ComponentError) as raised:
+        compute_recent(git, window(), {"head": {"a.py": lines(1, 2)}}, tips={"head": HEAD})
+    assert raised.value.component == "history"
+    assert git.closed == 1
+
+
+def test_a_no_newline_marker_after_the_last_hunk_is_not_a_file_name_line() -> None:
+    section = file_diff(b"a.py", hunk(1, 0, 1, 1)) + b"\\ No newline at end of file\n"
+    chain = [(sha(1), when(1))]
+    assert recent_of(chain, [marker(sha(1)) + section], {"head": {"a.py": lines(1)}}) == {
+        ("head", "a.py", 1)
+    }
+
+
 @pytest.mark.parametrize(
     "stream",
     [
