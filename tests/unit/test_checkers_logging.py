@@ -185,8 +185,8 @@ def test_the_registry_maps_the_canonical_file_to_its_checkers_ac_f2_5() -> None:
             "Use uv for dependencies.",
         ]
     )
-    # All eight are rules at lines 1-8; package-manager arrives with T-019, so only
-    # line 8 is still unmapped. Money maps even when the checker is off (AC-F3.14).
+    # All eight are rules at lines 1-8, each mapped to its own checker.
+    # Money maps even when the checker is off (AC-F3.14).
     assert rules_of(text) == [
         (1, "logging"),
         (2, "http-client"),
@@ -195,7 +195,7 @@ def test_the_registry_maps_the_canonical_file_to_its_checkers_ac_f2_5() -> None:
         (5, "string-format"),
         (6, "exceptions"),
         (7, "type-hints"),
-        (8, None),
+        (8, "package-manager"),
     ]
 
 
