@@ -140,6 +140,15 @@ def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
     assert match_rule(sentence) is None
 
 
+def test_a_two_word_mention_spans_both_words() -> None:
+    # In a trailing-cue clause the mentions must be one unbroken list (I-10 item 4a):
+    # "integer cents or integer cents" is one, so the span covers "cents" too.
+    assert match_rule("integer cents or integer cents are banned.") == NO_CENTS
+    assert match_rule("integer cents and the integer cents are banned.") is None
+    assert match_rule("integer cents the integer cents are banned.") is None
+    assert match_rule("integer cents plus integer cents are banned.") is None
+
+
 def test_the_words_it_reads() -> None:
     assert HINT_WORDS == {"cent", "cents"}
     assert HYPHENATED == {
@@ -275,6 +284,8 @@ def test_a_rule_against_integer_cents_counts_floats_as_following() -> None:
         ("(price := 5)", "integer-cents"),
         ("charge(price=5)", "integer-cents"),
         ("charge(price=9.99)", "float"),
+        ("charge(name=1, price=5)", "integer-cents"),
+        ("charge(**kwargs, price=9.99)", "float"),
     ],
 )
 def test_recognized_values_on_money_names_are_sites(code: str, option: str) -> None:
@@ -303,6 +314,8 @@ def test_recognized_values_on_money_names_are_sites(code: str, option: str) -> N
         "charge(**{'price': 5})",
         "charge(price=True)",
         "charge(name=5)",
+        "price = obj.foo()",
+        "price = math.sqrt(1)",
         "price: int",
         "price: int = True",
         "name: int = 5",
