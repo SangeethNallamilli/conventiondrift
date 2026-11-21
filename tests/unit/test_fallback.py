@@ -546,7 +546,7 @@ def test_a_symlink_to_a_regular_file_is_refused(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "kept\n"
 
 
-FIFO_OPEN_LIMIT = 30.0
+FIFO_OPEN_LIMIT = 5.0
 """Seconds the no-reader FIFO open may take before the test calls it a hang (no clock read)."""
 
 
@@ -734,6 +734,13 @@ def no_nofollow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Take the platform's ``O_NOFOLLOW`` out of the open flags, as on Windows."""
     monkeypatch.setattr(fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~fallback._NOFOLLOW)
     monkeypatch.setattr(fallback, "_NOFOLLOW", 0)
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_the_no_nofollow_fixture_clears_both_the_flag_and_the_constant() -> None:
+    assert fallback._NOFOLLOW == 0
+    assert not fallback.SUMMARY_OPEN_FLAGS & getattr(os, "O_NOFOLLOW", 0)
+    assert fallback.SUMMARY_OPEN_FLAGS | getattr(os, "O_NOFOLLOW", 0) == SUMMARY_OPEN_FLAGS
 
 
 class _LstatSpy:

@@ -49,9 +49,8 @@ _PARTS: Final = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 
 def words_of(identifier: str) -> tuple[str, ...]:
     """The identifier split at ``_`` and camelCase boundaries, each word lowercased (I-8)."""
-    return tuple(
-        token.lower() for part in identifier.split("_") if part for token in _PARTS.findall(part)
-    )
+    # ``_PARTS`` never matches ``_``, so one ``findall`` over the identifier splits there too.
+    return tuple(token.lower() for token in _PARTS.findall(identifier))
 
 
 def is_named_like_money(identifier: str) -> bool:
@@ -118,7 +117,11 @@ def _site(target: ast.AST, value: ast.AST, ctx: FileContext) -> Site | None:
 
 
 def money_sites(node: ast.AST, ctx: FileContext) -> Iterator[Site]:
-    """Handler for assignments, annotated assignments and calls (keyword arguments)."""
+    """Handler for assignments, annotated assignments and calls (keyword arguments).
+
+    An augmented assignment counts like a plain one, so ``price += 0.5`` is a ``float`` site:
+    the value added is stored on a money name in the same form.
+    """
     if isinstance(node, ast.Assign):
         for target in node.targets:
             site = _site(target, node.value, ctx)

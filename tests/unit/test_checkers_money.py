@@ -133,6 +133,7 @@ def test_match_rule_reads_the_polarity_of_each_mention(sentence: str, expected: 
         "count the money.",
         "store values as cents.",
         "store money as integer.",  # "integer" with no "cents"
+        "store money as int cents.",  # "int" is not "integer"
         "store money as integer cents; never store money as integer cents.",
     ],
 )
@@ -322,6 +323,8 @@ def test_recognized_values_on_money_names_are_sites(code: str, option: str) -> N
         "price += True",
         "(price := True)",
         "(name := 5)",
+        "price = obj.foo",  # an attribute not ending in "_cents"
+        "price = 5j",  # a complex literal is neither int nor float
     ],
 )
 def test_other_values_and_unnamed_targets_are_not_sites(code: str) -> None:
@@ -342,6 +345,26 @@ def test_option_of_reads_the_i8_value_forms() -> None:
 def test_a_site_is_at_the_target_name() -> None:
     source = "total_cents = 999\n"
     assert sites_of("money", {"src/a.py": source}) == [Site("src/a.py", 1, 0, "integer-cents")]
+
+
+@pytest.mark.parametrize(("value", "option"), [("5", "integer-cents"), ("9.99", "float")])
+def test_a_chained_assignment_gives_one_site_per_money_target(value: str, option: str) -> None:
+    source = f"price = cost = {value}\n"
+    assert sites_of("money", {"src/a.py": source}) == [
+        Site("src/a.py", 1, 0, option),
+        Site("src/a.py", 1, 8, option),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "line", "column"),
+    [("charge(price=5)\n", 1, 7), ("charge(\n    price=5)\n", 2, 4)],
+    ids=["one-line", "next-line"],
+)
+def test_a_keyword_site_is_at_the_keyword(source: str, line: int, column: int) -> None:
+    assert sites_of("money", {"src/a.py": source}) == [
+        Site("src/a.py", line, column, "integer-cents")
+    ]
 
 
 def test_the_checker_works_in_a_spawn_pool() -> None:

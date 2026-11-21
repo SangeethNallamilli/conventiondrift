@@ -71,6 +71,7 @@ def _find(clause: tuple[str, ...]) -> Iterator[Mention]:
 
 def match_rule(normalized_text: str) -> RuleMatch | None:
     """The options a rule sentence prefers and forbids, or None if it isn't about type hints."""
+    # Deliberately cautious (D-TL-63): a scope word in any clause drops the whole sentence.
     if any(word in SCOPE_WORDS for clause in clauses(normalized_text) for word in clause):
         return None
     return classify(normalized_text, _find, OPTIONS)

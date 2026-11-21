@@ -30,8 +30,9 @@ from conventiondrift.checkers.package_manager.sites import (
 )
 from conventiondrift.checkers.pool import analyze
 from conventiondrift.discover.entrypoints import LOCKFILE_NAMES, REASON_MANIFEST_PARSE
-from conventiondrift.model import ManifestFile, RuleMatch, Site, SkippedFile
-from conventiondrift.policy.config import DEFAULT_CHECKERS
+from conventiondrift.model import Counts, ManifestFile, RuleMatch, Site, SkippedFile, Verdict
+from conventiondrift.policy.config import DEFAULT_CHECKERS, DEFAULT_THRESHOLDS
+from conventiondrift.verdicts import decide
 
 # Pinned so a silent edit of a constant fails (D-TL-25).
 _OPTIONS = frozenset({"pip", "poetry", "uv", "pdm"})
@@ -128,6 +129,17 @@ def test_match_rule_does_not_map_what_it_cannot_read(sentence: str) -> None:
     assert match_rule(sentence) is None
 
 
+def test_match_rule_reads_against_the_pinned_option_set() -> None:
+    # classify gets exactly the four managers: all four preferred, or all four forbidden, is
+    # no rule, while any three still map (a smaller or larger set would change these).
+    every = " or ".join(sorted(_OPTIONS))
+    assert match_rule(f"use {every}.") is None
+    assert match_rule(f"never use {every}.") is None
+    for left_out in sorted(_OPTIONS):
+        three = tuple(sorted(_OPTIONS - {left_out}))
+        assert match_rule("use " + " or ".join(three) + ".") == match(three)
+
+
 @pytest.mark.parametrize("option", sorted(OPTIONS))
 def test_each_option_is_its_own_word(option: str) -> None:
     assert match_rule(f"use {option}.") == match((option,))
@@ -195,7 +207,18 @@ def test_every_requirements_txt_is_a_pip_site(path: str) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    ["setup.py", "setup.cfg", "requirements.in", "dev-requirements.txt", "Pipfile", "x.lock"],
+    [
+        "setup.py",
+        "setup.cfg",
+        "requirements.in",
+        "dev-requirements.txt",
+        "Pipfile",
+        "x.lock",
+        "Pyproject.toml",  # the pyproject name is exact
+        "pyproject.toml.bak",
+        "old-pyproject.toml",
+        "sub/pyproject.tom",
+    ],
 )
 def test_other_files_are_not_evidence(path: str) -> None:
     assert list(manifest_sites({path: b"[tool.uv]\n"})) == []
@@ -205,6 +228,46 @@ def test_other_files_are_not_evidence(path: str) -> None:
 def test_a_lockfile_is_evidence_without_being_parsed(name: str) -> None:
     for data in (b"", b"not toml [[[", b"\x00\xff binary", b"k = " + b"[" * 2000):
         assert sites({f"pkg/{name}": data}) == [Site(f"pkg/{name}", 1, 0, LOCKFILES[name])]
+
+
+def test_a_lockfile_with_another_managers_table_inside_is_still_only_its_own_site() -> None:
+    assert sites({"uv.lock": b"[tool.poetry]\n"}) == [Site("uv.lock", 1, 0, "uv")]
+
+
+def test_sites_come_in_path_order_then_table_name_order() -> None:
+    files = {
+        "z/requirements.txt": b"",
+        "pyproject.toml": b"[tool.uv]\n[tool.poetry]\n[tool.pdm]\n",
+        "a/uv.lock": b"",
+    }
+    assert list(manifest_sites(files)) == [
+        Site("a/uv.lock", 1, 0, "uv"),
+        Site("pyproject.toml", 3, 0, "pdm"),
+        Site("pyproject.toml", 2, 0, "poetry"),
+        Site("pyproject.toml", 1, 0, "uv"),
+        Site("z/requirements.txt", 1, 0, "pip"),
+    ]
+
+
+EVIDENCE_IN_ORDER = (
+    ("uv.lock", b""),
+    ("pyproject.toml", b"[tool.uv]\n"),
+    ("sub/uv.lock", b""),
+)
+
+
+@pytest.mark.parametrize("count", range(1, len(EVIDENCE_IN_ORDER) + 1))
+def test_one_to_three_sites_are_insufficient_data_at_the_default_minimum(count: int) -> None:
+    # AC-F3.9 known v1 limit (D-PM-10): a repo's evidence rarely reaches min-sites.
+    assert count < DEFAULT_THRESHOLDS.min_sites
+    found = sites(dict(EVIDENCE_IN_ORDER[:count]))
+    rule = match_rule("use uv for dependencies.")
+    assert rule is not None
+    following, contradicting = counts(rule, found)
+    assert (following, contradicting) == (count, 0)
+    overall = Counts(following=following, contradicting=contradicting, relevant=count)
+    verdict = decide(verifiable=True, overall=overall, recent=None, thresholds=DEFAULT_THRESHOLDS)
+    assert verdict is Verdict.INSUFFICIENT
 
 
 @pytest.mark.parametrize("name", sorted(TOOL_TABLES))
@@ -266,9 +329,14 @@ def test_a_dotted_key_table_is_a_site_at_line_1() -> None:
 
 
 def _digit_limit() -> int:
-    """The running interpreter's int-to-str digit limit, 0 when it has none (D-TL-25)."""
-    getter = getattr(sys, "get_int_max_str_digits", None)
-    return int(getter()) if getter is not None else 0
+    """The running interpreter's int-to-str digit limit (D-TL-25).
+
+    Every supported Python (requires-python >= 3.11) has one, so there is no skip branch; it is
+    only 0 when ``PYTHONINTMAXSTRDIGITS=0`` turns it off, which the suite does not support.
+    """
+    limit = sys.get_int_max_str_digits()
+    assert limit > 0, "run the tests with the default int-to-str digit limit"
+    return limit
 
 
 def _nested(depth: int, opening: str, closing: str) -> bytes:
@@ -280,7 +348,7 @@ HOSTILE: dict[str, Callable[[], bytes]] = {
     "inline tables 1000 deep": lambda: _nested(1000, "{a=", "}"),
     "arrays past the recursion limit": lambda: _nested(sys.getrecursionlimit() * 2, "[", "]"),
     "integer over the digit limit": lambda: (
-        "[tool.uv]\nk = " + "9" * ((_digit_limit() or 4300) + 1) + "\n"
+        "[tool.uv]\nk = " + "9" * (_digit_limit() + 1) + "\n"
     ).encode(),
     "malformed toml": lambda: b"[tool.uv\n",
     "binary (NUL)": lambda: b"[tool.uv]\n\x00\n",
@@ -293,8 +361,6 @@ HOSTILE: dict[str, Callable[[], bytes]] = {
 @pytest.mark.parametrize("kind", HOSTILE)
 def test_an_unreadable_pyproject_gives_no_sites_and_never_raises(kind: str) -> None:
     data = HOSTILE[kind]()
-    if kind == "integer over the digit limit" and not _digit_limit():
-        pytest.skip("this interpreter has no int-to-str digit limit")
     assert tool_tables(data) is None
     assert list(manifest_sites({"pyproject.toml": data})) == []
     # The checker keeps working: the other manifests' sites are still reported.
@@ -307,8 +373,6 @@ def test_an_unreadable_pyproject_gives_no_sites_and_never_raises(kind: str) -> N
 def test_c4_lists_an_unreadable_pyproject_as_skipped_and_the_checker_never_sees_it(
     kind: str,
 ) -> None:
-    if kind == "integer over the digit limit" and not _digit_limit():
-        pytest.skip("this interpreter has no int-to-str digit limit")
     found = run({"AGENTS.md": b"r", "a.py": PY, "pyproject.toml": HOSTILE[kind](), "uv.lock": b""})
     assert [s.path for s in found.skipped] == ["pyproject.toml"]
     if kind in ("arrays 1000 deep", "integer over the digit limit"):
