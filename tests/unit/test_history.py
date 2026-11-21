@@ -14,7 +14,12 @@ from history_support import END, FakeGit, file_diff, hunk, marker, sha, when, wi
 
 from conventiondrift import history
 from conventiondrift.components import GitReaderProtocol, History, Side
-from conventiondrift.errors import ComponentError, FileSkipped, GitUnavailable
+from conventiondrift.errors import (
+    ComponentError,
+    FileSkipped,
+    GitUnavailable,
+    UnresolvableRevision,
+)
 from conventiondrift.history import (
     COMMIT_CAP,
     PATCH_MAX_BYTES,
@@ -1052,6 +1057,29 @@ def test_reader_failures_become_a_history_component_error(error: BaseException) 
     assert raised.value.component == "history"
     assert raised.value.__cause__ is error
     assert "gitread" not in raised.value.message
+
+
+def test_a_scan_head_that_does_not_resolve_is_a_history_component_error() -> None:
+    # Scan mode resolves HEAD through the reader; C8 fails only as ComponentError (SR T-09).
+    class NoHead(FakeGit):
+        def resolve(self, rev: str) -> str:
+            raise UnresolvableRevision
+
+    git = NoHead([(HEAD, END)], [])
+    with pytest.raises(ComponentError) as raised:
+        compute_recent(
+            git,
+            window(),
+            {"head": {"a.py": lines(1)}},
+            scan_files=[PyFile("a.py", b"x\n")],
+            scan_tracked={"a.py": TrackedState("c" * 40, True)},
+        )
+    assert (raised.value.component, raised.value.message) == (
+        "history",
+        "history could not be read",
+    )
+    assert isinstance(raised.value.__cause__, UnresolvableRevision)
+    assert git.chain_calls == []
 
 
 def test_a_history_error_passes_through_unchanged() -> None:

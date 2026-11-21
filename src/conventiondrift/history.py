@@ -43,7 +43,12 @@ from typing import Final
 
 from conventiondrift.components import GitReaderProtocol
 from conventiondrift.discover.safefs import size_limit
-from conventiondrift.errors import ComponentError, FileSkipped, GitUnavailable
+from conventiondrift.errors import (
+    ComponentError,
+    FileSkipped,
+    GitUnavailable,
+    UnresolvableRevision,
+)
 from conventiondrift.model import HistoryResult, PyFile, Side, TrackedState, Window
 
 __all__ = [
@@ -660,7 +665,7 @@ def compute_recent(
         if exc.component == _COMPONENT:
             raise
         raise ComponentError(_COMPONENT, _FAILED) from exc
-    except (GitUnavailable, FileSkipped, MemoryError) as exc:
+    except (GitUnavailable, FileSkipped, UnresolvableRevision, MemoryError) as exc:
         raise ComponentError(_COMPONENT, _FAILED) from exc
 
 
