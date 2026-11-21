@@ -10,13 +10,16 @@ This guard parses every ``.py`` file under ``tests/`` with ``ast``. A function o
 ``monotonic_ns``/``time``/``time_ns``/``process_time``/``thread_time`` and their ``_ns``
 forms, the ``timeit`` module or anything imported from it, ``from time import ...``
 aliases) or names ``assert_linear``, ``best_time`` or ``_best_time``, or when it uses a
-timed function, class or fixture, wherever under ``tests/`` that is defined: in the same
-module, imported (transitively) from another test module such as ``checker_support.py``,
-or a ``conftest.py`` fixture taken by parameter name. A timed test must carry the mark
-(decorator, class or module ``pytestmark``, or ``marks=`` on every ``pytest.param``) or
-be listed in ``EXEMPT`` with a reason. It fails closed: a new timed test, a stale or
-marked exemption, a ``timing`` mark on a test that times nothing, a partly marked
-parametrization, or a marker form the guard cannot read all fail, naming the node.
+timed function, class, module-level name (``CLOCK = time.perf_counter``) or fixture,
+wherever under ``tests/`` that is defined: in the same module, imported (transitively)
+from another test module such as ``checker_support.py``, a ``conftest.py`` fixture taken
+by parameter name (``@pytest.fixture(name=...)`` included), or a method reached through
+``self.``/``cls.``/``super()`` on the class or a base class under ``tests/`` (D-TL-62).
+A timed test must carry the mark (decorator, class or module ``pytestmark``, or
+``marks=`` on every ``pytest.param``) or be listed in ``EXEMPT`` with a reason. It fails
+closed: a new timed test, a stale or marked exemption, a ``timing`` mark on a test that
+times nothing, a partly marked parametrization, or a marker or fixture-name form the guard
+cannot read all fail, naming the node.
 This guard is not a timing test.
 """
 
@@ -135,6 +138,9 @@ _EXEMPT_BY_FILE: dict[str, dict[str, str]] = {
         "test_a_pipe_holding_grandchild_never_stretches_a_kill": (
             "a pipe-holding grandchild must not stretch a kill"
         ),
+        "test_triggers_cover_every_kill_path_in_the_code": (
+            "compares the names in TRIGGERS (whose triggers use _Gate's clock); runs nothing"
+        ),
     },
 }
 EXEMPT: dict[str, str] = {
@@ -163,7 +169,8 @@ class _Module:
     imported: dict[str, Key] = field(default_factory=dict)
     module_aliases: dict[str, Path] = field(default_factory=dict)
     defs: dict[str, ast.AST] = field(default_factory=dict)
-    fixtures: set[str] = field(default_factory=set)
+    fixtures: dict[str, str] = field(default_factory=dict)  # fixture name -> function
+    owner: dict[str, ast.ClassDef] = field(default_factory=dict)  # "Cls.meth" -> Cls
 
 
 class _Tree:
@@ -241,12 +248,41 @@ class _Tree:
         for node in m.tree.body:
             if isinstance(node, DEFS):
                 m.defs[node.name] = node
-                if isinstance(node, FUNCS) and any(
-                    self._is_fixture(m, d) for d in node.decorator_list
-                ):
-                    m.fixtures.add(node.name)
+                if isinstance(node, FUNCS):
+                    for d in node.decorator_list:
+                        if self._is_fixture(m, d):
+                            m.fixtures[self._fixture_name(m, node, d)] = node.name
+                if isinstance(node, ast.ClassDef):
+                    # Methods, so ``self.<name>`` / ``super().<name>`` can be followed.
+                    for item in node.body:
+                        if isinstance(item, FUNCS):
+                            m.defs[f"{node.name}.{item.name}"] = item
+                            m.owner[f"{node.name}.{item.name}"] = node
             elif isinstance(node, ast.Assign) and self.is_timing_mark(m, node.value):
                 m.timing_names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                # Module-level names (``CLOCK = time.perf_counter``) are followed like
+                # functions: a name bound to a clock is timed wherever it is used.
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    names = t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t]
+                    for n in names:
+                        if isinstance(n, ast.Name) and n.id not in m.defs:
+                            m.defs[n.id] = node
+
+    def _fixture_name(self, m: _Module, node: ast.AST, decorator: ast.expr) -> str:
+        """The name a test asks for: ``@pytest.fixture(name="...")`` or the function name."""
+        assert isinstance(node, FUNCS)
+        if isinstance(decorator, ast.Call):
+            for kw in decorator.keywords:
+                if kw.arg == "name":
+                    if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        return kw.value.value
+                    self.problems.append(
+                        f"{self._rel(m.path)}::{node.name}: cannot read fixture "
+                        f"name={ast.unparse(kw.value)}; use a string literal"
+                    )
+        return node.name
 
     def _is_fixture(self, m: _Module, node: ast.expr) -> bool:
         target = node.func if isinstance(node, ast.Call) else node
@@ -379,20 +415,75 @@ class _Tree:
     def _fixture_owner(self, m: _Module, name: str) -> Key | None:
         """Where pytest would find fixture ``name`` for a test in ``m``: module, then conftests."""
         if name in m.fixtures:
-            return (m.path, name)
+            return (m.path, m.fixtures[name])
         folder = m.path.parent
         while True:
             conftest = self.modules.get(folder / "conftest.py")
             if conftest is not None and name in conftest.fixtures:
-                return (conftest.path, name)
+                return (conftest.path, conftest.fixtures[name])
             if folder == self.tests or folder == folder.parent:
                 return None
             folder = folder.parent
 
-    def uses(self, m: _Module, node: ast.AST) -> set[Key]:
-        """The top-level definitions (anywhere under tests/) that ``node`` refers to."""
+    def _class_of(self, m: _Module, base: ast.expr) -> tuple[_Module, ast.ClassDef] | None:
+        """The class under tests/ that a base-class expression names, if any."""
+        key: Key | None = None
+        if isinstance(base, ast.Name):
+            if isinstance(m.defs.get(base.id), ast.ClassDef):
+                key = (m.path, base.id)
+            elif base.id in m.imported:
+                key = self._target(m.imported[base.id])
+        elif (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and base.value.id in m.module_aliases
+        ):
+            key = self._target((m.module_aliases[base.value.id], base.attr))
+        if key is None:
+            return None
+        owner = self.modules[key[0]]
+        found = owner.defs.get(key[1])
+        return (owner, found) if isinstance(found, ast.ClassDef) else None
+
+    def _method(
+        self, m: _Module, cls: ast.ClassDef, name: str, skip_own: bool = False
+    ) -> Key | None:
+        """Where ``name`` is defined for ``cls``: the class itself, then its bases."""
+        seen: set[tuple[Path, str]] = set()
+        todo: list[tuple[_Module, ast.ClassDef, bool]] = [(m, cls, skip_own)]
+        while todo:
+            mod, c, skip = todo.pop(0)
+            if (mod.path, c.name) in seen:
+                continue
+            seen.add((mod.path, c.name))
+            if not skip and f"{c.name}.{name}" in mod.defs:
+                return (mod.path, f"{c.name}.{name}")
+            for base in c.bases:
+                found = self._class_of(mod, base)
+                if found is not None:
+                    todo.append((found[0], found[1], False))
+        return None
+
+    def uses(self, m: _Module, node: ast.AST, cls: ast.ClassDef | None = None) -> set[Key]:
+        """The definitions (anywhere under tests/) that ``node`` refers to.
+
+        ``cls`` is the class a method belongs to, so ``self.x``/``cls.x`` and
+        ``super().x`` resolve through it and its bases under tests/.
+        """
         out: set[Key] = set()
         for n in self._body(node):
+            if cls is not None and isinstance(n, ast.Attribute):
+                v = n.value
+                if isinstance(v, ast.Name) and v.id in {"self", "cls"}:
+                    if (key := self._method(m, cls, n.attr)) is not None:
+                        out.add(key)
+                elif (
+                    isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Name)
+                    and v.func.id == "super"
+                    and (key := self._method(m, cls, n.attr, skip_own=True)) is not None
+                ):
+                    out.add(key)
             if isinstance(n, ast.Name):
                 if n.id in m.defs:
                     out.add((m.path, n.id))
@@ -435,7 +526,7 @@ class _Tree:
             for name, node in m.defs.items()
         }
         timed = {key for key, (m, node) in nodes.items() if self._direct(m, node)}
-        edges = {key: self.uses(m, node) for key, (m, node) in nodes.items()}
+        edges = {key: self.uses(m, node, m.owner.get(key[1])) for key, (m, node) in nodes.items()}
         changed = True
         while changed:
             changed = False
@@ -445,9 +536,9 @@ class _Tree:
                     changed = True
         return timed
 
-    def is_timed(self, m: _Module, node: ast.AST) -> bool:
+    def is_timed(self, m: _Module, node: ast.AST, cls: ast.ClassDef | None = None) -> bool:
         return self._direct(m, node) or any(
-            self._target(r) in self.timed for r in self.uses(m, node)
+            self._target(r) in self.timed for r in self.uses(m, node, cls)
         )
 
     # --- tests -------------------------------------------------------------------
@@ -471,11 +562,12 @@ class _Tree:
                 continue
             rel = self._rel(path)
             module_marked = self._pytestmark(m, m.tree.body, f"{rel}::pytestmark")
-            cases: list[tuple[str, ast.AST, bool]] = []
+            cases: list[tuple[str, ast.AST, bool, ast.ClassDef | None]] = []
             for node in m.tree.body:
                 if isinstance(node, FUNCS) and node.name.startswith("test"):
                     where = f"{rel}::{node.name}"
-                    cases.append((where, node, self.decorators_mark(m, node.decorator_list, where)))
+                    marks = self.decorators_mark(m, node.decorator_list, where)
+                    cases.append((where, node, marks, None))
                 elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
                     where = f"{rel}::{node.name}"
                     cls_marked = self.decorators_mark(m, node.decorator_list, where)
@@ -484,10 +576,10 @@ class _Tree:
                         if isinstance(item, FUNCS) and item.name.startswith("test"):
                             inner = f"{where}::{item.name}"
                             own = self.decorators_mark(m, item.decorator_list, inner)
-                            cases.append((inner, item, cls_marked or own))
-            for nodeid, case, is_marked in cases:
+                            cases.append((inner, item, cls_marked or own, node))
+            for nodeid, case, is_marked, owner in cases:
                 every.add(nodeid)
-                if self.is_timed(m, case):
+                if self.is_timed(m, case, owner):
                     timed.add(nodeid)
                 if module_marked or is_marked:
                     marked.add(nodeid)
@@ -780,3 +872,128 @@ def test_self_a_marked_param_outside_a_parametrize_literal_is_reported(tmp_path:
     _, marked, _, problems = _tree(tmp_path, {"unit/test_x.py": src})
     assert marked == set()
     assert any("outside a literal @pytest.mark.parametrize" in p for p in problems)
+
+
+# --- D-TL-62: self./super() methods, module-level clock aliases, named fixtures ------
+
+TA = "tests/unit/test_x.py::TestA::test_it"
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        # a helper method on the test class itself
+        "import time\n\nclass TestA:\n    def _measure(self):\n"
+        "        return time.perf_counter()\n\n    def test_it(self):\n        self._measure()\n",
+        # a helper method two hops away through another method
+        "import time\n\nclass TestA:\n    def _clock(self):\n        return time.monotonic()\n\n"
+        "    def _measure(self):\n        return self._clock()\n\n"
+        "    def test_it(self):\n        self._measure()\n",
+        # inherited from a base class in the same module
+        "import time\n\nclass _Base:\n    def _measure(self):\n        return time.monotonic()\n\n"
+        "class TestA(_Base):\n    def test_it(self):\n        self._measure()\n",
+        # inherited from a base class imported from another test module
+        "from support import Base\n\nclass TestA(Base):\n    def test_it(self):\n"
+        "        self._measure()\n",
+        # through a module alias and a grandparent class
+        "import support\n\nclass _Mid(support.Base):\n    pass\n\n"
+        "class TestA(_Mid):\n    def test_it(self):\n        self._measure()\n",
+        # super() from an override
+        "from support import Base\n\nclass TestA(Base):\n    def _measure(self):\n"
+        "        return super()._measure()\n\n    def test_it(self):\n        self._measure()\n",
+    ],
+    ids=["own", "two-hops", "base", "imported-base", "alias-grandparent", "super"],
+)
+def test_self_timed_methods_through_self_are_followed(tmp_path: Path, src: str) -> None:
+    files = {
+        "unit/support.py": "import time\n\nclass Base:\n    def _measure(self):\n"
+        "        return time.perf_counter()\n",
+        "unit/test_x.py": src,
+    }
+    timed, *_ = _tree(tmp_path, files)
+    assert timed == {TA}
+
+
+def test_self_an_untimed_method_or_an_unrelated_class_is_not_followed(tmp_path: Path) -> None:
+    src = (
+        "import time\n\nclass Other:\n    def _measure(self):\n        return time.monotonic()\n\n"
+        "class TestA:\n    def _measure(self):\n        return 1\n\n"
+        "    def test_it(self):\n        self._measure()\n"
+    )
+    timed, *_ = _tree(tmp_path, {"unit/test_x.py": src})
+    assert timed == set()
+
+
+@pytest.mark.parametrize(
+    ("support", "test"),
+    [
+        ("", "import time\nCLOCK = time.perf_counter\n\ndef test_it():\n    CLOCK()\n"),
+        ("", "from time import monotonic\nnow = monotonic\n\ndef test_it():\n    now()\n"),
+        ("", "import time\nnow: object = time.monotonic_ns\n\ndef test_it():\n    now\n"),
+        (
+            "",
+            "import time\nCLOCK = time.perf_counter\n\ndef _elapsed():\n    return CLOCK()\n\n"
+            "def test_it():\n    _elapsed()\n",
+        ),
+        (
+            "import time\nCLOCK = time.perf_counter\n",
+            "from support import CLOCK\n\ndef test_it():\n    CLOCK()\n",
+        ),
+        (
+            "import time\nCLOCK = time.perf_counter\n",
+            "import support\n\ndef test_it():\n    support.CLOCK()\n",
+        ),
+        (
+            "import time\n_C = time.perf_counter\nCLOCK = _C\n",
+            "from support import CLOCK as c\n\ndef test_it():\n    c()\n",
+        ),
+    ],
+    ids=["module", "from-time", "annotated", "via-helper", "imported", "module-attr", "chained"],
+)
+def test_self_module_level_clock_aliases_are_followed(
+    tmp_path: Path, support: str, test: str
+) -> None:
+    files = {"unit/test_x.py": test}
+    if support:
+        files["unit/support.py"] = support
+    timed, *_ = _tree(tmp_path, files)
+    assert timed == {T}
+
+
+def test_self_a_module_level_constant_without_a_clock_is_not_timed(tmp_path: Path) -> None:
+    src = "import time\nPAUSE = time.sleep\nLIMIT = 5\n\ndef test_it():\n    PAUSE(0)\n    LIMIT\n"
+    timed, *_ = _tree(tmp_path, {"unit/test_x.py": src})
+    assert timed == set()
+
+
+@pytest.mark.parametrize("where", ["conftest.py", "unit/conftest.py", "unit/test_x.py"])
+def test_self_a_fixture_registered_under_name_is_followed(tmp_path: Path, where: str) -> None:
+    fixture = (
+        "import time\nimport pytest\n\n@pytest.fixture(name='stopwatch')\n"
+        "def _stopwatch_fixture():\n    return time.monotonic()\n"
+    )
+    test = "def test_it(stopwatch):\n    pass\n"
+    files = {where: fixture + ("\n" + test if where == "unit/test_x.py" else "")}
+    if where != "unit/test_x.py":
+        files["unit/test_x.py"] = test
+    timed, *_ = _tree(tmp_path, files)
+    assert timed == {T}
+
+
+def test_self_a_renamed_fixture_is_not_found_under_its_function_name(tmp_path: Path) -> None:
+    files = {
+        "conftest.py": "import time\nimport pytest\n\n@pytest.fixture(name='stopwatch')\n"
+        "def clock():\n    return time.monotonic()\n",
+        "unit/test_x.py": "def test_it(clock):\n    pass\n",
+    }
+    timed, _, _, problems = _tree(tmp_path, files)
+    assert (timed, problems) == (set(), [])
+
+
+def test_self_an_unreadable_fixture_name_is_reported(tmp_path: Path) -> None:
+    src = (
+        "import pytest\nNAME = 'stopwatch'\n\n@pytest.fixture(name=NAME)\n"
+        "def clock():\n    return 1\n"
+    )
+    *_, problems = _tree(tmp_path, {"conftest.py": src})
+    assert len(problems) == 1 and "cannot read fixture name=NAME" in problems[0]
