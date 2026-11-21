@@ -84,6 +84,16 @@ CASES: dict[str, Case] = {
         (f"- Use a. Never b. {M}",),
         (Want(1, "Use a.", "use a.", True), Want(1, "Never b.", "never b.", True)),
     ),
+    # D-TL-57 (I-7 clarification, TL as Architect, 2026-11-20): with no whitespace around the
+    # marker, the line still splits into two sentences and every rule on it is ignored.
+    "d-tl-57-marker-glued-between-two-sentences": Case(
+        (f"Use a.{M}Never b.", "Avoid c."),
+        (
+            Want(1, "Use a.", "use a.", True),
+            Want(1, "Never b.", "never b.", True),
+            Want(2, "Avoid c.", "avoid c.", False),
+        ),
+    ),
     "many-markers-on-one-line": Case(
         (f"{M} Use a. {M}{M} Never b. {M}",),
         (Want(1, "Use a.", "use a.", True), Want(1, "Never b.", "never b.", True)),
@@ -216,15 +226,15 @@ def test_i7_marker_attachment(name: str, eol: str) -> None:
 
 @pytest.mark.parametrize("eol", sorted(EOLS))
 def test_i7_marker_glued_between_two_sentences_ignores_every_rule_on_the_line(eol: str) -> None:
-    # "Use a.<marker>Never b." has no whitespace around the marker, so whether it is one
-    # sentence or two is a segmenting question I-7 does not answer. Whatever the split,
-    # every rule starting on the marker's line is ignored and the marker is attached.
+    # D-TL-57: "Use a.<marker>Never b." (no whitespace around the marker) is two sentences,
+    # and every rule starting on the marker's line is ignored; the marker is attached.
     result = _extract((f"Use a.{M}Never b.", "Avoid c."), EOLS[eol])
-    on_line_1 = [r for r in result.rules if r.line == 1]
-    assert on_line_1 and all(r.ignored for r in on_line_1)
-    assert [(r.line, r.ignored) for r in result.rules if r.line != 1] == [(2, False)]
+    assert [(r.line, r.text, r.ignored) for r in result.rules] == [
+        (1, "Use a.", True),
+        (1, "Never b.", True),
+        (2, "Avoid c.", False),
+    ]
     assert result.unattached_markers == ()
-    assert all(M not in r.text for r in result.rules)
 
 
 @pytest.mark.parametrize("eol", sorted(EOLS))
