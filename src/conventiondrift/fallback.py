@@ -8,11 +8,12 @@ it imports nothing from ``render`` except ``render/escape.py`` (A-8).
   ``GITHUB_STEP_SUMMARY``, and nothing else (no comment, annotation, SARIF or stdout).
   Each error is one line, ``Internal error in `<component>`: <message>``, with the
   component escaped by ``md()``. It is never silent (I-14 "Fallback writer details" 2): if the
-  variable is unset or empty, or the append raises ``OSError``, the CLI stderr lines are
-  written instead. The file is opened without following a symlink and must be a regular file
-  (SR ruling); where ``O_NOFOLLOW`` is missing (Windows), an ``lstat`` before the open refuses
-  a symlink or reparse point instead. If it is refused, a fixed warning naming neither the
-  path nor the OS error comes first.
+  variable is unset or empty, or the append raises ``OSError`` (or ``ValueError``, as for a
+  path with a NUL byte), the CLI stderr lines are written instead. The file is opened without
+  following a symlink and must be a regular file (SR ruling); where ``O_NOFOLLOW`` is missing
+  (Windows), an ``lstat`` before the open refuses a symlink or reparse point instead. If it is
+  refused, a fixed warning naming neither the path nor the OS error comes first. A write that
+  fails part-way can leave a truncated section in the summary before the stderr fallback.
 * **CLI:** one line per error on stderr,
   ``conventiondrift: internal error in <component>: <message>``. The summary file is not
   touched, because ``GITHUB_*`` variables can also be set when the CLI runs in CI.
@@ -128,7 +129,7 @@ def _no_link_before_open(path: str) -> bool:
         st = os.lstat(path)
     except FileNotFoundError:
         return True
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a NUL byte in the path
         return False
     if stat.S_ISLNK(st.st_mode):
         return False
@@ -140,12 +141,14 @@ def _append_to_summary(path: str, errors: Sequence[InternalError]) -> bool:
 
     The file must open with ``SUMMARY_OPEN_FLAGS`` and ``fstat`` as a regular file (SR ruling);
     the descriptor is always closed. Without ``O_NOFOLLOW``, ``_no_link_before_open`` runs first.
+    A write that fails part-way can leave a truncated section in the file; the caller still
+    writes the stderr lines, so the report is never lost.
     """
     if not _no_link_before_open(path):
         return False
     try:
         fd = os.open(path, SUMMARY_OPEN_FLAGS, 0o666)
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a NUL byte in the path
         return False
     try:
         regular = stat.S_ISREG(os.fstat(fd).st_mode)
@@ -158,7 +161,7 @@ def _append_to_summary(path: str, errors: Sequence[InternalError]) -> bool:
         # Bytes, so the encoding is UTF-8 whatever the locale. ``fdopen`` owns and closes ``fd``.
         with os.fdopen(fd, "ab") as summary:
             summary.write(action_section(errors).encode("utf-8"))
-    except OSError:
+    except (OSError, ValueError):
         return False
     return True
 

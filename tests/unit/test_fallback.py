@@ -10,6 +10,8 @@ import ast
 import io
 import os
 import stat
+import sys
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Literal, get_args
@@ -544,12 +546,26 @@ def test_a_symlink_to_a_regular_file_is_refused(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "kept\n"
 
 
+FIFO_OPEN_LIMIT = 30.0
+"""Seconds the no-reader FIFO open may take before the test calls it a hang (no clock read)."""
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
 def test_a_fifo_is_refused_with_or_without_a_reader(tmp_path: Path) -> None:
     fifo = tmp_path / "summary.md"
     os.mkfifo(fifo)
-    # No reader: the non-blocking open fails, so nothing waits on the pipe.
-    assert _refused(fifo) == _fallback_output()
+    # No reader: the non-blocking open fails, so nothing waits on the pipe. It runs in a daemon
+    # thread joined with a timeout, so a lost O_NONBLOCK fails here instead of hanging CI.
+    outputs: list[str] = []
+    worker = threading.Thread(target=lambda: outputs.append(_refused(fifo)), daemon=True)
+    worker.start()
+    worker.join(timeout=FIFO_OPEN_LIMIT)
+    if worker.is_alive():
+        pytest.fail(
+            f"opening a FIFO with no reader blocked for {FIFO_OPEN_LIMIT} s: "
+            "SUMMARY_OPEN_FLAGS must keep O_NONBLOCK"
+        )
+    assert outputs == [_fallback_output()]
     reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
     try:
         # A reader: the open works and the regular-file check refuses it.
@@ -653,8 +669,9 @@ def test_an_open_error_gives_a_warning_without_the_path_or_the_error(
     assert not summary.exists()
 
 
+@pytest.mark.parametrize("error", [OSError, ValueError])
 def test_a_write_error_after_the_checks_falls_back_and_closes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: type[Exception]
 ) -> None:
     summary = tmp_path / "summary.md"
     closed: list[bool] = []
@@ -672,7 +689,7 @@ def test_a_write_error_after_the_checks_falls_back_and_closes(
             closed.append(self.file.closed)
 
         def write(self, data: bytes) -> int:
-            raise OSError(f"no space left for {summary}")
+            raise error(f"no space left for {summary}")
 
     monkeypatch.setattr(os, "fdopen", Failing)
     out = _refused(summary)
@@ -716,6 +733,7 @@ def test_a_created_summary_file_gets_the_same_mode_as_before(tmp_path: Path) -> 
 def no_nofollow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Take the platform's ``O_NOFOLLOW`` out of the open flags, as on Windows."""
     monkeypatch.setattr(fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~fallback._NOFOLLOW)
+    monkeypatch.setattr(fallback, "_NOFOLLOW", 0)
 
 
 class _LstatSpy:
@@ -884,3 +902,93 @@ def test_without_o_nofollow_fstat_still_refuses_a_non_regular_file(
 @pytest.mark.usefixtures("no_nofollow")
 def test_without_o_nofollow_a_real_directory_is_refused(tmp_path: Path) -> None:
     assert _refused(tmp_path) == _fallback_output()
+
+
+# --- review follow-ups: NUL in the path, a read-only file, symlinks on Windows CI -------------
+
+
+def _nul_path(tmp_path: Path) -> str:
+    return str(tmp_path / f"{PLANTED.split()[0]}\x00.md")
+
+
+def _assert_refused_quietly(out: str, path: str, error: Exception) -> None:
+    assert out == _fallback_output()
+    for part in (path, path.replace("\x00", ""), Path(path).name, str(error)):
+        assert part not in out
+
+
+def _nul_error(path: str) -> ValueError:
+    """The error ``os`` raises for this path, read from ``os`` itself rather than written here."""
+    with pytest.raises(ValueError) as caught:
+        os.lstat(path)
+    return caught.value
+
+
+def test_a_nul_byte_in_the_path_refuses_with_the_warning(tmp_path: Path) -> None:
+    path = _nul_path(tmp_path)
+    _assert_refused_quietly(_refused(path), path, _nul_error(path))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.usefixtures("no_nofollow")
+def test_without_o_nofollow_a_nul_byte_in_the_path_refuses_before_the_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = _nul_path(tmp_path)
+    error = _nul_error(path)
+    spy = _Spy(monkeypatch)
+    _assert_refused_quietly(_refused(path), path, error)
+    assert spy.opened == []
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("nofollow", [True, False], ids=["o_nofollow", "lstat"])
+def test_a_value_error_from_open_refuses_with_the_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, nofollow: bool
+) -> None:
+    if not nofollow:
+        monkeypatch.setattr(
+            fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~fallback._NOFOLLOW
+        )
+        monkeypatch.setattr(fallback, "_NOFOLLOW", 0)
+    summary = tmp_path / "summary.md"
+    error = ValueError(f"bad path {summary}")
+
+    def failing(path: str, flags: int, mode: int = 0o777) -> int:
+        assert flags == fallback.SUMMARY_OPEN_FLAGS
+        raise error
+
+    monkeypatch.setattr(os, "open", failing)
+    _assert_refused_quietly(_refused(summary), str(summary), error)
+    assert not summary.exists()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0,
+    reason="POSIX permission bits; root can write a read-only file",
+)
+def test_a_read_only_summary_file_is_refused_and_left_unchanged(tmp_path: Path) -> None:
+    summary = tmp_path / "summary.md"
+    summary.write_bytes(b"before\n")
+    summary.chmod(0o444)
+    try:
+        out = _refused(summary)
+    finally:
+        summary.chmod(0o644)
+    assert out == _fallback_output()
+    assert str(summary) not in out
+    assert summary.read_bytes() == b"before\n"
+
+
+@pytest.mark.skipif(
+    not (os.environ.get("CI") and sys.platform == "win32"),
+    reason="Windows CI only: the real-symlink tests must not skip there",
+)
+def test_symlinks_can_be_created_on_windows_ci(tmp_path: Path) -> None:
+    # The real-symlink tests skip when symlinks can't be made; on Windows CI that would hide
+    # the lstat check, so there it must work.
+    target = tmp_path / "target.md"
+    target.write_text("kept\n", encoding="utf-8")
+    link = tmp_path / "summary.md"
+    link.symlink_to(target)
+    assert link.is_symlink()
