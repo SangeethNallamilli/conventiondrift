@@ -238,6 +238,7 @@ def test_depth_counts_sequences_and_mappings_together(expect_reason) -> None:  #
     assert load_yaml("a:\n  b: [{c: [{d: [{e: [{f: 1}]}]}]}]\n") is not None
 
 
+@pytest.mark.timing
 def test_very_deep_input_stops_early_without_recursion_error(expect_reason) -> None:  # type: ignore[no-untyped-def]
     text = "[" * (MAX_BYTES - 1)
     start = time.perf_counter()
@@ -282,6 +283,7 @@ def test_alias_rejected(expect_reason, text: str) -> None:  # type: ignore[no-un
     expect_reason(text, "alias")
 
 
+@pytest.mark.timing
 def test_alias_bomb_rejected_quickly() -> None:
     # "Billion laughs": nine levels of nine aliases. Refused at the first anchor.
     lines = ['a0: &a0 ["lol"]']

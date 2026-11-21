@@ -187,6 +187,7 @@ def _segmented(text: str) -> Iterator[Candidate]:
     return iter(list(segment("AGENTS.md", text)))
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize(
     "unit",
     ["a. ", ". ", "a. " * 50 + MARKER],

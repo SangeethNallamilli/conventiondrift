@@ -337,6 +337,7 @@ HOSTILE_RULES = {
 }
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("kind", HOSTILE_RULES)
 def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
