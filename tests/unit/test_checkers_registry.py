@@ -14,12 +14,13 @@ def test_the_registry_is_a_fixed_tuple() -> None:
     # ADR-0003, DESIGN §6: no entry-point or plugin loading; checkers arrive with T-016..T-019.
     assert isinstance(REGISTRY, tuple)
     # T-016 registered exceptions and logging, T-017 http-client and string-format,
-    # T-018 test-framework and type-hints, T-019a money; package-manager remains for T-019.
+    # T-018 test-framework and type-hints, T-019a money, T-019 package-manager.
     assert list(registry()) == [
         "exceptions",
         "http-client",
         "logging",
         "money",
+        "package-manager",
         "string-format",
         "test-framework",
         "type-hints",
