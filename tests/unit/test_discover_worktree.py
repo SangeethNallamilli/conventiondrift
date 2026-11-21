@@ -4,6 +4,7 @@ INTERFACES I-12, I-13 scan-walk rulings, I-14 ``scan_tracked``, D-TL-55)."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import subprocess
@@ -831,7 +832,15 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     root = tmp_path_factory.mktemp("deep")
-    _deep_tree(root)
+    try:
+        _deep_tree(root)
+    except OSError as e:
+        # #76 CR B1: some filesystems (the git-minimum container's) refuse a 200-character
+        # name or a path this deep. That limit comes from the filesystem, not the OS, so
+        # skip only on ENAMETOOLONG and let any other error fail the test.
+        if e.errno != errno.ENAMETOOLONG:
+            raise
+        pytest.skip(f"this filesystem refuses the deep tree's names: {e}")
     _set_patterns(root, [])
     baseline, result = _best_of_3(root)
     assert len(py_paths(result)) == _DEEP_FILES
