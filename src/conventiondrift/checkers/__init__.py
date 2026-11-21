@@ -3,8 +3,8 @@
 Checkers are registered only in ``REGISTRY``, a fixed tuple. There is no entry
 point or plugin loading (SCOPE won't-have #6, THREAT-MODEL T-01). The eight
 checkers are added here by T-016 to T-019; so far ``exceptions`` and ``logging`` (T-016),
-``http-client`` and ``string-format`` (T-017), and ``test-framework`` and ``type-hints``
-(T-018).
+``http-client`` and ``string-format`` (T-017), ``test-framework`` and ``type-hints``
+(T-018), and ``money`` (T-019a).
 """
 
 from collections.abc import Iterable, Mapping
@@ -15,6 +15,7 @@ from conventiondrift.checkers.base import Checker
 from conventiondrift.checkers.exceptions import ExceptionsChecker
 from conventiondrift.checkers.http_client import HttpClientChecker
 from conventiondrift.checkers.logging import LoggingChecker
+from conventiondrift.checkers.money import MoneyChecker
 from conventiondrift.checkers.string_format import StringFormatChecker
 from conventiondrift.checkers.test_framework import TestFrameworkChecker
 from conventiondrift.checkers.type_hints import TypeHintsChecker
@@ -24,6 +25,7 @@ REGISTRY: tuple[Checker, ...] = (
     ExceptionsChecker(),
     HttpClientChecker(),
     LoggingChecker(),
+    MoneyChecker(),
     StringFormatChecker(),
     TestFrameworkChecker(),
     TypeHintsChecker(),
