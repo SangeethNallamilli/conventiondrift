@@ -47,6 +47,7 @@ def test_the_vs_rule_is_one_rule_and_not_verifiable() -> None:
     assert rule.checker is None
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("unit", ["a vs. ", "a v. ", "vs. "])
 def test_many_vs_periods_are_linear(unit: str) -> None:
     assert_linear(lambda n: "Use " + unit * (n // len(unit)), texts, label=unit)

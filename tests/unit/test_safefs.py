@@ -1077,6 +1077,7 @@ def test_every_module_regex_is_registered() -> None:
     assert found <= {id(p) for p in d.REGEXES}, "add new regexes to safefs.REGEXES"
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("text", ADVERSARIAL, ids=lambda t: f"{t[:6]!r}x{len(t)}")
 def test_registered_regexes_are_linear(text: str) -> None:
     for pattern in d.REGEXES:
@@ -1086,6 +1087,7 @@ def test_registered_regexes_are_linear(text: str) -> None:
         assert time.perf_counter() - start < REDOS_BUDGET_S, pattern.pattern
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("origin", ["tree", "input"])
 @pytest.mark.parametrize("text", ADVERSARIAL, ids=lambda t: f"{t[:6]!r}x{len(t)}")
 def test_validate_relpath_is_linear_on_long_hostile_names(text: str, origin: PathOrigin) -> None:
@@ -1097,6 +1099,7 @@ def test_validate_relpath_is_linear_on_long_hostile_names(text: str, origin: Pat
     assert time.perf_counter() - start < REDOS_BUDGET_S
 
 
+@pytest.mark.timing
 def test_decode_text_cookie_is_linear_on_a_long_hostile_line() -> None:
     data = b"# coding" + b":" * 100_000 + b" " + b"-" * 100_000 + b"\n"
     start = time.perf_counter()

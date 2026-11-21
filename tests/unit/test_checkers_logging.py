@@ -482,17 +482,20 @@ HOSTILE_RULES = {
 }
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("kind", HOSTILE_RULES)
 def test_match_rule_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_RULES[kind], match_rule, label=kind)
 
 
+@pytest.mark.timing
 def test_the_cr1_sentence_with_100_000_prints_is_fast() -> None:
     text = "Use " + "print " * 100_000
     assert best_time(partial(match_rule, text), repeat=1) < 5.0
     assert match_rule(text) == match(("print",), (), 1)
 
 
+@pytest.mark.timing
 def test_the_registry_maps_a_1_mib_rule_sentence_in_linear_time() -> None:
 
     text = "use " + "print " * (MIB // 6)
@@ -503,6 +506,7 @@ def guard_source(guards: int, prints: int) -> str:
     return 'if __name__ == "__main__":\n    pass\n' * guards + "print(1)\n" * prints
 
 
+@pytest.mark.timing
 def test_many_guards_and_many_prints_are_linear_in_a_run() -> None:
     # The per-print scan of every guard span was quadratic: 8,000 guards and 32,000 prints
     # took 10 s. Sizes here are in bytes, so the budget in assert_linear applies.

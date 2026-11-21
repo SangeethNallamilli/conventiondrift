@@ -113,6 +113,7 @@ def test_globset_caches_folder_verdicts() -> None:
 
 # ReDoS (SR condition, Architect ruling 2026-11-12): hostile patterns against hostile
 # names finish at once. A backtracking regex would take exponential time on these.
+@pytest.mark.timing
 @pytest.mark.parametrize(
     ("pattern", "path"),
     [
@@ -131,6 +132,7 @@ def test_hostile_patterns_are_fast(pattern: str, path: str) -> None:
     assert time.monotonic() - started < 2.0
 
 
+@pytest.mark.timing
 def test_matching_work_grows_polynomially_not_exponentially() -> None:
     # The same hostile shape at 2x the size must not cost anywhere near 2**n more.
     def cost(n: int) -> float:

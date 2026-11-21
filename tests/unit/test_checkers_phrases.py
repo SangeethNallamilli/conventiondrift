@@ -553,6 +553,7 @@ def test_token_is_a_single_compiled_regex() -> None:
     assert isinstance(TOKEN, re.Pattern)
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize(
     "hostile",
     [
@@ -636,11 +637,13 @@ HOSTILE_SENTENCES: dict[str, Callable[[int], str]] = {
 #   after ``_read``).
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("kind", HOSTILE_SENTENCES)
 def test_classify_is_linear_up_to_the_1_mib_cap(kind: str) -> None:
     assert_linear(HOSTILE_SENTENCES[kind], lambda text: classify(text, find, OPTIONS), label=kind)
 
 
+@pytest.mark.timing
 def test_one_clause_with_100_000_mentions_is_read_once() -> None:
     # The CR1 case: is_negated used to scan clause[:index] for every mention (quadratic).
     for text, expected in (
@@ -651,6 +654,7 @@ def test_one_clause_with_100_000_mentions_is_read_once() -> None:
         assert classify(text, find, OPTIONS) == expected
 
 
+@pytest.mark.timing
 def test_a_cue_in_the_middle_of_a_1_mib_clause_splits_the_polarity() -> None:
     # INTERFACES I-10: a cue applies from the cue to the end of its clause, so the words
     # before it are preferred and the words after it are prohibited, however many there are.

@@ -80,6 +80,7 @@ def test_sec_t09_shapes_are_one_line_of_many_sentences(shape: str) -> None:
     assert sum(1 for _ in segment("AGENTS.md", text)) >= n // 64
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_sec_t09_single_line_extraction_is_linear(shape: str) -> None:
     make = SHAPES[shape]
