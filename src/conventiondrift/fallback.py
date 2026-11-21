@@ -161,7 +161,7 @@ def _append_to_summary(path: str, errors: Sequence[InternalError]) -> bool:
         # Bytes, so the encoding is UTF-8 whatever the locale. ``fdopen`` owns and closes ``fd``.
         with os.fdopen(fd, "ab") as summary:
             summary.write(action_section(errors).encode("utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError):  # ValueError too (e.g. a closed file): never raise, fall back
         return False
     return True
 

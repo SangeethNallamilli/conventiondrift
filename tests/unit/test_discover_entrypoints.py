@@ -10,8 +10,9 @@ import pytest
 from checker_support import LINEAR_SIZES, assert_linear
 from test_discover_tree import PHASE, PY, SHA, FakeGit, names, run
 
+from conventiondrift import discover
 from conventiondrift.core import BasePhaseDone
-from conventiondrift.discover import discover_tree, is_manifest_name
+from conventiondrift.discover import MAX_INSTRUCTION_FILES, discover_tree, is_manifest_name
 from conventiondrift.discover.entrypoints import (
     LOCKFILE_NAMES,
     MANIFEST_NAMES,
@@ -446,11 +447,14 @@ def test_a_pyproject_nested_about_1000_deep_is_skipped_not_raised(
 
 
 def _int_str_digit_limit() -> int:
-    """0 when the interpreter has no limit or the limit is disabled."""
-    getter = getattr(sys, "get_int_max_str_digits", None)
-    if getter is None:
-        return 0
-    return int(getter())
+    """The running interpreter's int-to-str digit limit (D-TL-25, D-TL-67).
+
+    Every supported Python (requires-python >= 3.11) has one, so there is no fallback; it is
+    only 0 when ``PYTHONINTMAXSTRDIGITS=0`` turns it off, which the suite does not support.
+    """
+    limit = sys.get_int_max_str_digits()
+    assert limit > 0, "run the tests with the default int-to-str digit limit"
+    return limit
 
 
 def _assert_huge_int_pyproject_never_escapes(text: str, *, expect_skip: bool) -> None:
@@ -470,11 +474,9 @@ def _assert_huge_int_pyproject_never_escapes(text: str, *, expect_skip: bool) ->
 
 def test_a_pyproject_with_an_integer_over_the_digit_limit_is_skipped_not_raised() -> None:
     # D-TL-25: the digit count is taken from the running interpreter's limit, not a magic 4301.
-    limit = _int_str_digit_limit()
-    digits = limit + 1 if limit > 0 else 4301
     _assert_huge_int_pyproject_never_escapes(
-        "k = " + "9" * digits + "\n",
-        expect_skip=limit > 0,
+        "k = " + "9" * (_int_str_digit_limit() + 1) + "\n",
+        expect_skip=True,
     )
 
 
@@ -482,7 +484,7 @@ def test_a_pyproject_with_a_5000_digit_integer_is_skipped_not_raised() -> None:
     limit = _int_str_digit_limit()
     _assert_huge_int_pyproject_never_escapes(
         "version = " + "1" * 5000 + "\n",
-        expect_skip=0 < limit < 5000,
+        expect_skip=limit < 5000,
     )
 
 
@@ -542,6 +544,103 @@ def test_invalid_module_object_refs_are_not_resolved() -> None:
         )
         == frozenset()
     )
+
+
+def test_a_bad_module_name_is_rejected_even_when_its_file_exists() -> None:
+    # Every file the bad refs would map to is discovered, so only the identifier check stops
+    # them; a well-formed ref (spaces around the module are stripped) still resolves.
+    py_paths = frozenset(
+        {
+            ".py",
+            "/.py",
+            "pkg/.py",
+            "pkg-name.py",
+            "src/pkg-name.py",
+            "123bad.py",
+            "pkg cli.py",
+            "pkg/cli.py",
+        }
+    )
+    refs = [":main", ".:main", "pkg.:main", "pkg-name:main", "123bad:main", "pkg cli:main"]
+    assert entry_points_from_scripts(refs, py_paths, "pyproject.toml") == frozenset()
+    assert entry_points_from_scripts([" pkg.cli :main"], py_paths, "pyproject.toml") == (
+        frozenset({"pkg/cli.py"})
+    )
+
+
+def test_a_ref_with_no_colon_does_not_resolve() -> None:
+    py_paths = frozenset({"pkg/cli.py", "pkg/cli/main.py"})
+    for ref in ("pkg.cli", "pkg.cli.main", "pkg/cli.py"):
+        assert entry_points_from_scripts([ref], py_paths, "pyproject.toml") == frozenset()
+
+
+def test_a_script_whose_py_file_was_dropped_is_not_an_entry_point() -> None:
+    files = {
+        "AGENTS.md": b"r",
+        "pyproject.toml": b'[project.scripts]\na = "pkg.binary:main"\nb = "vendor.cli:main"\n',
+        "pkg/binary.py": b"a\x00b",  # skipped as binary, so not among the .py files
+        "vendor/cli.py": PY,  # dropped by the default excludes
+        "x.py": PY,
+    }
+    found = run(files)
+    assert found.entry_points == frozenset()
+    assert found.skipped == (SkippedFile("pkg/binary.py", REASON_BINARY),)
+
+
+def test_a_nested_pyproject_ignores_an_in_scope_root_module() -> None:
+    # D-TL-65 #1: refs resolve under the manifest's folder only, even when the same module
+    # path exists, in scope, at the repo root.
+    files = {
+        "AGENTS.md": b"r",
+        "services/a/pyproject.toml": b'[project.scripts]\ncli = "pkg.cli:main"\n',
+        "pkg/cli.py": PY,
+        "services/a/x.py": PY,
+    }
+    found = run(files)
+    assert "pkg/cli.py" in names(found)[1]
+    assert found.entry_points == frozenset()
+
+
+def test_entry_points_console_scripts_are_not_read() -> None:
+    # D-TL-65 #4: [project.entry-points.console_scripts] is out of scope for v0.1.
+    toml = b'[project.entry-points.console_scripts]\ncli = "pkg.cli:main"\n'
+    assert scripts_from_toml(toml.decode()) == []
+    found = run({"AGENTS.md": b"r", "pyproject.toml": toml, "pkg/cli.py": PY})
+    assert found.entry_points == frozenset()
+    assert [m.path for m in found.manifest_files] == ["pyproject.toml"]
+
+
+def test_manifest_bytes_are_kept_raw() -> None:
+    files = {
+        "AGENTS.md": b"r",
+        "pyproject.toml": b'[project]\r\nname = "x"  \r\n\r\n',
+        "requirements.txt": b"\xef\xbb\xbfhttpx\r\n  flask",  # BOM, CRLF, no final newline
+        "a.py": PY,
+    }
+    found = run(files)
+    assert [(m.path, m.data) for m in found.manifest_files] == [
+        ("pyproject.toml", files["pyproject.toml"]),
+        ("requirements.txt", files["requirements.txt"]),
+    ]
+
+
+def test_manifests_have_no_cap_of_their_own() -> None:
+    # D-TL-65 #3: more manifests than the instruction-file cap are all kept.
+    count = MAX_INSTRUCTION_FILES + 1
+    files: dict[str, bytes | tuple[str, bytes]] = {"AGENTS.md": b"r", "a.py": PY}
+    files.update({f"r{i:04d}/requirements.txt": b"x\n" for i in range(count)})
+    found = run(files)
+    assert len(found.manifest_files) == count
+    assert found.skipped == ()
+
+
+def test_a_path_skipped_for_two_reasons_keeps_the_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    # setup.py is a .py file and a manifest: past the .py cap it is "cap exceeded" first, and
+    # its binary manifest read would be "binary"; only the first reason is listed.
+    monkeypatch.setattr(discover, "MAX_PY_FILES", 0)
+    found = run({"AGENTS.md": b"r", "setup.py": b"a\x00b"})
+    assert found.skipped == (SkippedFile("setup.py", "cap exceeded"),)
+    assert found.manifest_files == ()
 
 
 def test_a_mapping_guard_ignores_a_non_table() -> None:

@@ -187,9 +187,10 @@ def test_the_scope_words_are_the_d_tl_63_list() -> None:
     assert SCOPE_WORDS == _SCOPE_WORDS
 
 
-@pytest.mark.parametrize("word", sorted(SCOPE_WORDS))
+@pytest.mark.parametrize("word", sorted(_SCOPE_WORDS))
 def test_a_scope_word_makes_a_type_hints_rule_not_verifiable(word: str) -> None:
-    # Negatives are built from the pinned list, which equals the code constant (D-TL-25).
+    # Over the pinned list, which the test above holds equal to the code constant (D-TL-25),
+    # so dropping a word from the code fails here as well as there.
     assert match_rule(f"use type hints in {word}.") is None
     assert rules_of(f"Use type hints in {word}.") == [(1, None)]
 
