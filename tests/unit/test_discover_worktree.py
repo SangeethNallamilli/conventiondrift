@@ -937,3 +937,54 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _DEEP_FILES
     assert [n for n in result.discovery.notes if "budget" in n]
+
+
+_LONG_NAME = 255  # NAME_MAX on Linux and macOS: the most per-character allowance a path gets
+_LONG_NAME_LINES = 3  # "*[q]N": the largest set that never runs this tree's budget out
+
+
+def _long_name_tree(root: Path) -> None:
+    """20,000 files with 255-character names, laid out as the near-cap tree."""
+    write(root, {"AGENTS.md": AGENTS})
+    (root / ".git" / "info").mkdir(parents=True)
+    for d in range(200):
+        folder = root.joinpath(*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}")
+        folder.mkdir(parents=True)
+        for f in range(_NEAR_CAP_FILES // 200):
+            (folder / (f"mod_{f:03d}_".ljust(_LONG_NAME - 3, "m") + ".py")).write_bytes(b"")
+
+
+# SR (L-76-1 follow-up, D-TL-77 #3): the allowance grows with the name, so a hostile set
+# gets the most per path on 255-character names: up to 256 + 2 * 255 = 766 steps. "*[q]N"
+# is tried on every name and its "*" scans all of it, so it costs the most per pattern;
+# 3 of them are the largest set that never runs this tree's budget out (4 do: checked
+# when the set was chosen), so they pay about all of the allowance on every path. Same
+# bounds as the near-cap sets: the counter on every leg, at most double the time with
+# no patterns on Linux. POSIX only: Windows needs long-path support for these paths.
+@pytest.mark.timing
+@pytest.mark.skipif(not POSIX, reason="paths with 255-character names need long-path support")
+def test_hostile_patterns_add_little_on_the_longest_file_names(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path_factory.mktemp("long_names")
+    try:
+        _long_name_tree(root)
+    except OSError as e:
+        if e.errno != errno.ENAMETOOLONG or _MUST_BUILD_THE_DEEP_TREE:
+            raise  # as for the deep tree: only git-minimum's container and local runs skip
+        pytest.skip(f"this filesystem refuses 255-character names: {e}")
+    _set_patterns(root, [])
+    baseline, result = _best_of_2(root)
+    assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert {len(p.rpartition("/")[2]) for p in py_paths(result)} == {_LONG_NAME}
+    assert result.discovery.notes == ()
+    _set_patterns(root, [f"*[q]{i}\n" for i in range(_LONG_NAME_LINES)])
+    made = _record_rules(monkeypatch)
+    best, result = _best_of_2(root)
+    assert len(made) == 2
+    for rules in made:
+        assert not rules.exhausted
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+    _assert_at_most_doubles(best, baseline)
+    assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert result.stats["gitignore_patterns_loaded"] == _LONG_NAME_LINES
