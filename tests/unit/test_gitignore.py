@@ -723,6 +723,20 @@ def test_only_the_last_component_earns_the_per_character_allowance(
     assert loaded._budget() == 10_000 + name_length
 
 
+def test_nothing_more_is_counted_once_the_budget_is_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #78 CR S2 (#76 S1): once the budget runs out every later path is unchecked, and
+    # the paths and name characters counted for the allowance stop growing.
+    _budget(monkeypatch, 0, 17, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert not loaded.ignored("a/b/abc.py")  # this check runs it out: counted, then unchecked
+    counted = (loaded._checks, loaded._names, loaded._budget())
+    assert (loaded.exhausted, loaded.unchecked, counted) == (True, 1, (1, 6, 23))
+    for k, path in enumerate(["x.py", "long/name/here.py", "q"], start=2):
+        assert not loaded.ignored(path)
+        assert loaded.unchecked == k
+        assert (loaded._checks, loaded._names, loaded._budget()) == counted
+
+
 def test_unused_allowance_carries_over(monkeypatch: pytest.MonkeyPatch) -> None:
     _budget(monkeypatch, 0, 18)
     loaded = rules(("", b"*.py\n"))
