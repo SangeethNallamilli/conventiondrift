@@ -4,7 +4,6 @@ INTERFACES I-12, I-13 scan-walk rulings, I-14 ``scan_tracked``, D-TL-55)."""
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import os
 import subprocess
@@ -14,6 +13,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
+from long_paths import build_or_skip
 from tests.fixtures.gitrepo import GitRepo
 
 import conventiondrift.discover.safefs as safefs
@@ -941,35 +941,12 @@ _DEEP_FILES = 2_000  # enough paths to run the budget out
 
 def _deep_tree(root: Path) -> None:
     """2,000 files under 58 folders of 200 characters each: paths of about 11,700
-    characters, built with ``dir_fd`` because they are longer than ``PATH_MAX``."""
+    characters, past the git-minimum container's limit, so that leg skips (long_paths)."""
     write(root, {"AGENTS.md": AGENTS})
     (root / ".git" / "info").mkdir(parents=True)
-    fd = os.open(root, os.O_RDONLY)
-    try:
-        for k in range(_DEEP_FOLDERS):
-            name = f"{k:02d}" + "n" * 198
-            os.mkdir(name, dir_fd=fd)
-            inner = os.open(name, os.O_RDONLY, dir_fd=fd)
-            os.close(fd)
-            fd = inner
-        for b in range(4):
-            os.mkdir(f"b{b}", dir_fd=fd)
-        for d in range(20):
-            leaf = f"b{d % 4}/leaf{d}"
-            os.mkdir(leaf, dir_fd=fd)
-            for f in range(_DEEP_FILES // 20):
-                os.close(os.open(f"{leaf}/mod_{f}.py", os.O_CREAT | os.O_WRONLY, dir_fd=fd))
-    finally:
-        os.close(fd)
-
-
-# The ubuntu and macOS CI legs must build the deep tree; only the git-minimum container
-# (GIT_MIN_VERSION set, its filesystem refuses the names) and local runs may skip.
-_MUST_BUILD_THE_DEEP_TREE = (
-    bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
-    and sys.platform in ("linux", "darwin")
-    and not os.environ.get("GIT_MIN_VERSION")
-)
+    chain = [f"{k:02d}" + "n" * 198 for k in range(_DEEP_FOLDERS)]
+    files = (f"b{d % 4}/leaf{d}/mod_{f}.py" for d in range(20) for f in range(_DEEP_FILES // 20))
+    build_or_skip(root, chain, files)
 
 
 # #76 CR B2: the budget pays for path length, so 2,000 patterns tried on
@@ -981,17 +958,7 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path_factory.mktemp("deep")
-    try:
-        _deep_tree(root)
-    except OSError as e:
-        # #76 CR B1: some filesystems (the git-minimum container's) refuse a 200-character
-        # name or a path this deep. That limit comes from the filesystem, not the OS, so
-        # skip only on ENAMETOOLONG and let any other error fail the test.
-        if e.errno != errno.ENAMETOOLONG:
-            raise
-        if _MUST_BUILD_THE_DEEP_TREE:
-            raise  # #76 CR, D-TL-76 addendum 2: no skip on the ubuntu and macOS CI legs
-        pytest.skip(f"this filesystem refuses the deep tree's names: {e}")
+    _deep_tree(root)  # #76 CR B1, D-TL-76 addendum 2: skips only as long_paths says
     _set_patterns(root, [])
     baseline, result = _best_of_2(root)
     assert len(py_paths(result)) == _DEEP_FILES
@@ -1015,14 +982,19 @@ _LONG_NAME_LINES = 3  # "*[q]N": the largest set that never runs this tree's bud
 
 
 def _long_name_tree(root: Path) -> None:
-    """20,000 files with 255-character names, laid out as the near-cap tree."""
+    """20,000 files with 255-character names, laid out as the near-cap tree. Some
+    filesystems refuse names this long; the test skips only as long_paths says."""
     write(root, {"AGENTS.md": AGENTS})
     (root / ".git" / "info").mkdir(parents=True)
-    for d in range(200):
-        folder = root.joinpath(*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}")
-        folder.mkdir(parents=True)
-        for f in range(_NEAR_CAP_FILES // 200):
-            (folder / (f"mod_{f:03d}_".ljust(_LONG_NAME - 3, "m") + ".py")).write_bytes(b"")
+    files = (
+        "/".join((*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}"))
+        + "/"
+        + f"mod_{f:03d}_".ljust(_LONG_NAME - 3, "m")
+        + ".py"
+        for d in range(200)
+        for f in range(_NEAR_CAP_FILES // 200)
+    )
+    build_or_skip(root, (), files)
 
 
 # SR (L-76-1 follow-up, D-TL-77 #3): the allowance grows with the name, so a hostile set
@@ -1038,12 +1010,7 @@ def test_hostile_patterns_add_little_on_the_longest_file_names(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path_factory.mktemp("long_names")
-    try:
-        _long_name_tree(root)
-    except OSError as e:
-        if e.errno != errno.ENAMETOOLONG or _MUST_BUILD_THE_DEEP_TREE:
-            raise  # as for the deep tree: only git-minimum's container and local runs skip
-        pytest.skip(f"this filesystem refuses 255-character names: {e}")
+    _long_name_tree(root)
     _set_patterns(root, [])
     baseline, result = _best_of_2(root)
     assert len(py_paths(result)) == _NEAR_CAP_FILES
