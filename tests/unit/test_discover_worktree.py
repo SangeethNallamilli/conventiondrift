@@ -306,6 +306,95 @@ def test_gitignore_drops_untracked_files(tmp_path: Path) -> None:
     assert result.stats["gitignore_patterns_loaded"] == 3
 
 
+def test_a_gitignore_two_folders_deep_applies_under_its_own_folder(tmp_path: Path) -> None:
+    # TE #76: a .gitignore is read at any depth, not only at the root and one level down.
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            "a/b/.gitignore": "x.py\n/y.py\n",
+            "a/b/x.py": "",
+            "a/b/c/x.py": "",
+            "a/x.py": "",
+            "a/b/y.py": "",
+            "a/b/c/y.py": "",
+        },
+    )
+    result = run(tmp_path)
+    assert py_paths(result) == ["a/b/c/y.py", "a/x.py"]
+    assert result.stats["gitignore_patterns_loaded"] == 2
+
+
+def test_negation_never_brings_back_hard_excluded_folders(tmp_path: Path) -> None:
+    # A-3 #4, TE #76: "!" patterns can't reach .git/ or node_modules/ (I-5).
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            ".gitignore": "*\n!*/\n!*.py\n!*.md\n!.git/\n!node_modules/\n!**/node_modules/**\n",
+            ".git/hooks/x.py": "",
+            "node_modules/m.py": "",
+            "sub/node_modules/n.py": "",
+            "kept.py": "",
+        },
+    )
+    assert py_paths(run(tmp_path)) == ["kept.py"]
+
+
+def test_the_scan_path_starts_no_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A-3 #6: past the HEAD listing C3 gives it, scan discovery calls no git. Walking,
+    # .gitignore, hashing (with the CRLF re-hash) and reading all stay in Python.
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            ".git/info/exclude": "x.py\n",
+            ".gitignore": "*.log\n",
+            "sub/.gitignore": "y.py\n",
+            "t.py": "a\nb\n",
+            "u.py": "a\n",
+            "sub/y.py": "",
+            "x.py": "",
+        },
+    )
+    head = tracked(tmp_path, "t.py", "u.py")
+    (tmp_path / "t.py").write_bytes(b"a\r\nb\r\n")  # a CRLF checkout of the same blob
+    (tmp_path / "u.py").write_bytes(b"changed\n")
+
+    def no_process(*args: object, **kwargs: object) -> None:
+        raise AssertionError("scan discovery started a process")
+
+    monkeypatch.setattr(subprocess, "Popen", no_process)
+    for name in ("system", "posix_spawn", "posix_spawnp", "fork", "execv", "execvp"):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, no_process)
+    result = run(tmp_path, head)
+    assert py_paths(result) == ["t.py", "u.py"]
+    assert {p: s.unchanged for p, s in result.scan_tracked.items()} == {
+        "t.py": True,
+        "u.py": False,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a ':' in a name is an NTFS stream on Windows")
+def test_names_with_a_colon_are_walked_read_and_ignored_on_posix(tmp_path: Path) -> None:
+    # I-13: a ":" in a walked name is fine on POSIX, for the read of a .py file and of a
+    # .gitignore alike (origin "tree"; #76 mutmut survivors).
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            "c:x.py": "",
+            "d:e/.gitignore": "f.py\n",
+            "d:e/f.py": "",
+            "d:e/g.py": "",
+        },
+    )
+    result = run(tmp_path)
+    assert py_paths(result) == ["c:x.py", "d:e/g.py"]
+    assert result.discovery.skipped == ()
+
+
 def test_an_ignored_folder_is_not_entered(tmp_path: Path) -> None:
     # scratch/ is not a default exclude, so only .gitignore keeps the walk out of it.
     write(tmp_path, {".gitignore": "scratch/\n", "scratch/a/b.py": "", "x.py": ""})
@@ -832,30 +921,51 @@ def _assert_at_most_doubles(hostile: float, baseline: float) -> None:
     )
 
 
-def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[gitignore.IgnoreRules]:
+class _Recorded(gitignore.IgnoreRules):
+    """An :class:`IgnoreRules` that also notes how many paths it had checked when its
+    budget ran out (CR #76 S1: none are checked after that)."""
+
+    def __init__(self, made: list[_Recorded]) -> None:
+        super().__init__()
+        self.checks_when_spent: int | None = None
+        made.append(self)
+
+    def ignored(self, path: str, is_dir: bool = False) -> bool:
+        answer = super().ignored(path, is_dir)
+        if self.exhausted and self.checks_when_spent is None:
+            self.checks_when_spent = self._checks
+        return answer
+
+
+def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[_Recorded]:
     """Every :class:`IgnoreRules` discovery makes from now on, in order."""
-    made: list[gitignore.IgnoreRules] = []
-
-    class Recorded(gitignore.IgnoreRules):
-        def __init__(self) -> None:
-            super().__init__()
-            made.append(self)
-
-    monkeypatch.setattr(scan, "IgnoreRules", Recorded)
+    made: list[_Recorded] = []
+    monkeypatch.setattr(scan, "IgnoreRules", lambda: _Recorded(made))
     return made
 
 
-def _assert_work_within_budget(rules: gitignore.IgnoreRules, longest: int) -> None:
+def _assert_work_within_budget(rules: _Recorded, longest: int, runs_out: bool) -> None:
     """D-TL-76: the work stays within the budget plus the allowance per path checked,
     past it only by what the last check paid before it could stop: its start cost, its
     candidates (L-76-1), one folder cut and one match step, for a path of at most
-    ``longest`` components."""
+    ``longest`` components. The budget is worked out here from the constants (TE #76
+    N1). A spent budget leaves paths unchecked, and no path is checked after it (CR #76
+    S1)."""
+    budget = (
+        gitignore.GITIGNORE_MATCH_BUDGET
+        + gitignore.GITIGNORE_MATCH_ALLOWANCE * rules._checks
+        + gitignore.GITIGNORE_MATCH_ALLOWANCE_PER_CHAR * rules._names
+    )
+    assert rules._budget() == budget
     lookups = 2 * sum(map(len, rules._lengths.values()))
     gathered = len(rules._rules) // gitignore._CANDIDATES_PER_STEP
     last_check = (4 + longest + lookups + gathered) + (2 + 1 + longest) + 2
-    assert rules._work <= rules._budget() + last_check, (
-        f"work {rules._work:,}, budget {rules._budget():,} for {rules._checks:,} paths"
+    assert rules._work <= budget + last_check, (
+        f"work {rules._work:,}, budget {budget:,} for {rules._checks:,} paths"
     )
+    assert rules.exhausted is runs_out
+    assert (rules.unchecked > 0) is runs_out
+    assert rules.checks_when_spent == (rules._checks if runs_out else None)
 
 
 def _set_patterns(root: Path, lines: Sequence[str]) -> None:
@@ -927,8 +1037,7 @@ def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
     best, result = _best_of_2(near_cap_tree)
     assert len(made) == 2
     for rules in made:
-        assert rules.exhausted is runs_out
-        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)), runs_out)
     _assert_at_most_doubles(best, near_cap_baseline)
     assert result.stats["gitignore_patterns_loaded"] == lines
     assert len(py_paths(result)) == _NEAR_CAP_FILES
@@ -969,8 +1078,7 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     best, result = _best_of_2(root)
     assert len(made) == 2
     for rules in made:
-        assert rules.exhausted
-        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)), True)
     _assert_at_most_doubles(best, baseline)
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _DEEP_FILES
@@ -1021,8 +1129,7 @@ def test_hostile_patterns_add_little_on_the_longest_file_names(
     best, result = _best_of_2(root)
     assert len(made) == 2
     for rules in made:
-        assert not rules.exhausted
-        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)), False)
     _assert_at_most_doubles(best, baseline)
     assert len(py_paths(result)) == _NEAR_CAP_FILES
     assert result.stats["gitignore_patterns_loaded"] == _LONG_NAME_LINES

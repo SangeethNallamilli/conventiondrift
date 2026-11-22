@@ -50,6 +50,15 @@ def test_escaped_hash_and_bang_are_patterns() -> None:
     assert gitignore_patterns(b"\\#h\n\\!n\n") == ["\\#h", "\\!n"]
 
 
+def test_a_hash_after_a_space_or_a_bang_is_a_pattern() -> None:
+    # TE #76: only a "#" in the first column starts a comment, as in git.
+    assert gitignore_patterns(b" #x\n!#x\n#c\n") == [" #x", "!#x"]
+    loaded = rules(("", b" #x\n\\#*\n!#x\n"))
+    assert loaded.ignored(" #x")
+    assert loaded.ignored("#y")
+    assert not loaded.ignored("#x")
+
+
 def test_crlf_lines_lose_the_cr() -> None:
     assert gitignore_patterns(b"a\r\nb\r\n") == ["a", "b"]
 
@@ -134,6 +143,16 @@ def test_a_nested_file_applies_only_under_its_folder() -> None:
     assert not loaded.ignored("x.py")
     assert not loaded.ignored("ab/x.py")
     assert not loaded.ignored("a")
+
+
+def test_an_anchored_pattern_two_folders_deep_is_anchored_to_its_folder() -> None:
+    # TE #76 and its mutmut survivors: the folder is cut off the path by its components.
+    loaded = rules(("a/b", b"/y.py\n"), ("my dir", b"/z.py\n"))
+    assert loaded.ignored("a/b/y.py")
+    assert not loaded.ignored("a/b/c/y.py")
+    assert not loaded.ignored("a/y.py")
+    assert loaded.ignored("my dir/z.py")
+    assert not loaded.ignored("my dir/q/z.py")
 
 
 def test_a_deeper_file_overrides_a_shallower_one() -> None:
@@ -519,6 +538,21 @@ def test_the_budget_is_shared_by_every_gitignore_file(monkeypatch: pytest.Monkey
     alone = rules(("", b"*.py\n"), ("sub", b"*.txt\n"))
     assert alone.ignored("sub/c.py")
     assert alone._work == 31
+
+
+def test_the_allowance_earned_so_far_is_kept_across_gitignore_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # TE #76 N8: adding a nested .gitignore keeps the paths and name characters already
+    # counted, so the allowance they earned is not lost.
+    _budget(monkeypatch, 0, 40, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored("a.py") and loaded.ignored("b.py")
+    assert (loaded._work, loaded._budget()) == (36, 2 * (40 + 4))
+    loaded.add("sub", b"*.txt\n")
+    assert loaded._budget() == 2 * (40 + 4)
+    assert loaded.ignored("sub/c.py")  # 31 more steps: 67 against 132, carried over
+    assert (loaded._work, loaded._budget(), loaded.exhausted) == (67, 132, False)
 
 
 def test_running_out_on_a_folder_leaves_the_path_in(monkeypatch: pytest.MonkeyPatch) -> None:
