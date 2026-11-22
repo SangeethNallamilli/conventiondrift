@@ -622,6 +622,57 @@ def test_sha256_object_ids_are_compared_with_sha256(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("worktree", "at_head", "unchanged"),
+    [
+        (b"a\r\nb\r\n", b"a\nb\n", True),  # core.autocrlf checkout of an LF blob
+        (b"a\r\nb\n", b"a\nb\n", True),  # mixed line ends: each CRLF is read as LF
+        (b"a\r\nb\r\n", b"a\r\nb\r\n", True),  # a CRLF blob, as it is
+        (b"a\r\nb\r\n", b"a\nc\n", False),  # an edit is still an edit
+        (b"a\nb\n", b"a\r\nb\r\n", False),  # only CRLF to LF, never LF to CRLF
+        (b"a\rb\n", b"a\nb\n", False),  # a lone CR is not a line end
+        (b"a\rb\r\nc\r\n", b"a\rb\nc\n", False),  # with a lone CR, git converts nothing
+        (b"a\r\r\nb\n", b"a\r\nb\n", False),  # "\r\r\n" has a lone CR too
+    ],
+)
+def test_crlf_line_ends_are_read_as_lf_when_the_bytes_differ(
+    tmp_path: Path, worktree: bytes, at_head: bytes, unchanged: bool
+) -> None:
+    # D-TL-69 #2: git config is not read; a CRLF file is hashed again with LF.
+    write(tmp_path, {"AGENTS.md": AGENTS, "a.py": worktree})
+    result = run(tmp_path, Head([("100644", blob40(at_head), 1, "a.py")]))
+    assert result.scan_tracked["a.py"] == TrackedState(blob40(at_head), unchanged)
+
+
+def test_crlf_rehash_uses_the_head_hash(tmp_path: Path) -> None:
+    write(tmp_path, {"AGENTS.md": AGENTS, "a.py": b"a\r\n"})
+    a256 = hashlib.sha256(b"blob 2\0a\n").hexdigest()
+    result = run(tmp_path, Head([("100644", a256, 1, "a.py")]))
+    assert result.scan_tracked["a.py"] == TrackedState(a256, True)
+
+
+def test_a_crlf_checkout_is_unchanged_as_git_says(repo: GitRepo) -> None:
+    # D-TL-69 #2, against git itself: with core.autocrlf, git stores an LF blob for a
+    # CRLF file (hash-object applies the same conversion as add) unless it has a lone
+    # CR; that is HEAD's blob for a.py only. Here that is found without reading config.
+    files = {"AGENTS.md": AGENTS, "a.py": "x\ny\n", "b.py": "p\n", "c.py": "c\rd\ne\n"}
+    repo.commit_files("c", files, date=DAY)
+    write(repo.path, {"a.py": b"x\r\ny\r\n", "b.py": b"q\r\n", "c.py": b"c\rd\r\ne\r\n"})
+    for name, same in (("a.py", True), ("b.py", False), ("c.py", False)):
+        stored = repo.git("-c", "core.autocrlf=true", "hash-object", name).strip()
+        assert (stored == repo.git("rev-parse", f"HEAD:{name}").strip()) is same
+    git = GitReader(repo.path)
+    try:
+        result = discover_worktree(PHASE, repo.path, git, git.resolve("HEAD"))
+    finally:
+        git.close()
+    assert {p: s.unchanged for p, s in result.scan_tracked.items()} == {
+        "a.py": True,
+        "b.py": False,
+        "c.py": False,  # a lone CR: git keeps the bytes as they are
+    }
+
+
 def test_against_real_git_status(repo: GitRepo) -> None:
     repo.commit_files(
         "c",

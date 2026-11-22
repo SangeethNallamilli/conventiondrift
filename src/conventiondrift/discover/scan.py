@@ -24,7 +24,9 @@ already read through C3 (A-3 condition 6).
 
 For each kept ``.py`` file that is tracked at ``HEAD``, the git blob id of its
 working-tree bytes is computed in Python and compared with the ``HEAD`` object id
-(A-3 "Tracked files"); the result is the I-14 ``scan_tracked`` mapping C8 takes.
+(A-3 "Tracked files"); if they differ and the file has CRLF line ends, it is hashed
+again with CRLF read as LF, so a checkout with ``core.autocrlf`` is unchanged
+(D-TL-69 #2). The result is the I-14 ``scan_tracked`` mapping C8 takes.
 """
 
 from __future__ import annotations
@@ -90,6 +92,20 @@ def git_blob_id(data: bytes, object_id_length: int) -> str:
     digest.update(b"blob %d\0" % len(data))
     digest.update(data)
     return digest.hexdigest()
+
+
+def _unchanged(data: bytes, oid: str) -> bool:
+    """True if the working-tree bytes ``data`` are the ``HEAD`` blob ``oid``: as they
+    are, or with each CRLF read as LF (D-TL-69 #2), as git stores a file checked out
+    with ``core.autocrlf``. git config is never read, so both are tried. As in git, a
+    file with a CR that does not end a line is never converted (git takes it as binary).
+    """
+    if git_blob_id(data, len(oid)) == oid:
+        return True
+    crlf = data.count(b"\r\n")
+    if not crlf or data.count(b"\r") != crlf:
+        return False
+    return git_blob_id(data.replace(b"\r\n", b"\n"), len(oid)) == oid
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,7 +363,7 @@ def discover_worktree(
         if entry is None or entry[0] == _GITLINK:
             continue
         mode, oid = entry[0], entry[1]
-        same = mode in _REGULAR_MODES and git_blob_id(py.data, len(oid)) == oid
+        same = mode in _REGULAR_MODES and _unchanged(py.data, oid)
         tracked[py.path] = TrackedState(oid, same)
     stats = {  # I-12 schema order
         "scan_walk_entries": walk.entries,
