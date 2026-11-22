@@ -709,6 +709,20 @@ def test_hostile_pattern_sets_run_out_on_the_longest_names(pattern: bytes) -> No
     assert loaded.unchecked == 1
 
 
+@pytest.mark.parametrize(
+    ("path", "name_length"), [("m.py", 4), ("a/m.py", 4), ("a/b/m.py", 4), ("ab/cd/ef/gh.py", 5)]
+)
+def test_only_the_last_component_earns_the_per_character_allowance(
+    monkeypatch: pytest.MonkeyPatch, path: str, name_length: int
+) -> None:
+    # #78 CR S1: with two or more "/" the name starts after the last one, not the first.
+    _budget(monkeypatch, 10_000, 0, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored(path)
+    assert loaded._names == name_length
+    assert loaded._budget() == 10_000 + name_length
+
+
 def test_unused_allowance_carries_over(monkeypatch: pytest.MonkeyPatch) -> None:
     _budget(monkeypatch, 0, 18)
     loaded = rules(("", b"*.py\n"))
