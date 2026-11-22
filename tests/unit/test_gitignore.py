@@ -17,6 +17,7 @@ from tests.fixtures.gitrepo import GitRepo
 
 from conventiondrift.discover import gitignore
 from conventiondrift.discover.gitignore import IgnoreRules, gitignore_patterns
+from conventiondrift.discover.safefs import WALK_MAX_DEPTH
 
 
 @pytest.fixture
@@ -381,7 +382,7 @@ def _budget(monkeypatch: pytest.MonkeyPatch, steps: int, allowance: int = 0) -> 
 
 def test_the_match_budget_is_the_chosen_value() -> None:
     assert gitignore.GITIGNORE_MATCH_BUDGET == 3_000_000
-    assert gitignore.GITIGNORE_MATCH_ALLOWANCE == 384
+    assert gitignore.GITIGNORE_MATCH_ALLOWANCE == 256
 
 
 def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
@@ -632,26 +633,37 @@ def _stock_rules() -> IgnoreRules:
     return rules(("", "\n".join(_STOCK_PYTHON).encode()))
 
 
-@pytest.mark.parametrize("depth", [1, 8, 32, 64])
-@pytest.mark.parametrize(
-    "name",
-    [
-        "m.py",
-        "a" * 100,
-        "module_name_" * 8 + "long.py",
-        "x" * 96 + ".pyc",
-        "a.b." * 25,
-        "__pycache__",
-        ".env",
-        "pkg.egg-info",
-    ],
-)
-def test_one_stock_python_check_costs_less_than_the_allowance(depth: int, name: str) -> None:
-    path = "/".join(["pkg"] * (depth - 1) + [name])
-    for is_dir in (False, True):
-        loaded = _stock_rules()
-        loaded._verdict(path, is_dir)
-        assert loaded._work <= gitignore.GITIGNORE_MATCH_ALLOWANCE, (path, is_dir)
+def _stock_walk(loaded: IgnoreRules, prefix: str, folders: int) -> int:
+    """A synthetic walk as the scan does it: each folder is checked before the 99 files
+    of common kinds in it. Returns how many entries were checked."""
+    kinds = ("mod_{}.py", "test_{}.py", "{}.pyc", "README_{}.md", "data_{}.json", ".env{}")
+    entries = 0
+    for n in range(folders):
+        folder = f"{prefix}src{n % 50}/pkg_{n % 7}/sub{n}"
+        loaded.ignored(folder, is_dir=True)
+        entries += 1
+        for i in range(99):
+            loaded.ignored(f"{folder}/{kinds[i % 6].format(i)}")
+            entries += 1
+    return entries
+
+
+# D-TL-73, D-TL-75: at any depth the walk allows, a walk with GitHub's Python .gitignore
+# spends less than the allowance per entry, so the base budget is never touched and it
+# never runs out however many entries there are. One deep check alone may cost more
+# than the allowance (about 350 steps at depth 64); unused allowance carries over.
+@pytest.mark.parametrize("depth", [0, 8, 32, WALK_MAX_DEPTH - 3])  # + src/pkg/sub
+@pytest.mark.parametrize("name_length", [8, 60])
+def test_a_stock_python_walk_spends_less_than_its_allowance_at_any_depth(
+    depth: int, name_length: int
+) -> None:
+    prefix = "".join(f"p{k:02d}{'q' * name_length}/" for k in range(depth))
+    loaded = _stock_rules()
+    entries = _stock_walk(loaded, prefix, 200)
+    assert entries == 20_000
+    assert depth + 3 <= WALK_MAX_DEPTH  # the deepest folder is inside the walk cap
+    assert not loaded.exhausted
+    assert loaded._work <= gitignore.GITIGNORE_MATCH_ALLOWANCE * entries
 
 
 def test_the_stock_python_gitignore_never_runs_out_below_the_walk_cap() -> None:

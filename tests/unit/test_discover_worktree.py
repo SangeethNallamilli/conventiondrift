@@ -779,9 +779,10 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
 # A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with patterns the index
 # can't narrow, takes at most twice as long to discover as the same tree with no patterns
 # (best of 2 each; D-TL-74a). The 2,000-line sets run the budget out, so the time
-# includes reaching it. The 90- and 100-line sets (CR, TE) are the largest that stay
-# under the per-path allowance and never run it out, so they pay it on every path: the
-# worst case for this bound.
+# includes reaching it. With the D-TL-75 allowance of 256, the 75-line sets are about the
+# largest that stay under it and never run it out, so they pay it on every path: the
+# worst case for this bound (CR's and TE's k=90-100 peak at the old 384). The 100-line
+# sets run it out just past that peak.
 @pytest.mark.timing
 @pytest.mark.parametrize(
     ("line", "lines", "runs_out"),
@@ -789,9 +790,10 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
         ("[q]{}", _HOSTILE_LINES, True),  # TE
         ("[x]*{}*q/", _HOSTILE_LINES, True),  # CR
         ("**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}", _HOSTILE_LINES, True),  # SR, deep "**"
-        ("[x]*{}*q", 90, False),  # CR, under the allowance (D-TL-74)
-        ("[x]*{}*q", 100, False),  # TE, under the allowance
-        ("[q]{}", 100, False),  # TE, under the allowance
+        ("[x]*{}*q", 75, False),  # CR's shape, the peak under the allowance (D-TL-75)
+        ("[q]{}", 75, False),  # TE's shape, the peak under the allowance (D-TL-75)
+        ("[x]*{}*q", 100, True),  # CR's shape, just past the peak
+        ("[q]{}", 100, True),  # TE's shape, just past the peak
     ],
 )
 def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(

@@ -68,14 +68,17 @@ __all__ = [
 
 GITIGNORE_MAX_BYTES: Final = 65_536  # A-3 condition 4: 64 KiB per file
 GITIGNORE_MAX_PATTERNS: Final = 2_000  # A-3 condition 4: patterns in total, all files
-# A-3 condition 7 (#76, D-TL-69, D-TL-73): match steps per scan, plus an allowance per
-# path checked. A step costs about 70-200 ns, so the base is about 0.5 s of matching,
-# which is all 2,000 hostile patterns get (they run it out within a few dozen paths).
-# The allowance is more than one check with GitHub's Python .gitignore costs at any
-# depth up to the 64-folder cap with names up to 100 characters (about 80-350 steps),
-# so that file never runs out below the 500,000-entry walk cap.
+# A-3 condition 7 (#76, D-TL-69, D-TL-73, D-TL-75): match steps per scan, plus an
+# allowance per path checked. A step costs about 70-200 ns, so the base is about 0.5 s of
+# matching, which is all 2,000 hostile patterns get (they run it out within a few dozen
+# paths). The allowance is more than a walk with GitHub's Python .gitignore spends per
+# entry at any depth up to the 64-folder cap (about 85 steps near the root, about 205
+# at depth 63; one check alone can cost up to about 350, and unused allowance carries
+# over), so that file never runs out below the 500,000-entry walk cap. 192 ran out at
+# about 240,000 entries at depth 63 (D-TL-75 says 256 then). Patterns that stay under
+# the allowance never run it out and pay it on every path, so it also bounds their cost.
 GITIGNORE_MATCH_BUDGET: Final = 3_000_000
-GITIGNORE_MATCH_ALLOWANCE: Final = 384
+GITIGNORE_MATCH_ALLOWANCE: Final = 256
 
 _BOM: Final = "\ufeff"
 _SPECIAL: Final = frozenset("*?[\\")  # anything in a segment that is not plain text
