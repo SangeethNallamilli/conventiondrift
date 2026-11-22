@@ -15,7 +15,8 @@ amended by SC-2.32 (D-PM-13's text still says 4 KiB; SC-2.32 made it 16 KiB):
 
 Usage:
     gen_bench_repo.py --profile b10k|b500 --seed N --out DIR [--manifest PATH]
-    gen_bench_repo.py --profile b10k --seed N --out DIR --near-cap te|cr|sr|cr-deep|cr-k90|python
+    gen_bench_repo.py --profile b10k --seed N --out DIR --near-cap SET
+        (SET: te, cr, sr, cr-deep, cr-k90, cr-k100, cr-k150 or python)
 
 `--near-cap` writes the DESIGN A-3 #7 overlay (`write_near_cap`) into the existing
 checkout at DIR instead of generating: untracked files and `.gitignore` /
@@ -849,9 +850,14 @@ NEAR_CAP_SETS = {
     "cr": "[x]*{i}*q/",  # CR: folder-only, leading bracket and two stars
     "sr": "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{i}",  # SR: seven "**" segments
     "cr-deep": "[x]/[y]*",  # CR deep-path set: 2,000 times, run over ~12k-char paths
-    "cr-k90": "[x]*{i}*q",  # D-TL-74: 90 patterns, under the per-path allowance (no note)
+    # Mid-size sets (D-TL-74, D-TL-75): matched on every path, or for most of the walk,
+    # because they cost about the per-path allowance; k=100 and k=150 were the TE sweep's
+    # peaks on the 20k tree and on this B10k tree.
+    "cr-k90": "[x]*{i}*q",
+    "cr-k100": "[x]*{i}*q",
+    "cr-k150": "[x]*{i}*q",
 }
-NEAR_CAP_COUNTS = {"cr-k90": 90}  # patterns per set; the rest use NEAR_CAP_PATTERNS
+NEAR_CAP_COUNTS = {"cr-k90": 90, "cr-k100": 100, "cr-k150": 150}  # else NEAR_CAP_PATTERNS
 NEAR_CAP_PYTHON = "python"  # GitHub's stock Python.gitignore near the 500k walk cap
 PYTHON_GITIGNORE = Path(__file__).resolve().parent / "bench_data" / "Python.gitignore"
 UNTRACKED_PY = 10_000  # the B10k figure again, untracked: every one is matched

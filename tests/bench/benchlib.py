@@ -302,11 +302,21 @@ def write_results(profile: str, head_ref: str, manifest: dict, runs: list[Run]) 
 
 
 # ------------------------------------------------------------- A-3 #7 near-cap discovery
-# DESIGN A-3 #7: "a repo near every cap finishes inside the B10k stage budget"; DESIGN §5:
-# discovery 4 s on B10k. D-TL-71 (3): the A-3 #7 limit is the absolute 4 s, not 125%.
+# DESIGN A-3 #7: "a repo near every cap finishes inside the B10k stage budget". DESIGN §5:
+# "Discovery and object reads (`cat-file --batch`) | 4 s" on B10k, and the benchmark job
+# "fails if any stage goes over 125% of its budget". D-TL-75 (3): the near-cap case uses
+# that rule as written, with no exception: fail above 4 s x 125%.
 # D-TL-73: only the stage time is asserted, never the match budget's internals.
-NEAR_CAP_DISCOVER_S = 4.0
-NEAR_CAP_SETS = ("te", "cr", "sr", "cr-deep", "cr-k90")  # gen_bench_repo.NEAR_CAP_SETS
+NEAR_CAP_DISCOVER_S = STAGE_BUDGET_S["b10k"]["discover"] * STAGE_TOLERANCE
+NEAR_CAP_SETS = (  # gen_bench_repo.NEAR_CAP_SETS
+    "te",
+    "cr",
+    "sr",
+    "cr-deep",
+    "cr-k90",
+    "cr-k100",
+    "cr-k150",
+)
 NEAR_CAP_PYTHON = "python"
 
 
@@ -385,7 +395,8 @@ def write_near_cap_results(pattern_set: str, manifest: dict, info: dict, runs: l
         "overlay": {k: v for k, v in info.items() if k != "ignored_py"},
         "discover_s": [round(r.seconds, 3) for r in runs],
         "median_s": round(statistics.median(r.seconds for r in runs), 3),
-        "budget_s": NEAR_CAP_DISCOVER_S,
+        "budget_s": STAGE_BUDGET_S["b10k"]["discover"],
+        "limit_s": NEAR_CAP_DISCOVER_S,
         "walk_entries": [r.stats.get("scan_walk_entries") for r in runs],
     }
     (Path(dest) / f"b10k-a3-7-near-cap-{pattern_set}.json").write_text(

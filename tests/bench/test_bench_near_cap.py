@@ -1,14 +1,16 @@
 """DESIGN A-3 #7 near-cap case on B10k (D-TL-72, D-TL-73): scan-mode discovery stage.
 
 A-3 #7: "a repo near every cap finishes inside the B10k stage budget". DESIGN §5 gives
-discovery 4 s on B10k; D-TL-71 (3) keeps that as an absolute limit for A-3 #7. The
+discovery 4 s on B10k, and the benchmark job "fails if any stage goes over 125% of its
+budget"; D-TL-75 (3) applies that rule as written (fail above 5 s, derived). The
 seeded B10k checkout (10,000 tracked `.py` files) gets the `gen_bench_repo --near-cap`
 overlay: 10,000 untracked `.py` files six deep, a deep tree at depth 62 with paths of
 about 12k characters, and 2,000 patterns (the A-3 #4 cap) that the rule index can't
 narrow, in `.git/info/exclude` and `.gitignore`. Sets: TE `[q]N`, CR `[x]*N*q/`, SR
-seven `**` segments, CR's deep-path set (2,000 x `[x]/[y]*`), and (D-TL-74) 90 x
-`[x]*N*q`, a mid-size set that stays under the per-path allowance and so is matched on
-every path. None of them matches any file, so every file must still be found.
+seven `**` segments, CR's deep-path set (2,000 x `[x]/[y]*`), and (D-TL-74/75) 90, 100
+and 150 x `[x]*N*q`, mid-size sets near the per-path allowance that are matched on every
+path or most of the walk (the sweep's peaks). None of them matches any file, so every
+file must still be found.
 
 Only the stage time and the found files are asserted, never the match budget's
 internals (D-TL-73). The stock-Python case puts GitHub's `Python.gitignore` on a tree
@@ -61,20 +63,24 @@ def _overlay(repo: Path, pattern_set: str) -> dict:
 
 @pytest.mark.timing
 @pytest.mark.parametrize("pattern_set", benchlib.NEAR_CAP_SETS)
-def test_a3_7_b10k_near_cap_discovery_stage_under_4s(
+def test_a3_7_b10k_near_cap_discovery_stage_within_125pct(
     pattern_set: str, b10k: tuple[Path, dict, frozenset[str]]
 ) -> None:
     repo, manifest, tracked = b10k
     info = _overlay(repo, pattern_set)
-    assert info["patterns"] == (90 if pattern_set == "cr-k90" else 2_000)
+    counts = {"cr-k90": 90, "cr-k100": 100, "cr-k150": 150}
+    assert info["patterns"] == counts.get(pattern_set, 2_000)
     assert 60 <= info["deep_depth"] <= 64 and 11_000 <= info["deep_max_path"] <= 13_000, info
     expected = len(tracked) + info["untracked_py"]
     runs = [benchlib.time_scan_discovery(repo) for _ in range(benchlib.RUNS)]
     benchlib.write_near_cap_results(pattern_set, manifest, info, runs)
     problems = []
     for n, run in enumerate(runs):
-        if run.seconds >= benchlib.NEAR_CAP_DISCOVER_S:
-            problems.append(f"run {n}: discovery {run.seconds:.2f} s >= 4 s (DESIGN §5, A-3 #7)")
+        if run.seconds > benchlib.NEAR_CAP_DISCOVER_S:  # DESIGN §5: "goes over 125%"
+            problems.append(
+                f"run {n}: discovery {run.seconds:.2f} s > {benchlib.NEAR_CAP_DISCOVER_S:g} s "
+                "(125% of the 4 s B10k budget, DESIGN §5; A-3 #7)"
+            )
         if run.stats["gitignore_patterns_loaded"] != info["patterns"]:
             problems.append(f"run {n}: {run.stats['gitignore_patterns_loaded']} patterns loaded")
         if run.walk_limit_skips:

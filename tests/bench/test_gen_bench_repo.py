@@ -459,13 +459,14 @@ def test_near_cap_cli_rejects_an_unknown_set(tmp_path: Path) -> None:
     assert b"invalid choice" in proc.stderr
 
 
-def test_near_cap_k90_overlay_is_90_patterns_split_in_two(tmp_path: Path) -> None:
-    """D-TL-74: the mid-size set under the per-path allowance, 45 + 45 lines."""
+@pytest.mark.parametrize("k", [90, 100, 150])
+def test_near_cap_mid_size_overlay_is_k_patterns_split_in_two(k: int, tmp_path: Path) -> None:
+    """D-TL-74/75: the mid-size sets near the per-path allowance, k/2 + k/2 lines."""
     gen = benchlib.load_generator()
     repo = _bare_checkout(tmp_path)
-    info = gen.write_near_cap(repo, "cr-k90", untracked_py=100, deep_levels=0)
+    info = gen.write_near_cap(repo, f"cr-k{k}", untracked_py=100, deep_levels=0)
     files = [repo / ".git" / "info" / "exclude", repo / ".gitignore"]
     lines = [f.read_text(encoding="utf-8").splitlines() for f in files]
-    assert [len(x) for x in lines] == [45, 45]
-    assert lines[0][0] == "[x]*0*q" and lines[1][-1] == "[x]*89*q"
-    assert info["patterns"] == 90
+    assert [len(x) for x in lines] == [k // 2, k // 2]
+    assert lines[0][0] == "[x]*0*q" and lines[1][-1] == f"[x]*{k - 1}*q"
+    assert info["patterns"] == k
