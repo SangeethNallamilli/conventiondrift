@@ -997,6 +997,47 @@ def test_hunks_that_overlap_are_an_internal_error() -> None:
         compute_recent(git, window(), {"head": {"a.py": lines(1, 4)}}, tips={"head": HEAD})
 
 
+@pytest.mark.parametrize(
+    "hunks",
+    [
+        (hunk(1, 3, 1, 3), hunk(3, 1, 3, 1)),  # TE #75 N2: one shared line, +1,3 then +3,1
+        (hunk(1, 0, 2, 1), hunk(2, 0, 2, 1)),
+        (hunk(3, 1, 2, 0), hunk(4, 0, 2, 1)),  # after a deletion at line 2, line 2 again
+    ],
+)
+def test_hunks_that_share_a_line_are_an_internal_error(hunks: tuple[bytes, ...]) -> None:
+    git = FakeGit([(sha(1), when(1))], [marker(sha(1)) + file_diff(b"a.py", *hunks)])
+    with pytest.raises(ComponentError):
+        compute_recent(git, window(), {"head": {"a.py": lines(1, 4)}}, tips={"head": HEAD})
+
+
+def test_hunks_one_unchanged_line_apart_are_read() -> None:
+    git = FakeGit(
+        [(sha(1), when(1))],
+        [marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 1), hunk(1, 0, 3, 1))],
+    )
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 2, 3)}}, tips={"head": HEAD})
+    assert got.recent == frozenset({("head", "a.py", 1), ("head", "a.py", 3)})
+
+
+def test_a_deletion_at_the_start_of_the_file_is_read() -> None:
+    git = FakeGit(
+        [(sha(1), when(1))],
+        [marker(sha(1)) + file_diff(b"a.py", hunk(1, 1, 0, 0), hunk(3, 1, 2, 1))],
+    )
+    got = compute_recent(git, window(), {"head": {"a.py": lines(1, 2)}}, tips={"head": HEAD})
+    assert got.recent == frozenset({("head", "a.py", 2)})
+
+
+def test_a_stream_one_hunk_line_short_is_an_internal_error() -> None:
+    # CR #75: the stream ends on a newline right after the first of two "+" lines; the
+    # empty text after that last newline is not a line, so the hunk stays one line short.
+    text = marker(sha(1)) + file_diff(b"a.py", hunk(1, 0, 1, 2))
+    git = FakeGit([(sha(1), when(1))], [text[: text.rindex(b"+new line\n")]])
+    with pytest.raises(ComponentError):
+        compute_recent(git, window(), {"head": {"a.py": lines(1, 2)}}, tips={"head": HEAD})
+
+
 def test_hunks_that_go_backwards_are_an_internal_error() -> None:
     git = FakeGit(
         [(sha(1), when(1))],

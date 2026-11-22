@@ -198,7 +198,7 @@ class _Mapper:
         self._sink = sink  # where dated lines go; None when the commit is outside the window
         self._pos = 0
         self._shift = 0
-        self._end = 0
+        self._end = -1  # the last line of the previous hunk; a "+0,0" hunk may come first
         self._now: list[int] = []
         self._original: list[int] = []
 
@@ -209,7 +209,7 @@ class _Mapper:
 
     def hunk(self, old_count: int, first: int, count: int) -> None:
         """Apply one ``@@ -a,old_count +first,count @@`` hunk."""
-        if first < self._end:
+        if first <= self._end:  # -U0 hunks never touch: an unchanged line is between
             raise ComponentError(_COMPONENT, _MALFORMED)
         self._end = first + count - 1 if count else first
         lines = self.tracked.now
