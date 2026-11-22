@@ -773,10 +773,12 @@ def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[gitignore.IgnoreRules
 
 def _assert_work_within_budget(rules: gitignore.IgnoreRules, longest: int) -> None:
     """D-TL-76: the work stays within the budget plus the allowance per path checked,
-    past it only by what the last check paid before it could stop: its start cost, one
-    folder cut and one match step, for a path of at most ``longest`` components."""
+    past it only by what the last check paid before it could stop: its start cost, its
+    candidates (L-76-1), one folder cut and one match step, for a path of at most
+    ``longest`` components."""
     lookups = 2 * sum(map(len, rules._lengths.values()))
-    last_check = (4 + longest + lookups) + (2 + 1 + longest) + 2
+    gathered = len(rules._rules) // gitignore._CANDIDATES_PER_STEP
+    last_check = (4 + longest + lookups + gathered) + (2 + 1 + longest) + 2
     assert rules._work <= rules._budget() + last_check, (
         f"work {rules._work:,}, budget {rules._budget():,} for {rules._checks:,} paths"
     )
@@ -811,10 +813,11 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
 # A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with patterns the index
 # can't narrow, takes at most twice as long to discover as the same tree with no patterns
 # (best of 2 each; D-TL-74a). The 2,000-line sets run the budget out, so the time
-# includes reaching it. With the D-TL-75 allowance of 256, the 75-line sets are about the
-# largest that stay under it and never run it out, so they pay it on every path: the
-# worst case for this bound (CR's and TE's k=90-100 peak at the old 384). The 100-line
-# sets run it out just past that peak.
+# includes reaching it. With the D-TL-75 allowance of 256, the 74-line sets are the
+# largest that never run it out on this tree, so they pay about all of it on every
+# path: the worst case for this bound (CR's and TE's k=90-100 peak at the old 384; 76
+# before L-76-1 charged the candidates gathered). The 100-line sets run it out just
+# past that peak.
 @pytest.mark.timing
 @pytest.mark.parametrize(
     ("line", "lines", "runs_out"),
@@ -822,8 +825,8 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
         ("[q]{}", _HOSTILE_LINES, True),  # TE
         ("[x]*{}*q/", _HOSTILE_LINES, True),  # CR
         ("**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}", _HOSTILE_LINES, True),  # SR, deep "**"
-        ("[x]*{}*q", 75, False),  # CR's shape, the peak under the allowance (D-TL-75)
-        ("[q]{}", 75, False),  # TE's shape, the peak under the allowance (D-TL-75)
+        ("[x]*{}*q", 74, False),  # CR's shape, the peak under the allowance (D-TL-75)
+        ("[q]{}", 74, False),  # TE's shape, the peak under the allowance (D-TL-75)
         ("[x]*{}*q", 100, True),  # CR's shape, just past the peak
         ("[q]{}", 100, True),  # TE's shape, just past the peak
         ("[q]{}", _HOSTILE_LINES, False),  # SR's L-76-1 set: 1,999 of these, then "!*"
@@ -840,9 +843,9 @@ def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
     patterns = [line.format(i) + "\n" for i in range(lines)]
     if not runs_out and lines == _HOSTILE_LINES:
         # SR's L-76-1 set (D-TL-76 addendum): "!*" last is tried first and matches every
-        # path in a few steps, so the budget never runs out, but gathering and sorting
-        # all 2,000 candidates is not charged yet. Until L-76-1 charges it, only the
-        # ubuntu wall-clock bound covers that cost.
+        # path in a few steps, but gathering and sorting all 2,000 candidates is paid
+        # (L-76-1), about 280 steps a path. That is a little over the allowance, so it
+        # runs the base budget out only after about 110,000 paths, not on this tree.
         patterns[-1] = "!*\n"
     _set_patterns(near_cap_tree, patterns)
     made = _record_rules(monkeypatch)

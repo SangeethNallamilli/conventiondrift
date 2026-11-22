@@ -405,11 +405,11 @@ def test_the_budget_runs_out_and_nothing_more_is_ignored(
     loaded = rules(("", b"*.py\n"))  # each check: 4 + 1 + 2 + 2 + 2 + 7 = 18
     assert [loaded.ignored(p) for p in ("a.py", "b.py")] == [True, True]
     assert (loaded._work, loaded.exhausted, loaded.unchecked) == (36, False, 0)
-    assert not loaded.ignored("c.py")  # runs out before the match: 36 + 11 + 2
-    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (49, True, 1)
+    assert not loaded.ignored("c.py")  # runs out on its start cost: 36 + 7, nothing tried
+    assert (loaded._work, loaded.exhausted, loaded.unchecked) == (43, True, 1)
     assert not loaded.ignored("d.py")
     assert not loaded.ignored("e/f.py", is_dir=True)
-    assert (loaded._work, loaded.unchecked) == (49, 3)  # no more work once spent
+    assert (loaded._work, loaded.unchecked) == (43, 3)  # no more work once spent
 
 
 def test_exactly_the_budget_is_not_spent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -466,7 +466,9 @@ def test_long_paths_pay_for_their_components() -> None:
 
     short = work("a/b.py")
     deep = work("/".join(["n" * 200] * 60) + "/b.py")
-    assert short == 4 + 2 + 10 * 2 + (1 + 2) + 10 * 4  # each match: [x] fails on "a" in 4
+    # 10 candidates gathered (L-76-1), then each match: [x] fails on "a" in 4
+    gathered = 10 // gitignore._CANDIDATES_PER_STEP
+    assert short == 4 + 2 + gathered + 10 * 2 + (1 + 2) + 10 * 4
     assert deep == short + 59 + 59  # 59 more components split, and 59 more cut
 
 
@@ -493,6 +495,41 @@ def test_hostile_pattern_sets_spend_the_budget(
     assert spent > 0 and not any(verdicts[spent:])  # ignored, then never again
     assert loaded.unchecked == len(paths) - spent
     assert loaded._work < 1_000_000 + 10  # a check stops within a few steps of the end
+
+
+def _sr_l76_set() -> bytes:
+    """SR's L-76-1 set: 1,999 patterns the index can't narrow, then ``!*``, which is
+    tried first (last loaded) and matches every path in a few steps."""
+    hostile = b"".join(b"[q]%d\n" % i for i in range(gitignore.GITIGNORE_MAX_PATTERNS - 1))
+    return hostile + b"!*\n"
+
+
+def test_gathered_candidates_are_paid_even_when_never_tried() -> None:
+    # L-76-1: only "!*" is tried, but all 2,000 candidates are gathered and sorted.
+    loaded = rules(("", _sr_l76_set()))
+    assert loaded.loaded == gitignore.GITIGNORE_MAX_PATTERNS
+    alone = rules(("", b"!*\n"))  # the same check with one candidate (paid nothing)
+    assert not loaded.ignored("m.py") and not alone.ignored("m.py")
+    gathered = gitignore.GITIGNORE_MAX_PATTERNS // gitignore._CANDIDATES_PER_STEP
+    assert loaded._work - alone._work == gathered
+
+
+def test_gathered_candidates_run_the_base_budget_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    # L-76-1: with no allowance, SR's set runs the base budget out within the number of
+    # checks its per-check cost allows (before the fix it never did: ~15 steps a check).
+    per_check = rules(("", _sr_l76_set()))
+    assert not per_check.ignored("m000000.py")  # "*" costs a step per character
+    cost = per_check._work
+    assert cost >= gitignore.GITIGNORE_MAX_PATTERNS // gitignore._CANDIDATES_PER_STEP
+    _budget(monkeypatch, gitignore.GITIGNORE_MATCH_BUDGET)
+    loaded = rules(("", _sr_l76_set()))
+    checks = 0
+    while not loaded.exhausted:
+        assert checks <= gitignore.GITIGNORE_MATCH_BUDGET // cost
+        assert not loaded.ignored(f"m{checks:06d}.py")
+        checks += 1
+    assert checks == gitignore.GITIGNORE_MATCH_BUDGET // cost + 1
+    assert loaded.unchecked == 1
 
 
 def test_the_allowance_grows_with_each_path_checked(monkeypatch: pytest.MonkeyPatch) -> None:

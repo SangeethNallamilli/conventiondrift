@@ -41,9 +41,10 @@ tree with short file names however many paths the walk has (long or dotted file 
 deep in the tree can run it out: a known limit, DESIGN A-3 #4a), while 2,000 hostile
 patterns run it out within a few dozen paths. Every path check, file or folder (a folder's
 verdict is paid once, when it is first worked out and cached), pays four steps, one
-per path component (the path is split once), two per index lookup, two per pattern
-tried, one per component each time the path is cut to a ``.gitignore``'s folder (once
-per folder per check), plus the steps
+per path component (the path is split once), two per index lookup, one per eight
+patterns gathered as candidates, tried or not (L-76-1), two per pattern tried, one per
+component each time the path is cut to a ``.gitignore``'s folder (once per folder per
+check), plus the steps
 :meth:`~conventiondrift.discover.globmatch.Glob.match_parts` reports. So a long path
 costs its length once per check, not once per pattern (#76 CR B2). A match stops
 as soon as it would pass the budget. Once the budget is spent, ``.gitignore`` is not
@@ -84,6 +85,10 @@ GITIGNORE_MAX_PATTERNS: Final = 2_000  # A-3 condition 4: patterns in total, all
 # run it out and pay it on every path, so it also bounds their cost.
 GITIGNORE_MATCH_BUDGET: Final = 3_000_000
 GITIGNORE_MATCH_ALLOWANCE: Final = 256
+# L-76-1: candidates gathered (put in a set, then sorted) per match step, rounded down.
+# Measured for the #76 follow-up: about 16 ns per candidate, whatever mix of index kinds
+# they come from, against 128-140 ns per step for the hostile sets on the same machine.
+_CANDIDATES_PER_STEP: Final = 8
 
 _BOM: Final = "\ufeff"
 _SPECIAL: Final = frozenset("*?[\\")  # anything in a segment that is not plain text
@@ -190,7 +195,8 @@ class IgnoreRules:
         self._lengths[kind].add(len(text))
 
     def _candidates(self, path: str) -> list[int]:
-        """Positions of the rules that can match ``path``, last loaded first."""
+        """Positions of the rules that can match ``path``, last loaded first (none once
+        the budget is spent)."""
         name = path.rpartition("/")[2]
         found = {*self._anywhere, *self._lookup["name"].get(name, ())}
         by_prefix, by_suffix = self._lookup["prefix"], self._lookup["suffix"]
@@ -200,7 +206,11 @@ class IgnoreRules:
             found.update(by_prefix.get(name[:length], ()))
         for length in self._lengths["suffix"]:
             found.update(by_suffix.get(name[-length:], ()))
-        return sorted(found, reverse=True)
+        # L-76-1: gathering and sorting are paid per candidate, so rules gathered but
+        # never tried (a "!*" loaded last answers first) still cost. If that spends the
+        # budget, nothing is sorted or tried.
+        self._work += len(found) // _CANDIDATES_PER_STEP
+        return [] if self.exhausted else sorted(found, reverse=True)
 
     @property
     def exhausted(self) -> bool:
