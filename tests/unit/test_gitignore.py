@@ -387,6 +387,7 @@ def test_the_match_budget_is_the_chosen_value() -> None:
     assert gitignore.GITIGNORE_MATCH_BUDGET == 3_000_000
     assert gitignore.GITIGNORE_MATCH_ALLOWANCE == 256
     assert gitignore.GITIGNORE_MATCH_ALLOWANCE_PER_CHAR == 2
+    assert gitignore._CANDIDATES_PER_STEP == 8
 
 
 def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
@@ -527,8 +528,7 @@ def test_gathered_candidates_are_paid_even_when_never_tried() -> None:
     assert loaded.loaded == gitignore.GITIGNORE_MAX_PATTERNS
     alone = rules(("", b"!*\n"))  # the same check with one candidate (paid nothing)
     assert not loaded.ignored("m.py") and not alone.ignored("m.py")
-    gathered = gitignore.GITIGNORE_MAX_PATTERNS // gitignore._CANDIDATES_PER_STEP
-    assert loaded._work - alone._work == gathered
+    assert loaded._work - alone._work == 250  # 2,000 candidates at 1 step per 8
 
 
 def test_gathered_candidates_run_the_base_budget_out(monkeypatch: pytest.MonkeyPatch) -> None:
