@@ -15,6 +15,12 @@ amended by SC-2.32 (D-PM-13's text still says 4 KiB; SC-2.32 made it 16 KiB):
 
 Usage:
     gen_bench_repo.py --profile b10k|b500 --seed N --out DIR [--manifest PATH]
+    gen_bench_repo.py --profile b10k --seed N --out DIR --near-cap SET
+        (SET: te, cr, sr, cr-deep, sr-l761, cr-k90, cr-k100, cr-k150 or python)
+
+`--near-cap` writes the DESIGN A-3 #7 overlay (`write_near_cap`) into the existing
+checkout at DIR instead of generating: untracked files and `.gitignore` /
+`.git/info/exclude` patterns, never committed.
 
 The repo is built with `git fast-import` from a stream that depends only on
 (profile, seed, this script), with fixed identities and explicit dates, so the
@@ -831,13 +837,186 @@ def script_sha256() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+# ----------------------------------------------------------------------------- near cap
+# DESIGN A-3 #7 (D-TL-72, D-TL-73): a B10k checkout "near every cap" for the scan-mode
+# discovery stage. The overlay is written into the working tree only and never committed,
+# so the commit SHAs, the composition and the manifest stay those of the seeded repo.
+NEAR_CAP_DIR = "near_cap"  # every overlay file is under this folder (plus the two below)
+NEAR_CAP_IGNORE_FILES = (".gitignore", ".git/info/exclude")
+NEAR_CAP_PATTERNS = 2_000  # A-3 #4 pattern cap, split 1,000 / 1,000 over the two files
+# Hostile sets: none of them matches an overlay or B10k name, so every file stays in.
+NEAR_CAP_SETS = {
+    "te": "[q]{i}",  # TE: a bracket first character, so the index can't narrow it
+    "cr": "[x]*{i}*q/",  # CR: folder-only, leading bracket and two stars
+    "sr": "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{i}",  # SR: seven "**" segments
+    "cr-deep": "[x]/[y]*",  # CR deep-path set: 2,000 times, run over ~12k-char paths
+    "sr-l761": "[q]{i}",  # SR's L-76-1 set: 1,999 x TE's line, then "!*" (NEAR_CAP_LAST)
+    # Mid-size sets (D-TL-74, D-TL-75): with the per-path allowance at 256, the worst case
+    # on B10k is a plateau at k of about 75-100 that never runs the budget out, so every
+    # path is matched against every line. cr-k100 does not run out either; k=150 is past
+    # the plateau.
+    "cr-k90": "[x]*{i}*q",
+    "cr-k100": "[x]*{i}*q",
+    "cr-k150": "[x]*{i}*q",
+}
+NEAR_CAP_COUNTS = {"cr-k90": 90, "cr-k100": 100, "cr-k150": 150}  # else NEAR_CAP_PATTERNS
+# L-76-1 (D-TL-76): "!*" as the last line, which is tried first and matches every path.
+NEAR_CAP_LAST = {"sr-l761": "!*"}
+NEAR_CAP_PYTHON = "python"  # GitHub's stock Python.gitignore near the 500k walk cap
+PYTHON_GITIGNORE = Path(__file__).resolve().parent / "bench_data" / "Python.gitignore"
+UNTRACKED_PY = 10_000  # the B10k figure again, untracked: every one is matched
+UNTRACKED_FOLDERS = 100  # six deep, as in the #76 unit test
+DEEP_LEVELS = 60  # near_cap/deep/ + 60 folders: depth 62, inside the 64 cap (A-3 #3)
+DEEP_NAME_LEN = 200  # 60 x 201 characters: paths of about 12k characters
+DEEP_FILES_PER_LEVEL = 3
+PY_WALK_TARGET = 480_000  # listed walk entries for the Python case (cap 500,000)
+PY_PKG_LISTED = 18  # per package: its folder, 3 .py, 13 .txt and __pycache__ are listed
+PY_IGNORED_EVERY = 100  # every 100th package also has local_settings.py and build/gen.py
+
+
+def _deep_tree(base: Path, levels: int, name_len: int, files: int) -> list[str]:
+    """`levels` nested folders of `name_len`-character names under `base`, `files` .py
+    files in each; returns the relative paths of the files. Paths go past PATH_MAX, so
+    each folder is made and opened relative to its parent (POSIX ``dir_fd``)."""
+    if not levels:
+        return []
+    if os.mkdir not in os.supports_dir_fd or os.open not in os.supports_dir_fd:
+        raise SystemExit("the deep-path near-cap tree needs dir_fd support (POSIX)")
+    base.mkdir(parents=True, exist_ok=True)
+    made: list[str] = []
+    rel = base.name
+    fd = os.open(base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for level in range(levels):
+            name = f"d{level:02d}".ljust(name_len, "n")
+            for f in range(files):
+                fh = os.open(f"m{f}.py", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644, dir_fd=fd)
+                os.close(fh)
+                made.append(f"{rel}/m{f}.py")
+            os.mkdir(name, dir_fd=fd)
+            nxt = os.open(name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0), dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            rel = f"{rel}/{name}"
+        for f in range(files):
+            os.close(os.open(f"m{f}.py", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd))
+            made.append(f"{rel}/m{f}.py")
+    finally:
+        os.close(fd)
+    return made
+
+
+def clear_near_cap(out: Path) -> None:
+    """Remove an earlier overlay (the deep tree needs the fd-based rmtree for long paths)."""
+    target = out / NEAR_CAP_DIR
+    if target.exists():
+        shutil.rmtree(target)
+    for rel in NEAR_CAP_IGNORE_FILES:
+        (out / rel).unlink(missing_ok=True)
+
+
+def write_near_cap(
+    out: Path,
+    pattern_set: str,
+    *,
+    untracked_py: int = UNTRACKED_PY,
+    deep_levels: int = DEEP_LEVELS,
+    deep_name_len: int = DEEP_NAME_LEN,
+    walk_target: int = PY_WALK_TARGET,
+) -> dict:
+    """Write the A-3 #7 near-cap overlay into the checked-out repo at `out`.
+
+    For a hostile set (`NEAR_CAP_SETS`): 2,000 patterns (1,000 in `.git/info/exclude`,
+    1,000 in `.gitignore`), `untracked_py` untracked empty `.py` files in 100 folders six
+    deep, and a deep tree of `deep_levels` folders. For `python`: GitHub's stock
+    `Python.gitignore` and enough untracked packages to bring the listed walk entries
+    to about `walk_target`, with files that the template ignores (`__pycache__/*.pyc`,
+    `local_settings.py`, `build/gen.py`). Returns what the harness checks against."""
+    if pattern_set != NEAR_CAP_PYTHON and pattern_set not in NEAR_CAP_SETS:
+        raise SystemExit(f"unknown near-cap set {pattern_set!r}")
+    if not (out / ".git").is_dir():
+        raise SystemExit(f"{out} is not a generated checkout")
+    clear_near_cap(out)
+    root = out / NEAR_CAP_DIR
+    root.mkdir()
+    (out / ".git" / "info").mkdir(exist_ok=True)
+    kept: list[str] = []
+    ignored: list[str] = []
+    if pattern_set == NEAR_CAP_PYTHON:
+        (out / ".gitignore").write_bytes(PYTHON_GITIGNORE.read_bytes())
+        (out / ".git" / "info" / "exclude").write_bytes(b"")
+        lines = PYTHON_GITIGNORE.read_text(encoding="utf-8").splitlines()
+        patterns = sum(1 for x in lines if x.strip() and not x.lstrip().startswith("#"))
+        packages = max(1, (walk_target - 1) // PY_PKG_LISTED)
+        for i in range(packages):
+            rel = f"{NEAR_CAP_DIR}/s{i // 1000}/pkg{i // 50}/sub{i}"
+            d = out / rel
+            (d / "__pycache__").mkdir(parents=True)
+            for j in range(3):
+                (d / f"m{j}.py").write_bytes(b"")
+                kept.append(f"{rel}/m{j}.py")
+                if j < 2:
+                    (d / "__pycache__" / f"m{j}.cpython-311.pyc").write_bytes(b"")
+            for j in range(13):
+                (d / f"data{j}.txt").write_bytes(b"")
+            if i % PY_IGNORED_EVERY == 0:
+                (d / "build").mkdir()
+                (d / "build" / "gen.py").write_bytes(b"")
+                (d / "local_settings.py").write_bytes(b"")
+                ignored += [f"{rel}/build/gen.py", f"{rel}/local_settings.py"]
+        return {
+            "set": pattern_set,
+            "patterns": patterns,
+            "untracked_py": len(kept),
+            "ignored_py": sorted(ignored),
+            "deep_depth": 0,
+            "deep_max_path": 0,
+        }
+    line = NEAR_CAP_SETS[pattern_set]
+    count = NEAR_CAP_COUNTS.get(pattern_set, NEAR_CAP_PATTERNS)
+    lines = [line.format(i=i) + "\n" for i in range(count)]
+    if pattern_set in NEAR_CAP_LAST:
+        lines[-1] = NEAR_CAP_LAST[pattern_set] + "\n"
+    half = count // 2
+    (out / ".git" / "info" / "exclude").write_text("".join(lines[:half]), encoding="utf-8")
+    (out / ".gitignore").write_text("".join(lines[half:]), encoding="utf-8")
+    per = max(1, untracked_py // UNTRACKED_FOLDERS)
+    for d in range(UNTRACKED_FOLDERS):
+        rel = "/".join((NEAR_CAP_DIR, *(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}"))
+        folder = out / rel
+        folder.mkdir(parents=True)
+        for f in range(per):
+            (folder / f"mod_{f}.py").write_bytes(b"")
+            kept.append(f"{rel}/mod_{f}.py")
+    deep = _deep_tree(root / "deep", deep_levels, deep_name_len, DEEP_FILES_PER_LEVEL)
+    kept += deep
+    return {
+        "set": pattern_set,
+        "patterns": count,
+        "untracked_py": len(kept),
+        "ignored_py": [],
+        "deep_depth": deep_levels + 2 if deep_levels else 0,
+        "deep_max_path": max((len(p) for p in deep), default=0),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--profile", required=True, choices=sorted(PROFILES))
     ap.add_argument("--seed", required=True, type=int)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--manifest", type=Path, help="default: <OUT>.manifest.json")
+    ap.add_argument(
+        "--near-cap",
+        choices=[*sorted(NEAR_CAP_SETS), NEAR_CAP_PYTHON],
+        help="only write the A-3 #7 near-cap overlay into the existing checkout at OUT",
+    )
     a = ap.parse_args(argv)
+    if a.near_cap:
+        info = write_near_cap(a.out.resolve(), a.near_cap)
+        info["ignored_py"] = len(info["ignored_py"])
+        print(json.dumps(info), file=sys.stderr)
+        return 0
     prof = PROFILES[a.profile]
     out = a.out.resolve()
     gen = generate(prof, a.seed, out)
