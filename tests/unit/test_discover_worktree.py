@@ -599,10 +599,30 @@ def test_an_executable_file_can_be_unchanged(tmp_path: Path) -> None:
     assert result.scan_tracked["a.py"].unchanged
 
 
-def test_a_symlink_at_head_is_changed_even_with_equal_bytes(tmp_path: Path) -> None:
-    write(tmp_path, {"AGENTS.md": AGENTS, "a.py": "target.py"})
+def test_a_symlink_at_head_gets_no_tracked_state(tmp_path: Path) -> None:
+    # A-3 #1, D-TL-70: a mode 120000 entry is skipped, even when a regular file with the
+    # link's bytes is in the working tree. The file is still a path git tracks, so
+    # .gitignore does not leave it out; with no TrackedState it counts as untracked.
+    write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "*.py\n", "a.py": "target.py"})
     result = run(tmp_path, tracked(tmp_path, "a.py", mode="120000"))
-    assert result.scan_tracked["a.py"] == TrackedState(blob40(b"target.py"), False)
+    assert result.scan_tracked == {}
+    assert py_paths(result) == ["a.py"]
+
+
+def test_a_committed_symlink_is_skipped(repo: GitRepo) -> None:
+    repo.commit_files("c", {"AGENTS.md": AGENTS, "t.py": "x = 1\n"}, date=DAY)
+    repo.symlink("link.py", "t.py")  # skips where symlinks can't be made
+    repo.commit("link", date=DAY)
+    git = GitReader(repo.path)
+    try:
+        head = git.resolve("HEAD")
+        assert ("120000", "link.py") in {(e[0], e[3]) for e in git.tree(head)}
+        result = discover_worktree(PHASE, repo.path, git, head)
+    finally:
+        git.close()
+    assert list(result.scan_tracked) == ["t.py"]
+    assert py_paths(result) == ["t.py"]
+    assert [(f.path, f.reason) for f in result.discovery.skipped] == [("link.py", "symlink")]
 
 
 def test_only_kept_python_files_are_in_scan_tracked(tmp_path: Path) -> None:

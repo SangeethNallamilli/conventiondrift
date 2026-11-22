@@ -69,6 +69,7 @@ __all__ = [
 ]
 
 _GITLINK: Final = "160000"
+_SYMLINK: Final = "120000"  # A-3 #1, D-TL-70: skipped, no TrackedState
 _REGULAR_MODES: Final = frozenset({"100644", "100755", "100664"})  # as discover_tree reads
 _PYVENV_CFG: Final = "pyvenv.cfg"  # S6 content rule: never hidden by .gitignore
 # Object id length -> hash: SHA-1 repositories (40 hex) and SHA-256 ones (64 hex).
@@ -360,8 +361,8 @@ def discover_worktree(
     tracked: dict[str, TrackedState] = {}
     for py in found.py_files:
         entry = head.get(py.path)
-        if entry is None or entry[0] == _GITLINK:
-            continue
+        if entry is None or entry[0] in (_GITLINK, _SYMLINK):
+            continue  # a symlink at HEAD is skipped (D-TL-70): the file counts as untracked
         mode, oid = entry[0], entry[1]
         same = mode in _REGULAR_MODES and _unchanged(py.data, oid)
         tracked[py.path] = TrackedState(oid, same)
