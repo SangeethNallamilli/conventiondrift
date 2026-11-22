@@ -427,6 +427,11 @@ _GIT_DIFFERENCES = (
     ("[!-/]x", "#x", True),
     ("[!-/]x", "-x", False),
     ("[/-/]x", "x", False),
+    ("[.-/]x", ".x", True),
+    ("[\\!/]x", "!x", True),  # an escaped member of a class with a "/"
+    ("[+-\\/]x", ",x", True),  # a range ending at an escaped "/"
+    ("[+-\\/]x", "0x", False),
+    ("a[b/c", "a[b/c", False),  # unclosed: matches nothing, "/" and all
     # an escaped "/" is a "/"
     ("a\\/b", "a/b", True),
     ("\\/a", "a", False),  # not a leading "/": git reads it as "\\" then "/a"
