@@ -239,3 +239,91 @@ def test_bracket_expressions_agree_with_git_check_ignore(
     )  # fmt: skip
     assert out.returncode in (0, 1)  # 0 ignored, 1 not ignored
     assert compile_glob(pattern).match(name) == (out.returncode == 0)
+
+
+# ---- #76 B2 / M-76-1: the work count the .gitignore match budget pays from -----------
+
+_NO_LIMIT = 1 << 40
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "is_dir", "expected"),
+    [
+        ("/a", "a", False, (True, 3)),  # start, one component compared (1 + 1)
+        ("a", "a", False, (True, 2)),  # one segment: only the last component, 1 step
+        ("**/x", "a/b/x", False, (True, 2)),  # the same shape written with "**/"
+        ("*.py", "x/m.py", False, (True, 7)),  # 6 steps inside "m.py": *, back up, 4 chars
+        ("a*", "x/a", False, (True, 3)),  # the trailing "*" matches nothing: no step
+        ("[q]1", "q1", False, (True, 4)),
+        ("[q]1", "q1/x", False, (False, 3)),
+        ("a/b", "a/c", False, (False, 5)),
+        ("a/*/c", "a/b/c", True, (True, 9)),
+        ("a/", "a", False, (False, 1)),  # a folder-only pattern on a file: no work
+        ("a", "", False, (False, 1)),
+    ],
+)
+def test_match_counted_answers_as_match_and_counts_steps(
+    pattern: str, path: str, is_dir: bool, expected: tuple[bool, int]
+) -> None:
+    glob = compile_glob(pattern)
+    assert glob.match_counted(path, is_dir, _NO_LIMIT) == expected
+    assert glob.match(path, is_dir) is expected[0]
+
+
+def test_a_one_segment_pattern_compares_only_the_last_component() -> None:
+    glob = compile_glob("[q]1")
+    shallow = glob.match_counted("q1", False, _NO_LIMIT)
+    deep = glob.match_counted("/".join(["q1"] * 60), False, _NO_LIMIT)
+    assert shallow == deep == (True, 4)
+    assert not glob.match("q1/x")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "limit", "stopped", "full"),
+    [
+        ("*a" * 40 + "b", "a" * 400, 100, 101, 802),  # inside one component
+        ("**/a/" * 30 + "b", "/".join(["a"] * 60), 10, 11, 211),  # across components
+    ],
+)
+def test_match_counted_stops_just_past_its_limit(
+    pattern: str, path: str, limit: int, stopped: int, full: int
+) -> None:
+    glob = compile_glob(pattern)
+    assert glob.match_counted(path, False, limit) == (False, stopped)
+    assert glob.match_counted(path, False, _NO_LIMIT) == (False, full)
+
+
+def test_a_match_that_needs_more_than_its_limit_does_not_match() -> None:
+    glob = compile_glob("a/*/c")
+    assert glob.match_counted("a/b/c", False, _NO_LIMIT) == (True, 9)
+    assert glob.match_counted("a/b/c", False, 8) == (True, 9)  # the last step may pass it
+    assert glob.match_counted("a/b/c", False, 5) == (False, 6)  # stopped inside "*"
+
+
+def test_match_reads_a_path_as_a_file_unless_told() -> None:
+    assert not compile_glob("d/").match("d")
+    assert compile_glob("d/").match("d", True)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "is_dir"),
+    [
+        ("a/*/c", "a/b/c", True),
+        ("*.py", "x/m.py", False),
+        ("a/", "a", False),
+        ("a/b", "a/c", False),
+    ],
+)
+def test_match_parts_is_match_counted_on_a_split_path(
+    pattern: str, path: str, is_dir: bool
+) -> None:
+    glob = compile_glob(pattern)
+    expected = glob.match_counted(path, is_dir, _NO_LIMIT)
+    assert glob.match_parts(path.split("/"), is_dir, _NO_LIMIT) == expected
+
+
+def test_match_parts_steps_do_not_grow_with_path_length() -> None:
+    glob = compile_glob("[x]/[y]*")
+    deep = ["n" * 200] * 60 + ["b.py"]
+    assert glob.match_parts(["a", "b.py"], False, _NO_LIMIT) == (False, 4)
+    assert glob.match_parts(deep, False, _NO_LIMIT) == (False, 4)
