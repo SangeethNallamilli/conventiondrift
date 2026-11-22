@@ -480,6 +480,14 @@ def test_a_pyproject_with_an_integer_over_the_digit_limit_is_skipped_not_raised(
     )
 
 
+def test_a_pyproject_with_an_integer_at_the_digit_limit_is_read() -> None:
+    # TE #74: the helper's "not skipped" branch, at exactly the running limit.
+    _assert_huge_int_pyproject_never_escapes(
+        "k = " + "9" * _int_str_digit_limit() + "\n",
+        expect_skip=False,
+    )
+
+
 def test_a_pyproject_with_a_5000_digit_integer_is_skipped_not_raised() -> None:
     limit = _int_str_digit_limit()
     _assert_huge_int_pyproject_never_escapes(
@@ -624,8 +632,10 @@ def test_manifest_bytes_are_kept_raw() -> None:
     ]
 
 
-def test_manifests_have_no_cap_of_their_own() -> None:
-    # D-TL-65 #3: more manifests than the instruction-file cap are all kept.
+def test_manifests_have_no_cap_of_their_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    # D-TL-65 #3: more manifests than the instruction-file cap, and than a lowered .py cap
+    # (CR #74), are all kept.
+    monkeypatch.setattr(discover, "MAX_PY_FILES", 1)
     count = MAX_INSTRUCTION_FILES + 1
     files: dict[str, bytes | tuple[str, bytes]] = {"AGENTS.md": b"r", "a.py": PY}
     files.update({f"r{i:04d}/requirements.txt": b"x\n" for i in range(count)})
@@ -653,6 +663,14 @@ def test_an_unsupported_manifest_path_is_skipped_and_not_kept() -> None:
     files = {"AGENTS.md": b"r", "CON/uv.lock": b"v\n", "a.py": PY}
     found = run(files)
     assert found.manifest_files == ()
+    assert found.skipped == (SkippedFile("CON/uv.lock", "unsupported path"),)
+
+
+def test_manifests_after_an_unsupported_one_are_still_kept() -> None:
+    # CR #74: an unusable manifest path is passed over, not the end of the list.
+    files = {"AGENTS.md": b"r", "CON/uv.lock": b"v\n", "D/pyproject.toml": b"", "a.py": PY}
+    found = run(files)
+    assert [m.path for m in found.manifest_files] == ["D/pyproject.toml"]
     assert found.skipped == (SkippedFile("CON/uv.lock", "unsupported path"),)
 
 
