@@ -36,10 +36,11 @@ Match budget (A-3 condition 7, #76 B2 and M-76-1, D-TL-69): the pattern cap limi
 many patterns there are, not how long they take, and patterns the index can't narrow
 are tried on every path. So all matching in one scan shares one budget:
 :data:`GITIGNORE_MATCH_BUDGET` steps, plus :data:`GITIGNORE_MATCH_ALLOWANCE` more for
-each path checked so far (D-TL-73), so a stock ``.gitignore`` does not run out on a
-tree with short file names however many paths the walk has (long or dotted file names
-deep in the tree can run it out: a known limit, DESIGN A-3 #4a), while 2,000 hostile
-patterns run it out within a few dozen paths. Every path check, file or folder (a folder's
+each path checked so far (D-TL-73) and :data:`GITIGNORE_MATCH_ALLOWANCE_PER_CHAR` for
+each character of its last component (D-TL-76: a long name costs more to match), so a
+stock ``.gitignore`` does not run out however many paths the walk has, at any depth
+and with any name length, while 2,000 hostile patterns run it out within a few dozen
+paths. Every path check, file or folder (a folder's
 verdict is paid once, when it is first worked out and cached), pays four steps, one
 per path component (the path is split once), two per index lookup, one per eight
 patterns gathered as candidates, tried or not (L-76-1), two per pattern tried, one per
@@ -64,6 +65,7 @@ from conventiondrift.discover.globmatch import Glob, compile_glob
 
 __all__ = [
     "GITIGNORE_MATCH_ALLOWANCE",
+    "GITIGNORE_MATCH_ALLOWANCE_PER_CHAR",
     "GITIGNORE_MATCH_BUDGET",
     "GITIGNORE_MAX_BYTES",
     "GITIGNORE_MAX_PATTERNS",
@@ -73,21 +75,23 @@ __all__ = [
 
 GITIGNORE_MAX_BYTES: Final = 65_536  # A-3 condition 4: 64 KiB per file
 GITIGNORE_MAX_PATTERNS: Final = 2_000  # A-3 condition 4: patterns in total, all files
-# A-3 condition 7 (#76, D-TL-69, D-TL-73, D-TL-75): match steps per scan, plus an
-# allowance per path checked. A step costs about 70-200 ns, so the base is about 0.5 s
-# of matching, which is all 2,000 hostile patterns get (they run it out within a few
-# dozen paths). With short file names the allowance is more than a walk with GitHub's
-# Python .gitignore spends per entry at any depth up to the 64-folder cap (about 85
-# steps near the root, about 205 at depth 63; one check alone can cost up to about 350,
-# and unused allowance carries over), so that file does not run out below the
-# 500,000-entry walk cap. 192 ran out at about 240,000 entries at depth 63 (D-TL-75 says
-# 256 then). A file name costs about one step per character, so long or dotted file
-# names deep in the tree can still run it out (from about depth 20 to 40, or at any
-# depth for 255-character names): a known limit until the allowance scales with the
-# file name (DESIGN A-3 #4a, follow-up). Patterns that stay under the allowance never
-# run it out and pay it on every path, so it also bounds their cost.
+# A-3 condition 7 (#76, D-TL-69, D-TL-73, D-TL-75, D-TL-76): match steps per scan, plus
+# an allowance per path checked that grows with the length of the path's last component
+# (its file or folder name). A step costs about 70-200 ns, so the base is about 0.5 s of
+# matching, which is all 2,000 hostile patterns get (they run it out within a few dozen
+# paths). A walk with GitHub's Python .gitignore spends about 85 steps per entry near
+# the root and about 210 at depth 61 with short names, plus about one step per
+# character of the name (about 1.5 for dotted names such as "a.b.a.b...", where each
+# "." restarts "*.py[codz]"). The allowance is more than that at any depth up to the
+# 64-folder cap and for any name length up to 255 (one check alone can cost more, up to
+# about 650 steps; unused allowance carries over), so that file does not run out below
+# the 500,000-entry walk cap. Before the allowance grew with the name, long or dotted
+# names deep in the tree ran it out (100 characters at about 68,500 entries at depth
+# 64; DESIGN A-3 #4a). Patterns that stay under the allowance never run it out and pay
+# it on every path, so it also bounds their cost.
 GITIGNORE_MATCH_BUDGET: Final = 3_000_000
 GITIGNORE_MATCH_ALLOWANCE: Final = 256
+GITIGNORE_MATCH_ALLOWANCE_PER_CHAR: Final = 2  # per character of the name checked
 # L-76-1: candidates gathered (put in a set, then sorted) per match step, rounded down.
 # Measured for the #76 follow-up: about 16 ns per candidate, whatever mix of index kinds
 # they come from, against 128-140 ns per step for the hostile sets on the same machine.
@@ -169,6 +173,7 @@ class IgnoreRules:
         self._folders: dict[str, bool] = {}
         self._work = 0  # match steps spent, against the budget
         self._checks = 0  # paths checked before the budget ran out, for the allowance
+        self._names = 0  # and the characters in their last components
         self.loaded = 0
         self.skipped = 0
         self.unchecked = 0  # paths answered "not ignored" because the budget was spent
@@ -222,7 +227,11 @@ class IgnoreRules:
 
     def _budget(self) -> int:
         # Paths are counted only until the budget runs out, so once spent it stays spent.
-        return GITIGNORE_MATCH_BUDGET + GITIGNORE_MATCH_ALLOWANCE * self._checks
+        return (
+            GITIGNORE_MATCH_BUDGET
+            + GITIGNORE_MATCH_ALLOWANCE * self._checks
+            + GITIGNORE_MATCH_ALLOWANCE_PER_CHAR * self._names
+        )
 
     def _verdict(self, path: str, is_dir: bool, above: set[str]) -> bool:
         """The last matching pattern decides; a path no pattern matches is not ignored.
@@ -270,6 +279,7 @@ class IgnoreRules:
             return False
         if not self.exhausted:
             self._checks += 1
+            self._names += len(path) - path.rfind("/") - 1
             if self._check(path, is_dir):
                 return True
         if self.exhausted:

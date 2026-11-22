@@ -9,7 +9,7 @@ git rather than to our reading of ``gitignore(5)``.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -375,14 +375,18 @@ def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
 # ------------------------------------------------------------------ match budget (#76 B2)
 
 
-def _budget(monkeypatch: pytest.MonkeyPatch, steps: int, allowance: int = 0) -> None:
+def _budget(
+    monkeypatch: pytest.MonkeyPatch, steps: int, allowance: int = 0, per_char: int = 0
+) -> None:
     monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_BUDGET", steps)
     monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_ALLOWANCE", allowance)
+    monkeypatch.setattr(gitignore, "GITIGNORE_MATCH_ALLOWANCE_PER_CHAR", per_char)
 
 
 def test_the_match_budget_is_the_chosen_value() -> None:
     assert gitignore.GITIGNORE_MATCH_BUDGET == 3_000_000
     assert gitignore.GITIGNORE_MATCH_ALLOWANCE == 256
+    assert gitignore.GITIGNORE_MATCH_ALLOWANCE_PER_CHAR == 2
 
 
 def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
@@ -556,6 +560,47 @@ def test_the_allowance_grows_with_each_path_checked(monkeypatch: pytest.MonkeyPa
     assert loaded.exhausted
 
 
+def test_the_allowance_grows_with_the_name_checked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # D-TL-76 addendum 2: each path checked also allows a few steps per character of its
+    # last component, the name its file patterns are matched against, not of the path.
+    _budget(monkeypatch, 0, 10, 2)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored("m.py")  # 18 steps, and 10 + 2 * 4 allowed
+    assert (loaded._work, loaded._budget(), loaded.exhausted) == (18, 18, False)
+    assert not loaded.ignored("abcdefgh/m.py")  # 7 + 20 more steps, only 18 more allowed
+    assert (loaded._budget(), loaded.exhausted) == (36, True)
+    _budget(monkeypatch, 0, 10, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert not loaded.ignored("m.py")  # 18 steps, 10 + 1 * 4 allowed
+    assert loaded.exhausted
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        b"[q]%d\n",  # TE
+        b"[x]*%d*q/\n",  # CR
+        b"**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q%d\n",  # SR
+    ],
+)
+def test_hostile_pattern_sets_run_out_on_the_longest_names(pattern: bytes) -> None:
+    # D-TL-76 addendum 2: 255-character names allow the most per path, but every hostile
+    # pattern is still tried on each check, at two steps or more, so the real budget runs
+    # out within the number of paths the code constants allow.
+    loaded = rules(("", b"".join(pattern % i for i in range(gitignore.GITIGNORE_MAX_PATTERNS))))
+    name = "q" * 255
+    allowed = (
+        gitignore.GITIGNORE_MATCH_ALLOWANCE + gitignore.GITIGNORE_MATCH_ALLOWANCE_PER_CHAR * 255
+    )
+    bound = gitignore.GITIGNORE_MATCH_BUDGET // (2 * gitignore.GITIGNORE_MAX_PATTERNS - allowed) + 1
+    paths = 0
+    while not loaded.exhausted:
+        assert paths < bound
+        loaded.ignored(f"d{paths}/{name}")
+        paths += 1
+    assert loaded.unchecked == 1
+
+
 def test_unused_allowance_carries_over(monkeypatch: pytest.MonkeyPatch) -> None:
     _budget(monkeypatch, 0, 18)
     loaded = rules(("", b"*.py\n"))
@@ -683,9 +728,12 @@ def _stock_rules() -> IgnoreRules:
     return rules(("", "\n".join(_STOCK_PYTHON).encode()))
 
 
-def _stock_walk(loaded: IgnoreRules, prefix: str, folders: int) -> int:
+def _stock_walk(
+    loaded: IgnoreRules, prefix: str, folders: int, name: Callable[[str], str] = str
+) -> int:
     """A synthetic walk as the scan does it: each folder is checked before the 99 files
-    of common kinds in it. Returns how many entries were checked."""
+    of common kinds in it, each file name made by ``name``. Returns how many entries
+    were checked."""
     kinds = ("mod_{}.py", "test_{}.py", "{}.pyc", "README_{}.md", "data_{}.json", ".env{}")
     entries = 0
     for n in range(folders):
@@ -693,7 +741,7 @@ def _stock_walk(loaded: IgnoreRules, prefix: str, folders: int) -> int:
         loaded.ignored(folder, is_dir=True)
         entries += 1
         for i in range(99):
-            loaded.ignored(f"{folder}/{kinds[i % 6].format(i)}")
+            loaded.ignored(f"{folder}/{name(kinds[i % 6].format(i))}")
             entries += 1
     return entries
 
@@ -702,8 +750,7 @@ def _stock_walk(loaded: IgnoreRules, prefix: str, folders: int) -> int:
 # and short file names spends less than the allowance per entry, so the base budget is
 # never touched and it does not run out however many entries there are. One deep check
 # alone may cost more than the allowance (about 350 steps at depth 64); unused allowance
-# carries over. Long or dotted file names deep in the tree can run it out: a known limit
-# (DESIGN A-3 #4a, D-TL-76 addendum 2) for the follow-up batch.
+# carries over. For long and dotted file names, see the per-character allowance below.
 @pytest.mark.parametrize("depth", [0, 8, 32, WALK_MAX_DEPTH - 3])  # + src/pkg/sub
 @pytest.mark.parametrize("name_length", [8, 60])
 def test_a_stock_python_walk_spends_less_than_its_allowance_at_any_depth(
@@ -754,3 +801,35 @@ def test_nested_stock_python_copies_spend_less_than_the_allowance() -> None:
     assert entries == packages * 1_001
     assert not loaded.exhausted
     assert loaded._work <= gitignore.GITIGNORE_MATCH_ALLOWANCE * entries
+
+
+# D-TL-76 addendum 2, DESIGN A-3 #4a (CR S1 and TE at f05e3ba): a file name costs about
+# a step per character to match, 1.5 if dotted, so the allowance grows with it. At 256
+# alone, these walks spent more than their allowance at this depth: 100-character names
+# ran out after about 68,500 entries at depth 64, dotted ones after about 31,000 and
+# 255-character ones after about 15,000.
+_NAMES: dict[str, Callable[[str], str]] = {
+    "64 characters": lambda kind: kind.rjust(64, "x"),  # the extension stays at the end
+    "100 characters": lambda kind: kind.rjust(100, "x"),
+    "255 characters": lambda kind: kind.rjust(255, "x"),  # NAME_MAX on Linux and macOS
+    "dotted": lambda kind: "a.b." * 24 + kind,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_NAMES))
+def test_long_and_dotted_file_names_spend_less_than_their_allowance(name: str) -> None:
+    prefix = "".join(f"p{k:02d}{'q' * 8}/" for k in range(WALK_MAX_DEPTH - 3))
+    loaded = _stock_rules()
+    entries = _stock_walk(loaded, prefix, 200, _NAMES[name])
+    assert entries == 20_000
+    assert not loaded.exhausted
+    assert loaded._work <= loaded._budget() - gitignore.GITIGNORE_MATCH_BUDGET
+
+
+def test_long_file_names_deep_in_the_tree_never_run_it_out() -> None:
+    # 70,000 entries of 100-character names at depth 64 ran the 256 allowance out
+    # (TE at f05e3ba: after about 68,500).
+    prefix = "".join(f"p{k:02d}{'q' * 8}/" for k in range(WALK_MAX_DEPTH - 3))
+    loaded = _stock_rules()
+    assert _stock_walk(loaded, prefix, 700, _NAMES["100 characters"]) == 70_000
+    assert not loaded.exhausted and loaded.unchecked == 0
