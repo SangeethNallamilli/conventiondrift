@@ -657,6 +657,19 @@ def test_gathered_candidates_run_the_base_budget_out(monkeypatch: pytest.MonkeyP
     assert loaded.unchecked == 1
 
 
+@pytest.mark.parametrize(("gathered", "paid"), [(1, 0), (7, 0), (8, 1), (15, 1), (16, 2)])
+def test_gathered_candidates_are_paid_one_step_per_eight_rounded_down(
+    gathered: int, paid: int
+) -> None:
+    # #78 TE N1: seven candidates pay nothing and the eighth pays one step. The rules
+    # are in another folder, so they are gathered (and paid for) but never tried.
+    lines = b"".join(b"[q]%d\n" % i for i in range(gathered))
+    loaded = rules(("", b"/x.txt\n"), ("other", lines))
+    baseline = rules(("", b"/x.txt\n"))
+    assert not loaded.ignored("m.py") and not baseline.ignored("m.py")
+    assert loaded._work - baseline._work == paid
+
+
 def test_the_allowance_grows_with_each_path_checked(monkeypatch: pytest.MonkeyPatch) -> None:
     _budget(monkeypatch, 0, 18)  # each "*.py" check costs 18
     loaded = rules(("", b"*.py\n"))
