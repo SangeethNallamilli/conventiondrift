@@ -372,6 +372,75 @@ def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
     assert set(expected.values()) == {True, False}
 
 
+# Where globmatch alone reads a pattern differently from git (D-TL-69 #3): one
+# pattern each, with git check-ignore's answer for the path. The table is also checked
+# against git itself below.
+_GIT_DIFFERENCES = (
+    # git matches bytes: "?" and each class member are one byte of a UTF-8 name
+    ("?.py", "\u00e9.py", False),
+    ("??.py", "\u00e9.py", True),
+    ("[\u00e9].py", "\u00e9.py", False),
+    ("[!a].py", "\u00e9.py", False),
+    ("[!a][!a].py", "\u00e9.py", True),
+    ("\u00e9?", "\u00e9a", True),
+    ("x\u00e9", "x\u00e9", True),
+    # an empty segment never matches
+    ("a//b", "a/b", False),
+    ("a//b", "a/b/c", False),
+    ("//a", "a", False),
+    ("a//", "a/x", False),
+    ("a///b", "a/b", False),
+    ("a/b", "a/b", True),
+    # a segment of three or more stars is "**"
+    ("***/x", "x", True),
+    ("***/x", "d/e/x", True),
+    ("x/****/z", "x/z", True),
+    ("x/***/z", "x/y/w/z", True),
+    ("a***b", "axyb", True),
+    # a "/" inside a class stays in it, never matches, and anchors the pattern
+    ("a[!/]b", "axb", True),
+    ("a[!/]b", "q/axb", False),
+    ("x/a[!/]b", "x/axb", True),
+    ("a[b/]c", "abc", True),
+    ("a[b/]c", "a/c", False),
+    ("a[/]b/c", "a/b/c", False),
+    ("[/-9]x", "5x", True),
+    ("[!-/]x", "#x", True),
+    ("[!-/]x", "-x", False),
+    ("[/-/]x", "x", False),
+    # an escaped "/" is a "/"
+    ("a\\/b", "a/b", True),
+    ("\\/a", "a", False),  # not a leading "/": git reads it as "\\" then "/a"
+    ("a\\/", "a", False),
+)
+
+
+@pytest.mark.parametrize(("pattern", "path", "ignored"), _GIT_DIFFERENCES)
+def test_patterns_match_bytes_and_segments_as_git_does(
+    pattern: str, path: str, ignored: bool
+) -> None:
+    assert rules(("", pattern.encode())).ignored(path) is ignored
+
+
+def test_the_git_differences_table_agrees_with_git(repo: GitRepo) -> None:
+    for pattern, path, ignored in _GIT_DIFFERENCES:
+        (repo.path / ".gitignore").write_bytes(pattern.encode())
+        assert _git_ignored(repo, path) is ignored, (pattern, path)
+
+
+def test_names_that_are_not_utf8_match_byte_for_byte() -> None:
+    loaded = rules(("", b"a?.py\n[\xff]b\n"))
+    assert loaded.ignored("a\udcff.py")  # one raw byte, kept by surrogateescape
+    assert loaded.ignored("\udcffb")
+    assert not loaded.ignored("a\u00ff.py")  # U+00FF is two bytes in UTF-8
+
+
+def test_a_non_ascii_folder_scopes_its_own_patterns() -> None:
+    loaded = rules(("\u00e9", b"x\n"))
+    assert loaded.ignored("\u00e9/x")
+    assert not loaded.ignored("e/x")
+
+
 # ------------------------------------------------------------------ match budget (#76 B2)
 
 
