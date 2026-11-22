@@ -16,7 +16,7 @@ amended by SC-2.32 (D-PM-13's text still says 4 KiB; SC-2.32 made it 16 KiB):
 Usage:
     gen_bench_repo.py --profile b10k|b500 --seed N --out DIR [--manifest PATH]
     gen_bench_repo.py --profile b10k --seed N --out DIR --near-cap SET
-        (SET: te, cr, sr, cr-deep, cr-k90, cr-k100, cr-k150 or python)
+        (SET: te, cr, sr, cr-deep, sr-l761, cr-k90, cr-k100, cr-k150 or python)
 
 `--near-cap` writes the DESIGN A-3 #7 overlay (`write_near_cap`) into the existing
 checkout at DIR instead of generating: untracked files and `.gitignore` /
@@ -850,14 +850,18 @@ NEAR_CAP_SETS = {
     "cr": "[x]*{i}*q/",  # CR: folder-only, leading bracket and two stars
     "sr": "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{i}",  # SR: seven "**" segments
     "cr-deep": "[x]/[y]*",  # CR deep-path set: 2,000 times, run over ~12k-char paths
-    # Mid-size sets (D-TL-74, D-TL-75): matched on every path, or for most of the walk,
-    # because they cost about the per-path allowance; k=100 and k=150 were the TE sweep's
-    # peaks on the 20k tree and on this B10k tree.
+    "sr-l761": "[q]{i}",  # SR's L-76-1 set: 1,999 x TE's line, then "!*" (NEAR_CAP_LAST)
+    # Mid-size sets (D-TL-74, D-TL-75): with the per-path allowance at 256, the worst case
+    # on B10k is a plateau at k of about 75-100 that never runs the budget out, so every
+    # path is matched against every line. cr-k100 does not run out either; k=150 is past
+    # the plateau.
     "cr-k90": "[x]*{i}*q",
     "cr-k100": "[x]*{i}*q",
     "cr-k150": "[x]*{i}*q",
 }
 NEAR_CAP_COUNTS = {"cr-k90": 90, "cr-k100": 100, "cr-k150": 150}  # else NEAR_CAP_PATTERNS
+# L-76-1 (D-TL-76): "!*" as the last line, which is tried first and matches every path.
+NEAR_CAP_LAST = {"sr-l761": "!*"}
 NEAR_CAP_PYTHON = "python"  # GitHub's stock Python.gitignore near the 500k walk cap
 PYTHON_GITIGNORE = Path(__file__).resolve().parent / "bench_data" / "Python.gitignore"
 UNTRACKED_PY = 10_000  # the B10k figure again, untracked: every one is matched
@@ -971,6 +975,8 @@ def write_near_cap(
     line = NEAR_CAP_SETS[pattern_set]
     count = NEAR_CAP_COUNTS.get(pattern_set, NEAR_CAP_PATTERNS)
     lines = [line.format(i=i) + "\n" for i in range(count)]
+    if pattern_set in NEAR_CAP_LAST:
+        lines[-1] = NEAR_CAP_LAST[pattern_set] + "\n"
     half = count // 2
     (out / ".git" / "info" / "exclude").write_text("".join(lines[:half]), encoding="utf-8")
     (out / ".gitignore").write_text("".join(lines[half:]), encoding="utf-8")

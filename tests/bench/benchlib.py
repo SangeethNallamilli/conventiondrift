@@ -313,6 +313,7 @@ NEAR_CAP_SETS = (  # gen_bench_repo.NEAR_CAP_SETS
     "cr",
     "sr",
     "cr-deep",
+    "sr-l761",
     "cr-k90",
     "cr-k100",
     "cr-k150",

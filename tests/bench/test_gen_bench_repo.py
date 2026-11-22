@@ -385,14 +385,20 @@ def _listed(root: Path) -> list[str]:
     return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if ".git" not in p.parts)
 
 
-@pytest.mark.parametrize("pattern_set", ["te", "cr", "sr", "cr-deep"])
+# #77 CR1 B1: the unit tests build 25 folders of 201 characters, about 5k characters: past
+# PATH_MAX (4096), so they still prove the dir_fd build and cleanup, but under the ~8k
+# the git-minimum container's filesystem allows. The bench keeps DEEP_LEVELS (60).
+_UNIT_DEEP_LEVELS = 25
+
+
+@pytest.mark.parametrize("pattern_set", ["te", "cr", "sr", "cr-deep", "sr-l761"])
 def test_near_cap_overlay_writes_2000_patterns_in_two_files(
     pattern_set: str, tmp_path: Path
 ) -> None:
     """DESIGN A-3 #4/#7: 2,000 patterns (the cap), 1,000 per file, each under 64 KiB."""
     gen = benchlib.load_generator()
     repo = _bare_checkout(tmp_path)
-    levels = 60 if _DIR_FD else 0
+    levels = _UNIT_DEEP_LEVELS if _DIR_FD else 0
     info = gen.write_near_cap(repo, pattern_set, untracked_py=200, deep_levels=levels)
     files = [repo / ".gitignore", repo / ".git" / "info" / "exclude"]
     counts = [len(f.read_text(encoding="utf-8").splitlines()) for f in files]
@@ -401,9 +407,27 @@ def test_near_cap_overlay_writes_2000_patterns_in_two_files(
     assert info["patterns"] == 2_000
     assert info["untracked_py"] == 200 + ((levels + 1) * 3 if levels else 0)
     if levels:
-        assert info["deep_depth"] == 62  # inside the 64 cap (A-3 #3)
-        assert 11_000 <= info["deep_max_path"] <= 13_000  # about 12k characters
+        assert info["deep_depth"] == levels + 2  # near_cap/deep/ + the folders
+        assert 4096 < info["deep_max_path"] <= 5_200  # past PATH_MAX, about 5k characters
     assert info["ignored_py"] == []
+
+
+def test_near_cap_bench_keeps_the_deep_tree_at_depth_62() -> None:
+    gen = benchlib.load_generator()
+    assert gen.DEEP_LEVELS == 60  # + near_cap/deep/: depth 62, inside the 64 cap (A-3 #3)
+    assert gen.DEEP_LEVELS * (gen.DEEP_NAME_LEN + 1) > 12_000  # paths of about 12k characters
+
+
+def test_near_cap_sr_l761_is_1999_lines_then_negate_all(tmp_path: Path) -> None:
+    """D-TL-76 L-76-1: 1,999 x `[q]N` and `!*` last (tried first, matches every path)."""
+    gen = benchlib.load_generator()
+    repo = _bare_checkout(tmp_path)
+    info = gen.write_near_cap(repo, "sr-l761", untracked_py=100, deep_levels=0)
+    exclude = (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    ignore = (repo / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert exclude == [f"[q]{i}" for i in range(1_000)]
+    assert ignore == [f"[q]{i}" for i in range(1_000, 1_999)] + ["!*"]
+    assert info["patterns"] == 2_000
 
 
 def test_near_cap_python_overlay_is_the_stock_template(tmp_path: Path) -> None:
@@ -429,10 +453,10 @@ def test_near_cap_python_overlay_is_the_stock_template(tmp_path: Path) -> None:
 def test_near_cap_clear_removes_the_overlay_even_past_path_max(tmp_path: Path) -> None:
     gen = benchlib.load_generator()
     repo = _bare_checkout(tmp_path)
-    levels = 60 if _DIR_FD else 0
+    levels = _UNIT_DEEP_LEVELS if _DIR_FD else 0
     info = gen.write_near_cap(repo, "cr-deep", untracked_py=100, deep_levels=levels)
     if levels:
-        assert info["deep_max_path"] > 4096
+        assert info["deep_max_path"] > 4096  # past PATH_MAX: needs the fd-based rmtree
     gen.clear_near_cap(repo)
     assert _listed(repo) == ["keep.py"]
     assert not (repo / ".git" / "info" / "exclude").exists()

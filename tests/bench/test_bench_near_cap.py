@@ -7,10 +7,11 @@ seeded B10k checkout (10,000 tracked `.py` files) gets the `gen_bench_repo --nea
 overlay: 10,000 untracked `.py` files six deep, a deep tree at depth 62 with paths of
 about 12k characters, and 2,000 patterns (the A-3 #4 cap) that the rule index can't
 narrow, in `.git/info/exclude` and `.gitignore`. Sets: TE `[q]N`, CR `[x]*N*q/`, SR
-seven `**` segments, CR's deep-path set (2,000 x `[x]/[y]*`), and (D-TL-74/75) 90, 100
-and 150 x `[x]*N*q`, mid-size sets near the per-path allowance that are matched on every
-path or most of the walk (the sweep's peaks). None of them matches any file, so every
-file must still be found.
+seven `**` segments, CR's deep-path set (2,000 x `[x]/[y]*`), SR's L-76-1 set (1,999 x
+`[q]N`, then `!*`), and (D-TL-74/75) 90, 100 and 150 x `[x]*N*q`, mid-size sets near the
+per-path allowance: with the allowance at 256 the B10k worst case is a plateau at k of
+about 75-100 that never runs the budget out, and k=150 is past it. None of them ignores
+any file, so every file must still be found.
 
 Only the stage time and the found files are asserted, never the match budget's
 internals (D-TL-73). The stock-Python case puts GitHub's `Python.gitignore` on a tree
