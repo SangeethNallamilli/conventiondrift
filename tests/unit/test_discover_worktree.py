@@ -735,18 +735,50 @@ def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return root
 
 
-# D-TL-72, D-TL-74a: hostile patterns may at most double discovery of the same tree, so
-# the time they add must not pass the time with no patterns, on every runner. A fixed
-# number of seconds broke on slower runners: a set that stays under the per-path
-# allowance never runs the budget out and pays up to GITIGNORE_MATCH_ALLOWANCE steps on
-# every path. The absolute 4 s B10k discovery budget (DESIGN §5) is the B10k benchmark
-# job's to enforce.
+# D-TL-72, D-TL-74a, D-TL-76: what the matcher guarantees, on every runner, is that its
+# work counter stays within GITIGNORE_MATCH_BUDGET plus GITIGNORE_MATCH_ALLOWANCE per path
+# checked; a check that starts inside the budget stops within its own start cost of the
+# end. The wall-clock bound (hostile patterns at most double discovery, so the time they
+# add must not pass the time with no patterns) is checked only on Linux, the ubuntu
+# reference runner: a set that stays under the allowance pays it on every path, and how
+# long a step takes next to a walk step differs by runner (macOS reached 1.07x at
+# 03520df). The absolute B10k discovery budget (DESIGN §5) is the B10k benchmark job's
+# to enforce.
 _HOSTILE_LINES = 2_000
 
 
+_REFERENCE_RUNNER = sys.platform == "linux"
+
+
 def _assert_at_most_doubles(hostile: float, baseline: float) -> None:
+    if not _REFERENCE_RUNNER:
+        return  # D-TL-76: wall clock only on the reference runner
     assert hostile - baseline <= baseline, (
         f"hostile {hostile:.2f} s, no patterns {baseline:.2f} s: +{hostile - baseline:.2f} s"
+    )
+
+
+def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[gitignore.IgnoreRules]:
+    """Every :class:`IgnoreRules` discovery makes from now on, in order."""
+    made: list[gitignore.IgnoreRules] = []
+
+    class Recorded(gitignore.IgnoreRules):
+        def __init__(self) -> None:
+            super().__init__()
+            made.append(self)
+
+    monkeypatch.setattr(scan, "IgnoreRules", Recorded)
+    return made
+
+
+def _assert_work_within_budget(rules: gitignore.IgnoreRules, longest: int) -> None:
+    """D-TL-76: the work stays within the budget plus the allowance per path checked,
+    past it only by what the last check paid before it could stop: its start cost, one
+    folder cut and one match step, for a path of at most ``longest`` components."""
+    lookups = 2 * sum(map(len, rules._lengths.values()))
+    last_check = (4 + longest + lookups) + (2 + 1 + longest) + 2
+    assert rules._work <= rules._budget() + last_check, (
+        f"work {rules._work:,}, budget {rules._budget():,} for {rules._checks:,} paths"
     )
 
 
@@ -794,13 +826,31 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
         ("[q]{}", 75, False),  # TE's shape, the peak under the allowance (D-TL-75)
         ("[x]*{}*q", 100, True),  # CR's shape, just past the peak
         ("[q]{}", 100, True),  # TE's shape, just past the peak
+        ("[q]{}", _HOSTILE_LINES, False),  # SR's L-76-1 set: 1,999 of these, then "!*"
     ],
 )
 def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
-    near_cap_tree: Path, near_cap_baseline: float, line: str, lines: int, runs_out: bool
+    near_cap_tree: Path,
+    near_cap_baseline: float,
+    monkeypatch: pytest.MonkeyPatch,
+    line: str,
+    lines: int,
+    runs_out: bool,
 ) -> None:
-    _set_patterns(near_cap_tree, [line.format(i) + "\n" for i in range(lines)])
+    patterns = [line.format(i) + "\n" for i in range(lines)]
+    if not runs_out and lines == _HOSTILE_LINES:
+        # SR's L-76-1 set (D-TL-76 addendum): "!*" last is tried first and matches every
+        # path in a few steps, so the budget never runs out, but gathering and sorting
+        # all 2,000 candidates is not charged yet. Until L-76-1 charges it, only the
+        # ubuntu wall-clock bound covers that cost.
+        patterns[-1] = "!*\n"
+    _set_patterns(near_cap_tree, patterns)
+    made = _record_rules(monkeypatch)
     best, result = _best_of_2(near_cap_tree)
+    assert len(made) == 2
+    for rules in made:
+        assert rules.exhausted is runs_out
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
     _assert_at_most_doubles(best, near_cap_baseline)
     assert result.stats["gitignore_patterns_loaded"] == lines
     assert len(py_paths(result)) == _NEAR_CAP_FILES
@@ -835,13 +885,22 @@ def _deep_tree(root: Path) -> None:
         os.close(fd)
 
 
+# The ubuntu and macOS CI legs must build the deep tree; only the git-minimum container
+# (GIT_MIN_VERSION set, its filesystem refuses the names) and local runs may skip.
+_MUST_BUILD_THE_DEEP_TREE = (
+    bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
+    and sys.platform in ("linux", "darwin")
+    and not os.environ.get("GIT_MIN_VERSION")
+)
+
+
 # #76 CR B2: the budget pays for path length, so 2,000 patterns tried on
 # very long paths at most double discovery (D-TL-74a). POSIX only: the tree is built
 # with dir_fd, and Windows needs long-path support for paths this long.
 @pytest.mark.timing
 @pytest.mark.skipif(not POSIX, reason="the deep tree is built with dir_fd (POSIX only)")
 def test_hostile_patterns_add_little_on_very_long_paths(
-    tmp_path_factory: pytest.TempPathFactory,
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path_factory.mktemp("deep")
     try:
@@ -852,6 +911,8 @@ def test_hostile_patterns_add_little_on_very_long_paths(
         # skip only on ENAMETOOLONG and let any other error fail the test.
         if e.errno != errno.ENAMETOOLONG:
             raise
+        if _MUST_BUILD_THE_DEEP_TREE:
+            raise  # #76 CR, D-TL-76 addendum 2: no skip on the ubuntu and macOS CI legs
         pytest.skip(f"this filesystem refuses the deep tree's names: {e}")
     _set_patterns(root, [])
     baseline, result = _best_of_2(root)
@@ -859,7 +920,12 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     assert max(len(p) for p in py_paths(result)) > 11_000
     assert result.discovery.notes == ()
     _set_patterns(root, ["[x]/[y]*\n"] * _HOSTILE_LINES)
+    made = _record_rules(monkeypatch)
     best, result = _best_of_2(root)
+    assert len(made) == 2
+    for rules in made:
+        assert rules.exhausted
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
     _assert_at_most_doubles(best, baseline)
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _DEEP_FILES

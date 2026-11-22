@@ -649,9 +649,11 @@ def _stock_walk(loaded: IgnoreRules, prefix: str, folders: int) -> int:
 
 
 # D-TL-73, D-TL-75: at any depth the walk allows, a walk with GitHub's Python .gitignore
-# spends less than the allowance per entry, so the base budget is never touched and it
-# never runs out however many entries there are. One deep check alone may cost more
-# than the allowance (about 350 steps at depth 64); unused allowance carries over.
+# and short file names spends less than the allowance per entry, so the base budget is
+# never touched and it does not run out however many entries there are. One deep check
+# alone may cost more than the allowance (about 350 steps at depth 64); unused allowance
+# carries over. Long or dotted file names deep in the tree can run it out: a known limit
+# (DESIGN A-3 #4a, D-TL-76 addendum 2) for the follow-up batch.
 @pytest.mark.parametrize("depth", [0, 8, 32, WALK_MAX_DEPTH - 3])  # + src/pkg/sub
 @pytest.mark.parametrize("name_length", [8, 60])
 def test_a_stock_python_walk_spends_less_than_its_allowance_at_any_depth(
