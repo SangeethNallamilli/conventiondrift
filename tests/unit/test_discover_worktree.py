@@ -735,12 +735,19 @@ def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return root
 
 
-# D-TL-72: hostile patterns may add at most this much to discovery of the same tree. The
-# absolute 4 s B10k discovery budget (DESIGN §5) moves to the B10k benchmark job: on
-# slower runners the file reads alone take longer than 4 s, and they are not what A-3 #7
-# bounds here.
-_MATCH_OVERHEAD_MAX_S = 1.0
+# D-TL-72, D-TL-74a: hostile patterns may at most double discovery of the same tree, so
+# the time they add must not pass the time with no patterns, on every runner. A fixed
+# number of seconds broke on slower runners: a set that stays under the per-path
+# allowance never runs the budget out and pays up to GITIGNORE_MATCH_ALLOWANCE steps on
+# every path. The absolute 4 s B10k discovery budget (DESIGN §5) is the B10k benchmark
+# job's to enforce.
 _HOSTILE_LINES = 2_000
+
+
+def _assert_at_most_doubles(hostile: float, baseline: float) -> None:
+    assert hostile - baseline <= baseline, (
+        f"hostile {hostile:.2f} s, no patterns {baseline:.2f} s: +{hostile - baseline:.2f} s"
+    )
 
 
 def _set_patterns(root: Path, lines: Sequence[str]) -> None:
@@ -749,9 +756,9 @@ def _set_patterns(root: Path, lines: Sequence[str]) -> None:
     (root / ".gitignore").write_text("".join(lines[len(lines) // 2 :]))
 
 
-def _best_of_3(root: Path) -> tuple[float, ScanDiscovery]:
+def _best_of_2(root: Path) -> tuple[float, ScanDiscovery]:
     best = float("inf")
-    for _ in range(3):
+    for _ in range(2):
         started = time.perf_counter()
         result = run(root)
         best = min(best, time.perf_counter() - started)
@@ -760,39 +767,42 @@ def _best_of_3(root: Path) -> tuple[float, ScanDiscovery]:
 
 @pytest.fixture(scope="module")
 def near_cap_baseline(near_cap_tree: Path) -> float:
-    """Best of 3 discoveries of the tree with both pattern files present but empty."""
+    """Best of 2 discoveries of the tree with both pattern files present but empty,
+    shared by every set on this tree."""
     _set_patterns(near_cap_tree, [])
-    best, result = _best_of_3(near_cap_tree)
+    best, result = _best_of_2(near_cap_tree)
     assert len(py_paths(result)) == _NEAR_CAP_FILES
     assert result.discovery.notes == ()
     return best
 
 
-# A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with 2,000 patterns the
-# index can't narrow, costs at most _MATCH_OVERHEAD_MAX_S more to discover than the same
-# tree with no patterns (best of 3 each). Each set runs the budget out, so the time
-# includes reaching it.
+# A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with patterns the index
+# can't narrow, takes at most twice as long to discover as the same tree with no patterns
+# (best of 2 each; D-TL-74a). The 2,000-line sets run the budget out, so the time
+# includes reaching it. The 90- and 100-line sets (CR, TE) are the largest that stay
+# under the per-path allowance and never run it out, so they pay it on every path: the
+# worst case for this bound.
 @pytest.mark.timing
 @pytest.mark.parametrize(
-    "line",
+    ("line", "lines", "runs_out"),
     [
-        "[q]{}",  # TE
-        "[x]*{}*q/",  # CR
-        "**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}",  # SR, deep "**"
+        ("[q]{}", _HOSTILE_LINES, True),  # TE
+        ("[x]*{}*q/", _HOSTILE_LINES, True),  # CR
+        ("**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}", _HOSTILE_LINES, True),  # SR, deep "**"
+        ("[x]*{}*q", 90, False),  # CR, under the allowance (D-TL-74)
+        ("[x]*{}*q", 100, False),  # TE, under the allowance
+        ("[q]{}", 100, False),  # TE, under the allowance
     ],
 )
 def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
-    near_cap_tree: Path, near_cap_baseline: float, line: str
+    near_cap_tree: Path, near_cap_baseline: float, line: str, lines: int, runs_out: bool
 ) -> None:
-    _set_patterns(near_cap_tree, [line.format(i) + "\n" for i in range(_HOSTILE_LINES)])
-    best, result = _best_of_3(near_cap_tree)
-    overhead = best - near_cap_baseline
-    assert overhead <= _MATCH_OVERHEAD_MAX_S, (
-        f"hostile {best:.2f} s, no patterns {near_cap_baseline:.2f} s: +{overhead:.2f} s"
-    )
-    assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
+    _set_patterns(near_cap_tree, [line.format(i) + "\n" for i in range(lines)])
+    best, result = _best_of_2(near_cap_tree)
+    _assert_at_most_doubles(best, near_cap_baseline)
+    assert result.stats["gitignore_patterns_loaded"] == lines
     assert len(py_paths(result)) == _NEAR_CAP_FILES
-    assert [n for n in result.discovery.notes if "budget" in n]
+    assert bool([n for n in result.discovery.notes if "budget" in n]) is runs_out
 
 
 _DEEP_FOLDERS = 58  # with b<n>/leaf<n>/mod_<n>.py: 61 components, inside the 64 cap
@@ -823,8 +833,8 @@ def _deep_tree(root: Path) -> None:
         os.close(fd)
 
 
-# #76 CR B2 (D-TL-72 margin): the budget pays for path length, so 2,000 patterns tried on
-# very long paths also add at most _MATCH_OVERHEAD_MAX_S. POSIX only: the tree is built
+# #76 CR B2: the budget pays for path length, so 2,000 patterns tried on
+# very long paths at most double discovery (D-TL-74a). POSIX only: the tree is built
 # with dir_fd, and Windows needs long-path support for paths this long.
 @pytest.mark.timing
 @pytest.mark.skipif(not POSIX, reason="the deep tree is built with dir_fd (POSIX only)")
@@ -842,16 +852,13 @@ def test_hostile_patterns_add_little_on_very_long_paths(
             raise
         pytest.skip(f"this filesystem refuses the deep tree's names: {e}")
     _set_patterns(root, [])
-    baseline, result = _best_of_3(root)
+    baseline, result = _best_of_2(root)
     assert len(py_paths(result)) == _DEEP_FILES
     assert max(len(p) for p in py_paths(result)) > 11_000
     assert result.discovery.notes == ()
     _set_patterns(root, ["[x]/[y]*\n"] * _HOSTILE_LINES)
-    best, result = _best_of_3(root)
-    overhead = best - baseline
-    assert overhead <= _MATCH_OVERHEAD_MAX_S, (
-        f"hostile {best:.2f} s, no patterns {baseline:.2f} s: +{overhead:.2f} s"
-    )
+    best, result = _best_of_2(root)
+    _assert_at_most_doubles(best, baseline)
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _DEEP_FILES
     assert [n for n in result.discovery.notes if "budget" in n]
