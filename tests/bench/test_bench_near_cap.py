@@ -62,6 +62,20 @@ def _overlay(repo: Path, pattern_set: str) -> dict:
     return benchlib.load_generator().write_near_cap(repo, pattern_set)
 
 
+def _no_pattern_baseline(repo: Path) -> list[benchlib.DiscoverRun]:
+    """The same overlay tree with both ignore files empty, timed RUNS times; restored after.
+    Recorded next to the hostile timings for comparison, never asserted."""
+    files = [repo / rel for rel in benchlib.load_generator().NEAR_CAP_IGNORE_FILES]
+    saved = [f.read_bytes() for f in files]
+    try:
+        for f in files:
+            f.write_bytes(b"")
+        return [benchlib.time_scan_discovery(repo) for _ in range(benchlib.RUNS)]
+    finally:
+        for f, data in zip(files, saved, strict=True):
+            f.write_bytes(data)
+
+
 @pytest.mark.timing
 @pytest.mark.parametrize("pattern_set", benchlib.NEAR_CAP_SETS)
 def test_a3_7_b10k_near_cap_discovery_stage_within_125pct(
@@ -73,8 +87,9 @@ def test_a3_7_b10k_near_cap_discovery_stage_within_125pct(
     assert info["patterns"] == counts.get(pattern_set, 2_000)
     assert 60 <= info["deep_depth"] <= 64 and 11_000 <= info["deep_max_path"] <= 13_000, info
     expected = len(tracked) + info["untracked_py"]
+    baseline = _no_pattern_baseline(repo)
     runs = [benchlib.time_scan_discovery(repo) for _ in range(benchlib.RUNS)]
-    benchlib.write_near_cap_results(pattern_set, manifest, info, runs)
+    benchlib.write_near_cap_results(pattern_set, manifest, info, runs, baseline)
     problems = []
     for n, run in enumerate(runs):
         if run.seconds > benchlib.NEAR_CAP_DISCOVER_S:  # DESIGN §5: "goes over 125%"

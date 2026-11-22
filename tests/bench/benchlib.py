@@ -382,7 +382,9 @@ def time_scan_discovery(repo: Path) -> DiscoverRun:
     )
 
 
-def write_near_cap_results(pattern_set: str, manifest: dict, info: dict, runs: list) -> None:
+def write_near_cap_results(
+    pattern_set: str, manifest: dict, info: dict, runs: list, baseline: list | None = None
+) -> None:
     """Near-cap timings next to the CLI results (CD_BENCH_RESULTS), with seed and hash."""
     dest = os.environ.get("CD_BENCH_RESULTS")
     if not dest:
@@ -400,6 +402,9 @@ def write_near_cap_results(pattern_set: str, manifest: dict, info: dict, runs: l
         "limit_s": NEAR_CAP_DISCOVER_S,
         "walk_entries": [r.stats.get("scan_walk_entries") for r in runs],
     }
+    if baseline:  # the same tree with both ignore files empty: recorded, not asserted
+        payload["baseline_no_patterns_s"] = [round(r.seconds, 3) for r in baseline]
+        payload["baseline_median_s"] = round(statistics.median(r.seconds for r in baseline), 3)
     (Path(dest) / f"b10k-a3-7-near-cap-{pattern_set}.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

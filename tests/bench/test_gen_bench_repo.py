@@ -371,6 +371,8 @@ def test_b10k_same_seed_identical_manifest_and_refs(b10k_pair: tuple) -> None:
 
 
 # ------------------------------------------------------------- A-3 #7 near-cap overlay
+# Windows has no dir_fd for os.open and os.mkdir, so there the deep tests run with 0 levels:
+# no deep tree is built, and the pattern and cleanup checks still run (no skip).
 _DIR_FD = os.open in os.supports_dir_fd and os.mkdir in os.supports_dir_fd
 
 
