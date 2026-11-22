@@ -467,6 +467,7 @@ def _budget(monkeypatch: pytest.MonkeyPatch, steps: int) -> None:
     for module in (gitignore, scan):
         monkeypatch.setattr(module, "GITIGNORE_MATCH_BUDGET", steps)
         monkeypatch.setattr(module, "GITIGNORE_MATCH_ALLOWANCE", 0)
+        monkeypatch.setattr(module, "GITIGNORE_MATCH_ALLOWANCE_PER_CHAR", 0)
 
 
 def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
@@ -480,7 +481,8 @@ def test_the_match_budget_is_a_note_and_leaves_the_rest_in(
     result = run(tmp_path)
     assert py_paths(result) == ["a.py", "z3.py", "z4.py", "z5.py"]
     assert result.discovery.notes == (
-        ".gitignore matching used up its budget (60 steps plus 0 per path checked); "
+        ".gitignore matching used up its budget (60 steps plus 0 per path checked"
+        " and 0 per character of its name); "
         "the last 3 paths were not "
         "checked against .gitignore, so none of them was left out",
     )
@@ -501,7 +503,8 @@ def test_the_match_budget_note_for_one_path(
     result = run(tmp_path)
     assert py_paths(result) == ["z3.py"]
     assert result.discovery.notes == (
-        ".gitignore matching used up its budget (60 steps plus 0 per path checked); "
+        ".gitignore matching used up its budget (60 steps plus 0 per path checked"
+        " and 0 per character of its name); "
         "the last path was not "
         "checked against .gitignore, so it was not left out",
     )
@@ -736,14 +739,14 @@ def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 # D-TL-72, D-TL-74a, D-TL-76: what the matcher guarantees, on every runner, is that its
-# work counter stays within GITIGNORE_MATCH_BUDGET plus GITIGNORE_MATCH_ALLOWANCE per path
-# checked; a check that starts inside the budget stops within its own start cost of the
-# end. The wall-clock bound (hostile patterns at most double discovery, so the time they
-# add must not pass the time with no patterns) is checked only on Linux, the ubuntu
-# reference runner: a set that stays under the allowance pays it on every path, and how
-# long a step takes next to a walk step differs by runner (macOS reached 1.07x at
-# 03520df). The absolute B10k discovery budget (DESIGN §5) is the B10k benchmark job's
-# to enforce.
+# work counter stays within GITIGNORE_MATCH_BUDGET plus the allowance per path checked
+# (which grows with its name); a check that starts inside the budget stops within its
+# own start cost of the end. The wall-clock bound (hostile patterns at most double
+# discovery, so the time they add must not pass the time with no patterns) is checked
+# only on Linux, the ubuntu reference runner: a set that stays under the allowance pays
+# it on every path, and how long a step takes next to a walk step differs by runner
+# (macOS reached 1.07x at 03520df). The absolute B10k discovery budget (DESIGN §5) is
+# the B10k benchmark job's to enforce.
 _HOSTILE_LINES = 2_000
 
 
@@ -773,10 +776,12 @@ def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[gitignore.IgnoreRules
 
 def _assert_work_within_budget(rules: gitignore.IgnoreRules, longest: int) -> None:
     """D-TL-76: the work stays within the budget plus the allowance per path checked,
-    past it only by what the last check paid before it could stop: its start cost, one
-    folder cut and one match step, for a path of at most ``longest`` components."""
+    past it only by what the last check paid before it could stop: its start cost, its
+    candidates (L-76-1), one folder cut and one match step, for a path of at most
+    ``longest`` components."""
     lookups = 2 * sum(map(len, rules._lengths.values()))
-    last_check = (4 + longest + lookups) + (2 + 1 + longest) + 2
+    gathered = len(rules._rules) // gitignore._CANDIDATES_PER_STEP
+    last_check = (4 + longest + lookups + gathered) + (2 + 1 + longest) + 2
     assert rules._work <= rules._budget() + last_check, (
         f"work {rules._work:,}, budget {rules._budget():,} for {rules._checks:,} paths"
     )
@@ -811,10 +816,12 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
 # A-3 #7 (DESIGN §12, #76 B2 and M-76-1): a repo near the caps, with patterns the index
 # can't narrow, takes at most twice as long to discover as the same tree with no patterns
 # (best of 2 each; D-TL-74a). The 2,000-line sets run the budget out, so the time
-# includes reaching it. With the D-TL-75 allowance of 256, the 75-line sets are about the
-# largest that stay under it and never run it out, so they pay it on every path: the
-# worst case for this bound (CR's and TE's k=90-100 peak at the old 384). The 100-line
-# sets run it out just past that peak.
+# includes reaching it. With the D-TL-75 allowance of 256 per path plus 2 per character
+# of its name (D-TL-76 addendum 2; about 274 a path here), the 77-line sets are the
+# largest that never run it out on this tree, so they pay about all of it on every
+# path: the worst case for this bound (CR's and TE's k=90-100 peak at the old 384; 76
+# at 256 alone before L-76-1 charged the candidates gathered, 74 with that charge).
+# The 100-line sets run it out past that peak.
 @pytest.mark.timing
 @pytest.mark.parametrize(
     ("line", "lines", "runs_out"),
@@ -822,8 +829,8 @@ def near_cap_baseline(near_cap_tree: Path) -> float:
         ("[q]{}", _HOSTILE_LINES, True),  # TE
         ("[x]*{}*q/", _HOSTILE_LINES, True),  # CR
         ("**/*/**/*/**/*/**/*/**/*/**/*/**/[a-z]*q{}", _HOSTILE_LINES, True),  # SR, deep "**"
-        ("[x]*{}*q", 75, False),  # CR's shape, the peak under the allowance (D-TL-75)
-        ("[q]{}", 75, False),  # TE's shape, the peak under the allowance (D-TL-75)
+        ("[x]*{}*q", 77, False),  # CR's shape, the peak under the allowance (D-TL-75)
+        ("[q]{}", 77, False),  # TE's shape, the peak under the allowance (D-TL-75)
         ("[x]*{}*q", 100, True),  # CR's shape, just past the peak
         ("[q]{}", 100, True),  # TE's shape, just past the peak
         ("[q]{}", _HOSTILE_LINES, False),  # SR's L-76-1 set: 1,999 of these, then "!*"
@@ -840,9 +847,9 @@ def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
     patterns = [line.format(i) + "\n" for i in range(lines)]
     if not runs_out and lines == _HOSTILE_LINES:
         # SR's L-76-1 set (D-TL-76 addendum): "!*" last is tried first and matches every
-        # path in a few steps, so the budget never runs out, but gathering and sorting
-        # all 2,000 candidates is not charged yet. Until L-76-1 charges it, only the
-        # ubuntu wall-clock bound covers that cost.
+        # path in a few steps, but gathering and sorting all 2,000 candidates is paid
+        # (L-76-1): about 286 steps a path, about 12 over its allowance here, so it runs
+        # the base budget out only after about 240,000 paths, not on this tree.
         patterns[-1] = "!*\n"
     _set_patterns(near_cap_tree, patterns)
     made = _record_rules(monkeypatch)
@@ -930,3 +937,54 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _DEEP_FILES
     assert [n for n in result.discovery.notes if "budget" in n]
+
+
+_LONG_NAME = 255  # NAME_MAX on Linux and macOS: the most per-character allowance a path gets
+_LONG_NAME_LINES = 3  # "*[q]N": the largest set that never runs this tree's budget out
+
+
+def _long_name_tree(root: Path) -> None:
+    """20,000 files with 255-character names, laid out as the near-cap tree."""
+    write(root, {"AGENTS.md": AGENTS})
+    (root / ".git" / "info").mkdir(parents=True)
+    for d in range(200):
+        folder = root.joinpath(*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}")
+        folder.mkdir(parents=True)
+        for f in range(_NEAR_CAP_FILES // 200):
+            (folder / (f"mod_{f:03d}_".ljust(_LONG_NAME - 3, "m") + ".py")).write_bytes(b"")
+
+
+# SR (L-76-1 follow-up, D-TL-77 #3): the allowance grows with the name, so a hostile set
+# gets the most per path on 255-character names: up to 256 + 2 * 255 = 766 steps. "*[q]N"
+# is tried on every name and its "*" scans all of it, so it costs the most per pattern;
+# 3 of them are the largest set that never runs this tree's budget out (4 do: checked
+# when the set was chosen), so they pay about all of the allowance on every path. Same
+# bounds as the near-cap sets: the counter on every leg, at most double the time with
+# no patterns on Linux. POSIX only: Windows needs long-path support for these paths.
+@pytest.mark.timing
+@pytest.mark.skipif(not POSIX, reason="paths with 255-character names need long-path support")
+def test_hostile_patterns_add_little_on_the_longest_file_names(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path_factory.mktemp("long_names")
+    try:
+        _long_name_tree(root)
+    except OSError as e:
+        if e.errno != errno.ENAMETOOLONG or _MUST_BUILD_THE_DEEP_TREE:
+            raise  # as for the deep tree: only git-minimum's container and local runs skip
+        pytest.skip(f"this filesystem refuses 255-character names: {e}")
+    _set_patterns(root, [])
+    baseline, result = _best_of_2(root)
+    assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert {len(p.rpartition("/")[2]) for p in py_paths(result)} == {_LONG_NAME}
+    assert result.discovery.notes == ()
+    _set_patterns(root, [f"*[q]{i}\n" for i in range(_LONG_NAME_LINES)])
+    made = _record_rules(monkeypatch)
+    best, result = _best_of_2(root)
+    assert len(made) == 2
+    for rules in made:
+        assert not rules.exhausted
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+    _assert_at_most_doubles(best, baseline)
+    assert len(py_paths(result)) == _NEAR_CAP_FILES
+    assert result.stats["gitignore_patterns_loaded"] == _LONG_NAME_LINES
