@@ -46,7 +46,10 @@ patterns gathered as candidates, tried or not (L-76-1), two per pattern tried, o
 component each time the path is cut to a ``.gitignore``'s folder (once per folder per
 check), plus the steps
 :meth:`~conventiondrift.discover.globmatch.Glob.match_parts` reports. So a long path
-costs its length once per check, not once per pattern (#76 CR B2). A match stops
+costs its length once per check, not once per pattern (#76 CR B2). The folders above a
+path are worked out once per check, and a pattern from a ``.gitignore`` in any other
+folder is skipped without a try, so 20 copies of a ``.gitignore`` in sibling packages
+cost about what one does (#76 CR S1). A match stops
 as soon as it would pass the budget. Once the budget is spent, ``.gitignore`` is not
 used for the rest of the walk: the path being checked and every later one are not
 ignored, so the scan reads more, never less, as with the other caps.
@@ -221,31 +224,30 @@ class IgnoreRules:
         # Paths are counted only until the budget runs out, so once spent it stays spent.
         return GITIGNORE_MATCH_BUDGET + GITIGNORE_MATCH_ALLOWANCE * self._checks
 
-    def _verdict(self, path: str, is_dir: bool) -> bool:
+    def _verdict(self, path: str, is_dir: bool, above: set[str]) -> bool:
         """The last matching pattern decides; a path no pattern matches is not ignored.
         Every step is paid from the match budget; if it runs out, ``False``.
 
-        The path is split once, and cut to each ``.gitignore`` folder once, so a try
-        costs the same however long the path is; the split and the cuts are paid one
-        step per component (#76 CR B2).
+        ``above`` holds the folders above ``path`` (``""`` for the root): a rule applies
+        only if its ``.gitignore`` is in one of them. Any other rule is skipped without a
+        try, paid only as a candidate gathered (#76 CR S1). The path is split once, and
+        cut to each such folder once, so a try costs the same however long the path is;
+        the split and the cuts are paid one step per component (#76 CR B2).
         """
         parts = path.split("/")
         # A check costs about four steps to start, one per component split and two per
         # index lookup (a slice and a dict lookup), measured against match steps for #76.
         self._work += 4 + len(parts) + 2 * sum(map(len, self._lengths.values()))
-        below: dict[str, list[str] | None] = {}  # base folder -> path components under it
+        below: dict[str, list[str]] = {}  # base folder -> path components under it
         for position in self._candidates(path):
-            self._work += 2  # a try costs about two match steps before matching starts
             base, base_parts, glob = self._rules[position]
-            if base in below:
-                rel = below[base]
-            else:
-                self._work += 1 + len(parts)
-                depth = len(base_parts)
-                inside = depth < len(parts) and tuple(parts[:depth]) == base_parts
-                rel = below[base] = parts[depth:] if inside else None
-            if rel is None:
+            if base not in above:
                 continue
+            self._work += 2  # a try costs about two match steps before matching starts
+            rel = below.get(base)
+            if rel is None:
+                self._work += 1 + len(parts)
+                rel = below[base] = parts[len(base_parts) :]
             matched, steps = glob.match_parts(rel, is_dir, self._budget() - self._work)
             self._work += steps
             if self.exhausted:
@@ -254,10 +256,10 @@ class IgnoreRules:
                 return not glob.negated
         return False
 
-    def _folder_ignored(self, folder: str) -> bool:
+    def _folder_ignored(self, folder: str, above: set[str]) -> bool:
         cached = self._folders.get(folder)
         if cached is None:
-            cached = self._verdict(folder, True)
+            cached = self._verdict(folder, True, above)
             self._folders[folder] = cached
         return cached
 
@@ -275,11 +277,14 @@ class IgnoreRules:
         return False
 
     def _check(self, path: str, is_dir: bool) -> bool:
+        above = {""}  # the folders above the one being checked, worked out once per path
         end = path.find("/")
         while end != -1:  # prefixes are sliced from the path, never rejoined
-            if self._folder_ignored(path[:end]):
+            folder = path[:end]
+            if self._folder_ignored(folder, above):
                 return True
             if self.exhausted:
                 return False
+            above.add(folder)
             end = path.find("/", end + 1)
-        return self._verdict(path, is_dir)
+        return self._verdict(path, is_dir, above)

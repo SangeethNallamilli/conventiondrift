@@ -162,9 +162,9 @@ def test_each_folder_verdict_is_worked_out_once(monkeypatch: pytest.MonkeyPatch)
     seen: list[str] = []
     real = loaded._verdict
 
-    def spy(path: str, is_dir: bool) -> bool:
+    def spy(path: str, is_dir: bool, above: set[str]) -> bool:
         seen.append(path)
-        return real(path, is_dir)
+        return real(path, is_dir, above)
 
     monkeypatch.setattr(loaded, "_verdict", spy)
     assert not loaded.ignored("a/b/x.py")
@@ -398,6 +398,19 @@ def test_each_check_pays_its_lookups_tries_and_match_steps() -> None:
     assert loaded._work == 53  # the cached folder verdict is not paid again
 
 
+def test_rules_of_other_folders_are_skipped_without_a_try() -> None:
+    # #76 CR S1: a rule whose .gitignore is not above the path costs nothing to skip
+    # (only its share of the candidates gathered, none for fewer than eight).
+    alone = rules(("", b"*.py\n"))
+    assert alone.ignored("a/x.py")
+    others = rules(("", b"*.py\n"), ("b", b"*.py\n"), ("a/x.py", b"*.py\n"), ("ab", b"*.py\n"))
+    assert others.ignored("a/x.py")
+    assert others._work == alone._work == 27  # the folder "a" (7) and the file (20)
+    under = rules(("", b"*.py\n"), ("a", b"!*.py\n"))
+    assert not under.ignored("a/x.py")  # "a" is above it: its rule is tried and decides
+    assert under._work == alone._work  # one try, one cut, one match, as for the root's
+
+
 def test_the_budget_runs_out_and_nothing_more_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -461,7 +474,7 @@ def test_long_paths_pay_for_their_components() -> None:
     # so a deep path costs more than a short one with the same patterns and name.
     def work(path: str) -> int:
         loaded = rules(("", b"".join(b"[x]/[y]%d*\n" % i for i in range(10))))
-        assert not loaded._verdict(path, False)
+        assert not loaded._verdict(path, False, {""})
         return loaded._work
 
     short = work("a/b.py")
@@ -724,3 +737,20 @@ def test_the_stock_python_gitignore_never_runs_out_below_the_walk_cap() -> None:
     assert entries == 500_000
     assert not loaded.exhausted and loaded.unchecked == 0
     assert ignored == 50 * 100 * 17  # the .pyc files
+
+
+def test_nested_stock_python_copies_spend_less_than_the_allowance() -> None:
+    # #76 CR S1: a monorepo with the stock file at the root and a copy in each of 19
+    # packages (20 copies, as many as the pattern cap takes). A path is under only two
+    # of them; the other copies' rules are gathered (L-76-1) but skipped without a try.
+    stock = "\n".join(_STOCK_PYTHON).encode()
+    packages = gitignore.GITIGNORE_MAX_PATTERNS // len(_STOCK_PYTHON) - 1
+    loaded = rules(("", stock), *((f"packages/pkg{i}", stock) for i in range(packages)))
+    assert (packages, loaded.skipped) == (19, 0)
+    entries = 0
+    for i in range(packages):
+        assert not loaded.ignored(f"packages/pkg{i}", is_dir=True)
+        entries += 1 + _stock_walk(loaded, f"packages/pkg{i}/", 10)
+    assert entries == packages * 1_001
+    assert not loaded.exhausted
+    assert loaded._work <= gitignore.GITIGNORE_MATCH_ALLOWANCE * entries
