@@ -741,12 +741,12 @@ def near_cap_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
 # D-TL-72, D-TL-74a, D-TL-76: what the matcher guarantees, on every runner, is that its
 # work counter stays within GITIGNORE_MATCH_BUDGET plus the allowance per path checked
 # (which grows with its name); a check that starts inside the budget stops within its
-# own start cost of the end. The wall-clock bound (hostile patterns at most double discovery, so the time they
-# add must not pass the time with no patterns) is checked only on Linux, the ubuntu
-# reference runner: a set that stays under the allowance pays it on every path, and how
-# long a step takes next to a walk step differs by runner (macOS reached 1.07x at
-# 03520df). The absolute B10k discovery budget (DESIGN §5) is the B10k benchmark job's
-# to enforce.
+# own start cost of the end. The wall-clock bound (hostile patterns at most double
+# discovery, so the time they add must not pass the time with no patterns) is checked
+# only on Linux, the ubuntu reference runner: a set that stays under the allowance pays
+# it on every path, and how long a step takes next to a walk step differs by runner
+# (macOS reached 1.07x at 03520df). The absolute B10k discovery budget (DESIGN §5) is
+# the B10k benchmark job's to enforce.
 _HOSTILE_LINES = 2_000
 
 
