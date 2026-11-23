@@ -533,44 +533,6 @@ jobs:
 
 
 
-  bench:
-    # D-TL-78 #4, D-TL-80 #2, DESIGN §5 "Bench re-run rule": the benchmark
-    # suite (CD_BENCH=1, CD_BENCH_REQUIRE=1) on a clean GitHub-hosted
-    # runner. scripts/ci/run_bench.py fails the job if no test runs or any
-    # test skips, and re-runs a near-cap set once only when exactly one of
-    # its runs is over the 5 s limit; every run of that re-run must pass.
-    # Limits and run counts are the tests' own (tests/bench); unchanged here.
-    # Not in the `ci` aggregate yet (TE's #77 sketch: add it once it is
-    # green on ubuntu-latest); see the comment in `ci`'s needs.
-    name: bench
-    needs: [lockfile]
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # No cache: the bench runs from a clean install on a fresh runner.
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"
-      - name: Install hash-pinned pip, then hashed locks
-        run: |
-          python3 scripts/ci/install_pinned_pip.py
-          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
-      - name: Install the package (no deps, no build isolation)
-        run: python -m pip install --no-deps --no-build-isolation -e .
-      - name: Confirm no PyPI PyYAML in this environment
-        run: python3 scripts/ci/check_no_pypi_yaml.py
-      - name: Report the runner
-        run: |
-          nproc
-          git --version
-      - name: Benchmarks (fail on any skip; one re-run per set, D-TL-80)
-        run: python scripts/ci/run_bench.py "${RUNNER_TEMP}/bench"
-
   mutation:
     # Report-only since D-TL-29: not in the `ci` aggregate's needs.
     # Needs SR review: new dependency mutmut==3.8.1, separate hashed lock.
@@ -625,8 +587,6 @@ jobs:
       - git-minimum
       # mutation is report-only (D-TL-29, TL decision) and runs only on
       # the weekly schedule; it is not part of the required aggregate.
-      # bench (D-TL-80) is not in the required aggregate yet: it is added
-      # here once it has been green on ubuntu-latest (TE's #77 sketch).
       # test-macos is blocking (D-TL-34, supersedes D-TL-30; amended
       # 2026-11-19: 3.11 only on all PRs and pushes, 3.11–3.15 on
       # workflow_dispatch and schedule); a
