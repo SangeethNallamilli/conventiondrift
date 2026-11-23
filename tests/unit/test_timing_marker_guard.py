@@ -100,7 +100,7 @@ _EXEMPT_BY_FILE: dict[str, dict[str, str]] = {
             "slow child output ends at the overall read deadline"
         ),
         "test_running_out_kills_the_whole_tree": (
-            "polls (via _gone/_polls) until the killed grandchild is gone"
+            "polls (via gone_within) until the killed grandchild is gone"
         ),
     },
     "tests/unit/test_gitread_job.py": {
@@ -113,6 +113,13 @@ _EXEMPT_BY_FILE: dict[str, dict[str, str]] = {
     },
     "tests/unit/test_gitread_kill.py": {
         "test_timeout_kills_the_grandchild_too": "timeout kill takes the grandchild too",
+    },
+    "tests/unit/test_liveness_probe.py": {
+        "test_a_live_process_reads_running_and_the_probe_leaves_it_running": (
+            "polls a live child for a moment; asserts the probe's answers, not wall time"
+        ),
+        "test_an_ended_process_reads_gone": "one poll of a reaped child (wait=0)",
+        "test_a_zombie_reads_gone": "polls a killed child until it is a zombie",
     },
     "tests/unit/test_gitread_listing.py": {
         "test_blob_request_timeout_kills_both_processes": (

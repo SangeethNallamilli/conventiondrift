@@ -10,32 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.fixtures.liveness import gone_within
 
 from conventiondrift import gitread
 from conventiondrift.errors import ComponentError
-
-
-def _gone(pid: int, wait: float = 10.0) -> bool:
-    """True once ``pid`` no longer runs (exited, or a zombie waiting to be reaped)."""
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            pass
-        except OSError:
-            return True
-        else:
-            if os.name != "nt":
-                try:
-                    if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                        return True
-                except OSError:
-                    pass
-        time.sleep(0.05)
-    return False
 
 
 def _fake_git(tmp_path: Path, parent_exits: bool) -> list[str]:
@@ -70,7 +48,7 @@ def test_timeout_kills_the_grandchild_too(tmp_path: Path, parent_exits: bool) ->
             timeout=2.0,
         )
     assert time.monotonic() - start < 20
-    assert _gone(_grandchild(tmp_path))
+    assert gone_within(_grandchild(tmp_path), wait=10.0)  # goneprobe: never os.kill(pid, 0)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX sessions")
