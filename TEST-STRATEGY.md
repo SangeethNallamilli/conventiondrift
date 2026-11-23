@@ -15,6 +15,7 @@ The historical spec-gate review lives in the team copy of this file.
 | snapshot | Raw comment/summary Markdown compared byte-for-byte with `tests/snapshot/approved/`. Changes need PM sign-off (AC-F6.7). | fast stage |
 | regression | Every closed bug has a test that names the issue | every PR |
 | security | Joint TE+SR tests under `tests/security/`, including PATH-hijack cases | every PR; also the required Windows leg |
+| benchmark | `tests/bench/` with `CD_BENCH=1`: AC-N2.x CLI runs on the seeded B10k/B500 repos, and the DESIGN A-3 #7 near-cap case (`test_bench_near_cap.py`: the B10k checkout plus the `gen_bench_repo --near-cap` overlay, 5 runs, each scan-mode discovery stage at most 125% of the 4 s B10k discovery budget, as DESIGN §5 says the benchmark job fails (D-TL-75); stock `Python.gitignore` near the 500k walk cap gives no note). Only stage time and found files are asserted, not match-budget internals (D-TL-73). | benchmark job (fresh ubuntu-latest) |
 
 ## 2. Coverage gates (GATES.md; do not lower)
 
