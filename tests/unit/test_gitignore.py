@@ -982,3 +982,16 @@ def test_long_file_names_deep_in_the_tree_never_run_it_out() -> None:
     loaded = _stock_rules()
     assert _stock_walk(loaded, prefix, 700, _NAMES["100 characters"]) == 70_000
     assert not loaded.exhausted and loaded.unchecked == 0
+
+
+@pytest.mark.parametrize("path", ["\ud800.py", "a/\udbff.py", "\ud800/m.py", "\ud800\udc00.py"])
+@pytest.mark.parametrize("is_dir", [False, True])
+def test_a_name_with_no_utf8_bytes_is_not_ignored(path: str, is_dir: bool) -> None:
+    # SR M-P2-1: a Windows name with a lone high surrogate cannot be encoded, so it is
+    # answered "not ignored" (the walk reports it as skipped) instead of raising, and
+    # nothing is charged for it.
+    loaded = rules(("", b"*\n*.py\n"))
+    assert loaded.ignored("m.py")  # the rules would ignore any name they could read
+    work, checks = loaded._work, loaded._checks
+    assert not loaded.ignored(path, is_dir)
+    assert (loaded._work, loaded._checks, loaded.unchecked) == (work, checks, 0)

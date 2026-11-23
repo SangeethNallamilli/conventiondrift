@@ -405,7 +405,10 @@ class IgnoreRules:
         once the match budget is spent (counted in :attr:`unchecked`)."""
         if not self._rules:
             return False
-        path = _bytes_view(path)
+        try:
+            path = _bytes_view(path)
+        except UnicodeEncodeError:  # a lone high surrogate (Windows): no bytes to match;
+            return False  # the walk still reports the name as skipped (D-TL-81 #1, M-P2-1)
         if not self.exhausted:
             self._checks += 1
             self._names += len(path) - path.rfind("/") - 1
