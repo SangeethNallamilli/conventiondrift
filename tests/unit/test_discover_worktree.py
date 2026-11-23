@@ -286,6 +286,64 @@ def test_the_walk_tree_reader_serves_walk_refusals(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ .gitignore
 
 
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows cannot hold a reserved device name on disk"
+)
+def test_a_name_the_walk_refuses_is_not_dropped_by_a_folder_gitignore(
+    tmp_path: Path,
+) -> None:
+    # D-TL-81 #1 / TE N1: a name the walk cannot validate is judged as a file, so a
+    # folder-only .gitignore pattern must not hide it. The U1 mutant judged it as a
+    # folder, and `CON.py/` silently dropped `CON.py`. The name is built from the
+    # walk's reserved-name set (D-TL-25).
+    assert "CON" in safefs._DEVICE_NAMES
+    name = "CON.py"
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            ".gitignore": f"{name}/\nignored.py\n",
+            "ignored.py": "",
+            "kept.py": "",
+        },
+    )
+    (tmp_path / name).write_bytes(b"x = 1\n")
+    result = run(tmp_path)
+    assert py_paths(result) == ["kept.py"]
+    assert result.discovery.skipped == (SkippedFile(name, "unsupported path"),)
+    assert result.stats["gitignore_patterns_loaded"] == 2
+
+
+def test_an_unlistable_name_is_not_dropped_by_a_folder_gitignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same ruling on every OS: an lstat failure also takes the "offered as a file"
+    # branch, so a folder-only pattern must not drop the name (Windows cannot create
+    # CON.py to exercise the device-name case above).
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            ".gitignore": "hidden.py/\nignored.py\n",
+            "hidden.py": "",
+            "ignored.py": "",
+            "kept.py": "",
+        },
+    )
+    real = os.lstat
+
+    def fail(path: str, *a: object, **k: object) -> os.stat_result:
+        if os.path.basename(str(path)) == "hidden.py":
+            raise PermissionError("no")
+        return real(path, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "lstat", fail)
+    result = run(tmp_path)
+    assert py_paths(result) == ["kept.py"]
+    assert result.discovery.skipped == (SkippedFile("hidden.py", "unreadable"),)
+    assert result.stats["gitignore_patterns_loaded"] == 2
+
+
 def test_gitignore_drops_untracked_files(tmp_path: Path) -> None:
     write(
         tmp_path,
