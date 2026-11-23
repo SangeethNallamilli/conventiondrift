@@ -239,7 +239,12 @@ def test_bracket_expressions_agree_with_git_check_ignore(
     (tmp_path / ".gitignore").write_bytes(pattern.encode() + b"\n")
     env = {"PATH": __import__("os").environ.get("PATH", ""), "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": "/dev/null", "HOME": str(tmp_path)}  # fmt: skip
-    for args in (["init", "-q"], ["config", "core.excludesFile", ""]):
+    # Pinned config: macOS git init sets core.ignorecase=true, which matches [X] to X.
+    for args in (
+        ["init", "-q"],
+        ["config", "core.excludesFile", ""],
+        ["config", "core.ignorecase", "false"],
+    ):
         subprocess.run([_GIT, *args], cwd=tmp_path, env=env, check=True, capture_output=True)  # noqa: S603
     out = subprocess.run(  # noqa: S603
         [_GIT, "check-ignore", "-q", "--no-index", "--", name],
