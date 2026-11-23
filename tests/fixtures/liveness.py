@@ -17,6 +17,7 @@ reused for a new process reads as running, so a test can only fail that way, nev
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import sys
 import time
@@ -63,6 +64,8 @@ def posix_running(pid: int) -> bool:
         return True  # it exists; it is not ours
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
+    except ProcessLookupError:
+        return False  # ESRCH: it ended while /proc was being read
     except FileNotFoundError:
         # With a /proc (Linux) it ended since the kill; without one (macOS) the kill said
         # it runs, and a zombie there is reaped by launchd soon after its parent dies.
@@ -70,7 +73,9 @@ def posix_running(pid: int) -> bool:
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
+@functools.cache
 def _kernel32() -> Any:
+    """kernel32 with the prototypes the probe uses, loaded once per process."""
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]

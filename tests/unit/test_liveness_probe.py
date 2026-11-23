@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -39,12 +40,18 @@ def test_a_live_process_reads_running_and_the_probe_leaves_it_running() -> None:
 def test_an_ended_process_reads_gone() -> None:
     proc = _sleeper()
     proc.kill()
-    proc.wait()  # reaped (POSIX) and its last handle closed with the Popen (Windows)
+    # POSIX: reaped. Windows: Popen still holds a handle, so the process object stays,
+    # but it is signaled and the probe reads WAIT_OBJECT_0 (exited).
+    proc.wait()
     assert not running(proc.pid)
     assert gone_within(proc.pid, wait=0.0)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="zombies are POSIX")
+@pytest.mark.skipif(
+    sys.platform == "win32" or not os.path.isdir("/proc"),
+    reason="no /proc (macOS, Windows): the helper can't tell a zombie from a live "
+    "process there, so a zombie reads as running (fail-safe: never a fake pass)",
+)
 def test_a_zombie_reads_gone() -> None:
     proc = _sleeper()
     proc.kill()
@@ -124,3 +131,13 @@ def test_posix_lookup_and_permission(
 
     monkeypatch.setattr(os, "kill", kill)
     assert liveness.posix_running(4242) is expected
+
+
+def test_posix_a_process_ending_mid_read_reads_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CR S1: reading /proc/<pid>/stat can fail with ESRCH when the process ends mid-read.
+    def read_text(self: Path, *args: object, **kwargs: object) -> str:
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    assert liveness.posix_running(4242) is False
