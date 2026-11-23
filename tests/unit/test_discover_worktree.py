@@ -286,9 +286,7 @@ def test_the_walk_tree_reader_serves_walk_refusals(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ .gitignore
 
 
-@pytest.mark.skipif(
-    os.name == "nt", reason="Windows cannot hold a reserved device name on disk"
-)
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot hold a reserved device name on disk")
 def test_a_name_the_walk_refuses_is_not_dropped_by_a_folder_gitignore(
     tmp_path: Path,
 ) -> None:
