@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -77,6 +78,9 @@ def parse_junit(path: Path) -> Report:
 
 
 def run_pytest(targets: list[str], junit: Path, results: Path, env: dict[str, str]) -> int:
+    # Never let a stale report or results file from an earlier run be read as this run's.
+    junit.unlink(missing_ok=True)
+    shutil.rmtree(results, ignore_errors=True)
     results.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, "-m", "pytest", *targets, "-m", MARKERS, "-rs", f"--junitxml={junit}"]
     run_env = {**env, "CD_BENCH_RESULTS": str(results)}
@@ -128,7 +132,7 @@ def main(argv: list[str]) -> int:
 
     junit = work / "junit-1.xml"
     results = work / "results-1"
-    run_pytest(targets, junit, results, env)
+    rc = run_pytest(targets, junit, results, env)
     if not junit.is_file():
         print("bench: pytest wrote no JUnit report", file=sys.stderr)
         return 1
@@ -140,6 +144,12 @@ def main(argv: list[str]) -> int:
         failed.append(f"skipped (D-TL-78 #4: any skip fails the job): {c.nodeid}: {c.message}")
     for c in report.by_outcome("error"):
         failed.append(f"error (not re-run): {c.nodeid}")
+    # pytest's exit status must agree with the report: 0 with no failures or errors,
+    # or 1 with at least one. Anything else (a session-hook error, a usage or internal
+    # error) fails the job and is never re-run.
+    bad = bool(report.by_outcome("failed") or report.by_outcome("error"))
+    if rc not in (0, 1) or (rc == 0) == bad:
+        failed.append(f"pytest exit status {rc} does not match the JUnit report (failures: {bad})")
 
     reruns: list[Case] = []
     for c in report.by_outcome("failed"):
@@ -157,11 +167,11 @@ def main(argv: list[str]) -> int:
             print(f"bench: re-running once (D-TL-80): {c.nodeid}", flush=True)
             junit2 = work / f"junit-rerun-{n}.xml"
             results2 = work / f"results-rerun-{n}"
-            run_pytest([c.nodeid], junit2, results2, env)
+            rc2 = run_pytest([c.nodeid], junit2, results2, env)
             again = parse_junit(junit2) if junit2.is_file() else Report()
-            if again.tests != 1 or again.by_outcome("passed") != again.cases:
+            if rc2 != 0 or again.tests != 1 or again.by_outcome("passed") != again.cases:
                 outcomes = [x.outcome for x in again.cases] or ["no report"]
-                failed.append(f"failed twice (D-TL-80): {c.nodeid} re-run: {outcomes}")
+                failed.append(f"failed twice (D-TL-80): {c.nodeid} re-run: {outcomes}, exit {rc2}")
                 m = SET_NAME_RE.match(c.name)
                 if m:
                     runs_over_limit_in_results(results2, m.group("set"))
