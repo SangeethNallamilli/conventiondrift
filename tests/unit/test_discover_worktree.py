@@ -4,7 +4,6 @@ INTERFACES I-12, I-13 scan-walk rulings, I-14 ``scan_tracked``, D-TL-55)."""
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import os
 import subprocess
@@ -14,6 +13,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
+from long_paths import build_or_skip
 from tests.fixtures.gitrepo import GitRepo
 
 import conventiondrift.discover.safefs as safefs
@@ -304,6 +304,95 @@ def test_gitignore_drops_untracked_files(tmp_path: Path) -> None:
     result = run(tmp_path)
     assert py_paths(result) == ["kept.py", "local.py", "zz/local.py"]
     assert result.stats["gitignore_patterns_loaded"] == 3
+
+
+def test_a_gitignore_two_folders_deep_applies_under_its_own_folder(tmp_path: Path) -> None:
+    # TE #76: a .gitignore is read at any depth, not only at the root and one level down.
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            "a/b/.gitignore": "x.py\n/y.py\n",
+            "a/b/x.py": "",
+            "a/b/c/x.py": "",
+            "a/x.py": "",
+            "a/b/y.py": "",
+            "a/b/c/y.py": "",
+        },
+    )
+    result = run(tmp_path)
+    assert py_paths(result) == ["a/b/c/y.py", "a/x.py"]
+    assert result.stats["gitignore_patterns_loaded"] == 2
+
+
+def test_negation_never_brings_back_hard_excluded_folders(tmp_path: Path) -> None:
+    # A-3 #4, TE #76: "!" patterns can't reach .git/ or node_modules/ (I-5).
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            ".gitignore": "*\n!*/\n!*.py\n!*.md\n!.git/\n!node_modules/\n!**/node_modules/**\n",
+            ".git/hooks/x.py": "",
+            "node_modules/m.py": "",
+            "sub/node_modules/n.py": "",
+            "kept.py": "",
+        },
+    )
+    assert py_paths(run(tmp_path)) == ["kept.py"]
+
+
+def test_the_scan_path_starts_no_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A-3 #6: past the HEAD listing C3 gives it, scan discovery calls no git. Walking,
+    # .gitignore, hashing (with the CRLF re-hash) and reading all stay in Python.
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            ".git/info/exclude": "x.py\n",
+            ".gitignore": "*.log\n",
+            "sub/.gitignore": "y.py\n",
+            "t.py": "a\nb\n",
+            "u.py": "a\n",
+            "sub/y.py": "",
+            "x.py": "",
+        },
+    )
+    head = tracked(tmp_path, "t.py", "u.py")
+    (tmp_path / "t.py").write_bytes(b"a\r\nb\r\n")  # a CRLF checkout of the same blob
+    (tmp_path / "u.py").write_bytes(b"changed\n")
+
+    def no_process(*args: object, **kwargs: object) -> None:
+        raise AssertionError("scan discovery started a process")
+
+    monkeypatch.setattr(subprocess, "Popen", no_process)
+    for name in ("system", "posix_spawn", "posix_spawnp", "fork", "execv", "execvp"):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, no_process)
+    result = run(tmp_path, head)
+    assert py_paths(result) == ["t.py", "u.py"]
+    assert {p: s.unchanged for p, s in result.scan_tracked.items()} == {
+        "t.py": True,
+        "u.py": False,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a ':' in a name is an NTFS stream on Windows")
+def test_names_with_a_colon_are_walked_read_and_ignored_on_posix(tmp_path: Path) -> None:
+    # I-13: a ":" in a walked name is fine on POSIX, for the read of a .py file and of a
+    # .gitignore alike (origin "tree"; #76 mutmut survivors).
+    write(
+        tmp_path,
+        {
+            "AGENTS.md": AGENTS,
+            "c:x.py": "",
+            "d:e/.gitignore": "f.py\n",
+            "d:e/f.py": "",
+            "d:e/g.py": "",
+        },
+    )
+    result = run(tmp_path)
+    assert py_paths(result) == ["c:x.py", "d:e/g.py"]
+    assert result.discovery.skipped == ()
 
 
 def test_an_ignored_folder_is_not_entered(tmp_path: Path) -> None:
@@ -599,10 +688,30 @@ def test_an_executable_file_can_be_unchanged(tmp_path: Path) -> None:
     assert result.scan_tracked["a.py"].unchanged
 
 
-def test_a_symlink_at_head_is_changed_even_with_equal_bytes(tmp_path: Path) -> None:
-    write(tmp_path, {"AGENTS.md": AGENTS, "a.py": "target.py"})
+def test_a_symlink_at_head_gets_no_tracked_state(tmp_path: Path) -> None:
+    # A-3 #1, D-TL-70: a mode 120000 entry is skipped, even when a regular file with the
+    # link's bytes is in the working tree. The file is still a path git tracks, so
+    # .gitignore does not leave it out; with no TrackedState it counts as untracked.
+    write(tmp_path, {"AGENTS.md": AGENTS, ".gitignore": "*.py\n", "a.py": "target.py"})
     result = run(tmp_path, tracked(tmp_path, "a.py", mode="120000"))
-    assert result.scan_tracked["a.py"] == TrackedState(blob40(b"target.py"), False)
+    assert result.scan_tracked == {}
+    assert py_paths(result) == ["a.py"]
+
+
+def test_a_committed_symlink_is_skipped(repo: GitRepo) -> None:
+    repo.commit_files("c", {"AGENTS.md": AGENTS, "t.py": "x = 1\n"}, date=DAY)
+    repo.symlink("link.py", "t.py")  # skips where symlinks can't be made
+    repo.commit("link", date=DAY)
+    git = GitReader(repo.path)
+    try:
+        head = git.resolve("HEAD")
+        assert ("120000", "link.py") in {(e[0], e[3]) for e in git.tree(head)}
+        result = discover_worktree(PHASE, repo.path, git, head)
+    finally:
+        git.close()
+    assert list(result.scan_tracked) == ["t.py"]
+    assert py_paths(result) == ["t.py"]
+    assert [(f.path, f.reason) for f in result.discovery.skipped] == [("link.py", "symlink")]
 
 
 def test_only_kept_python_files_are_in_scan_tracked(tmp_path: Path) -> None:
@@ -619,6 +728,57 @@ def test_sha256_object_ids_are_compared_with_sha256(tmp_path: Path) -> None:
     assert dict(result.scan_tracked) == {
         "a.py": TrackedState(a256, True),
         "b.py": TrackedState("0" * 64, False),
+    }
+
+
+@pytest.mark.parametrize(
+    ("worktree", "at_head", "unchanged"),
+    [
+        (b"a\r\nb\r\n", b"a\nb\n", True),  # core.autocrlf checkout of an LF blob
+        (b"a\r\nb\n", b"a\nb\n", True),  # mixed line ends: each CRLF is read as LF
+        (b"a\r\nb\r\n", b"a\r\nb\r\n", True),  # a CRLF blob, as it is
+        (b"a\r\nb\r\n", b"a\nc\n", False),  # an edit is still an edit
+        (b"a\nb\n", b"a\r\nb\r\n", False),  # only CRLF to LF, never LF to CRLF
+        (b"a\rb\n", b"a\nb\n", False),  # a lone CR is not a line end
+        (b"a\rb\r\nc\r\n", b"a\rb\nc\n", False),  # with a lone CR, git converts nothing
+        (b"a\r\r\nb\n", b"a\r\nb\n", False),  # "\r\r\n" has a lone CR too
+    ],
+)
+def test_crlf_line_ends_are_read_as_lf_when_the_bytes_differ(
+    tmp_path: Path, worktree: bytes, at_head: bytes, unchanged: bool
+) -> None:
+    # D-TL-69 #2: git config is not read; a CRLF file is hashed again with LF.
+    write(tmp_path, {"AGENTS.md": AGENTS, "a.py": worktree})
+    result = run(tmp_path, Head([("100644", blob40(at_head), 1, "a.py")]))
+    assert result.scan_tracked["a.py"] == TrackedState(blob40(at_head), unchanged)
+
+
+def test_crlf_rehash_uses_the_head_hash(tmp_path: Path) -> None:
+    write(tmp_path, {"AGENTS.md": AGENTS, "a.py": b"a\r\n"})
+    a256 = hashlib.sha256(b"blob 2\0a\n").hexdigest()
+    result = run(tmp_path, Head([("100644", a256, 1, "a.py")]))
+    assert result.scan_tracked["a.py"] == TrackedState(a256, True)
+
+
+def test_a_crlf_checkout_is_unchanged_as_git_says(repo: GitRepo) -> None:
+    # D-TL-69 #2, against git itself: with core.autocrlf, git stores an LF blob for a
+    # CRLF file (hash-object applies the same conversion as add) unless it has a lone
+    # CR; that is HEAD's blob for a.py only. Here that is found without reading config.
+    files = {"AGENTS.md": AGENTS, "a.py": "x\ny\n", "b.py": "p\n", "c.py": "c\rd\ne\n"}
+    repo.commit_files("c", files, date=DAY)
+    write(repo.path, {"a.py": b"x\r\ny\r\n", "b.py": b"q\r\n", "c.py": b"c\rd\r\ne\r\n"})
+    for name, same in (("a.py", True), ("b.py", False), ("c.py", False)):
+        stored = repo.git("-c", "core.autocrlf=true", "hash-object", name).strip()
+        assert (stored == repo.git("rev-parse", f"HEAD:{name}").strip()) is same
+    git = GitReader(repo.path)
+    try:
+        result = discover_worktree(PHASE, repo.path, git, git.resolve("HEAD"))
+    finally:
+        git.close()
+    assert {p: s.unchanged for p, s in result.scan_tracked.items()} == {
+        "a.py": True,
+        "b.py": False,
+        "c.py": False,  # a lone CR: git keeps the bytes as they are
     }
 
 
@@ -761,30 +921,51 @@ def _assert_at_most_doubles(hostile: float, baseline: float) -> None:
     )
 
 
-def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[gitignore.IgnoreRules]:
+class _Recorded(gitignore.IgnoreRules):
+    """An :class:`IgnoreRules` that also notes how many paths it had checked when its
+    budget ran out (CR #76 S1: none are checked after that)."""
+
+    def __init__(self, made: list[_Recorded]) -> None:
+        super().__init__()
+        self.checks_when_spent: int | None = None
+        made.append(self)
+
+    def ignored(self, path: str, is_dir: bool = False) -> bool:
+        answer = super().ignored(path, is_dir)
+        if self.exhausted and self.checks_when_spent is None:
+            self.checks_when_spent = self._checks
+        return answer
+
+
+def _record_rules(monkeypatch: pytest.MonkeyPatch) -> list[_Recorded]:
     """Every :class:`IgnoreRules` discovery makes from now on, in order."""
-    made: list[gitignore.IgnoreRules] = []
-
-    class Recorded(gitignore.IgnoreRules):
-        def __init__(self) -> None:
-            super().__init__()
-            made.append(self)
-
-    monkeypatch.setattr(scan, "IgnoreRules", Recorded)
+    made: list[_Recorded] = []
+    monkeypatch.setattr(scan, "IgnoreRules", lambda: _Recorded(made))
     return made
 
 
-def _assert_work_within_budget(rules: gitignore.IgnoreRules, longest: int) -> None:
+def _assert_work_within_budget(rules: _Recorded, longest: int, runs_out: bool) -> None:
     """D-TL-76: the work stays within the budget plus the allowance per path checked,
     past it only by what the last check paid before it could stop: its start cost, its
     candidates (L-76-1), one folder cut and one match step, for a path of at most
-    ``longest`` components."""
+    ``longest`` components. The budget is worked out here from the constants (TE #76
+    N1). A spent budget leaves paths unchecked, and no path is checked after it (CR #76
+    S1)."""
+    budget = (
+        gitignore.GITIGNORE_MATCH_BUDGET
+        + gitignore.GITIGNORE_MATCH_ALLOWANCE * rules._checks
+        + gitignore.GITIGNORE_MATCH_ALLOWANCE_PER_CHAR * rules._names
+    )
+    assert rules._budget() == budget
     lookups = 2 * sum(map(len, rules._lengths.values()))
     gathered = len(rules._rules) // gitignore._CANDIDATES_PER_STEP
     last_check = (4 + longest + lookups + gathered) + (2 + 1 + longest) + 2
-    assert rules._work <= rules._budget() + last_check, (
-        f"work {rules._work:,}, budget {rules._budget():,} for {rules._checks:,} paths"
+    assert rules._work <= budget + last_check, (
+        f"work {rules._work:,}, budget {budget:,} for {rules._checks:,} paths"
     )
+    assert rules.exhausted is runs_out
+    assert (rules.unchecked > 0) is runs_out
+    assert rules.checks_when_spent == (rules._checks if runs_out else None)
 
 
 def _set_patterns(root: Path, lines: Sequence[str]) -> None:
@@ -856,8 +1037,7 @@ def test_hostile_patterns_add_little_to_discovering_a_repo_near_the_caps(
     best, result = _best_of_2(near_cap_tree)
     assert len(made) == 2
     for rules in made:
-        assert rules.exhausted is runs_out
-        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)), runs_out)
     _assert_at_most_doubles(best, near_cap_baseline)
     assert result.stats["gitignore_patterns_loaded"] == lines
     assert len(py_paths(result)) == _NEAR_CAP_FILES
@@ -870,35 +1050,12 @@ _DEEP_FILES = 2_000  # enough paths to run the budget out
 
 def _deep_tree(root: Path) -> None:
     """2,000 files under 58 folders of 200 characters each: paths of about 11,700
-    characters, built with ``dir_fd`` because they are longer than ``PATH_MAX``."""
+    characters, past the git-minimum container's limit, so that leg skips (long_paths)."""
     write(root, {"AGENTS.md": AGENTS})
     (root / ".git" / "info").mkdir(parents=True)
-    fd = os.open(root, os.O_RDONLY)
-    try:
-        for k in range(_DEEP_FOLDERS):
-            name = f"{k:02d}" + "n" * 198
-            os.mkdir(name, dir_fd=fd)
-            inner = os.open(name, os.O_RDONLY, dir_fd=fd)
-            os.close(fd)
-            fd = inner
-        for b in range(4):
-            os.mkdir(f"b{b}", dir_fd=fd)
-        for d in range(20):
-            leaf = f"b{d % 4}/leaf{d}"
-            os.mkdir(leaf, dir_fd=fd)
-            for f in range(_DEEP_FILES // 20):
-                os.close(os.open(f"{leaf}/mod_{f}.py", os.O_CREAT | os.O_WRONLY, dir_fd=fd))
-    finally:
-        os.close(fd)
-
-
-# The ubuntu and macOS CI legs must build the deep tree; only the git-minimum container
-# (GIT_MIN_VERSION set, its filesystem refuses the names) and local runs may skip.
-_MUST_BUILD_THE_DEEP_TREE = (
-    bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
-    and sys.platform in ("linux", "darwin")
-    and not os.environ.get("GIT_MIN_VERSION")
-)
+    chain = [f"{k:02d}" + "n" * 198 for k in range(_DEEP_FOLDERS)]
+    files = (f"b{d % 4}/leaf{d}/mod_{f}.py" for d in range(20) for f in range(_DEEP_FILES // 20))
+    build_or_skip(root, chain, files)
 
 
 # #76 CR B2: the budget pays for path length, so 2,000 patterns tried on
@@ -910,17 +1067,7 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path_factory.mktemp("deep")
-    try:
-        _deep_tree(root)
-    except OSError as e:
-        # #76 CR B1: some filesystems (the git-minimum container's) refuse a 200-character
-        # name or a path this deep. That limit comes from the filesystem, not the OS, so
-        # skip only on ENAMETOOLONG and let any other error fail the test.
-        if e.errno != errno.ENAMETOOLONG:
-            raise
-        if _MUST_BUILD_THE_DEEP_TREE:
-            raise  # #76 CR, D-TL-76 addendum 2: no skip on the ubuntu and macOS CI legs
-        pytest.skip(f"this filesystem refuses the deep tree's names: {e}")
+    _deep_tree(root)  # #76 CR B1, D-TL-76 addendum 2: skips only as long_paths says
     _set_patterns(root, [])
     baseline, result = _best_of_2(root)
     assert len(py_paths(result)) == _DEEP_FILES
@@ -931,8 +1078,7 @@ def test_hostile_patterns_add_little_on_very_long_paths(
     best, result = _best_of_2(root)
     assert len(made) == 2
     for rules in made:
-        assert rules.exhausted
-        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)), True)
     _assert_at_most_doubles(best, baseline)
     assert result.stats["gitignore_patterns_loaded"] == _HOSTILE_LINES
     assert len(py_paths(result)) == _DEEP_FILES
@@ -944,14 +1090,19 @@ _LONG_NAME_LINES = 3  # "*[q]N": the largest set that never runs this tree's bud
 
 
 def _long_name_tree(root: Path) -> None:
-    """20,000 files with 255-character names, laid out as the near-cap tree."""
+    """20,000 files with 255-character names, laid out as the near-cap tree. Some
+    filesystems refuse names this long; the test skips only as long_paths says."""
     write(root, {"AGENTS.md": AGENTS})
     (root / ".git" / "info").mkdir(parents=True)
-    for d in range(200):
-        folder = root.joinpath(*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}")
-        folder.mkdir(parents=True)
-        for f in range(_NEAR_CAP_FILES // 200):
-            (folder / (f"mod_{f:03d}_".ljust(_LONG_NAME - 3, "m") + ".py")).write_bytes(b"")
+    files = (
+        "/".join((*(f"d{d % 7}l{k}" for k in range(5)), f"leaf{d}"))
+        + "/"
+        + f"mod_{f:03d}_".ljust(_LONG_NAME - 3, "m")
+        + ".py"
+        for d in range(200)
+        for f in range(_NEAR_CAP_FILES // 200)
+    )
+    build_or_skip(root, (), files)
 
 
 # SR (L-76-1 follow-up, D-TL-77 #3): the allowance grows with the name, so a hostile set
@@ -967,12 +1118,7 @@ def test_hostile_patterns_add_little_on_the_longest_file_names(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path_factory.mktemp("long_names")
-    try:
-        _long_name_tree(root)
-    except OSError as e:
-        if e.errno != errno.ENAMETOOLONG or _MUST_BUILD_THE_DEEP_TREE:
-            raise  # as for the deep tree: only git-minimum's container and local runs skip
-        pytest.skip(f"this filesystem refuses 255-character names: {e}")
+    _long_name_tree(root)
     _set_patterns(root, [])
     baseline, result = _best_of_2(root)
     assert len(py_paths(result)) == _NEAR_CAP_FILES
@@ -983,8 +1129,7 @@ def test_hostile_patterns_add_little_on_the_longest_file_names(
     best, result = _best_of_2(root)
     assert len(made) == 2
     for rules in made:
-        assert not rules.exhausted
-        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)))
+        _assert_work_within_budget(rules, max(p.count("/") + 1 for p in py_paths(result)), False)
     _assert_at_most_doubles(best, baseline)
     assert len(py_paths(result)) == _NEAR_CAP_FILES
     assert result.stats["gitignore_patterns_loaded"] == _LONG_NAME_LINES

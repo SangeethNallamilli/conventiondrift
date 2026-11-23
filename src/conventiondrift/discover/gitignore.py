@@ -16,6 +16,15 @@ Line rules follow git's ``dir.c`` (``add_patterns_from_buffer`` and
 * a pattern that ends in an unescaped ``\\`` is counted but never matches (git's
   ``wildmatch`` rejects it; ``compile_glob`` alone would match a literal ``\\``).
 
+Where :mod:`~conventiondrift.discover.globmatch` alone reads a pattern differently from
+git, the pattern is rewritten first (D-TL-69 #3, checked against ``git check-ignore``):
+patterns and paths are matched as UTF-8 bytes, so ``?`` and each class member stand for
+one byte (``??`` matches ``é``); a ``/`` inside a ``[...]`` class stays in the class,
+where it never matches, and anchors the pattern; ``\\/`` is a ``/``; a pattern with an
+empty segment (``a//b``) is counted but never matches; and a segment of three or more
+stars is ``**``. One difference is kept: git strips the literal text before a ``**``
+from ``a**/*`` and so also matches the file ``a``; here ``a**/*`` needs a folder.
+
 Matching is :mod:`conventiondrift.discover.globmatch` (linear time, no regular
 expressions). Precedence is git's: the last matching pattern wins, a deeper
 ``.gitignore`` overrides a shallower one, and nothing under an ignored folder can
@@ -122,6 +131,121 @@ def _index_key(pattern: str) -> tuple[str, str] | None:
     return None
 
 
+def _bytes_view(text: str) -> str:
+    """``text`` with one character per UTF-8 byte (``latin-1``), as git sees a name.
+
+    Git matches bytes, so ``?`` and each class member stand for one byte and ``??``
+    matches ``é``. Patterns and paths both go through this, so plain text still matches
+    itself; names that are not UTF-8 keep their raw bytes (``surrogateescape``).
+    """
+    if text.isascii():
+        return text
+    return text.encode("utf-8", "surrogateescape").decode("latin-1")
+
+
+def _class_items(text: str, start: int) -> tuple[list[tuple[str, str]], bool, int] | None:
+    """The members of the class at ``text[start]`` (a ``[``), read as
+    ``globmatch._parse_class`` reads them: ``(lo, hi)`` pairs (``lo == hi`` for a single
+    character), whether it negates, and the index after its ``]``. ``None`` if not closed.
+    """
+    i = start + 1
+    negate = i < len(text) and text[i] in "!^"
+    i += negate
+    items: list[tuple[str, str]] = []
+    first = True
+    while i < len(text):
+        ch = text[i]
+        if ch == "]" and not first:
+            return items, negate, i + 1
+        first = False
+        if ch == "\\" and i + 1 < len(text):
+            i += 1
+            ch = text[i]
+        hi = ch
+        if i + 2 < len(text) and text[i + 1] == "-" and text[i + 2] != "]":
+            hi = text[i + 2]
+            i += 2
+            if hi == "\\" and i + 1 < len(text):
+                i += 1
+                hi = text[i]
+        items.append((ch, hi))
+        i += 1
+    return None
+
+
+def _without_slash(items: list[tuple[str, str]], negate: bool) -> str:
+    """A class with the same members as ``items`` except ``/``, which a path component
+    never holds. A lone ``/`` becomes NUL, which no name holds either; a range that starts
+    or ends at ``/`` starts at ``0`` or ends at ``.`` (the characters next to ``/``)."""
+    out = ["[!" if negate else "["]
+    for lo, hi in items:
+        if lo == "/":
+            lo, hi = ("0", hi) if hi > "/" else ("\0", "\0")
+        elif hi == "/":
+            hi = "."
+        out.append("\\" + lo if lo == hi else f"\\{lo}-\\{hi}")
+    out.append("]")
+    return "".join(out)
+
+
+def _git_glob(pattern: str) -> str | None:
+    """``pattern`` rewritten so :func:`compile_glob` reads it as git does (#69 TE, D-TL-69
+    #3), or ``None`` if git never matches it.
+
+    * A ``/`` inside a class stays in the class (where it never matches) instead of
+      splitting the pattern; ``\\/`` outside a class is a plain ``/``.
+    * An empty segment (``a//b``, ``//a``, ``a//``) never matches in git.
+    * A segment of three or more stars (``***``) is ``**``, as in git.
+    """
+    negate = pattern.startswith("!")
+    body = pattern[negate:]
+    segments: list[str] = []
+    escaped: list[bool] = []  # per "/" split: was it written "\\/"
+    current: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            if body[i + 1] == "/":
+                segments.append("".join(current))
+                escaped.append(True)
+                current = []
+            else:
+                current.append(body[i : i + 2])
+            i += 2
+        elif ch == "/":
+            segments.append("".join(current))
+            escaped.append(False)
+            current = []
+            i += 1
+        elif ch == "[":
+            parsed = _class_items(body, i)
+            if parsed is None:  # unclosed: compile_glob makes it match nothing, as git does
+                current.append(body[i:])
+                break
+            items, class_negate, end = parsed
+            if any("/" in item for item in items):
+                current.append(_without_slash(items, class_negate))
+            else:
+                current.append(body[i:end])
+            i = end
+        else:
+            current.append(ch)
+            i += 1
+    segments.append("".join(current))
+    last = len(segments) - 1
+    if any(not text and 0 < k < last for k, text in enumerate(segments)):
+        return None
+    if last and ((escaped[0] and not segments[0]) or (escaped[-1] and not segments[last])):
+        return None  # "\\/a" is not anchored and "a\\/" not a folder pattern: no match
+    rewritten = "/".join(
+        "**" if len(text) > 2 and not text.strip("*") else text for text in segments
+    )
+    if "/" in body.removesuffix("/") and "/" not in rewritten.removesuffix("/"):
+        rewritten = "/" + rewritten  # git anchors on any "/", even one inside a class
+    return ("!" if negate else "") + rewritten
+
+
 def _trim_trailing_spaces(line: str) -> str:
     """Git's ``trim_trailing_spaces``: drop the trailing run of spaces, except that a
     space escaped by an unescaped ``\\`` is kept, with nothing after it."""
@@ -187,9 +311,13 @@ class IgnoreRules:
             self.loaded += 1
             if (len(pattern) - len(pattern.rstrip("\\"))) % 2:
                 continue  # ends in an unescaped "\\": git counts it but it never matches
-            self._index(len(self._rules), pattern)
+            glob = _git_glob(_bytes_view(pattern))
+            if glob is None:
+                continue  # git never matches it
+            folder = _bytes_view(base)
+            self._index(len(self._rules), glob)
             self._rules.append(
-                (base, tuple(base.split("/")) if base else (), compile_glob(pattern))
+                (folder, tuple(folder.split("/")) if folder else (), compile_glob(glob))
             )
         self._folders.clear()  # a cached folder verdict may change with new patterns
 
@@ -277,6 +405,10 @@ class IgnoreRules:
         once the match budget is spent (counted in :attr:`unchecked`)."""
         if not self._rules:
             return False
+        try:
+            path = _bytes_view(path)
+        except UnicodeEncodeError:  # a lone high surrogate (Windows): no bytes to match;
+            return False  # the walk still reports the name as skipped (D-TL-81 #1, M-P2-1)
         if not self.exhausted:
             self._checks += 1
             self._names += len(path) - path.rfind("/") - 1
