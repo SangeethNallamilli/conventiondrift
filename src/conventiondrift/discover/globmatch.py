@@ -26,6 +26,15 @@ nothing and a reversed range such as ``[c-a]`` matching only ``c``, were checked
   git reads it as the class ``a-c`` plus a ``/`` that never matches, so it matches ``ax``.
 * A segment of three or more stars, such as ``a/***/b`` or ``***``, is one ``*`` here: it
   stays inside one path component. Git treats a bare ``***`` segment like ``**``.
+* Characters, not bytes: ``?`` and a class member match one character, where git
+  matches one byte of a UTF-8 name, so ``?`` matches ``é`` here and ``??`` does in git.
+* An empty segment is dropped, so ``a//b`` matches ``a/b`` here and nothing in git.
+* Git strips the plain text before a ``**`` in ``a**/*`` and so also matches ``a``
+  itself; here it needs a folder whose name starts with ``a``.
+
+The ``.gitignore`` loader (:mod:`conventiondrift.discover.gitignore`) rewrites patterns
+and paths so that all but the last of these match git there; C5 excludes and script
+paths keep the rules above (D-TL-69 #3).
 
 Compiling is linear in the pattern: an unclosed ``[`` makes its segment, and so the
 pattern, match nothing, and the rest of the segment is not scanned.

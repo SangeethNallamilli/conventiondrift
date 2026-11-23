@@ -50,6 +50,15 @@ def test_escaped_hash_and_bang_are_patterns() -> None:
     assert gitignore_patterns(b"\\#h\n\\!n\n") == ["\\#h", "\\!n"]
 
 
+def test_a_hash_after_a_space_or_a_bang_is_a_pattern() -> None:
+    # TE #76: only a "#" in the first column starts a comment, as in git.
+    assert gitignore_patterns(b" #x\n!#x\n#c\n") == [" #x", "!#x"]
+    loaded = rules(("", b" #x\n\\#*\n!#x\n"))
+    assert loaded.ignored(" #x")
+    assert loaded.ignored("#y")
+    assert not loaded.ignored("#x")
+
+
 def test_crlf_lines_lose_the_cr() -> None:
     assert gitignore_patterns(b"a\r\nb\r\n") == ["a", "b"]
 
@@ -134,6 +143,16 @@ def test_a_nested_file_applies_only_under_its_folder() -> None:
     assert not loaded.ignored("x.py")
     assert not loaded.ignored("ab/x.py")
     assert not loaded.ignored("a")
+
+
+def test_an_anchored_pattern_two_folders_deep_is_anchored_to_its_folder() -> None:
+    # TE #76 and its mutmut survivors: the folder is cut off the path by its components.
+    loaded = rules(("a/b", b"/y.py\n"), ("my dir", b"/z.py\n"))
+    assert loaded.ignored("a/b/y.py")
+    assert not loaded.ignored("a/b/c/y.py")
+    assert not loaded.ignored("a/y.py")
+    assert loaded.ignored("my dir/z.py")
+    assert not loaded.ignored("my dir/q/z.py")
 
 
 def test_a_deeper_file_overrides_a_shallower_one() -> None:
@@ -372,6 +391,80 @@ def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
     assert set(expected.values()) == {True, False}
 
 
+# Where globmatch alone reads a pattern differently from git (D-TL-69 #3): one
+# pattern each, with git check-ignore's answer for the path. The table is also checked
+# against git itself below.
+_GIT_DIFFERENCES = (
+    # git matches bytes: "?" and each class member are one byte of a UTF-8 name
+    ("?.py", "\u00e9.py", False),
+    ("??.py", "\u00e9.py", True),
+    ("[\u00e9].py", "\u00e9.py", False),
+    ("[!a].py", "\u00e9.py", False),
+    ("[!a][!a].py", "\u00e9.py", True),
+    ("\u00e9?", "\u00e9a", True),
+    ("x\u00e9", "x\u00e9", True),
+    # an empty segment never matches
+    ("a//b", "a/b", False),
+    ("a//b", "a/b/c", False),
+    ("//a", "a", False),
+    ("a//", "a/x", False),
+    ("a///b", "a/b", False),
+    ("a/b", "a/b", True),
+    # a segment of three or more stars is "**"
+    ("***/x", "x", True),
+    ("***/x", "d/e/x", True),
+    ("x/****/z", "x/z", True),
+    ("x/***/z", "x/y/w/z", True),
+    ("a***b", "axyb", True),
+    # a "/" inside a class stays in it, never matches, and anchors the pattern
+    ("a[!/]b", "axb", True),
+    ("a[!/]b", "q/axb", False),
+    ("x/a[!/]b", "x/axb", True),
+    ("a[b/]c", "abc", True),
+    ("a[b/]c", "a/c", False),
+    ("a[/]b/c", "a/b/c", False),
+    ("[/-9]x", "5x", True),
+    ("[!-/]x", "#x", True),
+    ("[!-/]x", "-x", False),
+    ("[/-/]x", "x", False),
+    ("[.-/]x", ".x", True),
+    ("[\\!/]x", "!x", True),  # an escaped member of a class with a "/"
+    ("[+-\\/]x", ",x", True),  # a range ending at an escaped "/"
+    ("[+-\\/]x", "0x", False),
+    ("a[b/c", "a[b/c", False),  # unclosed: matches nothing, "/" and all
+    # an escaped "/" is a "/"
+    ("a\\/b", "a/b", True),
+    ("\\/a", "a", False),  # not a leading "/": git reads it as "\\" then "/a"
+    ("a\\/", "a", False),
+)
+
+
+@pytest.mark.parametrize(("pattern", "path", "ignored"), _GIT_DIFFERENCES)
+def test_patterns_match_bytes_and_segments_as_git_does(
+    pattern: str, path: str, ignored: bool
+) -> None:
+    assert rules(("", pattern.encode())).ignored(path) is ignored
+
+
+def test_the_git_differences_table_agrees_with_git(repo: GitRepo) -> None:
+    for pattern, path, ignored in _GIT_DIFFERENCES:
+        (repo.path / ".gitignore").write_bytes(pattern.encode())
+        assert _git_ignored(repo, path) is ignored, (pattern, path)
+
+
+def test_names_that_are_not_utf8_match_byte_for_byte() -> None:
+    loaded = rules(("", b"a?.py\n[\xff]b\n"))
+    assert loaded.ignored("a\udcff.py")  # one raw byte, kept by surrogateescape
+    assert loaded.ignored("\udcffb")
+    assert not loaded.ignored("a\u00ff.py")  # U+00FF is two bytes in UTF-8
+
+
+def test_a_non_ascii_folder_scopes_its_own_patterns() -> None:
+    loaded = rules(("\u00e9", b"x\n"))
+    assert loaded.ignored("\u00e9/x")
+    assert not loaded.ignored("e/x")
+
+
 # ------------------------------------------------------------------ match budget (#76 B2)
 
 
@@ -451,6 +544,21 @@ def test_the_budget_is_shared_by_every_gitignore_file(monkeypatch: pytest.Monkey
     alone = rules(("", b"*.py\n"), ("sub", b"*.txt\n"))
     assert alone.ignored("sub/c.py")
     assert alone._work == 31
+
+
+def test_the_allowance_earned_so_far_is_kept_across_gitignore_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # TE #76 N8: adding a nested .gitignore keeps the paths and name characters already
+    # counted, so the allowance they earned is not lost.
+    _budget(monkeypatch, 0, 40, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored("a.py") and loaded.ignored("b.py")
+    assert (loaded._work, loaded._budget()) == (36, 2 * (40 + 4))
+    loaded.add("sub", b"*.txt\n")
+    assert loaded._budget() == 2 * (40 + 4)
+    assert loaded.ignored("sub/c.py")  # 31 more steps: 67 against 132, carried over
+    assert (loaded._work, loaded._budget(), loaded.exhausted) == (67, 132, False)
 
 
 def test_running_out_on_a_folder_leaves_the_path_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -549,6 +657,19 @@ def test_gathered_candidates_run_the_base_budget_out(monkeypatch: pytest.MonkeyP
     assert loaded.unchecked == 1
 
 
+@pytest.mark.parametrize(("gathered", "paid"), [(1, 0), (7, 0), (8, 1), (15, 1), (16, 2)])
+def test_gathered_candidates_are_paid_one_step_per_eight_rounded_down(
+    gathered: int, paid: int
+) -> None:
+    # #78 TE N1: seven candidates pay nothing and the eighth pays one step. The rules
+    # are in another folder, so they are gathered (and paid for) but never tried.
+    lines = b"".join(b"[q]%d\n" % i for i in range(gathered))
+    loaded = rules(("", b"/x.txt\n"), ("other", lines))
+    baseline = rules(("", b"/x.txt\n"))
+    assert not loaded.ignored("m.py") and not baseline.ignored("m.py")
+    assert loaded._work - baseline._work == paid
+
+
 def test_the_allowance_grows_with_each_path_checked(monkeypatch: pytest.MonkeyPatch) -> None:
     _budget(monkeypatch, 0, 18)  # each "*.py" check costs 18
     loaded = rules(("", b"*.py\n"))
@@ -599,6 +720,34 @@ def test_hostile_pattern_sets_run_out_on_the_longest_names(pattern: bytes) -> No
         loaded.ignored(f"d{paths}/{name}")
         paths += 1
     assert loaded.unchecked == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "name_length"), [("m.py", 4), ("a/m.py", 4), ("a/b/m.py", 4), ("ab/cd/ef/gh.py", 5)]
+)
+def test_only_the_last_component_earns_the_per_character_allowance(
+    monkeypatch: pytest.MonkeyPatch, path: str, name_length: int
+) -> None:
+    # #78 CR S1: with two or more "/" the name starts after the last one, not the first.
+    _budget(monkeypatch, 10_000, 0, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert loaded.ignored(path)
+    assert loaded._names == name_length
+    assert loaded._budget() == 10_000 + name_length
+
+
+def test_nothing_more_is_counted_once_the_budget_is_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #78 CR S2 (#76 S1): once the budget runs out every later path is unchecked, and
+    # the paths and name characters counted for the allowance stop growing.
+    _budget(monkeypatch, 0, 17, 1)
+    loaded = rules(("", b"*.py\n"))
+    assert not loaded.ignored("a/b/abc.py")  # this check runs it out: counted, then unchecked
+    counted = (loaded._checks, loaded._names, loaded._budget())
+    assert (loaded.exhausted, loaded.unchecked, counted) == (True, 1, (1, 6, 23))
+    for k, path in enumerate(["x.py", "long/name/here.py", "q"], start=2):
+        assert not loaded.ignored(path)
+        assert loaded.unchecked == k
+        assert (loaded._checks, loaded._names, loaded._budget()) == counted
 
 
 def test_unused_allowance_carries_over(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -833,3 +982,16 @@ def test_long_file_names_deep_in_the_tree_never_run_it_out() -> None:
     loaded = _stock_rules()
     assert _stock_walk(loaded, prefix, 700, _NAMES["100 characters"]) == 70_000
     assert not loaded.exhausted and loaded.unchecked == 0
+
+
+@pytest.mark.parametrize("path", ["\ud800.py", "a/\udbff.py", "\ud800/m.py", "\ud800\udc00.py"])
+@pytest.mark.parametrize("is_dir", [False, True])
+def test_a_name_with_no_utf8_bytes_is_not_ignored(path: str, is_dir: bool) -> None:
+    # SR M-P2-1: a Windows name with a lone high surrogate cannot be encoded, so it is
+    # answered "not ignored" (the walk reports it as skipped) instead of raising, and
+    # nothing is charged for it.
+    loaded = rules(("", b"*\n*.py\n"))
+    assert loaded.ignored("m.py")  # the rules would ignore any name they could read
+    work, checks = loaded._work, loaded._checks
+    assert not loaded.ignored(path, is_dir)
+    assert (loaded._work, loaded._checks, loaded.unchecked) == (work, checks, 0)
