@@ -992,6 +992,11 @@ def test_a_name_with_no_utf8_bytes_is_not_ignored(path: str, is_dir: bool) -> No
     # nothing is charged for it.
     loaded = rules(("", b"*\n*.py\n"))
     assert loaded.ignored("m.py")  # the rules would ignore any name they could read
-    work, checks = loaded._work, loaded._checks
+    work, checks, names = loaded._work, loaded._checks, loaded._names
     assert not loaded.ignored(path, is_dir)
-    assert (loaded._work, loaded._checks, loaded.unchecked) == (work, checks, 0)
+    assert (loaded._work, loaded._checks, loaded._names, loaded.unchecked) == (
+        work,
+        checks,
+        names,
+        0,
+    )
