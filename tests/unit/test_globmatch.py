@@ -223,6 +223,14 @@ _GIT = shutil.which("git") or "git"
         ("[c-a]x", "bx"),
         ("[c-a]x", "ax"),
         ("[z-a]x", "zx"),
+        # #76 mutmut survivors (15a655f), each a case that answers differently under one
+        ("[X]", "X"),  # only "!" and "^" negate
+        ("[!a]", "!"),  # the class starts after the "!"
+        ("[!a]", "["),
+        ("[ab]", "X"),  # members are the characters given, nothing between them
+        ("[a-]", "-"),  # "-" before "]" is a plain character
+        ("[a-]", "a"),
+        ("[xa-]", "-"),
     ],
 )
 def test_bracket_expressions_agree_with_git_check_ignore(
@@ -231,7 +239,12 @@ def test_bracket_expressions_agree_with_git_check_ignore(
     (tmp_path / ".gitignore").write_bytes(pattern.encode() + b"\n")
     env = {"PATH": __import__("os").environ.get("PATH", ""), "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": "/dev/null", "HOME": str(tmp_path)}  # fmt: skip
-    for args in (["init", "-q"], ["config", "core.excludesFile", ""]):
+    # Pinned config: macOS git init sets core.ignorecase=true, which matches [X] to X.
+    for args in (
+        ["init", "-q"],
+        ["config", "core.excludesFile", ""],
+        ["config", "core.ignorecase", "false"],
+    ):
         subprocess.run([_GIT, *args], cwd=tmp_path, env=env, check=True, capture_output=True)  # noqa: S603
     out = subprocess.run(  # noqa: S603
         [_GIT, "check-ignore", "-q", "--no-index", "--", name],
@@ -239,6 +252,33 @@ def test_bracket_expressions_agree_with_git_check_ignore(
     )  # fmt: skip
     assert out.returncode in (0, 1)  # 0 ignored, 1 not ignored
     assert compile_glob(pattern).match(name) == (out.returncode == 0)
+
+
+def test_a_backslash_at_the_end_of_a_class_escapes_nothing() -> None:
+    # #76 mutmut survivors: a "\\" as the last character, or escaping the "]", leaves
+    # the class unclosed (git agrees), and reading it never runs past the pattern.
+    assert not hit("x[\\", "x[\\")
+    assert not hit("x[a\\", "xa")
+    assert not hit("[\\]", "\\") and not hit("[\\]", "]")
+    assert not hit("[a-\\]", "a") and not hit("[a-\\]", "\\")
+
+
+def test_a_folder_pattern_keeps_the_rest_of_its_name() -> None:
+    # #76 mutmut survivor: only the trailing "/" is dropped from a folder pattern.
+    assert hit("dX/", "dX", is_dir=True)
+    assert not hit("dX/", "d", is_dir=True)
+
+
+def test_globset_reads_a_path_as_a_file_unless_told() -> None:
+    assert not GlobSet(["a.py/"]).excludes("a.py")
+    assert GlobSet(["a.py/"]).excludes("a.py", is_dir=True)
+
+
+def test_globset_checks_every_folder_above_a_path() -> None:
+    # #76 mutmut survivor: an anchored folder in the middle of the path is not skipped.
+    assert GlobSet(["a/b/"]).excludes("a/b/c/d.py")
+    assert GlobSet(["/a/b/c/"]).excludes("a/b/c/d/e.py")
+    assert not GlobSet(["a/b/"]).excludes("a/c/b.py")
 
 
 # ---- #76 B2 / M-76-1: the work count the .gitignore match budget pays from -----------
