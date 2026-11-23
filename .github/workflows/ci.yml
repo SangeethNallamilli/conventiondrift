@@ -311,7 +311,8 @@ jobs:
     # non-Windows `test` legs.
     name: test-macos (${{ matrix.python-version }})
     needs: [lockfile]
-    runs-on: macos-latest
+    # Pinned to macos-14 (D-TL-91): macos-latest jobs went unacquired twice on #80 (hosted capacity).
+    runs-on: macos-14
     # D-TL-58a (2026-11-20): raised from 10 to 25 min.
     timeout-minutes: 25
     permissions:
