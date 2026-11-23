@@ -22,8 +22,13 @@ patterns and paths are matched as UTF-8 bytes, so ``?`` and each class member st
 one byte (``??`` matches ``é``); a ``/`` inside a ``[...]`` class stays in the class,
 where it never matches, and anchors the pattern; ``\\/`` is a ``/``; a pattern with an
 empty segment (``a//b``) is counted but never matches; and a segment of three or more
-stars is ``**``. One difference is kept: git strips the literal text before a ``**``
-from ``a**/*`` and so also matches the file ``a``; here ``a**/*`` needs a folder.
+stars is ``**``. Two differences are kept, both of which make us ignore less than git,
+never more (D-TL-81, D-TL-88, D-TL-89; INTERFACES I-5). (1) When a literal comes before
+``**`` in the same segment, as in ``a**``, git also matches across folders and at that
+level (``a**/x`` matches ``ab/c/x``; ``a**/*`` matches ``a.py``, ``ab``, and the file
+``a``), but here ``a**`` acts as a single ``*``. (2) A repo with
+``core.ignorecase=true``, the macOS default, gets case-insensitive ``.gitignore``
+matching from git; ours is always case-sensitive and never reads git config.
 
 Matching is :mod:`conventiondrift.discover.globmatch` (linear time, no regular
 expressions). Precedence is git's: the last matching pattern wins, a deeper

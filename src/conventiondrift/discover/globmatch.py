@@ -29,12 +29,20 @@ nothing and a reversed range such as ``[c-a]`` matching only ``c``, were checked
 * Characters, not bytes: ``?`` and a class member match one character, where git
   matches one byte of a UTF-8 name, so ``?`` matches ``é`` here and ``??`` does in git.
 * An empty segment is dropped, so ``a//b`` matches ``a/b`` here and nothing in git.
-* Git strips the plain text before a ``**`` in ``a**/*`` and so also matches ``a``
-  itself; here it needs a folder whose name starts with ``a``.
+* When a literal comes before ``**`` in the same segment, as in ``a**``, git also
+  matches across folders and at that level: ``a**/x`` matches ``ab/c/x``, and
+  ``a**/*`` matches every name at that level that starts with ``a`` (``a.py``,
+  ``ab``, and the file ``a``). Here ``a**`` acts as a single ``*``, so matching is
+  narrower. We ignore less than git, never more (D-TL-81, D-TL-88, D-TL-89).
+* A repo with ``core.ignorecase=true`` (the macOS default) gets case-insensitive
+  ``.gitignore`` matching from git; this matcher is always case-sensitive and never
+  reads git config. That too makes us ignore less than git, never more.
 
 The ``.gitignore`` loader (:mod:`conventiondrift.discover.gitignore`) rewrites patterns
-and paths so that all but the last of these match git there; C5 excludes and script
-paths keep the rules above (D-TL-69 #3).
+and paths so that all but the ``a**`` difference match git there; C5 excludes and script
+paths keep the rules above (D-TL-69 #3). The ``core.ignorecase`` limit is a known
+``.gitignore`` limit only: this module itself is always case-sensitive and does not
+read git config.
 
 Compiling is linear in the pattern: an unclosed ``[`` makes its segment, and so the
 pattern, match nothing, and the rest of the segment is not scanned.
