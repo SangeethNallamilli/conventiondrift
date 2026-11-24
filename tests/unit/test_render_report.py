@@ -10,7 +10,8 @@ from collections.abc import Sequence
 from types import MappingProxyType
 from typing import get_args
 
-from conventiondrift.core import RunContext
+from conventiondrift.core import FailOn, RunContext
+from conventiondrift.fallback import WITHHELD
 from conventiondrift.model import (
     Case,
     CheckerId,
@@ -34,7 +35,7 @@ from conventiondrift.model import (
 )
 from conventiondrift.render.annotations import format_run_level_annotation, render_annotations
 from conventiondrift.render.context import RenderContext, WindowAnchor
-from conventiondrift.render.escape import md, workflow_cmd, workflow_prop
+from conventiondrift.render.escape import md, text_field, workflow_cmd, workflow_prop
 from conventiondrift.render.findings import MAX_FINDING_ANNOTATIONS, is_finding
 from conventiondrift.render.strings import (
     FETCH_DEPTH,
@@ -250,11 +251,10 @@ def test_fixed_summary_names_the_unsupported_trigger() -> None:
 
 
 def test_error_policy_source_uses_the_explicit_input() -> None:
-    assert (
-        render_error_summary(RunContext(explicit_fail_on="new-stale"))
-        == "Policy source: new-stale\n"
-    )
-    assert render_error_summary(RunContext(explicit_fail_on="none")) == "Policy source: none\n"
+    for value in get_args(FailOn):
+        assert (
+            render_error_summary(RunContext(explicit_fail_on=value)) == f"Policy source: {value}\n"
+        )
 
 
 def test_error_policy_source_when_the_base_config_could_not_be_read() -> None:
@@ -270,6 +270,23 @@ def test_error_policy_source_default_when_nothing_is_known() -> None:
 def test_empty_explicit_fail_on_is_treated_as_unset() -> None:
     ctx = RunContext(explicit_fail_on="", config_known_present=False)
     assert render_error_summary(ctx) == "Policy source: default (none)\n"
+
+
+def test_error_policy_source_escapes_a_hostile_explicit_input() -> None:
+    # TE B1 / SR L-84-1: only the FailOn closed set is printed raw.
+    hostile = "<img src=x onerror=alert(1)>\n::warning::x"
+    assert hostile not in get_args(FailOn)
+    body = render_error_summary(RunContext(explicit_fail_on=hostile))
+    assert body == f"Policy source: {md(hostile)}\n"
+    assert hostile not in body
+    assert "<img src=x onerror=alert(1)>\n" not in body
+    assert "\n::warning::" not in body
+    assert body.count("\n") == 1
+    typo = "none "
+    assert typo not in get_args(FailOn)
+    typo_body = render_error_summary(RunContext(explicit_fail_on=typo))
+    assert typo_body == f"Policy source: {md(typo)}\n"
+    assert typo_body != "Policy source: none\n"
 
 
 # --- summary sections ------------------------------------------------------------------
@@ -453,7 +470,9 @@ def test_summary_escapes_a_hostile_path_and_rule_text() -> None:
     body = render_summary(_result([_item(rule)]), _ctx())
     assert md(HOSTILE_PATH) in body
     assert md(HOSTILE_TEXT) in body
-    assert "<img>" not in body or md(HOSTILE_TEXT) in body
+    # <img> is shown verbatim inside the code span; it must not appear raw outside it.
+    remainder = body.replace(md(HOSTILE_PATH), "").replace(md(HOSTILE_TEXT), "")
+    assert "<img>" not in remainder
     assert "\n::warning::" not in body
     assert f"{md(HOSTILE_PATH)} line 1: {md(HOSTILE_TEXT)}" in body
 
@@ -531,6 +550,10 @@ def test_run_level_annotation_escapes_a_hostile_message() -> None:
 
 
 # --- annotation cap and order (D-TL-86 #6, D-TL-25) ------------------------------------
+
+
+def test_max_finding_annotations_is_ten() -> None:
+    assert MAX_FINDING_ANNOTATIONS == 10
 
 
 def test_finding_annotations_follow_rule_results_order_and_stop_at_the_cap() -> None:
@@ -790,10 +813,76 @@ def test_text_reprs_paths_that_start_with_command_marker_or_backslash() -> None:
             for row in render_text(_result([_item(rule)]), _ctx()).splitlines()
             if row.startswith("rule ")
         )
-        assert (
-            path not in line.split(" ", 2)[1]
-            or line.split()[1].startswith("'")
-            or line.split()[1].startswith('"')
-        )
-        assert path in line or path.encode("unicode_escape").decode() in line or repr(path) in line
-        assert line.startswith("rule ")
+        escaped = text_field(path)
+        assert escaped == repr(path)
+        assert line.startswith(f"rule {escaped}:3 ")
+        field = line.split(" ", 2)[1]
+        assert field == f"{escaped}:3"
+        assert field.startswith(("'", '"'))
+        # The raw path may appear inside the repr, but not as an unquoted field.
+        assert not line.startswith(f"rule {path}:")
+
+
+def test_head_only_text_omits_a_missing_reason() -> None:
+    result = _result(
+        [_item(_rule(), case=None, head=_side(4, 40), omit_base=True)],
+        mode="head-only",
+    )
+    ctx = _ctx(mode="head-only", head_kind="pr_head", window=False, policy_source="head")
+    text = render_text(result, ctx)
+    assert "mode head-only" in text
+    assert "shallow clone" not in text
+    assert "\nhead-only " not in text
+    assert not any(row.startswith("head-only ") for row in text.splitlines())
+    assert f"analyzed {HEAD_SHA} (PR head)" in text
+    assert f"\n{FETCH_DEPTH}\n" in text
+
+
+def test_text_conflict_pair_tolerates_a_missing_rule_id() -> None:
+    rule = _rule("Use requests for HTTP calls", line=9)
+    pair = Conflict(("AGENTS.md:9", "missing.md:1"), "http-client")
+    text = render_text(_result([_item(rule)], conflicts=(pair,)), _ctx())
+    assert "conflict AGENTS.md:9 missing.md:1 http-client head Stale/none base Stale/none" in text
+
+
+def test_text_escapes_analyzed_sha_and_window_anchor_fields() -> None:
+    sha = "abc\n::warning::"
+    iso = "2026-11-12T15:04:05-05:00\n::warning::"
+    ctx = RenderContext(
+        mode="compare",
+        analyzed_sha=sha,
+        head_kind=None,
+        read_only_reason=None,
+        analyzer_python="3.12.7",
+        policy_source="base",
+        window_anchor=WindowAnchor(sha, iso, 90),
+        python_files_found=True,
+    )
+    text = render_text(_result(), ctx)
+    assert f"analyzed {text_field(sha)}" in text
+    assert f"ending {text_field(iso)}" in text
+    assert f"(PR head {text_field(sha)})" in text
+    assert sha not in text
+    assert iso not in text
+    assert "\n::warning::" not in text
+
+
+def test_internal_error_outside_the_allowlist_is_replaced() -> None:
+    hostile_component = "core<script>\n::warning::"
+    hostile_message = "<img src=x onerror=alert(1)>\n::warning::leak"
+    result = _result(
+        errors=(InternalError(hostile_component, hostile_message),),
+    )
+    body = render_summary(result, _ctx())
+    text = render_text(result, _ctx())
+    generic = f"Exception: {WITHHELD}"
+    assert f"Internal error in {md('core')}: {generic}" in body
+    assert hostile_component not in body
+    assert hostile_message not in body
+    assert "<img" not in body
+    assert "\n::warning::" not in body
+    assert f"internal-error core {text_field(generic)}" in text
+    assert hostile_component not in text
+    assert hostile_message not in text
+    assert "<img" not in text
+    assert "\n::warning::" not in text

@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-import unicodedata
-
 from conventiondrift.model import Rule, RuleResult, SideResult
+from conventiondrift.render.escape import text_field
 from conventiondrift.render.strings import recent_unavailable
 
-_SPECIAL_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+# Re-export so existing callers can keep importing the text-field helper here.
+__all__ = [
+    "display_rule",
+    "summary_counts",
+    "summary_side",
+    "text_counts",
+    "text_field",
+    "text_ref",
+    "verdict_label",
+]
 
 
 def display_rule(rule_result: RuleResult) -> Rule:
@@ -46,19 +54,6 @@ def text_counts(side: SideResult) -> str:
     return f"{overall} recent {side.recent.following} of {side.recent.relevant}"
 
 
-def text_field(value: str, *, quoted: bool = False) -> str:
-    """Escape a repo-derived field for ``--format text`` (SR T-01 b, layout §1.2)."""
-    if "\\" in value or value.startswith("::") or _has_special(value):
-        return repr(value)
-    if quoted:
-        return f'"{value}"'
-    return value
-
-
 def text_ref(file: str, line: int) -> str:
     """``{file}:{line}``, with ``file`` escaped as a text field."""
     return f"{text_field(file)}:{line}"
-
-
-def _has_special(value: str) -> bool:
-    return any(unicodedata.category(char) in _SPECIAL_CATEGORIES for char in value)

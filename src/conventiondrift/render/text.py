@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from conventiondrift.model import Conflict, Result, RuleResult, SkippedFile
+from conventiondrift.fallback import _safe
+from conventiondrift.model import Conflict, Result, Rule, RuleResult, SkippedFile
 from conventiondrift.render.context import RenderContext
 from conventiondrift.render.display import (
     display_rule,
@@ -36,7 +37,7 @@ def render_text(result: Result, context: RenderContext) -> str:
     """The plain-text report: one keyword-prefixed record per line."""
     lines: list[str] = [TEXT_HEADER, f"mode {context.mode}"]
     if context.mode != "head-only":
-        lines.append(f"analyzed {context.analyzed_sha}")
+        lines.append(f"analyzed {text_field(context.analyzed_sha)}")
     lines.extend(_mode_header(result, context))
     lines.append(f"analyzer-python {text_field(context.analyzer_python)}")
     lines.append(f"policy-source {context.policy_source}")
@@ -88,27 +89,34 @@ def render_text(result: Result, context: RenderContext) -> str:
         if omitted:
             lines.append(f"not-annotated {not_annotated_line(omitted)}")
     for error in result.internal_errors:
-        lines.append(f"internal-error {text_field(error.component)} {text_field(error.message)}")
+        component, message = _safe(error)
+        lines.append(f"internal-error {text_field(component)} {text_field(message)}")
     return "\n".join(lines) + "\n"
 
 
 def _mode_header(result: Result, context: RenderContext) -> list[str]:
     if context.mode == "head-only":
-        reason = result.head_only_reason or "shallow clone"
         kind = context.head_kind or "checkout"
         kind_label = "PR head" if kind == "pr_head" else "checked-out commit"
-        return [
-            f"head-only {reason}",
-            FETCH_DEPTH,
-            f"analyzed {context.analyzed_sha} ({kind_label})",
-            gating_line(markdown=False),
-        ]
+        lines: list[str] = []
+        if result.head_only_reason is not None:
+            lines.append(f"head-only {result.head_only_reason}")
+        lines.extend(
+            (
+                FETCH_DEPTH,
+                f"analyzed {text_field(context.analyzed_sha)} ({kind_label})",
+                gating_line(markdown=False),
+            )
+        )
+        return lines
     if context.window_anchor is not None:
         anchor = context.window_anchor
         # Text form: "window {sentence}" but the sentence uses "ending at" in
         # summary and "ending" in the text template: "{days} days ending {iso}".
         label = "HEAD" if context.mode == "scan" else "PR head"
-        return [f"window {anchor.days} days ending {anchor.iso} ({label} {anchor.sha})"]
+        iso = text_field(anchor.iso)
+        sha = text_field(anchor.sha)
+        return [f"window {anchor.days} days ending {iso} ({label} {sha})"]
     if result.window.unavailable_reason is not None:
         return [f"window {window_unavailable(result.window.unavailable_reason)}"]
     return []
@@ -185,13 +193,38 @@ def _conflict_lines(result: Result) -> list[str]:
 
 
 def _pair_line(pair: Conflict, by_id: dict[str, RuleResult]) -> str:
-    left = by_id[pair.rules[0]]
-    right = by_id[pair.rules[1]]
-    left_rule = display_rule(left)
-    right_rule = display_rule(right)
-    head = f"{verdict_label(left.head)}/{verdict_label(right.head)}"
-    base = f"{verdict_label(left.base)}/{verdict_label(right.base)}"
+    left = by_id.get(pair.rules[0])
+    right = by_id.get(pair.rules[1])
+    left_rule = display_rule(left) if left is not None else _missing_rule(pair.rules[0])
+    right_rule = display_rule(right) if right is not None else _missing_rule(pair.rules[1])
+    head = (
+        f"{verdict_label(left.head if left else None)}/"
+        f"{verdict_label(right.head if right else None)}"
+    )
+    base = (
+        f"{verdict_label(left.base if left else None)}/"
+        f"{verdict_label(right.base if right else None)}"
+    )
     return (
         f"conflict {text_ref(left_rule.file, left_rule.line)} "
         f"{text_ref(right_rule.file, right_rule.line)} {pair.checker} head {head} base {base}"
+    )
+
+
+def _missing_rule(rule_id: str) -> Rule:
+    """A stand-in when a conflict id is not in ``rule_results`` (should not happen)."""
+    file, _, line_s = rule_id.rpartition(":")
+    line = int(line_s) if line_s.isdigit() else 0
+    return Rule(
+        id=rule_id,
+        file=file or rule_id,
+        line=line,
+        also_at=(),
+        text="",
+        normalized_text="",
+        checker=None,
+        match=None,
+        scope_dir="",
+        ignored=False,
+        disabled=False,
     )

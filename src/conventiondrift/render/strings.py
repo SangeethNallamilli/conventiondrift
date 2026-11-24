@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import Final, Literal, get_args
+
+from conventiondrift.core import FailOn
+from conventiondrift.render.escape import md
 
 __all__ = [
     "ANNOTATION_TITLE_PREFIX",
@@ -140,14 +143,24 @@ def policy_source_line(source: Literal["base", "head"]) -> str:
     return f"Policy source: {source}"
 
 
+_EXPLICIT_FAIL_ON: Final = frozenset(get_args(FailOn))
+"""The only ``fail-on`` values shown raw on the error-only policy-source line."""
+
+
 def error_policy_source_line(
     explicit: str | None,
     *,
     config_known_present: bool,
 ) -> str:
-    """The I-14 error-only policy-source line. Never presents the error-path fail-on."""
+    """The I-14 error-only policy-source line. Never presents the error-path fail-on.
+
+    A value in the closed ``FailOn`` set is printed as is. Any other non-empty
+    value is escaped with :func:`md` so HTML, newlines and workflow commands
+    cannot leak. An empty or unset value is not presented as a configured source.
+    """
     if explicit is not None and explicit != "":
-        return f"Policy source: {explicit}"
+        shown = explicit if explicit in _EXPLICIT_FAIL_ON else md(explicit)
+        return f"Policy source: {shown}"
     if config_known_present:
         return "Policy source: base config could not be read"
     return "Policy source: default (none)"

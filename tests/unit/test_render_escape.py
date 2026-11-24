@@ -24,6 +24,7 @@ from conventiondrift.render.escape import (
     md_codeblock,
     output_heredoc,
     sarif_text,
+    text_field,
     workflow_cmd,
     workflow_prop,
 )
@@ -443,6 +444,26 @@ def test_output_heredoc_per_character_class(label: str, sample: str, mapped: str
     delivered = parse_output_file(entry)["report-path"]
     assert delivered == mapped
     assert hidden_chars(delivered) == []
+
+
+@pytest.mark.parametrize(("label", "sample", "_mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_text_field_per_character_class(label: str, sample: str, _mapped: str) -> None:
+    """R3: bidi, zero-width, format, surrogate and other labelled classes use repr()."""
+    assert any(unicodedata.category(char) in esc._LABEL_CATEGORIES for char in sample)
+    out = text_field(sample)
+    assert out == repr(sample)
+    # repr() is a single Python literal, so a raw newline or :: starter cannot begin a line.
+    assert "\n" not in out
+    assert not out.startswith("::")
+
+
+def test_text_field_reprs_backslash_and_command_prefix() -> None:
+    assert text_field(r"foo\bar.md") == repr(r"foo\bar.md")
+    assert text_field("::warning::x.md") == repr("::warning::x.md")
+    assert text_field("AGENTS.md") == "AGENTS.md"
+    assert text_field("a rule", quoted=True) == '"a rule"'
+    # A quoted field that also needs repr stays a repr, not a second wrap.
+    assert text_field("::warning::x", quoted=True) == repr("::warning::x")
 
 
 def test_label_format_is_uppercase_at_least_four_digits() -> None:
@@ -1213,6 +1234,7 @@ def test_public_surface_is_exactly_one_function_per_sink() -> None:
         "md_codeblock",
         "output_heredoc",
         "sarif_text",
+        "text_field",
         "workflow_cmd",
         "workflow_prop",
     ]
