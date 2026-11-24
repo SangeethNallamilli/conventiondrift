@@ -145,7 +145,7 @@ jobs:
       - name: ruff format --check
         run: ruff format --check .
       - name: ruff check
-        run: ruff check src
+        run: ruff check src scripts/ci
         # ruff excludes src/conventiondrift/_vendor/, so S506 (unsafe YAML loaders)
         # covers only our own code, not the vendored tree.
 
@@ -167,10 +167,10 @@ jobs:
         run: |
           python3 scripts/ci/install_pinned_pip.py
           python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
-      - name: mypy --strict src and tests/unit (D-TL-21)
+      - name: mypy --strict src, tests/unit, and scripts/ci (D-TL-21, D-TL-94)
         env:
           MYPYPATH: src
-        run: mypy --strict src tests/unit
+        run: mypy --strict src tests/unit scripts/ci
 
 
   test:
@@ -179,7 +179,7 @@ jobs:
     name: test (${{ matrix.os }}, ${{ matrix.python-version }})
     needs: [lockfile]
     runs-on: ${{ matrix.os }}
-    # D-TL-58a (2026-11-20): Windows legs get 25 min; Ubuntu stays at 15.
+    # D-TL-58a (2026-11-20), D-TL-95 (2026-11-23): Windows legs get 40 min; Ubuntu stays at 15.
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 15 }}
     permissions:
       contents: read

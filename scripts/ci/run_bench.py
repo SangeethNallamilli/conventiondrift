@@ -82,7 +82,18 @@ def run_pytest(targets: list[str], junit: Path, results: Path, env: dict[str, st
     junit.unlink(missing_ok=True)
     shutil.rmtree(results, ignore_errors=True)
     results.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "pytest", *targets, "-m", MARKERS, "-rs", f"--junitxml={junit}"]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        *targets,
+        "-m",
+        MARKERS,
+        "-o",
+        "xfail_strict=true",
+        "-rs",
+        f"--junitxml={junit}",
+    ]
     run_env = {**env, "CD_BENCH_RESULTS": str(results)}
     print("+ " + " ".join(cmd), flush=True)
     return subprocess.run(cmd, env=run_env, check=False).returncode
@@ -96,6 +107,28 @@ def runs_over_limit_in_results(results: Path, set_name: str) -> int | None:
     doc = json.loads(path.read_text(encoding="utf-8"))
     print(f"  {set_name}: discover_s={doc.get('discover_s')} limit_s={doc.get('limit_s')}")
     return sum(1 for s in doc.get("discover_s", []) if s > doc["limit_s"])
+
+
+def print_results_table(label: str, results: Path) -> None:
+    """Print a per-set timing summary table from `results` JSON files (TE N1)."""
+    if not results.is_dir():
+        return
+    files = sorted(results.glob("b10k-a3-7-near-cap-*.json"))
+    if not files:
+        return
+    print(f"bench: per-set summary ({label}):")
+    print(f"  {'set':<20} {'median_s':>8} {'base_med':>8} {'limit_s':>7}  discover_s")
+    for path in files:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        set_name = path.stem.removeprefix("b10k-a3-7-near-cap-")
+        median = doc.get("median_s")
+        base_med = doc.get("baseline_median_s")
+        limit = doc.get("limit_s")
+        runs = doc.get("discover_s", [])
+        med_str = f"{median:.3f}" if isinstance(median, (int, float)) else "-"
+        base_str = f"{base_med:.3f}" if isinstance(base_med, (int, float)) else "-"
+        lim_str = f"{limit:.2f}" if isinstance(limit, (int, float)) else "-"
+        print(f"  {set_name:<20} {med_str:>8} {base_str:>8} {lim_str:>7}  {runs}")
 
 
 def rerun_reason(case: Case, results: Path) -> str | None:
@@ -136,6 +169,7 @@ def main(argv: list[str]) -> int:
     if not junit.is_file():
         print("bench: pytest wrote no JUnit report", file=sys.stderr)
         return 1
+    print_results_table("run 1", results)
     report = parse_junit(junit)
     failed: list[str] = []
     if report.tests == 0:
@@ -168,6 +202,7 @@ def main(argv: list[str]) -> int:
             junit2 = work / f"junit-rerun-{n}.xml"
             results2 = work / f"results-rerun-{n}"
             rc2 = run_pytest([c.nodeid], junit2, results2, env)
+            print_results_table(f"re-run {n}", results2)
             again = parse_junit(junit2) if junit2.is_file() else Report()
             if rc2 != 0 or again.tests != 1 or again.by_outcome("passed") != again.cases:
                 outcomes = [x.outcome for x in again.cases] or ["no report"]

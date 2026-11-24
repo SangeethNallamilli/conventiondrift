@@ -13,6 +13,7 @@ import importlib
 import pkgutil
 import sys
 from pathlib import Path
+from types import ModuleType
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = (REPO / "src").resolve()
@@ -20,7 +21,7 @@ SRC = (REPO / "src").resolve()
 ALLOWED_PREFIXES = ("conventiondrift",)
 
 
-def is_stdlib(mod) -> bool:
+def is_stdlib(mod: ModuleType) -> bool:
     name = getattr(mod, "__name__", "") or ""
     if name in sys.builtin_module_names:
         return True
@@ -48,7 +49,7 @@ def is_stdlib(mod) -> bool:
     return False
 
 
-def is_allowed_package(mod) -> bool:
+def is_allowed_package(mod: ModuleType) -> bool:
     name = getattr(mod, "__name__", "") or ""
     if not name.startswith(ALLOWED_PREFIXES):
         return False
@@ -104,16 +105,17 @@ def main() -> int:
         return 1
 
     bad: list[str] = []
-    for name, mod in sorted(sys.modules.items()):
-        if mod is None:
+    modules_snapshot: list[tuple[str, ModuleType | None]] = sorted(sys.modules.items())
+    for name, loaded in modules_snapshot:
+        if loaded is None:
             continue
         # Skip the check script itself if it somehow landed on the path.
         if name in {"__main__", "__mp_main__"}:
             continue
-        if is_stdlib(mod) or is_allowed_package(mod):
+        if is_stdlib(loaded) or is_allowed_package(loaded):
             continue
         # Namespace leftovers or the script runner: ignore modules with no name.
-        origin = getattr(mod, "__file__", None)
+        origin = getattr(loaded, "__file__", None)
         bad.append(f"{name} -> {origin}")
 
     if bad:
@@ -129,7 +131,11 @@ def main() -> int:
         if yaml_mod is None:
             print("error: conventiondrift._vendor.yaml did not load", file=sys.stderr)
             return 1
-        origin = Path(yaml_mod.__file__).resolve()
+        yaml_file = yaml_mod.__file__
+        if not yaml_file:
+            print("error: conventiondrift._vendor.yaml has no __file__", file=sys.stderr)
+            return 1
+        origin = Path(yaml_file).resolve()
         expected = yaml_dir / "__init__.py"
         if origin != expected.resolve():
             print(
