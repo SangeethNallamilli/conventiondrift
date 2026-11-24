@@ -1,0 +1,85 @@
+# Benchmark workflow (D-TL-78 #4, D-TL-80 #2, D-TL-87; DESIGN §5 "Bench re-run
+# rule"). Every third-party uses: is pinned to a full 40-character SHA with a
+# version comment, the same SHAs as ci.yml (R7.3, AC-N3.11). This workflow
+# never uses pull_request_target or workflow_run (R5.2, AC-N3.5).
+#
+# Its own file because per-job path filters aren't possible in ci.yml without
+# a third-party action (D-TL-87 #4). Non-blocking: it is not part of the
+# required `ci` check until it has 5 green hosted runs in a row; RD then adds
+# it to `ci` in a separate PR (D-TL-87 #3). Thresholds live in tests/bench and
+# are not changed here.
+name: bench
+
+on:
+  pull_request:
+    branches: [release/develop]
+    paths:
+      - "src/**"
+      - "tests/bench/**"
+      - "tools/**"
+      # The job's own files, so a change to the bench job is benched too.
+      - ".github/workflows/bench.yml"
+      - "scripts/ci/run_bench.py"
+  push:
+    branches: [release/develop]
+  schedule:
+    # Nightly at 09:17 UTC = 04:17 EST / 05:17 EDT: after nightly-promote
+    # (07:00 UTC) and the weekly mutation run (Mondays 07:41 UTC). Scheduled
+    # runs use the default branch's copy of this file; the checkout below
+    # benches release/develop.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  # Same shape as ci.yml: only pull_request runs cancel an older run.
+  group: bench-${{ github.event_name == 'schedule' && 'schedule' || (github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PYTHONHASHSEED: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  HYPOTHESIS_SEED: "20261112"
+
+jobs:
+  bench:
+    # scripts/ci/run_bench.py runs the A-3 #7 near-cap bench with CD_BENCH=1
+    # and CD_BENCH_REQUIRE=1. It fails the job if no test runs or any test
+    # skips (D-TL-78 #4). A set whose only problem is exactly one run over
+    # the 5 s limit is re-run once by itself and every run must pass; any
+    # other failure, or a set over again, fails the job (D-TL-80 #2,
+    # D-TL-87 #2). test_benchmarks.py is added after T-031, T-033 and the
+    # T-039 baseline land (D-TL-87 #1).
+    name: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The nightly benches release/develop; every other event uses the
+          # default ref for that event.
+          ref: ${{ github.event_name == 'schedule' && 'release/develop' || '' }}
+      # No cache: the bench runs from a clean install on a fresh runner.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - name: Install hash-pinned pip, then hashed locks
+        run: |
+          python3 scripts/ci/install_pinned_pip.py
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+      - name: Install the package (no deps, no build isolation)
+        run: python -m pip install --no-deps --no-build-isolation -e .
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python3 scripts/ci/check_no_pypi_yaml.py
+      - name: Report the runner
+        run: |
+          nproc
+          git --version
+          git rev-parse HEAD
+      - name: Benchmarks (fail on any skip; one re-run per set, D-TL-80)
+        run: python scripts/ci/run_bench.py "${RUNNER_TEMP}/bench"
