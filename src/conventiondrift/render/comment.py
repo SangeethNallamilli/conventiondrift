@@ -30,7 +30,7 @@ from conventiondrift.model import (
 )
 from conventiondrift.render.escape import md_codeblock
 
-__all__ = ["MAX_COMMENT_CHARS", "STICKY_MARKER", "render_comment"]
+__all__ = ["MAX_COMMENT_CHARS", "STICKY_MARKER", "finding_lines", "render_comment"]
 
 STICKY_MARKER: Final = "<!-- conventiondrift:sticky v1 -->"
 """I-3: line 1 of every comment body."""
@@ -113,8 +113,13 @@ def _suggestion_lines(rule_result: RuleResult, rule_text: str, relevant: int) ->
     return []
 
 
-def _finding(rule_result: RuleResult, rule: Rule, head: SideResult) -> str:
-    """One finding as a fenced block (the seven AC-F6.3 fields, plus the tie wording)."""
+def finding_lines(rule_result: RuleResult, rule: Rule, head: SideResult) -> list[str]:
+    """One finding's raw, unescaped lines (the seven AC-F6.3 fields, plus the tie wording).
+
+    The first line has no warning prefix and no other line is indented; ``""`` separates the
+    suggestion lines. Each sink escapes every line itself: the comment through
+    ``md_codeblock`` and SARIF through ``sarif_text`` (SECURITY-RULES R3.2).
+    """
     options = rule.match.preferred if rule.match is not None else frozenset[str]()
     prohibition_only = not options
     if prohibition_only and rule.match is not None:
@@ -124,7 +129,7 @@ def _finding(rule_result: RuleResult, rule: Rule, head: SideResult) -> str:
     noun = "call sites" if rule.checker == "http-client" else "sites"
     relevant = head.overall.relevant
     after = f"{head.overall.following} of {relevant}"
-    lines = [f'{_WARNING} {rule.file} line {rule.line}: "{rule.text}"']
+    lines = [f'{rule.file} line {rule.line}: "{rule.text}"']
     if rule_result.base is None:
         lines.append(f"After this PR:  {after} {noun} {verb} {label}")
     else:
@@ -141,7 +146,13 @@ def _finding(rule_result: RuleResult, rule: Rule, head: SideResult) -> str:
     extra = _suggestion_lines(rule_result, rule.text, relevant)
     if extra:
         lines.extend(["", *extra])
-    body = [lines[0], *(f"{_INDENT}{line}" if line else "" for line in lines[1:])]
+    return lines
+
+
+def _finding(rule_result: RuleResult, rule: Rule, head: SideResult) -> str:
+    """One finding as a fenced block: :func:`finding_lines` with the warning prefix and indent."""
+    lines = finding_lines(rule_result, rule, head)
+    body = [f"{_WARNING} {lines[0]}", *(f"{_INDENT}{line}" if line else "" for line in lines[1:])]
     return md_codeblock(body)
 
 
