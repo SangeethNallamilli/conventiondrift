@@ -11,7 +11,8 @@ finding lines (approved wording, D-PM-40) and passes each whole line through
 ``escape.sarif_text``; the lines are joined by LF. A ``replace`` suggestion with no
 ``new_text`` shows the finding and the most-used option without suggested text (D-PM-38).
 No other SARIF field is built from repository text except the location: the artifact URI is
-the repo-relative POSIX path and the region is the rule's line number. The serializer is the
+the repo-relative POSIX path through ``escape.sarif_uri`` (D-TL-97) and the region is the
+rule's line number. The serializer is the
 I-9 one, so the bytes are deterministic and ASCII-only.
 """
 
@@ -22,7 +23,7 @@ from typing import Final
 from conventiondrift import __version__
 from conventiondrift.model import Result, Rule, RuleResult
 from conventiondrift.render.comment import finding_lines
-from conventiondrift.render.escape import sarif_text
+from conventiondrift.render.escape import sarif_text, sarif_uri
 from conventiondrift.render.findings import finding_rule
 from conventiondrift.render.jsonreport import JsonValue, dump_json
 from conventiondrift.render.strings import SARIF_RULES
@@ -83,7 +84,7 @@ def _result(rule_result: RuleResult, rule: Rule) -> dict[str, JsonValue]:
         "locations": [
             {
                 "physicalLocation": {
-                    "artifactLocation": {"uri": rule.file},
+                    "artifactLocation": {"uri": sarif_uri(rule.file)},
                     "region": {"startLine": rule.line},
                 }
             }

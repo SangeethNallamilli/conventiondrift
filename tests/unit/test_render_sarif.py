@@ -18,7 +18,7 @@ import conventiondrift
 from conventiondrift.model import Alternative, Case, Rule, RuleResult, Suggestion, Verdict
 from conventiondrift.render import escape
 from conventiondrift.render.comment import finding_lines, render_comment
-from conventiondrift.render.escape import sarif_text
+from conventiondrift.render.escape import sarif_text, sarif_uri
 from conventiondrift.render.findings import FINDING_CASES, MAX_FINDING_ANNOTATIONS, is_finding
 from conventiondrift.render.sarif import (
     SARIF_LEVEL,
@@ -51,6 +51,8 @@ INJECTION = (
     "Use requests, ping @someone <img src=x onerror=alert(1)> "
     "[link](https://evil.example) **bold** #123 ```"
 )
+# RFC 3986 relative reference: unreserved, "/" and %XX only (no scheme, query or fragment).
+_URI_REFERENCE = re.compile(r"(?:[A-Za-z0-9\-._~/]|%[0-9A-F]{2})*")
 _UNESCAPE = re.compile(r"\\([\\\[\]])")
 
 
@@ -100,7 +102,8 @@ def _check_sarif_shape(log: Any) -> None:
             assert driver["rules"][res["ruleIndex"]]["id"] == res["ruleId"]
             (location,) = res["locations"]
             physical = location["physicalLocation"]
-            assert isinstance(physical["artifactLocation"]["uri"], str)
+            uri = physical["artifactLocation"]["uri"]
+            assert isinstance(uri, str) and _URI_REFERENCE.fullmatch(uri)
             assert isinstance(physical["region"]["startLine"], int)
             assert physical["region"]["startLine"] >= 1
 
@@ -344,3 +347,36 @@ def test_policy_does_not_change_the_log() -> None:
     one = render_sarif(result([item()], the_policy=policy(notes=("a",))))
     two = render_sarif(result([item()], the_policy=policy()))
     assert one == two
+
+
+# --- artifact URI (D-TL-97) ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "uri"),
+    [
+        ("docs/my rules/AGENTS.md", "docs/my%20rules/AGENTS.md"),
+        ("docs/100%/AGENTS.md", "docs/100%25/AGENTS.md"),
+        ("docs/a#b?c/AGENTS.md", "docs/a%23b%3Fc/AGENTS.md"),
+        ("docs/caf\u00e9/AGENTS.md", "docs/caf%C3%A9/AGENTS.md"),
+    ],
+)
+def test_artifact_uri_is_percent_encoded(path: str, uri: str) -> None:
+    (res,) = _results([item(rule(file=path))])
+    assert res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == uri
+    assert sarif_uri(path) == uri
+
+
+def test_hostile_artifact_uri_is_one_ascii_reference_per_result() -> None:
+    hostile = "docs/@x/<b> ?#%\u202e\u200b\ud800\n\r::warning::/" + "".join(HOSTILE_CHARS) + ".md"
+    log = _log([item(rule(file=hostile))])
+    _check_sarif_shape(log)
+    uri = log["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"][
+        "uri"
+    ]
+    assert uri == sarif_uri(hostile)
+    assert uri.isascii() and _URI_REFERENCE.fullmatch(uri)
+    for char in (*HOSTILE_CHARS, " ", "#", "?", ":", "<", "@"):
+        assert char not in uri
+    assert "U%2B202E" in uri and "U%2BD800" in uri
+    assert uri.startswith("docs/") and uri.endswith(".md")
