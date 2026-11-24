@@ -427,9 +427,84 @@ HOSTILE_SOURCES = {
     "specs": lambda n: ('f"{a:>{w}}{b:.2f}"' + PAD) * (n // 82),
 }
 
+# "specs" is dense in f-string `{`, `}` and `:` (PEP 701 tokenizer triggers).
+# "every form" also has f-strings, but few enough that parse stays under the budget.
+_FSTRING_HEAVY_SOURCES = frozenset({"specs"})
+
+# Official first fixes: 3.13.16 and 3.14.8 (https://github.com/python/cpython/issues/155525).
+# Never fixed on 3.12. 3.11 and earlier are unaffected (PEP 701 landed in 3.12).
+_GH_155525 = "https://github.com/python/cpython/issues/155525"
+
+
+def _cpython_fstring_tokenize_is_quadratic() -> bool:
+    """True on CPython releases whose tokenizer still hits gh-155525."""
+    if sys.implementation.name != "cpython":
+        return False
+    version = sys.version_info
+    if version[:2] == (3, 12):
+        return True
+    if version[:2] == (3, 13) and version < (3, 13, 16):
+        return True
+    if version[:2] == (3, 14) and version < (3, 14, 8):
+        return True
+    return False
+
+
+_SKIP_QUADRATIC_FSTRING_PARSE = pytest.mark.skipif(
+    _cpython_fstring_tokenize_is_quadratic(),
+    reason=(
+        "CPython gh-155525: ast.parse of f-string-heavy modules is quadratic on 3.12.x, "
+        f"3.13 before 3.13.16, and 3.14 before 3.14.8 ({_GH_155525})"
+    ),
+)
+
 
 @pytest.mark.timing
-@pytest.mark.parametrize("kind", HOSTILE_SOURCES)
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param(
+            kind,
+            marks=_SKIP_QUADRATIC_FSTRING_PARSE if kind in _FSTRING_HEAVY_SOURCES else (),
+        )
+        for kind in HOSTILE_SOURCES
+    ],
+)
 def test_the_site_handlers_are_linear_in_a_run(kind: str) -> None:
     make = HOSTILE_SOURCES[kind]
     assert_linear(make, lambda text: sites_of("string-format", {"src/a.py": text}), label=kind)
+
+
+def _walk_string_format_handlers(tree: ast.AST) -> None:
+    """Run only the string-format handlers over a pre-parsed tree.
+
+    The loop matches ``Walker``'s explicit stack. A new handler table is built for
+    each call so FormatSites notes from one run cannot leak into the next.
+    """
+    handlers = StringFormatChecker().ast_handlers()
+    context = ctx("src/a.py")
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        handler = handlers.get(type(node))
+        if handler is not None:
+            for _ in handler(node, context):
+                pass
+        children = list(ast.iter_child_nodes(node))
+        children.reverse()
+        stack.extend(children)
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("kind", HOSTILE_SOURCES)
+def test_the_string_format_handlers_are_linear_on_a_parsed_tree(kind: str) -> None:
+    """The handler walk stays linear on every version, including CPython 3.12.
+
+    ``assert_linear`` times only ``run(make(n))``, so the parse in ``make`` is outside
+    the timed region. Same sizes and budget as the run-level test; never skipped.
+    """
+
+    def make(n: int) -> ast.AST:
+        return parse(HOSTILE_SOURCES[kind](n).encode())
+
+    assert_linear(make, _walk_string_format_handlers, label=kind)
