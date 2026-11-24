@@ -377,7 +377,15 @@ def _git_ignored(repo: GitRepo, path: str) -> bool:
     return proc.returncode == 0
 
 
+def _pin_git_reference_config(repo: GitRepo) -> None:
+    """Pin the git settings a check-ignore oracle depends on (D-TL-89 #4)."""
+    repo.git("config", "core.ignorecase", "false")
+    repo.git("config", "core.autocrlf", "false")
+    repo.git("config", "core.excludesFile", "")
+
+
 def test_verdicts_agree_with_git_check_ignore(repo: GitRepo) -> None:
+    _pin_git_reference_config(repo)
     for rel, data in _GIT_CASES.items():
         target = repo.path / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -431,11 +439,13 @@ _GIT_DIFFERENCES = (
     ("[\\!/]x", "!x", True),  # an escaped member of a class with a "/"
     ("[+-\\/]x", ",x", True),  # a range ending at an escaped "/"
     ("[+-\\/]x", "0x", False),
+    ("[^/]x", "ax", True),  # "^" also negates; a "/" in the class stays in it (CR S2)
     ("a[b/c", "a[b/c", False),  # unclosed: matches nothing, "/" and all
     # an escaped "/" is a "/"
     ("a\\/b", "a/b", True),
     ("\\/a", "a", False),  # not a leading "/": git reads it as "\\" then "/a"
     ("a\\/", "a", False),
+    ("a\\/", "a/x", False),  # not a folder pattern, so it does not ignore under a/ (CR S2)
 )
 
 
@@ -447,6 +457,7 @@ def test_patterns_match_bytes_and_segments_as_git_does(
 
 
 def test_the_git_differences_table_agrees_with_git(repo: GitRepo) -> None:
+    _pin_git_reference_config(repo)
     for pattern, path, ignored in _GIT_DIFFERENCES:
         (repo.path / ".gitignore").write_bytes(pattern.encode())
         assert _git_ignored(repo, path) is ignored, (pattern, path)
@@ -992,6 +1003,11 @@ def test_a_name_with_no_utf8_bytes_is_not_ignored(path: str, is_dir: bool) -> No
     # nothing is charged for it.
     loaded = rules(("", b"*\n*.py\n"))
     assert loaded.ignored("m.py")  # the rules would ignore any name they could read
-    work, checks = loaded._work, loaded._checks
+    work, checks, names = loaded._work, loaded._checks, loaded._names
     assert not loaded.ignored(path, is_dir)
-    assert (loaded._work, loaded._checks, loaded.unchecked) == (work, checks, 0)
+    assert (loaded._work, loaded._checks, loaded._names, loaded.unchecked) == (
+        work,
+        checks,
+        names,
+        0,
+    )

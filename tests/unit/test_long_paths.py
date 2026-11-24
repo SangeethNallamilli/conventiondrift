@@ -58,7 +58,10 @@ def test_a_refused_name_fails_on_the_legs_that_must_build(
     monkeypatch.setattr(long_paths, "MUST_BUILD_LONG_PATHS", True)
     monkeypatch.setattr(os, "mkdir", _refuse(errno.ENAMETOOLONG))
     with pytest.raises(OSError) as raised:
-        long_paths.build_or_skip(tmp_path, ["a"], ["f.py"])
+        try:
+            long_paths.build_or_skip(tmp_path, ["a"], ["f.py"])
+        except pytest.skip.Exception as exc:
+            pytest.fail(f"build_or_skip skipped instead of failing: {exc}")
     assert raised.value.errno == errno.ENAMETOOLONG
 
 
@@ -68,7 +71,10 @@ def test_any_other_error_fails_even_where_skips_are_allowed(
     monkeypatch.setattr(long_paths, "MUST_BUILD_LONG_PATHS", False)
     monkeypatch.setattr(os, "mkdir", _refuse(errno.EACCES))
     with pytest.raises(PermissionError):
-        long_paths.build_or_skip(tmp_path, ["a"], ["f.py"])
+        try:
+            long_paths.build_or_skip(tmp_path, ["a"], ["f.py"])
+        except pytest.skip.Exception as exc:
+            pytest.fail(f"build_or_skip skipped instead of failing: {exc}")
 
 
 def test_the_legs_that_must_build_are_ubuntu_and_macos_ci_only() -> None:
