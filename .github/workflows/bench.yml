@@ -16,7 +16,10 @@ on:
     paths:
       - "src/**"
       - "tests/bench/**"
+      - "tests/conftest.py"
       - "tools/**"
+      - "pyproject.toml"
+      - "requirements/**"
       # The job's own files, so a change to the bench job is benched too.
       - ".github/workflows/bench.yml"
       - "scripts/ci/run_bench.py"
@@ -24,9 +27,10 @@ on:
     branches: [release/develop]
   schedule:
     # Nightly at 09:17 UTC = 04:17 EST / 05:17 EDT: after nightly-promote
-    # (07:00 UTC) and the weekly mutation run (Mondays 07:41 UTC). Scheduled
-    # runs use the default branch's copy of this file; the checkout below
-    # benches release/develop.
+    # (07:00 UTC) and the weekly mutation run (Mondays 07:41 UTC). Note (TE N2):
+    # GitHub Actions only fires scheduled workflows from the default branch
+    # (`main`), so this cron begins running only after `bench.yml` is promoted
+    # to `main`; the checkout below then benches `release/develop`.
     - cron: '17 9 * * *'
   workflow_dispatch:
 
@@ -53,7 +57,8 @@ jobs:
     # D-TL-87 #2). test_benchmarks.py is added after T-031, T-033 and the
     # T-039 baseline land (D-TL-87 #1).
     name: bench
-    runs-on: ubuntu-latest
+    # Pinned to ubuntu-24.04 for timing stability across runs (TE N4).
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -83,3 +88,13 @@ jobs:
           git rev-parse HEAD
       - name: Benchmarks (fail on any skip; one re-run per set, D-TL-80)
         run: python scripts/ci/run_bench.py "${RUNNER_TEMP}/bench"
+      - name: Upload bench results and JUnit reports (TE N1)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bench/junit-*.xml
+            ${{ runner.temp }}/bench/results-*
+          retention-days: 14
+          if-no-files-found: ignore

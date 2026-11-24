@@ -8,6 +8,7 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
 LOCKFILES = (
@@ -32,7 +33,7 @@ def parse_lock(path: Path) -> list[tuple[str, str]]:
     return found
 
 
-def query_osv(packages: list[tuple[str, str]]) -> list[dict]:
+def query_osv(packages: list[tuple[str, str]]) -> list[dict[str, Any]]:
     queries = [
         {"package": {"name": name, "ecosystem": "PyPI"}, "version": version}
         for name, version in packages
@@ -46,7 +47,8 @@ def query_osv(packages: list[tuple[str, str]]) -> list[dict]:
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    return data.get("results", [])
+    raw = data.get("results", [])
+    return list(raw) if isinstance(raw, list) else []
 
 
 def main() -> int:
@@ -83,8 +85,8 @@ def main() -> int:
 
     if findings:
         print("dependency vulnerability scan failed:", file=sys.stderr)
-        for item in findings:
-            print(item, file=sys.stderr)
+        for finding in findings:
+            print(finding, file=sys.stderr)
         return 1
 
     print("ok: no OSV vulnerabilities for locked dependencies or vendored PyYAML 6.0.3")
