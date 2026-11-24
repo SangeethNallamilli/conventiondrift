@@ -1,0 +1,180 @@
+# DIAGNOSTIC ONLY (TL D-TL-99): never merge this branch. Per-size timings for
+# tests/unit/test_checkers_string_format.py::test_the_site_handlers_are_linear_in_a_run
+# on windows-latest / Python 3.12 (nightly #87 regression), with ubuntu 3.12 and
+# windows 3.13 as controls. Installs exactly as ci.yml's test job (hashed locks,
+# --only-binary, no deps). No secrets, read-only token, no cache save.
+name: diag-win312-linear
+
+on:
+  push:
+    branches: [diag/win312-linear-timing]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONHASHSEED: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  HYPOTHESIS_SEED: "20261112"
+  UV_VERSION: "0.13.7"
+
+jobs:
+  linear-timing:
+    name: linear-timing (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.12"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "${{ env.UV_VERSION }}"
+          # Same checksums as ci.yml.
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
+          enable-cache: false
+      - name: CONTRIBUTING setup (Windows), as ci.yml
+        if: runner.os == 'Windows'
+        run: |
+          python -m venv .venv
+          uv pip install --python .venv/Scripts/python.exe --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python .venv/Scripts/python.exe --no-deps --no-build-isolation -e .
+          echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
+          .venv/Scripts/conventiondrift --version
+      - name: Install hashed locks with uv, as ci.yml
+        if: runner.os != 'Windows'
+        run: |
+          uv pip install --python "$(command -v python)" --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python "$(command -v python)" --no-deps --no-build-isolation -e .
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python scripts/ci/check_no_pypi_yaml.py
+      - name: Per-size timings (3 runs each, helper's best-of rule, parse and gc split)
+        run: |
+          mkdir -p diag-out
+          python - <<'PY' 2>&1 | tee diag-out/timings.tsv
+          # D-TL-99 diagnostic: per-size timings for
+          # tests/unit/test_checkers_string_format.py::test_the_site_handlers_are_linear_in_a_run.
+          # Imports the test's own inputs and helper; edits nothing under src/ or tests/.
+          import ast
+          import gc
+          import os
+          import platform
+          import sys
+          import time
+
+          sys.path[:0] = ["tests", "tests/unit"]
+          from checker_support import LINEAR_SIZES, MIB, RATIO_FLOOR_S, sites_of  # noqa: E402
+          from test_checkers_string_format import HOSTILE_SOURCES  # noqa: E402
+
+
+          def runs(func, k=3):
+              out = []
+              for _ in range(k):
+                  t = time.perf_counter()
+                  func()
+                  out.append(time.perf_counter() - t)
+              return out
+
+
+          def helper_best(seq, budget):
+              # best_time(repeat=3, stop_above=5*budget, stop_below=RATIO_FLOOR_S) on the same run sequence.
+              best = float("inf")
+              for e in seq:
+                  best = min(best, e)
+                  if e > 5 * budget or e <= RATIO_FLOOR_S:
+                      break
+              return best
+
+
+          print(f"python {sys.version}")
+          print(f"platform {platform.platform()} machine={platform.machine()} cpus={os.cpu_count()}")
+          print(f"gc thresholds {gc.get_threshold()}")
+          hdr = (
+              "kind",
+              "n",
+              "bytes",
+              "budget",
+              "run1",
+              "run2",
+              "run3",
+              "helper_best",
+              "verdict",
+              "ratio_prev",
+              "parse_best",
+              "sites_minus_parse",
+              "sites_nogc_best",
+              "gc_gen2_in_3_runs",
+          )
+          print("\t".join(hdr))
+          for kind, make in HOSTILE_SOURCES.items():
+              previous = 0.0
+              for n in LINEAR_SIZES:
+                  text = make(n)
+                  data = text.encode()
+                  budget = 1.0 + 4.0 * n / MIB
+
+                  def call(text=text):
+                      return sites_of("string-format", {"src/a.py": text})
+
+                  gen2_before = gc.get_stats()[2]["collections"]
+                  seq = runs(call)
+                  gen2 = gc.get_stats()[2]["collections"] - gen2_before
+                  best = helper_best(seq, budget)
+                  verdict = "ok" if best < budget else "OVER_BUDGET"
+                  if previous > RATIO_FLOOR_S and not best < 3 * previous + 0.05:
+                      verdict += "+RATIO"
+                  ratio = best / previous if previous else float("nan")
+                  parse_best = min(runs(lambda data=data: ast.parse(data)))
+                  gc.disable()
+                  try:
+                      nogc = min(runs(call))
+                  finally:
+                      gc.enable()
+                  row = (
+                      kind,
+                      n,
+                      len(data),
+                      f"{budget:.3f}",
+                      *(f"{x:.3f}" for x in seq),
+                      f"{best:.3f}",
+                      verdict,
+                      f"{ratio:.2f}",
+                      f"{parse_best:.3f}",
+                      f"{min(seq) - parse_best:.3f}",
+                      f"{nogc:.3f}",
+                      gen2,
+                  )
+                  print("\t".join(map(str, row)), flush=True)
+                  previous = best
+          PY
+      - name: pytest the node id (all params, timing marker, no coverage)
+        run: |
+          unset COVERAGE_PROCESS_START
+          python -m pytest "tests/unit/test_checkers_string_format.py::test_the_site_handlers_are_linear_in_a_run" -m "timing and not network" -v -rA --durations=0 --junitxml=diag-out/pytest.xml 2>&1 | tee diag-out/pytest.txt
+      - name: Upload timings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diag-linear-timing-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: diag-out/
+          retention-days: 7
+          if-no-files-found: warn
