@@ -11,6 +11,7 @@ yaml_ft is never vendored and always fails if present.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.metadata
 import importlib.util
 import sys
@@ -20,7 +21,7 @@ REPO = Path(__file__).resolve().parents[2]
 VENDOR_YAML = (REPO / "src" / "conventiondrift" / "_vendor" / "yaml").resolve()
 
 
-def origin_path(spec) -> Path | None:
+def origin_path(spec: importlib.machinery.ModuleSpec) -> Path | None:
     origin = getattr(spec, "origin", None)
     if origin and origin not in {"built-in", "frozen"}:
         return Path(origin)
