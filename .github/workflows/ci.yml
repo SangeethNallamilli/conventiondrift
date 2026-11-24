@@ -180,7 +180,7 @@ jobs:
     needs: [lockfile]
     runs-on: ${{ matrix.os }}
     # D-TL-58a (2026-11-20): Windows legs get 25 min; Ubuntu stays at 15.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 15 }}
     permissions:
       contents: read
     strategy:

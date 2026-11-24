@@ -6,7 +6,6 @@ the exit wait use the time left; running out kills git's tree and raises
 rule: spawn at clock 1000.0 with the 60 s timeout means one deadline of 1060.0.
 """
 
-import os
 import sys
 import time
 from collections.abc import Iterator
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.fixtures.liveness import gone_within
 
 from conventiondrift import gitread
 from conventiondrift.errors import ComponentError
@@ -235,28 +235,7 @@ def test_running_out_kills_the_whole_tree(
     with pytest.raises(ComponentError) as info:
         list(GitReader(repo).patches(SHA, SHA2))
     assert (info.value.component, info.value.message) == ("gitread", "git log timed out")
-    assert _gone(int(pidfile.read_text()))
-
-
-def _gone(pid: int) -> bool:
-    for _ in _polls(5.0):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            pass
-        except OSError:
-            return True
-        else:
-            if os.name == "nt":
-                continue
-            try:
-                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                    return True
-            except OSError:
-                pass
-    return False
+    assert gone_within(int(pidfile.read_text()), wait=5.0)  # goneprobe: never os.kill(pid, 0)
 
 
 def _polls(total: float) -> Iterator[None]:

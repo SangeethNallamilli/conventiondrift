@@ -11,6 +11,7 @@ repo, the event payload or another user goes through exactly one of these:
 * :func:`output_heredoc` - one ``GITHUB_OUTPUT`` entry with a random delimiter.
 * :func:`sarif_text` - a SARIF ``message.text`` (plain text, never Markdown).
 * :func:`md_codeblock` - text inside a fenced code block in the comment or job summary.
+* :func:`text_field` - a repo-derived field in the ``--format text`` report.
 
 Nothing in this package ever writes ``GITHUB_ENV`` or ``GITHUB_PATH``.
 """
@@ -29,6 +30,7 @@ __all__ = [
     "md_codeblock",
     "output_heredoc",
     "sarif_text",
+    "text_field",
     "workflow_cmd",
     "workflow_prop",
 ]
@@ -205,3 +207,23 @@ def sarif_text(text: str) -> str:
     serializer, and no Markdown field is ever built from repo text.
     """
     return _visible_text(text).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def text_field(value: str, *, quoted: bool = False) -> str:
+    """Escape a repo-derived field for ``--format text`` (SR T-01 b, layout §1.2).
+
+    Values that contain a backslash, start with ``::``, or include a character
+    in :data:`_LABEL_CATEGORIES` (Cc, Cf, Zl, Zp, Cs) are returned as
+    ``repr(value)``. Otherwise a quoted field is wrapped in double quotes and
+    a plain field is returned unchanged.
+    """
+    if "\\" in value or value.startswith("::") or _has_special(value):
+        return repr(value)
+    if quoted:
+        return f'"{value}"'
+    return value
+
+
+def _has_special(value: str) -> bool:
+    """True when ``value`` contains a character in :data:`_LABEL_CATEGORIES`."""
+    return any(unicodedata.category(char) in _LABEL_CATEGORIES for char in value)
