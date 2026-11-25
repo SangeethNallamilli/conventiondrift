@@ -1,0 +1,153 @@
+# D-TL-104 one-off diagnostic (diag branch only; never merged, never a PR).
+# Loops the 6 escaped-grandchild ("own session, git exited") cases of
+# tests/unit/test_gitread_pipe_holders.py::test_a_pipe_holding_grandchild_never_stretches_a_kill
+# on windows-latest / Python 3.15, mirroring ci.yml's `test` job install and
+# coverage step, to capture the D-TL-103 (#91) thread-stack dumps when a kill
+# overruns PROMPT (4.5 s). No secrets, contents: read, persist-credentials: false,
+# every uses: pinned to the same full SHAs as ci.yml / bench.yml.
+# Runs on push to this diag branch only (workflow_dispatch needs the file on
+# the default branch, which this file never reaches).
+name: diag-win315-loop
+
+on:
+  push:
+    branches: [diag/d-tl-104-win315-loop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONHASHSEED: "0"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  HYPOTHESIS_SEED: "20261112"
+  UV_VERSION: "0.13.7"
+  MAX_ITERATIONS: "50"
+  BUDGET_SECONDS: "2400"
+
+jobs:
+  win315-loop:
+    name: diag win315 escaped-grandchild loop
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.15"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "${{ env.UV_VERSION }}"
+          checksum: ${{ fromJSON('{"Linux-X64":"c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83","Windows-X64":"0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021","macOS-ARM64":"81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731","macOS-X64":"20c47e4c1f630b8abaff8c291fa9b9aa300fef92c4fbff95adf198b55287cda7"}')[format('{0}-{1}', runner.os, runner.arch)] || 'MISSING_UV_CHECKSUM' }}
+          enable-cache: false
+      - name: Report the default runner git version
+        run: git --version
+      - name: CONTRIBUTING setup (Windows) — same as ci.yml test job
+        env:
+          UV_CACHE_DIR: ${{ runner.temp }}/uv-pkg-cache
+        run: |
+          python -m venv .venv
+          uv pip install --python .venv/Scripts/python.exe --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
+          uv pip install --python .venv/Scripts/python.exe --no-deps --no-build-isolation -e .
+          echo "$(cygpath -w "${PWD}/.venv/Scripts")" >> "$GITHUB_PATH"
+          .venv/Scripts/conventiondrift --version
+      - name: Confirm no PyPI PyYAML in this environment
+        run: python scripts/ci/check_no_pypi_yaml.py
+      - name: Collect the 6 escaped-grandchild node ids
+        run: |
+          python -m pytest --collect-only -q "tests/unit/test_gitread_pipe_holders.py::test_a_pipe_holding_grandchild_never_stretches_a_kill" -k "own and session" | tee "${RUNNER_TEMP}/collect.txt"
+          n=$(grep -c '::test_a_pipe_holding_grandchild_never_stretches_a_kill\[' "${RUNNER_TEMP}/collect.txt")
+          test "$n" -eq 6
+      - name: Loop the 6 cases under coverage (as the ci.yml coverage step)
+        run: |
+          set +e
+          out="${RUNNER_TEMP}/diag"
+          mkdir -p "$out"
+          python -c "import pathlib, sysconfig; pathlib.Path(sysconfig.get_path('purelib')).joinpath('coverage_startup.pth').write_text('import coverage; coverage.process_startup()\\n')"
+          export COVERAGE_PROCESS_START="${PWD}/pyproject.toml"
+          start=$(date +%s)
+          i=0
+          while [ "$i" -lt "$MAX_ITERATIONS" ] && [ $(( $(date +%s) - start )) -lt "$BUDGET_SECONDS" ]; do
+            i=$((i + 1))
+            n=$(printf '%03d' "$i")
+            echo "::group::iteration $n (elapsed $(( $(date +%s) - start )) s)"
+            python -m coverage run --parallel-mode -m pytest \
+              "tests/unit/test_gitread_pipe_holders.py::test_a_pipe_holding_grandchild_never_stretches_a_kill" \
+              -k "own and session" -rs -vv --tb=long --hypothesis-seed="${HYPOTHESIS_SEED}" \
+              -o junit_duration_report=call --junitxml="$out/junit-$n.xml" > "$out/pytest-$n.log" 2>&1
+            rc=$?
+            echo "iteration $n exit $rc" | tee -a "$out/exit-codes.txt"
+            tail -n 15 "$out/pytest-$n.log"
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "=== FULL OUTPUT OF FAILING ITERATION $n ==="
+              cat "$out/pytest-$n.log"
+            fi
+            rm -f .coverage .coverage.*
+          done
+          echo "ran $i iterations in $(( $(date +%s) - start )) s"
+          exit 0
+      - name: Summarize per-case timings, overruns and stack dumps
+        if: always()
+        run: |
+          python - <<'PY'
+          import glob, os, re, xml.etree.ElementTree as ET
+          out = os.path.join(os.environ["RUNNER_TEMP"], "diag")
+          PROMPT = 4.5
+          stats, overruns = {}, []
+          files = sorted(glob.glob(os.path.join(out, "junit-*.xml")))
+          for f in files:
+              it = re.search(r"junit-(\d+)\.xml", f).group(1)
+              for tc in ET.parse(f).iter("testcase"):
+                  name = tc.get("name")
+                  case = name[name.find("[") + 1 : -1] if "[" in name else name
+                  t = float(tc.get("time") or 0)
+                  s = stats.setdefault(case, {"n": 0, "times": [], "fail": 0, "overrun": 0, "took": []})
+                  s["n"] += 1
+                  s["times"].append(t)
+                  bad = tc.find("failure") if tc.find("failure") is not None else tc.find("error")
+                  if bad is not None:
+                      s["fail"] += 1
+                      text = (bad.get("message") or "") + "\n" + (bad.text or "")
+                      m = re.search(r"the kill took ([0-9.]+) s", text)
+                      if m:
+                          s["overrun"] += 1
+                          s["took"].append(float(m.group(1)))
+                      path = os.path.join(out, f"failure-{it}-{re.sub(r'[^A-Za-z0-9]+', '_', case)}.txt")
+                      with open(path, "w", encoding="utf-8") as fh:
+                          fh.write(text)
+                      overruns.append((it, case, m.group(1) if m else "n/a", path))
+          lines = [f"# D-TL-104 Windows 3.15 loop: {len(files)} iterations", "",
+                   "| case | runs | min call s | median | max call s | >4.5 s call | failures | overruns (took) |",
+                   "|---|---|---|---|---|---|---|---|"]
+          for case in sorted(stats):
+              s = stats[case]; ts = sorted(s["times"])
+              med = ts[len(ts) // 2] if ts else 0
+              lines.append(f"| {case} | {s['n']} | {ts[0]:.2f} | {med:.2f} | {ts[-1]:.2f} | {sum(t > PROMPT for t in ts)} | {s['fail']} | {s['overrun']} {['%.2f' % x for x in s['took']]} |")
+          lines += ["", f"Total failures: {len(overruns)}"]
+          for it, case, took, path in overruns:
+              lines.append(f"- iteration {it}: {case} took {took} s -> {os.path.basename(path)}")
+          text = "\n".join(lines) + "\n"
+          print(text)
+          open(os.path.join(out, "summary.md"), "w", encoding="utf-8").write(text)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(text)
+          for it, case, took, path in overruns:
+              print(f"\n===== STACK DUMP / FAILURE: iteration {it} {case} (took {took} s) =====")
+              print(open(path, encoding="utf-8").read())
+          PY
+      - name: Upload loop logs, JUnit and stack dumps
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: d-tl-104-win315-loop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diag
+          retention-days: 14
+          if-no-files-found: warn
