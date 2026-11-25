@@ -582,6 +582,7 @@ def _run_all(pattern: re.Pattern[str], text: str) -> None:
         pass
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("pattern", ex.REGEXES, ids=lambda p: p.pattern)
 def test_registered_regex_is_linear_on_adversarial_input(pattern: re.Pattern[str]) -> None:
     # Sizes double from 16 KiB up to 512 KiB (half the 1 MiB size limit), so a
@@ -600,6 +601,7 @@ def test_registered_regex_is_linear_on_adversarial_input(pattern: re.Pattern[str
             previous = elapsed
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("kind", range(len(_adversarial(10))))
 def test_extract_file_at_size_cap_is_fast(kind: int) -> None:
     text = _adversarial(_SIZE)[kind][:_SIZE]
@@ -608,6 +610,7 @@ def test_extract_file_at_size_cap_is_fast(kind: int) -> None:
         assert elapsed < 3.0, (kind, wrapped[:20], elapsed)
 
 
+@pytest.mark.timing
 def test_extract_file_with_many_short_lines_is_fast() -> None:
     blocks = ["- Use a.", "```", "Prose. " * 20, f"{MARKER}", "# H", "---", "Prefer x over y."]
     text = "\n".join(blocks * (_SIZE // 200))

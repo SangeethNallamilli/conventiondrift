@@ -520,3 +520,76 @@ def test_keyboard_interrupt_from_a_checker_propagates() -> None:
 
     with pytest.raises(KeyboardInterrupt):
         Walker([InterruptingTable()])
+
+
+# --- per-file handler tables (INTERFACES I-10, "Per-file handler state") --------------------
+
+
+class TableCounter(NodeCounter):
+    """Counts the handler tables it is asked for, and keeps memory in each table."""
+
+    def __init__(self) -> None:
+        self.tables = 0
+        self.fail_from: int | None = None
+        self.remembered: list[list[str]] = []
+
+    def ast_handlers(self):  # type: ignore[no-untyped-def]
+        self.tables += 1
+        if self.fail_from is not None and self.tables >= self.fail_from:
+            raise ValueError
+        names: list[str] = []
+        self.remembered.append(names)
+
+        def on_name(node: ast.AST, ctx: FileContext) -> list[Site]:
+            assert isinstance(node, ast.Name)
+            names.append(node.id)
+            return []
+
+        return {ast.Name: on_name}
+
+
+def test_the_handler_table_is_asked_for_once_per_file_and_dropped() -> None:
+    checker = TableCounter()
+    walker = Walker([checker])
+    assert checker.tables == 1  # the table made with the walker serves the first file
+    walker.walk(job("a.py", "a = b\n"))
+    assert checker.tables == 1
+    walker.walk(job("b.py", "c = d\n"))
+    walker.walk(job("c.py", "e = f\n"))
+    assert checker.tables == 3
+    # Each table saw only its own file's names.
+    assert checker.remembered == [["a", "b"], ["c", "d"], ["e", "f"]]
+
+
+def test_a_skipped_file_still_gets_the_next_file_a_new_table() -> None:
+    checker = TableCounter()
+    walker = Walker([checker])
+    walker.walk(job("a.py", "def (:\n"))
+    walker.walk(job("b.py", "x = 1\n"))
+    assert checker.tables == 2
+    assert checker.remembered[1] == ["x"]
+
+
+def test_a_table_that_fails_for_a_later_file_isolates_the_checker_from_then_on() -> None:
+    checker = TableCounter()
+    checker.fail_from = 2
+    walker = Walker([checker, PRINT])
+    first = walker.walk(job("a.py", "print(1)\n"))
+    assert walker.failed == {}
+    second = walker.walk(job("b.py", "print(2)\n"))
+    assert walker.failed == {"string-format": "ValueError"}
+    assert [cid for cid, _ in first.sites] == ["logging", "string-format"]
+    assert [cid for cid, _ in second.sites] == ["logging"]
+    walker.walk(job("c.py", "print(3)\n"))
+    assert checker.tables == 2  # a failed checker is not asked again
+
+
+def test_pool_batches_ask_for_a_table_per_file() -> None:
+    from conventiondrift.checkers.pool import analyze_batch
+
+    checker = TableCounter()
+    outcome = analyze_batch(
+        (checker,), (job("a.py", "a\n"), job("b.py", "b\n"), job("c.py", "c\n"))
+    )
+    assert len(outcome.files) == 3
+    assert checker.remembered == [["a"], ["b"], ["c"]]

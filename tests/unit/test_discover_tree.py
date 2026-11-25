@@ -300,9 +300,13 @@ def test_missing_and_hard_excluded_entries_each_get_their_own_note() -> None:
     assert found.notes == ("`.git/config` is always excluded", "`gone.md` was not found")
 
 
-def test_discovery_carries_empty_manifest_and_entry_point_fields_until_t010c() -> None:
+def test_a_pyproject_in_scope_is_kept_as_a_manifest() -> None:
+    # T-010c fills the A-4 fields that T-010a left empty.
     found = run({"AGENTS.md": b"r", "pyproject.toml": b"[project]\n", "a.py": PY})
-    assert found.manifest_files == () and found.entry_points == frozenset()
+    assert [m.path for m in found.manifest_files] == ["pyproject.toml"]
+    assert found.manifest_files[0].data == b"[project]\n"
+    assert found.entry_points == frozenset()
+    assert found.skipped == ()
 
 
 def test_the_base_phase_token_is_required_and_changes_nothing() -> None:

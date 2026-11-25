@@ -6,7 +6,6 @@ the exit wait use the time left; running out kills git's tree and raises
 rule: spawn at clock 1000.0 with the 60 s timeout means one deadline of 1060.0.
 """
 
-import os
 import sys
 import time
 from collections.abc import Iterator
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.fixtures.liveness import gone_within
 
 from conventiondrift import gitread
 from conventiondrift.errors import ComponentError
@@ -142,20 +142,55 @@ def test_time_spent_by_the_consumer_counts(repo: Path, monkeypatch: pytest.Monke
 # --- the same rule against real processes (short real sleeps only) -------------
 
 
-def _slow_git(chunks: int, gap: float) -> str:
+def _slow_git(chunks: int, gap: float, ready: Path | None = None) -> str:
+    # Optional ready file: the child creates it as soon as the interpreter is
+    # up, before the first sleep, so the test can arm the short deadline only
+    # after start-up (CON-14: a cold macOS python can eat a 0.7 s budget).
+    notice = f"open({str(ready)!r}, 'w').write('1')\n" if ready is not None else ""
     return (
-        "import sys, time\n"
-        f"for i in range({chunks}):\n"
+        "import sys, time\n" + notice + f"for i in range({chunks}):\n"
         f"    time.sleep({gap}); sys.stdout.write('c%d;' % i); sys.stdout.flush()\n"
     )
 
 
-def _real_start(monkeypatch: pytest.MonkeyPatch, script: str) -> list[Any]:
+def _short_timeout(monkeypatch: pytest.MonkeyPatch, seconds: float = 0.7) -> None:
+    """Apply a short overall deadline only after the child is already running.
+
+    ``_stream_patches`` snapshots ``GIT_TIMEOUT_SECONDS`` after ``_start_batch``
+    returns. A child's interpreter start-up on a slow runner (CON-14: macOS
+    nightly 44706120232, test-macos 3.13) must not count against that budget:
+    the product default (60 s) applies during start-up.
+    """
+    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", seconds)
+
+
+def _wait_ready(path: Path, timeout: float = 30.0) -> None:
+    for _ in _polls(timeout):
+        if path.exists():
+            return
+    raise AssertionError(f"child python was not ready within {timeout}s")
+
+
+def _real_start(
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    ready: Path | None = None,
+    armed: list[float] | None = None,
+    timeout: float = 0.7,
+) -> list[Any]:
     real = gitread._start_batch
     started: list[Any] = []
 
     def start(argv: list[str], **kwargs: Any) -> Any:
         started.append(real([sys.executable, "-c", script], **kwargs))
+        if ready is not None:
+            # Product default still applies during start-up. Arm the short
+            # deadline only once the child is running, and before this returns,
+            # so _stream_patches snapshots it after ready.
+            _wait_ready(ready)
+            _short_timeout(monkeypatch, timeout)
+            if armed is not None:
+                armed.append(time.monotonic())
         return started[-1]
 
     monkeypatch.setattr(gitread, "_start_batch", start)
@@ -163,17 +198,19 @@ def _real_start(monkeypatch: pytest.MonkeyPatch, script: str) -> list[Any]:
 
 
 def test_real_slow_chunks_time_out_on_the_overall_deadline(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # 10 chunks 0.2 s apart (each well under the 0.7 s timeout; 2 s in all).
-    started = _real_start(monkeypatch, _slow_git(10, 0.2))
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.7)
+    # Arm 0.7 s only after the child is running so interpreter start-up does
+    # not eat the budget (CON-14: nightly 44706120232, test-macos 3.13, 0 chunks).
+    ready = tmp_path / "ready"
+    armed: list[float] = []
+    started = _real_start(monkeypatch, _slow_git(10, 0.2, ready), ready, armed)
     got = b""
-    begin = time.monotonic()
     with pytest.raises(ComponentError, match=r"git log timed out"):
         for chunk in GitReader(repo).patches(SHA, SHA2):
             got += chunk
-    assert time.monotonic() - begin < 1.7
+    assert armed and time.monotonic() - armed[0] < 1.7
     assert 0 < got.count(b";") < 10
     assert started[0]._proc.returncode is not None  # killed and reaped
 
@@ -181,40 +218,24 @@ def test_real_slow_chunks_time_out_on_the_overall_deadline(
 def test_running_out_kills_the_whole_tree(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Arm 0.8 s only once the child has started the grandchild and written its
+    # pid, so the child's interpreter start-up does not eat the budget (CON-14,
+    # D-TL-61: a start-up over 0.8 s killed the tree before grandchild.pid
+    # existed, and read_text raised FileNotFoundError).
     pidfile = tmp_path / "grandchild.pid"
+    ready = tmp_path / "ready"
     script = (
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
         f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+        f"open({str(ready)!r}, 'w').write('1')\n"
         "sys.stdout.write('x'); sys.stdout.flush(); time.sleep(60)\n"
     )
-    _real_start(monkeypatch, script)
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.8)
+    _real_start(monkeypatch, script, ready, timeout=0.8)
     with pytest.raises(ComponentError) as info:
         list(GitReader(repo).patches(SHA, SHA2))
     assert (info.value.component, info.value.message) == ("gitread", "git log timed out")
-    assert _gone(int(pidfile.read_text()))
-
-
-def _gone(pid: int) -> bool:
-    for _ in _polls(5.0):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            pass
-        except OSError:
-            return True
-        else:
-            if os.name == "nt":
-                continue
-            try:
-                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                    return True
-            except OSError:
-                pass
-    return False
+    assert gone_within(int(pidfile.read_text()), wait=5.0)  # goneprobe: never os.kill(pid, 0)
 
 
 def _polls(total: float) -> Iterator[None]:

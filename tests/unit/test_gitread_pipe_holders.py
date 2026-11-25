@@ -11,6 +11,7 @@ grandchild kind separately.
 """
 
 import ast
+import faulthandler
 import inspect
 import os
 import re
@@ -186,8 +187,13 @@ class _Gate:
 
     def __init__(self, tmp_path: Path) -> None:
         self.pidfile = tmp_path / "grandchild.pid"
+        self.stacks = tmp_path / "stacks.txt"
         self.armed = False
         self.ready_at: float | None = None
+        #: D-TL-103: once the grandchild runs, every thread's stack is written to
+        #: :attr:`stacks` if the kill is still going this long after (see :meth:`stop`).
+        self.dump_after = PROMPT
+        self._dump: Any = None
 
     def arm(self) -> None:
         self.armed = True
@@ -200,7 +206,23 @@ class _Gate:
                 assert time.monotonic() < end, "the fake git never started its grandchild"
                 time.sleep(0.01)
             self.ready_at = time.monotonic()
+            self._dump = self.stacks.open("w", encoding="utf-8")
+            faulthandler.dump_traceback_later(self.dump_after, file=self._dump)
         return self.ready_at
+
+    def stop(self) -> str:
+        """Cancel the stack dump; return what it wrote ("" if the kill was prompt).
+
+        A kill that overran PROMPT on Windows 3.15 (run 45564181345, 20.11 s) left no
+        trace of where it waited. faulthandler's watchdog thread needs no GIL, so the
+        dump shows the frame each thread is blocked in. Idempotent.
+        """
+        faulthandler.cancel_dump_traceback_later()
+        dump, self._dump = self._dump, None
+        if dump is None:
+            return ""
+        dump.close()
+        return self.stacks.read_text(encoding="utf-8", errors="replace")
 
     def clock(self) -> float:
         if self.armed:
@@ -210,6 +232,38 @@ class _Gate:
 
 #: Longest wait for the fake git to start its grandchild (a slow runner's cold start).
 READY_LIMIT = 30.0
+
+
+def test_the_gate_dumps_every_thread_when_a_kill_overruns(tmp_path: Path) -> None:
+    gate = _Gate(tmp_path)
+    gate.dump_after = 0.05
+    gate.pidfile.write_text("1")
+    try:
+        gate.wait()
+        time.sleep(1.0)  # an overrunning kill: the watchdog fires meanwhile
+        stacks = gate.stop()
+    finally:
+        gate.stop()
+    assert "test_the_gate_dumps_every_thread_when_a_kill_overruns" in stacks
+    assert gate.stop() == ""  # idempotent, and the dump is cancelled
+
+
+def test_the_gate_dumps_nothing_for_a_prompt_kill(tmp_path: Path) -> None:
+    gate = _Gate(tmp_path)
+    assert gate.stop() == ""  # never armed
+    gate.dump_after = 0.2
+    gate.pidfile.write_text("1")
+    try:
+        gate.wait()
+        assert gate.stop() == ""  # stopped before dump_after
+        # A dump left armed would fire now, into whatever file reuses its fd.
+        with (tmp_path / "later.txt").open("w+", encoding="utf-8") as later:
+            time.sleep(0.5)
+            later.seek(0)
+            assert later.read() == ""
+    finally:
+        gate.stop()
+    assert gate.stacks.read_text() == ""
 
 
 def _use_fake(monkeypatch: pytest.MonkeyPatch, argv: list[str], gate: _Gate) -> None:
@@ -374,13 +428,16 @@ def test_a_pipe_holding_grandchild_never_stretches_a_kill(
     try:
         trigger(tmp_path, argv, monkeypatch, gate)
         assert gate.ready_at is not None, "the kill came before the grandchild started"
-        assert time.monotonic() - gate.ready_at < PROMPT
+        took = time.monotonic() - gate.ready_at
+        stacks = gate.stop()
+        assert took < PROMPT, f"the kill took {took:.2f} s; every thread at {PROMPT} s:\n{stacks}"
         pid = int((tmp_path / "grandchild.pid").read_text())
         if escapes:
             assert _alive(pid)  # outside git's group: not ours to kill, and not waited for
         else:
             assert _gone_soon(pid)  # the whole group is gone
     finally:
+        gate.stop()
         pidfile = tmp_path / "grandchild.pid"
         if pidfile.exists():
             try:

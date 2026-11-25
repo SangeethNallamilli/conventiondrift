@@ -163,6 +163,7 @@ ADVERSARIAL = [
 ]
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("text", ADVERSARIAL, ids=lambda t: f"{t[:6]!r}x{len(t)}")
 def test_hard_exclude_regexes_and_check_are_linear(text: str) -> None:
     start = time.perf_counter()

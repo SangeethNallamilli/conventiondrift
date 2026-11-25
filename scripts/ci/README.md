@@ -54,3 +54,13 @@ mutmut, and again at pytest session start inside the mutated tree
 (`-p mutation_yaml_guard`), `check_mutation_yaml.py` requires that
 conventiondrift's yaml import resolves under `_vendor/yaml/` and that no
 `_yaml` / `cyaml` module is in `sys.modules`.
+
+`run_bench.py` drives the `bench` job in `.github/workflows/bench.yml`
+(D-TL-78 #4, D-TL-80 #2, D-TL-87, DESIGN §5).
+It runs `tests/bench/test_bench_near_cap.py -m "timing and not network" -rs`
+with `CD_BENCH=1` and `CD_BENCH_REQUIRE=1` and reads pytest's JUnit XML. The
+job fails if no test ran or any test was skipped. A near-cap set whose only
+problem is exactly one of its 5 runs over the 5 s limit is re-run once by
+itself, and every run of that re-run must pass; any other failure, or a set
+that fails twice, fails the job. Limits and run counts stay in `tests/bench`.
+Standard library only.

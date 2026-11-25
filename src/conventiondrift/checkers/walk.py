@@ -234,22 +234,42 @@ class Walker:
         self._handlers: dict[str, Mapping[type[ast.AST], Handler]] = {}
         self._options: dict[str, frozenset[str]] = {}
         self._dispatch: dict[type[ast.AST], list[tuple[str, Handler]]] = {}
+        self._fresh = True
         for checker in self._checkers:
             if "python-ast" not in checker.inputs:
                 continue
             self._options[checker.id] = checker.options
-            try:
-                handlers = checker.ast_handlers()
-                if not isinstance(handlers, Mapping) or not all(
-                    isinstance(k, type) and issubclass(k, ast.AST) and callable(v)
-                    for k, v in handlers.items()
-                ):
-                    raise CheckerFault("bad handler table")
-                self._handlers[checker.id] = dict(handlers)
-            except KeyboardInterrupt:
-                raise
-            except BaseException as exc:  # noqa: BLE001 -- I-11: a failing checker is isolated
-                self.failed[checker.id] = type(exc).__name__
+            self._load(checker)
+
+    def _load(self, checker: Checker) -> None:
+        """Ask ``checker`` for a new handler table; a failure marks it failed."""
+        try:
+            handlers = checker.ast_handlers()
+            if not isinstance(handlers, Mapping) or not all(
+                isinstance(k, type) and issubclass(k, ast.AST) and callable(v)
+                for k, v in handlers.items()
+            ):
+                raise CheckerFault("bad handler table")
+            self._handlers[checker.id] = dict(handlers)
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:  # noqa: BLE001 -- I-11: a failing checker is isolated
+            self.failed[checker.id] = type(exc).__name__
+
+    def _renew(self) -> None:
+        """New handler tables for the next file (I-10, "Per-file handler state").
+
+        The tables made when the walker was built serve the first file. After that every
+        file gets new ones and the old ones are dropped, so memory that a checker's
+        handlers keep for one file's tree never reaches the next.
+        """
+        if self._fresh:
+            self._fresh = False
+            return
+        self._dispatch.clear()
+        for checker in self._checkers:
+            if checker.id in self._options and checker.id not in self.failed:
+                self._load(checker)
 
     @property
     def ast_checker_ids(self) -> tuple[str, ...]:
@@ -271,6 +291,7 @@ class Walker:
 
     def walk(self, job: FileJob) -> FileOutcome:
         """Parse ``job`` once, walk it once, and gather each healthy checker's sites."""
+        self._renew()
         try:
             tree = parse(job.data)
         except FileSkipped as skip:

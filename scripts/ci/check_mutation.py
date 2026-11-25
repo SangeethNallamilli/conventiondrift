@@ -28,6 +28,7 @@ CRITICAL_SUFFIXES = (
     "/verdicts.py",
     "/compare.py",
     "/render/escape.py",
+    "/checkers/phrases.py",
 )
 
 
@@ -72,11 +73,11 @@ def main() -> int:
     if meta_root.is_dir():
         # Lazy import of mutmut internals only to read per-file results already produced.
         try:
-            from mutmut.mutation.data import SourceFileMutationData
-            from mutmut.stats import collect_stat
-            from mutmut.utils.file_utils import walk_mutatable_files
+            from mutmut.mutation.data import SourceFileMutationData  # type: ignore[import-not-found]
+            from mutmut.stats import collect_stat  # type: ignore[import-not-found]
+            from mutmut.utils.file_utils import walk_mutatable_files  # type: ignore[import-not-found]
         except ImportError:
-            SourceFileMutationData = None  # type: ignore[assignment]
+            pass
         else:
             for path in walk_mutatable_files():
                 name = str(path)

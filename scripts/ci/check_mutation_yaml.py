@@ -20,6 +20,7 @@ import importlib
 import sys
 from collections.abc import Iterable
 from pathlib import Path
+from types import ModuleType
 
 FORBIDDEN_MODULES = (
     "_yaml",
@@ -47,7 +48,7 @@ def _under_vendor(path: Path) -> bool:
     return False
 
 
-def vendored_yaml_module():
+def vendored_yaml_module() -> ModuleType:
     """Import yaml the way policy.py does (DESIGN §3a): conventiondrift._vendor.yaml."""
     try:
         policy = importlib.import_module("conventiondrift.policy")
@@ -56,7 +57,7 @@ def vendored_yaml_module():
     # Prefer an attribute the policy module already imported.
     for attr in ("yaml", "vendor_yaml"):
         mod = getattr(policy, attr, None)
-        if getattr(mod, "__file__", None):
+        if isinstance(mod, ModuleType) and getattr(mod, "__file__", None):
             return mod
     load = getattr(policy, "load_yaml", None) or getattr(policy, "load", None)
     if callable(load):

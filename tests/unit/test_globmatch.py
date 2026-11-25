@@ -113,6 +113,7 @@ def test_globset_caches_folder_verdicts() -> None:
 
 # ReDoS (SR condition, Architect ruling 2026-11-12): hostile patterns against hostile
 # names finish at once. A backtracking regex would take exponential time on these.
+@pytest.mark.timing
 @pytest.mark.parametrize(
     ("pattern", "path"),
     [
@@ -131,6 +132,7 @@ def test_hostile_patterns_are_fast(pattern: str, path: str) -> None:
     assert time.monotonic() - started < 2.0
 
 
+@pytest.mark.timing
 def test_matching_work_grows_polynomially_not_exponentially() -> None:
     # The same hostile shape at 2x the size must not cost anywhere near 2**n more.
     def cost(n: int) -> float:
@@ -221,6 +223,14 @@ _GIT = shutil.which("git") or "git"
         ("[c-a]x", "bx"),
         ("[c-a]x", "ax"),
         ("[z-a]x", "zx"),
+        # #76 mutmut survivors (15a655f), each a case that answers differently under one
+        ("[X]", "X"),  # only "!" and "^" negate
+        ("[!a]", "!"),  # the class starts after the "!"
+        ("[!a]", "["),
+        ("[ab]", "X"),  # members are the characters given, nothing between them
+        ("[a-]", "-"),  # "-" before "]" is a plain character
+        ("[a-]", "a"),
+        ("[xa-]", "-"),
     ],
 )
 def test_bracket_expressions_agree_with_git_check_ignore(
@@ -229,7 +239,15 @@ def test_bracket_expressions_agree_with_git_check_ignore(
     (tmp_path / ".gitignore").write_bytes(pattern.encode() + b"\n")
     env = {"PATH": __import__("os").environ.get("PATH", ""), "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": "/dev/null", "HOME": str(tmp_path)}  # fmt: skip
-    for args in (["init", "-q"], ["config", "core.excludesFile", ""]):
+    # Pinned config (D-TL-89 #4): macOS git init sets core.ignorecase=true, and with
+    # that setting git does *not* match [X] to X. Also pin core.autocrlf and clear
+    # core.excludesFile, which this oracle depends on.
+    for args in (
+        ["init", "-q"],
+        ["config", "core.excludesFile", ""],
+        ["config", "core.ignorecase", "false"],
+        ["config", "core.autocrlf", "false"],
+    ):
         subprocess.run([_GIT, *args], cwd=tmp_path, env=env, check=True, capture_output=True)  # noqa: S603
     out = subprocess.run(  # noqa: S603
         [_GIT, "check-ignore", "-q", "--no-index", "--", name],
@@ -237,3 +255,118 @@ def test_bracket_expressions_agree_with_git_check_ignore(
     )  # fmt: skip
     assert out.returncode in (0, 1)  # 0 ignored, 1 not ignored
     assert compile_glob(pattern).match(name) == (out.returncode == 0)
+
+
+def test_a_backslash_at_the_end_of_a_class_escapes_nothing() -> None:
+    # #76 mutmut survivors: a "\\" as the last character, or escaping the "]", leaves
+    # the class unclosed (git agrees), and reading it never runs past the pattern.
+    assert not hit("x[\\", "x[\\")
+    assert not hit("x[a\\", "xa")
+    assert not hit("[\\]", "\\") and not hit("[\\]", "]")
+    assert not hit("[a-\\]", "a") and not hit("[a-\\]", "\\")
+
+
+def test_a_folder_pattern_keeps_the_rest_of_its_name() -> None:
+    # #76 mutmut survivor: only the trailing "/" is dropped from a folder pattern.
+    assert hit("dX/", "dX", is_dir=True)
+    assert not hit("dX/", "d", is_dir=True)
+
+
+def test_globset_reads_a_path_as_a_file_unless_told() -> None:
+    assert not GlobSet(["a.py/"]).excludes("a.py")
+    assert GlobSet(["a.py/"]).excludes("a.py", is_dir=True)
+
+
+def test_globset_checks_every_folder_above_a_path() -> None:
+    # #76 mutmut survivor: an anchored folder in the middle of the path is not skipped.
+    assert GlobSet(["a/b/"]).excludes("a/b/c/d.py")
+    assert GlobSet(["/a/b/c/"]).excludes("a/b/c/d/e.py")
+    assert not GlobSet(["a/b/"]).excludes("a/c/b.py")
+
+
+# ---- #76 B2 / M-76-1: the work count the .gitignore match budget pays from -----------
+
+_NO_LIMIT = 1 << 40
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "is_dir", "expected"),
+    [
+        ("/a", "a", False, (True, 3)),  # start, one component compared (1 + 1)
+        ("a", "a", False, (True, 2)),  # one segment: only the last component, 1 step
+        ("**/x", "a/b/x", False, (True, 2)),  # the same shape written with "**/"
+        ("*.py", "x/m.py", False, (True, 7)),  # 6 steps inside "m.py": *, back up, 4 chars
+        ("a*", "x/a", False, (True, 3)),  # the trailing "*" matches nothing: no step
+        ("[q]1", "q1", False, (True, 4)),
+        ("[q]1", "q1/x", False, (False, 3)),
+        ("a/b", "a/c", False, (False, 5)),
+        ("a/*/c", "a/b/c", True, (True, 9)),
+        ("a/", "a", False, (False, 1)),  # a folder-only pattern on a file: no work
+        ("a", "", False, (False, 1)),
+    ],
+)
+def test_match_counted_answers_as_match_and_counts_steps(
+    pattern: str, path: str, is_dir: bool, expected: tuple[bool, int]
+) -> None:
+    glob = compile_glob(pattern)
+    assert glob.match_counted(path, is_dir, _NO_LIMIT) == expected
+    assert glob.match(path, is_dir) is expected[0]
+
+
+def test_a_one_segment_pattern_compares_only_the_last_component() -> None:
+    glob = compile_glob("[q]1")
+    shallow = glob.match_counted("q1", False, _NO_LIMIT)
+    deep = glob.match_counted("/".join(["q1"] * 60), False, _NO_LIMIT)
+    assert shallow == deep == (True, 4)
+    assert not glob.match("q1/x")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "limit", "stopped", "full"),
+    [
+        ("*a" * 40 + "b", "a" * 400, 100, 101, 802),  # inside one component
+        ("**/a/" * 30 + "b", "/".join(["a"] * 60), 10, 11, 211),  # across components
+    ],
+)
+def test_match_counted_stops_just_past_its_limit(
+    pattern: str, path: str, limit: int, stopped: int, full: int
+) -> None:
+    glob = compile_glob(pattern)
+    assert glob.match_counted(path, False, limit) == (False, stopped)
+    assert glob.match_counted(path, False, _NO_LIMIT) == (False, full)
+
+
+def test_a_match_that_needs_more_than_its_limit_does_not_match() -> None:
+    glob = compile_glob("a/*/c")
+    assert glob.match_counted("a/b/c", False, _NO_LIMIT) == (True, 9)
+    assert glob.match_counted("a/b/c", False, 8) == (True, 9)  # the last step may pass it
+    assert glob.match_counted("a/b/c", False, 5) == (False, 6)  # stopped inside "*"
+
+
+def test_match_reads_a_path_as_a_file_unless_told() -> None:
+    assert not compile_glob("d/").match("d")
+    assert compile_glob("d/").match("d", True)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path", "is_dir"),
+    [
+        ("a/*/c", "a/b/c", True),
+        ("*.py", "x/m.py", False),
+        ("a/", "a", False),
+        ("a/b", "a/c", False),
+    ],
+)
+def test_match_parts_is_match_counted_on_a_split_path(
+    pattern: str, path: str, is_dir: bool
+) -> None:
+    glob = compile_glob(pattern)
+    expected = glob.match_counted(path, is_dir, _NO_LIMIT)
+    assert glob.match_parts(path.split("/"), is_dir, _NO_LIMIT) == expected
+
+
+def test_match_parts_steps_do_not_grow_with_path_length() -> None:
+    glob = compile_glob("[x]/[y]*")
+    deep = ["n" * 200] * 60 + ["b.py"]
+    assert glob.match_parts(["a", "b.py"], False, _NO_LIMIT) == (False, 4)
+    assert glob.match_parts(deep, False, _NO_LIMIT) == (False, 4)

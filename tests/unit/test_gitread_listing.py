@@ -116,14 +116,43 @@ def _fake(monkeypatch: pytest.MonkeyPatch, *outputs: tuple[int, bytes]) -> list[
     return calls
 
 
-def _fake_batch(monkeypatch: pytest.MonkeyPatch, script: str) -> list[list[str]]:
-    """Make every long-lived git a Python process running ``script`` (stdin -> stdout)."""
+#: Ready-file polls in ``_fake_batch`` (0.05 s apart: 30 s); a test lowers it.
+READY_POLLS = 600
+
+
+def _fake_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    script: str,
+    ready: Path | None = None,
+    timeout: float | None = None,
+    processes: list[Any] | None = None,
+) -> list[list[str]]:
+    """Make every long-lived git a Python process running ``script`` (stdin -> stdout).
+
+    With ``ready``, wait (bounded) until the child has created that file, then set
+    ``GIT_TIMEOUT_SECONDS`` to ``timeout`` before returning, so a slow interpreter
+    start-up does not count against a deadline that starts at spawn (CON-14, D-TL-61).
+    If it never does, the fake is killed and reaped before the error, so no process
+    outlives the test (D-TL-62). ``processes`` collects each started process.
+    """
     real_start = gitread._start_batch
     started: list[list[str]] = []
 
     def start(argv: list[str], **kwargs: Any) -> Any:
         started.append(list(argv))
-        return real_start([sys.executable, "-c", script], **kwargs)
+        process = real_start([sys.executable, "-c", script], **kwargs)
+        if processes is not None:
+            processes.append(process)
+        if ready is not None:
+            for _ in range(READY_POLLS):
+                if ready.exists():
+                    break
+                time.sleep(0.05)
+            else:
+                process.kill()  # kills the tree and reaps git (bounded)
+                raise AssertionError(f"fake git was not ready within {READY_POLLS * 0.05:g} s")
+            monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", timeout)
+        return process
 
     monkeypatch.setattr(gitread, "_start_batch", start)
     return started
@@ -915,18 +944,46 @@ def test_patches_waiting_too_long_for_a_chunk_is_a_component_error(
 
 
 def test_patches_waiting_too_long_for_the_exit_is_a_component_error(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The 0.5 s deadline starts at spawn; arm it only once the child is up, so
+    # interpreter start-up cannot time out the first chunk (CON-14, D-TL-61).
+    ready = tmp_path / "ready"
     _fake_batch(
         monkeypatch,
-        "import os, sys, time\nsys.stdout.write('x'); sys.stdout.flush()\n"
+        f"import os, sys, time\nopen({str(ready)!r}, 'w').write('1')\n"
+        "sys.stdout.write('x'); sys.stdout.flush()\n"
         "os.close(1); time.sleep(60)",
+        ready,
+        0.5,
     )
-    monkeypatch.setattr(gitread, "GIT_TIMEOUT_SECONDS", 0.5)
     stream = GitReader(repo).patches(SHA, SHA2)
     assert next(stream) == b"x"
     with pytest.raises(ComponentError, match="git log timed out"):
         next(stream)
+
+
+def test_a_fake_git_that_never_gets_ready_is_killed_and_reaped(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D-TL-62: when _fake_batch's ready wait gives up, the fake git must not be
+    # left running. The bound is lowered so this takes 0.15 s, not 30 s.
+    monkeypatch.setattr(sys.modules[__name__], "READY_POLLS", 3)
+    processes: list[Any] = []
+    _fake_batch(
+        monkeypatch,
+        "import time; time.sleep(60)",
+        tmp_path / "never",
+        0.5,
+        processes,
+    )
+    with pytest.raises(AssertionError, match=r"fake git was not ready within 0\.15 s"):
+        list(GitReader(repo).patches(SHA, SHA2))
+    assert len(processes) == 1
+    proc = processes[0]._proc
+    assert proc.returncode is not None  # killed and reaped by _BatchProcess.kill
+    assert proc.poll() is not None
+    assert not (tmp_path / "never").exists()
 
 
 @pytest.mark.parametrize(("a", "b"), [("HEAD", SHA), (SHA, "a" * 40 + "..HEAD")])

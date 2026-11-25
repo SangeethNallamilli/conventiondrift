@@ -10,7 +10,9 @@ repo, the event payload or another user goes through exactly one of these:
 * :func:`workflow_prop` - a property value of a workflow command (``file=``, ``title=``).
 * :func:`output_heredoc` - one ``GITHUB_OUTPUT`` entry with a random delimiter.
 * :func:`sarif_text` - a SARIF ``message.text`` (plain text, never Markdown).
+* :func:`sarif_uri` - a SARIF ``artifactLocation.uri`` (RFC 3986 URI reference, D-TL-97).
 * :func:`md_codeblock` - text inside a fenced code block in the comment or job summary.
+* :func:`text_field` - a repo-derived field in the ``--format text`` report.
 
 Nothing in this package ever writes ``GITHUB_ENV`` or ``GITHUB_PATH``.
 """
@@ -22,6 +24,7 @@ import secrets
 import unicodedata
 from collections.abc import Callable, Sequence
 from typing import Final
+from urllib.parse import quote
 
 __all__ = [
     "md",
@@ -29,6 +32,8 @@ __all__ = [
     "md_codeblock",
     "output_heredoc",
     "sarif_text",
+    "sarif_uri",
+    "text_field",
     "workflow_cmd",
     "workflow_prop",
 ]
@@ -205,3 +210,47 @@ def sarif_text(text: str) -> str:
     serializer, and no Markdown field is ever built from repo text.
     """
     return _visible_text(text).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+_URI_SAFE: Final = "/"
+"""The only character ``sarif_uri`` keeps besides RFC 3986 unreserved ``A-Z a-z 0-9 - . _ ~``."""
+_LEADING_SLASHES: Final = re.compile(r"/+")  # anchored with match(); single quantifier, linear
+
+
+def sarif_uri(path: str) -> str:
+    """Return a repo-relative POSIX ``path`` as a SARIF ``artifactLocation.uri`` (D-TL-97).
+
+    The I-14 mapping is applied first, as in every escape function, so control, format,
+    separator and surrogate characters become their documented visible form (lone
+    surrogates become ``U+D800``-style text and never reach the UTF-8 encoder). The result
+    is then UTF-8 percent-encoded per RFC 3986 keeping only unreserved characters and
+    ``/``: space, ``%``, ``#``, ``?``, ``:``, ``\\``, ``[``, ``]``, ``@`` and every non-ASCII
+    character are encoded, so the output is pure ASCII, has no scheme, query or fragment,
+    and is a valid relative URI reference. Leading ``/`` characters are encoded too so the
+    value can never read as an absolute path or a ``//host`` network-path reference.
+    """
+    encoded = quote(_visible_text(path), safe=_URI_SAFE)
+    lead = _LEADING_SLASHES.match(encoded)
+    if lead is None:
+        return encoded
+    return quote(lead.group(), safe="") + encoded[lead.end() :]
+
+
+def text_field(value: str, *, quoted: bool = False) -> str:
+    """Escape a repo-derived field for ``--format text`` (SR T-01 b, layout §1.2).
+
+    Values that contain a backslash, start with ``::``, or include a character
+    in :data:`_LABEL_CATEGORIES` (Cc, Cf, Zl, Zp, Cs) are returned as
+    ``repr(value)``. Otherwise a quoted field is wrapped in double quotes and
+    a plain field is returned unchanged.
+    """
+    if "\\" in value or value.startswith("::") or _has_special(value):
+        return repr(value)
+    if quoted:
+        return f'"{value}"'
+    return value
+
+
+def _has_special(value: str) -> bool:
+    """True when ``value`` contains a character in :data:`_LABEL_CATEGORIES`."""
+    return any(unicodedata.category(char) in _LABEL_CATEGORIES for char in value)

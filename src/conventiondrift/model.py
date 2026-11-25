@@ -27,6 +27,7 @@ CheckerId = Literal[
     "type-hints",
     "package-manager",
 ]
+Side = Literal["base", "head"]
 SkipReason = Literal[
     "syntax error",
     "not decodable",
@@ -518,6 +519,29 @@ class Window:
     def __post_init__(self) -> None:
         if self.end is not None and self.end.utcoffset() is None:
             raise ValueError("Window.end must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class TrackedState:
+    """One tracked scan file's ``HEAD`` state, from C4's blob hash against ``ls-tree`` (A-3)."""
+
+    head_blob: str
+    unchanged: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryResult:
+    """C8 output (I-14 ``History``): the recent set, whether it is known, and the call's notes."""
+
+    recent: frozenset[tuple[Side, str, int]]
+    available: bool
+    notes: tuple[str, ...]
+    stats: Mapping[str, int]
+
+    __hash__ = None  # type: ignore[assignment]  # holds a mapping: unhashable like Policy
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stats", _read_only(self.stats))
 
 
 @dataclass(frozen=True, slots=True)

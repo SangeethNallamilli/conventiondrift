@@ -94,21 +94,25 @@ def _assert_runs(profile: str, head_ref: str, manifest: dict, runs: list[benchli
     assert not problems, "\n".join(problems)
 
 
+@pytest.mark.timing
 def test_ac_n2_1_b10k_under_60s(bench_tmp: Path) -> None:
     manifest, runs = _runs("b10k", "bench-pr", bench_tmp)
     _assert_runs("b10k", "bench-pr", manifest, runs)
 
 
+@pytest.mark.timing
 def test_ac_n2_2_b500_under_15s(bench_tmp: Path) -> None:
     manifest, runs = _runs("b500", "bench-pr", bench_tmp)
     _assert_runs("b500", "bench-pr", manifest, runs)
 
 
+@pytest.mark.timing
 def test_ac_e_12_large_pr_under_60s(bench_tmp: Path) -> None:
     manifest, runs = _runs("b10k", "bench-pr-5000", bench_tmp)
     _assert_runs("b10k", "bench-pr-5000", manifest, runs)
 
 
+@pytest.mark.timing
 @pytest.mark.parametrize("profile", ["b10k", "b500"])
 def test_ac_n2_3_regression_gate(profile: str, bench_tmp: Path) -> None:
     baseline_path = os.environ.get("CD_BENCH_BASELINE")

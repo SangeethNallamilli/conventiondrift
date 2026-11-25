@@ -2,8 +2,8 @@
 
 T-006a ships the ``run()`` skeleton, the pure I-4 exit-code policy, the
 exception-to-``InternalError`` helper and the ``fail-on`` fallback used when an
-error happens before policy loads. The pipeline itself is T-028; writing the
-Internal error section is T-006b.
+error happens before policy loads. The pipeline itself is T-028. ``run`` writes the Internal
+error section through ``fallback`` (T-006b).
 """
 
 import re
@@ -13,6 +13,7 @@ from typing import Literal, get_args
 
 from conventiondrift.components import Components
 from conventiondrift.errors import ComponentError, GitTooOld
+from conventiondrift.fallback import write_internal_errors
 from conventiondrift.model import InternalError
 
 FailOn = Literal["none", "new-stale", "any-stale"]
@@ -202,4 +203,7 @@ def run(
             any_stale_met=False,
             internal_error=True,
         )
+        # A-8: the minimal fallback writer, for both entries. It never raises and never
+        # changes the exit status.
+        write_internal_errors(context.internal_errors, entry=entry, env=env)
     return exit_code(outcome)
