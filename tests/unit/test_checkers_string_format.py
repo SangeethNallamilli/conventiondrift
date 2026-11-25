@@ -12,10 +12,11 @@ import pytest
 from checker_support import assert_linear, counts, rules_of, sites_of
 
 from conventiondrift.checkers import REGISTRY
+from conventiondrift.checkers import walk as walk_module
 from conventiondrift.checkers.string_format import StringFormatChecker
 from conventiondrift.checkers.string_format.match import OPTIONS, SCOPE_WORDS, match_rule
 from conventiondrift.checkers.string_format.sites import FormatSites
-from conventiondrift.checkers.walk import parse
+from conventiondrift.checkers.walk import FileJob, Walker, parse
 from conventiondrift.model import FileContext, RuleMatch, Site
 
 USE_F_STRINGS = match_rule("use f-strings.")
@@ -427,9 +428,91 @@ HOSTILE_SOURCES = {
     "specs": lambda n: ('f"{a:>{w}}{b:.2f}"' + PAD) * (n // 82),
 }
 
+# "specs" is dense in f-string `{`, `}` and `:` (PEP 701 tokenizer triggers).
+# "every form" also has f-strings, but few enough that parse stays under the budget.
+_FSTRING_HEAVY_SOURCES = frozenset({"specs"})
+
+# Official first fixes: 3.13.16 and 3.14.8 (https://github.com/python/cpython/issues/155525).
+# Never fixed on 3.12. 3.11 and earlier are unaffected (PEP 701 landed in 3.12).
+_GH_155525 = "https://github.com/python/cpython/issues/155525"
+
+
+def _cpython_fstring_tokenize_is_quadratic() -> bool:
+    """True on CPython releases whose tokenizer still hits gh-155525."""
+    # gh-155525 is a bug in CPython's own C tokenizer. Other implementations (PyPy, GraalPy)
+    # use their own parsers, so they never hit it and are never gated here.
+    if sys.implementation.name != "cpython":
+        return False
+    version = sys.version_info
+    if version[:2] == (3, 12):
+        return True
+    if version[:2] == (3, 13) and version < (3, 13, 16):
+        return True
+    if version[:2] == (3, 14) and version < (3, 14, 8):
+        return True
+    return False
+
+
+_SKIP_QUADRATIC_FSTRING_PARSE = pytest.mark.skipif(
+    _cpython_fstring_tokenize_is_quadratic(),
+    reason=(
+        "D-TL-100 (SECURITY-RULES R2.5 known limit): CPython gh-155525 makes ast.parse of "
+        "f-string-heavy modules quadratic on 3.12.x, 3.13 before 3.13.16, and 3.14 before "
+        f"3.14.8 ({_GH_155525})"
+    ),
+)
+
 
 @pytest.mark.timing
-@pytest.mark.parametrize("kind", HOSTILE_SOURCES)
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param(
+            kind,
+            marks=_SKIP_QUADRATIC_FSTRING_PARSE if kind in _FSTRING_HEAVY_SOURCES else (),
+        )
+        for kind in HOSTILE_SOURCES
+    ],
+)
 def test_the_site_handlers_are_linear_in_a_run(kind: str) -> None:
     make = HOSTILE_SOURCES[kind]
     assert_linear(make, lambda text: sites_of("string-format", {"src/a.py": text}), label=kind)
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize("kind", HOSTILE_SOURCES)
+def test_the_string_format_handlers_are_linear_on_a_parsed_tree(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real walk stays linear on every version, including CPython 3.12.
+
+    This times ``Walker([StringFormatChecker()]).walk`` itself. Only ``parse`` in the walk
+    module, which ``Walker.walk`` calls, is patched: it hands back a tree parsed ahead of
+    time in ``make``, outside the timed region, so gh-155525 can't reach the budget. Same
+    sizes and budget as the run-level test; never skipped.
+    """
+    trees: dict[bytes, ast.Module] = {}
+    served: list[bytes] = []
+
+    def preparsed(data: bytes) -> ast.Module:
+        served.append(data)
+        return trees[data]
+
+    monkeypatch.setattr(walk_module, "parse", preparsed)
+
+    def make(n: int) -> FileJob:
+        data = HOSTILE_SOURCES[kind](n).encode()
+        trees[data] = parse(data)
+        return FileJob("src/a.py", data, is_test_file=False, is_script=False)
+
+    def run(job: FileJob) -> None:
+        walker = Walker([StringFormatChecker()])
+        outcome = walker.walk(job)
+        assert outcome.skipped is None
+        assert not walker.failed
+        assert outcome.nodes > 0
+
+    assert_linear(make, run, label=kind)
+    # Every timed walk got a pre-parsed tree, so none of them timed real parsing.
+    assert served
+    assert set(served) == set(trees)
