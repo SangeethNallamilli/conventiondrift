@@ -13,13 +13,20 @@ No clock is read here: a step that waited for the holder would only return once
 fail. D-TL-25: the bounds come from gitread's own constants.
 """
 
+import builtins
 import io
 import os
+import shutil
+import subprocess
+import sys
 import threading
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from test_gitread_pipe_holders import PROMPT, TIMEOUT
 
 from conventiondrift import gitread
 
@@ -241,6 +248,202 @@ def test_an_abandoned_step_keeps_its_error_to_itself() -> None:
         threading.excepthook = hook
     assert hold.left.wait(_HOLD_SECONDS)
     assert caught == []  # kept in the step, never an unhandled thread error
+
+
+def test_a_whole_kill_fits_the_pipe_holder_bound() -> None:
+    """TE B2 on #93: the bounds themselves, not only stand-ins with a shrunk bound.
+
+    A kill closes stdin and both pipes; ``PROMPT`` minus git's ``TIMEOUT`` is what the
+    pipe-holder cases allow for that (test_gitread_pipe_holders.py).
+    """
+    whole_close = 2 * gitread._CLOSE_PIPE_SECONDS + gitread._CLOSE_STDIN_SECONDS
+    assert whole_close < PROMPT - TIMEOUT
+
+
+def test_the_close_worker_is_a_daemon_thread() -> None:
+    """An abandoned close must never keep the interpreter from exiting (TE B2)."""
+    seen: list[tuple[bool, int | None]] = []
+    here = threading.get_ident()
+
+    def record() -> None:
+        thread = threading.current_thread()
+        seen.append((thread.daemon, thread.ident))
+
+    assert gitread._within(gitread._CLOSE_PIPE_SECONDS, record)
+    assert len(seen) == 1
+    daemon, ident = seen[0]
+    assert daemon and ident != here
+
+
+class _NoThreads:
+    """gitread's view of ``threading`` when no thread can be started."""
+
+    Event = threading.Event
+
+    def __init__(self, error: BaseException | None) -> None:
+        self.error = error
+        self.made = 0
+
+    def Thread(self, **_kwargs: Any) -> Any:  # stands in for the class
+        self.made += 1
+        outer = self
+
+        class _Unstartable:
+            daemon = True
+
+            def start(self) -> None:
+                if outer.error is not None:
+                    raise outer.error
+
+        return _Unstartable()
+
+
+#: A subclass of RuntimeError from 3.13 on; RuntimeError itself before.
+_FINALIZATION_ERROR: type[RuntimeError] = getattr(builtins, "PythonFinalizationError", RuntimeError)
+#: How ``Thread.start()`` fails: at shutdown (3.12, then 3.13+), or the OS refuses (N2).
+START_ERRORS: dict[str, Callable[[], BaseException]] = {
+    "shutdown (3.12)": lambda: RuntimeError("can't create new thread at interpreter shutdown"),
+    "shutdown (3.13+)": lambda: _FINALIZATION_ERROR(
+        "can't create new thread at interpreter shutdown"
+    ),
+    "no thread to be had": lambda: RuntimeError("can't start new thread"),
+}
+
+
+@pytest.mark.parametrize("why", sorted(START_ERRORS))
+def test_a_refused_thread_start_runs_the_fallback_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch, why: str
+) -> None:
+    threads = _NoThreads(START_ERRORS[why]())
+    monkeypatch.setattr(gitread, "threading", threads)
+    ran: list[str] = []
+    assert not gitread._within(
+        gitread._CLOSE_PIPE_SECONDS, lambda: ran.append("step"), lambda: ran.append("fallback")
+    )
+    assert threads.made == 1 and ran == ["fallback"]
+
+
+def test_at_shutdown_no_thread_is_even_started(monkeypatch: pytest.MonkeyPatch) -> None:
+    """3.11 at shutdown: ``Thread.start()`` waits forever for a thread that never runs."""
+    threads = _NoThreads(AssertionError("Thread.start() during interpreter shutdown"))
+    monkeypatch.setattr(gitread, "threading", threads)
+    monkeypatch.setattr(gitread, "sys", SimpleNamespace(is_finalizing=lambda: True))
+    ran: list[str] = []
+    assert not gitread._within(
+        gitread._CLOSE_PIPE_SECONDS, lambda: ran.append("step"), lambda: ran.append("fallback")
+    )
+    assert threads.made == 0 and ran == ["fallback"]
+
+
+def test_a_failing_fallback_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gitread, "threading", _NoThreads(RuntimeError("can't start new thread")))
+
+    def fails() -> None:
+        raise OSError("bad fd")
+
+    assert not gitread._within(gitread._CLOSE_PIPE_SECONDS, lambda: None, fails)
+
+
+class _Stream:
+    def __init__(self) -> None:
+        self.raw = SimpleNamespace(closes=0)
+        self.raw.close = self._close_raw
+        self.closes = 0
+
+    def _close_raw(self) -> None:
+        self.raw.closes += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+@pytest.mark.parametrize("name", ["posix", "nt"])
+def test_a_kill_without_threads_closes_what_cannot_block_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """TE B1/N2: kill() reaches every close; none takes a lock a held read keeps."""
+    monkeypatch.setattr(gitread, "os", _OsAs(name))
+    monkeypatch.setattr(gitread, "threading", _NoThreads(RuntimeError("can't start new thread")))
+    monkeypatch.setattr(gitread, "_kill_tree", lambda *_a: None)
+    stdin, stdout, stderr = _Stream(), _Stream(), _Stream()
+    process = object.__new__(gitread._BatchProcess)
+    process._proc = cast(Any, SimpleNamespace(stdin=stdin, stdout=stdout, stderr=stderr))
+    process._job = None
+    process._stop = threading.Event()
+    process._threads = cast(Any, [object(), object()])  # never joined: no thread to ask
+    process.kill()
+    assert stdin.raw.closes == 1  # nothing reads git's stdin in this process
+    pipes = 0 if name == "nt" else 1  # Windows: even the raw close waits on a held read
+    assert (stdout.raw.closes, stderr.raw.closes) == (pipes, pipes)
+    assert stdin.closes == stdout.closes == stderr.closes == 0  # never the buffered close
+
+
+def test_windows_raw_close_thread_refused_is_left_to_the_os(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gitread, "os", _OsAs("nt"))
+    monkeypatch.setattr(gitread, "_kernel32", _no_cancel)
+    monkeypatch.setattr(gitread, "threading", _NoThreads(RuntimeError("can't start new thread")))
+    hold = _Hold()
+    stream = _Stream()
+    gitread._close_pipe(stream, cast(threading.Thread, _Reader(hold, "", alive=True)))
+    assert stream.raw.closes == 0 and stream.closes == 0
+
+
+#: TE's #93 B1 repro: a patches stream still open when the interpreter exits.
+_EXIT_WITH_OPEN_STREAM = """
+import sys
+from conventiondrift.gitread import GitReader
+repo, head = sys.argv[1], sys.argv[2]
+stream = GitReader(repo).patches(None, head)
+next(stream)
+sys.exit(0)
+"""
+
+
+def _fixture_repo(tmp_path: Path) -> tuple[Path, str]:
+    """Test helper only: a two-commit repo made with the test machine's git."""
+    git = shutil.which("git")
+    assert git is not None, "the subprocess case needs git on PATH"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = dict(os.environ, HOME=str(tmp_path), GIT_CONFIG_NOSYSTEM="1")
+    flags = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false"]
+
+    def run(*args: str) -> str:
+        out = subprocess.run(  # noqa: S603 (resolved git, fixed argv)
+            [git, *flags, *args], cwd=repo, env=env, capture_output=True, text=True, check=True
+        )
+        return out.stdout.strip()
+
+    run("init", "-q")
+    run("commit", "-q", "--allow-empty", "-m", "one")
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    run("add", "f.txt")
+    run("commit", "-q", "-m", "two")
+    return repo, run("rev-parse", "HEAD")
+
+
+def test_an_open_patches_stream_at_interpreter_exit_closes_quietly(tmp_path: Path) -> None:
+    """TE B1 on #93, end to end on this interpreter: no hang, no error at exit.
+
+    The generator's ``finally`` (kill) runs while the interpreter shuts down, where
+    3.11 hung in ``Thread.start()`` and 3.12+ raised out of ``kill()``.
+    """
+    repo, head = _fixture_repo(tmp_path)
+    src = str(Path(gitread.__file__).resolve().parents[1])
+    path = os.pathsep.join(p for p in (src, os.environ.get("PYTHONPATH")) if p)
+    out = subprocess.run(  # noqa: S603 (this interpreter, fixed script)
+        [sys.executable, "-c", _EXIT_WITH_OPEN_STREAM, str(repo), head],
+        env=dict(os.environ, PYTHONPATH=path),
+        capture_output=True,
+        text=True,
+        timeout=gitread.GIT_TIMEOUT_SECONDS,  # a hang ends here as TimeoutExpired
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "Exception ignored" not in out.stderr
+    assert "Traceback" not in out.stderr
 
 
 def test_the_close_bounds_cover_a_full_cancel() -> None:
