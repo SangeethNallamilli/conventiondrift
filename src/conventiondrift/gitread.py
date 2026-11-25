@@ -50,7 +50,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -616,6 +616,12 @@ _READER_JOIN_SECONDS = 1.0
 #: close is handed to a background thread, and the pause between attempts.
 _CANCEL_READ_SECONDS = 0.5
 _CANCEL_POLL_SECONDS = 0.05
+#: D-TL-104: hard bounds on the close steps as a whole, from the caller's side. One
+#: pipe's close may take its reader join, the cancel window and a poll of slack;
+#: closing git's stdin takes no more than the cancel window. Past these, the step is
+#: left to finish on its own daemon thread (see :func:`_within`).
+_CLOSE_PIPE_SECONDS = _READER_JOIN_SECONDS + _CANCEL_READ_SECONDS + 2 * _CANCEL_POLL_SECONDS
+_CLOSE_STDIN_SECONDS = _CANCEL_READ_SECONDS
 #: ``OpenThread`` access right that ``CancelSynchronousIo`` needs.
 _THREAD_TERMINATE = 0x0001
 #: Windows job object constants (I-13 C3 Windows kill-scope ruling).
@@ -838,7 +844,50 @@ def _close_raw(raw: object) -> None:
         cast(io.RawIOBase, raw).close()
 
 
+def _within(seconds: float, step: Callable[[], None]) -> bool:
+    """Run ``step`` on a daemon thread and wait for it at most ``seconds`` (D-TL-104).
+
+    The close steps below call things that are bounded only on paper: a thread's
+    ``join(timeout)`` and ``is_alive()`` end in an untimed OS-level join once the
+    thread has started to exit (CPython 3.13+ ``ThreadHandle``), and a pipe close
+    can wait on a lock (the buffered wrapper's, the C runtime's per-fd one, or the
+    kernel's on a synchronous pipe) that a read blocked by a pipe holder outside
+    git's group still holds. So the caller waits on an ``Event``, which is a timed
+    lock wait and nothing else. Returns True once ``step`` has finished (re-raising
+    what it raised), or False after ``seconds``: ``step`` then keeps running and
+    finishes once the holder lets go. It only closes our own handles, so nothing
+    leaks and nothing waits for the holder's lifetime (C3, CR2 S1).
+    """
+    done = threading.Event()
+    failure: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            step()
+        except BaseException as exc:  # noqa: BLE001 (handed to the caller, if it still waits)
+            failure.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    if not done.wait(seconds):
+        return False
+    if failure:
+        raise failure[0]
+    return True
+
+
 def _close_when_done(stream: object, reader: threading.Thread) -> None:
+    """Close one of git's pipes, waiting at most :data:`_CLOSE_PIPE_SECONDS`.
+
+    The close itself (:func:`_close_pipe`) runs under :func:`_within`, so no step
+    of it can hold the caller for a pipe holder's lifetime; past the bound it
+    finishes on its own and the pipe is still closed.
+    """
+    _within(_CLOSE_PIPE_SECONDS, lambda: _close_pipe(stream, reader))
+
+
+def _close_pipe(stream: object, reader: threading.Thread) -> None:
     """Close a pipe once its reader is done, or close the raw fd if it is not.
 
     Closing a buffered pipe waits on the lock a blocked reader holds, so while a
@@ -995,6 +1044,14 @@ class _BatchProcess:
             raise self._error("stopped") from exc
 
     def close_stdin(self) -> None:
+        """Close git's stdin, waiting at most :data:`_CLOSE_STDIN_SECONDS` (D-TL-104).
+
+        A pipe holder outside git's group keeps the other end open, so the close
+        runs under :func:`_within`; past the bound it finishes on its own.
+        """
+        _within(_CLOSE_STDIN_SECONDS, self._close_stdin)
+
+    def _close_stdin(self) -> None:
         with contextlib.suppress(OSError):
             cast(io.BufferedIOBase, self._proc.stdin).close()
 
