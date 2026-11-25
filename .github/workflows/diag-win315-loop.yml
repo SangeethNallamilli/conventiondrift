@@ -1,16 +1,15 @@
-# D-TL-104 / D-TL-105 / D-TL-106 one-off diagnostic (diag branch only; never
-# merged, never a PR, non-blocking).
-# D-TL-106: on windows-latest / Python 3.15, repeat ci.yml's Windows `test` job
-# "pytest with coverage" step (the FULL offline suite, same command, markers,
-# coverage options and env) so tests/unit/test_gitread_pipe_holders.py runs
-# in-process after the earlier tests, as in run 45564181345. Like that job, the
-# timing-marked step runs once first (non-blocking here). 3 parallel shards
-# (separate runners) x up to 5 iterations, no added CPU load. Captures failures,
-# every test call over PROMPT (4.5 s), per-iteration durations and any D-TL-103
-# (#91) thread-stack dump into the log, the step summary and an artifact.
-# No secrets, contents: read, persist-credentials: false, every uses: pinned to
-# the same full SHAs as ci.yml / bench.yml. Runs on push to this diag branch
-# only (workflow_dispatch needs the file on the default branch).
+# D-TL-104 one-off diagnostic (diag branch only; never merged, never a PR).
+# Loops the 6 escaped-grandchild ("own session, git exited") cases of
+# tests/unit/test_gitread_pipe_holders.py::test_a_pipe_holding_grandchild_never_stretches_a_kill
+# on windows-latest / Python 3.15, mirroring ci.yml's `test` job install and
+# coverage step, to capture the D-TL-103 (#91) thread-stack dumps when a kill
+# overruns PROMPT (4.5 s). No secrets, contents: read, persist-credentials: false,
+# every uses: pinned to the same full SHAs as ci.yml / bench.yml.
+# Runs on push to this diag branch only (workflow_dispatch needs the file on
+# the default branch, which this file never reaches).
+# Rerun against release/develop 32995c0 (#93 close-path bound), merged into
+# this diag branch. Loop mechanism, pins, and the 50 x 6 own-session cases
+# are unchanged from D-TL-104 (commit 539e479).
 name: diag-win315-loop
 
 on:
@@ -26,21 +25,16 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   HYPOTHESIS_SEED: "20261112"
   UV_VERSION: "0.13.7"
-  ITERATIONS: "5"
-  # Start no new iteration after 100 min (a full coverage step is ~10-13 min).
-  BUDGET_SECONDS: "6000"
+  MAX_ITERATIONS: "50"
+  BUDGET_SECONDS: "2400"
 
 jobs:
-  win315-full-coverage-loop:
-    name: diag win315 full coverage step loop (shard ${{ matrix.shard }})
+  win315-loop:
+    name: diag win315 escaped-grandchild loop
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 60
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
     defaults:
       run:
         shell: bash
@@ -69,12 +63,12 @@ jobs:
           .venv/Scripts/conventiondrift --version
       - name: Confirm no PyPI PyYAML in this environment
         run: python scripts/ci/check_no_pypi_yaml.py
-      - name: pytest timing-marked tests without coverage (as ci.yml; once, non-blocking)
-        continue-on-error: true
+      - name: Collect the 6 escaped-grandchild node ids
         run: |
-          unset COVERAGE_PROCESS_START
-          python -m pytest tests -m "timing and not network" -rs --hypothesis-seed="${HYPOTHESIS_SEED}"
-      - name: Loop the full ci.yml coverage step
+          python -m pytest --collect-only -q "tests/unit/test_gitread_pipe_holders.py::test_a_pipe_holding_grandchild_never_stretches_a_kill" -k "own and session" | tee "${RUNNER_TEMP}/collect.txt"
+          n=$(grep -c '::test_a_pipe_holding_grandchild_never_stretches_a_kill\[' "${RUNNER_TEMP}/collect.txt")
+          test "$n" -eq 6
+      - name: Loop the 6 cases under coverage (as the ci.yml coverage step)
         run: |
           set +e
           out="${RUNNER_TEMP}/diag"
@@ -83,103 +77,80 @@ jobs:
           export COVERAGE_PROCESS_START="${PWD}/pyproject.toml"
           start=$(date +%s)
           i=0
-          while [ "$i" -lt "$ITERATIONS" ] && [ $(( $(date +%s) - start )) -lt "$BUDGET_SECONDS" ]; do
+          while [ "$i" -lt "$MAX_ITERATIONS" ] && [ $(( $(date +%s) - start )) -lt "$BUDGET_SECONDS" ]; do
             i=$((i + 1))
             n=$(printf '%03d' "$i")
-            echo "::group::shard ${{ matrix.shard }} iteration $n (elapsed $(( $(date +%s) - start )) s)"
-            t0=$(date +%s)
-            # Same command as ci.yml's coverage step; only --junitxml and its
-            # duration mode are added (reporting only).
-            python -m coverage run --parallel-mode -m pytest tests -m "not network and not timing" -rs \
-              --hypothesis-seed="${HYPOTHESIS_SEED}" \
+            echo "::group::iteration $n (elapsed $(( $(date +%s) - start )) s)"
+            python -m coverage run --parallel-mode -m pytest \
+              "tests/unit/test_gitread_pipe_holders.py::test_a_pipe_holding_grandchild_never_stretches_a_kill" \
+              -k "own and session" -rs -vv --tb=long --hypothesis-seed="${HYPOTHESIS_SEED}" \
               -o junit_duration_report=call --junitxml="$out/junit-$n.xml" > "$out/pytest-$n.log" 2>&1
             rc=$?
-            t1=$(date +%s)
-            python -m coverage combine > "$out/coverage-$n.log" 2>&1
-            python -m coverage json -o "$out/coverage-$n.json" >> "$out/coverage-$n.log" 2>&1
-            python -m coverage report --show-missing >> "$out/coverage-$n.log" 2>&1
-            echo "iteration $n exit $rc pytest-seconds $((t1 - t0))" | tee -a "$out/iterations.txt"
-            tail -n 30 "$out/pytest-$n.log"
+            echo "iteration $n exit $rc" | tee -a "$out/exit-codes.txt"
+            tail -n 15 "$out/pytest-$n.log"
             echo "::endgroup::"
             if [ "$rc" -ne 0 ]; then
-              echo "=== FAILURES IN ITERATION $n ==="
-              sed -n '/= FAILURES =/,/short test summary/p' "$out/pytest-$n.log"
+              echo "=== FULL OUTPUT OF FAILING ITERATION $n ==="
+              cat "$out/pytest-$n.log"
             fi
             rm -f .coverage .coverage.*
           done
-          echo "shard ${{ matrix.shard }}: ran $i iterations in $(( $(date +%s) - start )) s"
+          echo "ran $i iterations in $(( $(date +%s) - start )) s"
           exit 0
-      - name: Summarize failures, tests over 4.5 s, pipe-holder timings and stack dumps
+      - name: Summarize per-case timings, overruns and stack dumps
         if: always()
-        env:
-          SHARD: ${{ matrix.shard }}
         run: |
           python - <<'PY'
           import glob, os, re, xml.etree.ElementTree as ET
           out = os.path.join(os.environ["RUNNER_TEMP"], "diag")
-          shard = os.environ["SHARD"]
           PROMPT = 4.5
-          PIPE = "test_gitread_pipe_holders"
-          iters = {}
-          if os.path.exists(os.path.join(out, "iterations.txt")):
-              for line in open(os.path.join(out, "iterations.txt"), encoding="utf-8"):
-                  p = line.split()
-                  iters[p[1]] = (p[3], p[5])
-          pipe, fails, over, per_it = {}, [], [], {}
-          for f in sorted(glob.glob(os.path.join(out, "junit-*.xml"))):
+          stats, overruns = {}, []
+          files = sorted(glob.glob(os.path.join(out, "junit-*.xml")))
+          for f in files:
               it = re.search(r"junit-(\d+)\.xml", f).group(1)
-              cnt = {"tests": 0, "fail": 0, "skip": 0, "over": 0, "pipe_over": 0}
               for tc in ET.parse(f).iter("testcase"):
-                  cls, name = tc.get("classname") or "", tc.get("name")
-                  full = f"{cls}::{name}"
+                  name = tc.get("name")
+                  case = name[name.find("[") + 1 : -1] if "[" in name else name
                   t = float(tc.get("time") or 0)
-                  cnt["tests"] += 1
-                  if tc.find("skipped") is not None:
-                      cnt["skip"] += 1
-                  if PIPE in cls:
-                      pipe.setdefault(name, []).append(t)
-                  if t > PROMPT:
-                      cnt["over"] += 1
-                      cnt["pipe_over"] += PIPE in cls
-                      over.append((it, full, t))
+                  s = stats.setdefault(case, {"n": 0, "times": [], "fail": 0, "overrun": 0, "took": []})
+                  s["n"] += 1
+                  s["times"].append(t)
                   bad = tc.find("failure") if tc.find("failure") is not None else tc.find("error")
                   if bad is not None:
-                      cnt["fail"] += 1
+                      s["fail"] += 1
                       text = (bad.get("message") or "") + "\n" + (bad.text or "")
                       m = re.search(r"the kill took ([0-9.]+) s", text)
-                      path = os.path.join(out, f"failure-{it}-{re.sub(r'[^A-Za-z0-9]+', '_', full)[-140:]}.txt")
+                      if m:
+                          s["overrun"] += 1
+                          s["took"].append(float(m.group(1)))
+                      path = os.path.join(out, f"failure-{it}-{re.sub(r'[^A-Za-z0-9]+', '_', case)}.txt")
                       with open(path, "w", encoding="utf-8") as fh:
                           fh.write(text)
-                      fails.append((it, full, m.group(1) if m else "n/a", path))
-              per_it[it] = cnt
-          L = [f"# D-TL-106 shard {shard}: {len(per_it)} iterations of the full Windows 3.15 coverage step", "",
-               "| iteration | pytest exit | pytest s | tests | skipped | failures | calls > 4.5 s | pipe-holder calls > 4.5 s |",
-               "|---|---|---|---|---|---|---|---|"]
-          for it in sorted(per_it):
-              c = per_it[it]; rc, secs = iters.get(it, ("?", "?"))
-              L.append(f"| {it} | {rc} | {secs} | {c['tests']} | {c['skip']} | {c['fail']} | {c['over']} | {c['pipe_over']} |")
-          L += ["", "## Pipe-holder tests (call s), slowest first", "", "| test | runs | min | median | max |", "|---|---|---|---|---|"]
-          for name in sorted(pipe, key=lambda k: -max(pipe[k])):
-              ts = sorted(pipe[name])
-              L.append(f"| {name} | {len(ts)} | {ts[0]:.2f} | {ts[len(ts)//2]:.2f} | {ts[-1]:.2f} |")
-          L += ["", f"## Test calls over {PROMPT} s ({len(over)})"] + [f"- iteration {it}: {n} {t:.2f} s" for it, n, t in sorted(over, key=lambda x: -x[2])]
-          L += ["", f"## Failures ({len(fails)})"] + [f"- iteration {it}: {n} (kill took {k} s) -> {os.path.basename(p)}" for it, n, k, p in fails]
-          text = "\n".join(L) + "\n"
+                      overruns.append((it, case, m.group(1) if m else "n/a", path))
+          lines = [f"# D-TL-104 Windows 3.15 loop: {len(files)} iterations", "",
+                   "| case | runs | min call s | median | max call s | >4.5 s call | failures | overruns (took) |",
+                   "|---|---|---|---|---|---|---|---|"]
+          for case in sorted(stats):
+              s = stats[case]; ts = sorted(s["times"])
+              med = ts[len(ts) // 2] if ts else 0
+              lines.append(f"| {case} | {s['n']} | {ts[0]:.2f} | {med:.2f} | {ts[-1]:.2f} | {sum(t > PROMPT for t in ts)} | {s['fail']} | {s['overrun']} {['%.2f' % x for x in s['took']]} |")
+          lines += ["", f"Total failures: {len(overruns)}"]
+          for it, case, took, path in overruns:
+              lines.append(f"- iteration {it}: {case} took {took} s -> {os.path.basename(path)}")
+          text = "\n".join(lines) + "\n"
           print(text)
           open(os.path.join(out, "summary.md"), "w", encoding="utf-8").write(text)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
               fh.write(text)
-              for it, n, k, p in fails:
-                  fh.write(f"\n<details><summary>iteration {it}: {n} (took {k} s)</summary>\n\n```\n{open(p, encoding='utf-8').read()[:60000]}\n```\n</details>\n")
-          for it, n, k, p in fails:
-              print(f"\n===== FAILURE / STACK DUMP: shard {shard} iteration {it} {n} (took {k} s) =====")
-              print(open(p, encoding="utf-8").read())
+          for it, case, took, path in overruns:
+              print(f"\n===== STACK DUMP / FAILURE: iteration {it} {case} (took {took} s) =====")
+              print(open(path, encoding="utf-8").read())
           PY
-      - name: Upload loop logs, JUnit, coverage reports and stack dumps
+      - name: Upload loop logs, JUnit and stack dumps
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: d-tl-106-win315-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: d-tl-104-win315-loop-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/diag
           retention-days: 14
           if-no-files-found: warn
