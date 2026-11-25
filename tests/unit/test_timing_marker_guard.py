@@ -148,6 +148,12 @@ _EXEMPT_BY_FILE: dict[str, dict[str, str]] = {
         "test_triggers_cover_every_kill_path_in_the_code": (
             "compares the names in TRIGGERS (whose triggers use _Gate's clock); runs nothing"
         ),
+        "test_the_gate_dumps_every_thread_when_a_kill_overruns": (
+            "checks the stack dump _Gate writes when a kill overruns; asserts no budget"
+        ),
+        "test_the_gate_dumps_nothing_for_a_prompt_kill": (
+            "checks _Gate writes no stack dump when stopped in time; asserts no budget"
+        ),
     },
 }
 EXEMPT: dict[str, str] = {
