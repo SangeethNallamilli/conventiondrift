@@ -24,6 +24,7 @@ from conventiondrift.render.escape import (
     md_codeblock,
     output_heredoc,
     sarif_text,
+    sarif_uri,
     text_field,
     workflow_cmd,
     workflow_prop,
@@ -97,6 +98,22 @@ def visible(text: str) -> str:
             parts.append("U+" + format(code, "04X"))
         else:
             parts.append(char)
+    return "".join(parts)
+
+
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+# RFC 3986 relative-ref path with no scheme, query or fragment: pchar / "/" only.
+_URI_REFERENCE = re.compile(r"(?:[A-Za-z0-9\-._~/]|%[0-9A-F]{2})*")
+
+
+def pct(text: str) -> str:
+    """Independent RFC 3986 percent-encoding: unreserved and ``/`` kept, rest UTF-8 %XX."""
+    parts: list[str] = []
+    for char in text:
+        if char in _UNRESERVED or char == "/":
+            parts.append(char)
+        else:
+            parts.append("".join(f"%{byte:02X}" for byte in char.encode("utf-8")))
     return "".join(parts)
 
 
@@ -439,6 +456,16 @@ def test_sarif_text_per_character_class(label: str, sample: str, mapped: str) ->
 
 
 @pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
+def test_sarif_uri_per_character_class(label: str, sample: str, mapped: str) -> None:
+    """R3 / D-TL-97: the I-14 mapping first, then RFC 3986 percent-encoding of the result."""
+    assert any(unicodedata.category(char) in esc._LABEL_CATEGORIES for char in sample)
+    out = sarif_uri(sample)
+    assert out == pct(mapped)
+    assert out.isascii() and _URI_REFERENCE.fullmatch(out)
+    assert hidden_chars(out) == []
+
+
+@pytest.mark.parametrize(("label", "sample", "mapped"), _CLASS_CASES, ids=_CLASS_IDS)
 def test_output_heredoc_per_character_class(label: str, sample: str, mapped: str) -> None:
     entry = output_heredoc("report-path", sample)
     delivered = parse_output_file(entry)["report-path"]
@@ -498,6 +525,7 @@ def test_lone_surrogates_do_not_crash() -> None:
         assert workflow_cmd(sample) == visible(sample)
         assert workflow_prop(sample) == visible(sample)
         assert sarif_text(sample) == visible(sample)
+        assert sarif_uri(sample) == pct(visible(sample))
         assert output_heredoc("report-path", sample).endswith("\n")
         assert codeblock_body(md_codeblock([sample])) == [visible(sample)]
 
@@ -889,6 +917,66 @@ def test_sarif_text_json_roundtrips_every_mapped_class() -> None:
     assert json.loads(json.dumps(payload, ensure_ascii=False)) == payload
 
 
+# ---- sarif_uri() (D-TL-97) ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("AGENTS.md", "AGENTS.md"),
+        (".github/copilot-instructions.md", ".github/copilot-instructions.md"),
+        ("a-b_c~d/e.f", "a-b_c~d/e.f"),
+        ("docs/my rules/AGENTS.md", "docs/my%20rules/AGENTS.md"),
+        ("100%.md", "100%25.md"),
+        ("a#b.md", "a%23b.md"),
+        ("a?b=c.md", "a%3Fb%3Dc.md"),
+        ("c:x.md", "c%3Ax.md"),
+        ("a\\b.md", "a%5Cb.md"),
+        ("[x]@y!$&'()*+,;=.md", "%5Bx%5D%40y%21%24%26%27%28%29%2A%2B%2C%3B%3D.md"),
+        ("caf\u00e9/\u65e5\u672c.md", "caf%C3%A9/%E6%97%A5%E6%9C%AC.md"),
+        ("\U0001f600.md", "%F0%9F%98%80.md"),
+        ("/abs.md", "%2Fabs.md"),
+        ("//host/x.md", "%2F%2Fhost/x.md"),
+        ("a//b/", "a//b/"),
+        ("", ""),
+    ],
+)
+def test_sarif_uri_exact(path: str, expected: str) -> None:
+    out = sarif_uri(path)
+    assert out == expected
+    assert out.isascii() and _URI_REFERENCE.fullmatch(out)
+    assert not out.startswith("/")
+
+
+def test_sarif_uri_maps_invisible_classes_before_encoding() -> None:
+    sample = (
+        f"d{C0_NUL}{C0_TAB}{C0_LF}{C0_CR}{DEL}{C1_NEL}{CF_BIDI}{CF_ZWSP}{CF_BOM}"
+        f"{ZL}{ZP}{CS_LOW}{CS_HIGH}/x.md"
+    )
+    out = sarif_uri(sample)
+    assert out == pct(visible(sample))
+    assert "U%2B202E" in out and "U%2BD800" in out and "%E2%90%8A" in out
+    assert out.isascii() and "\n" not in out and "\r" not in out
+
+
+def test_sarif_uri_hostile_path_is_one_ascii_reference() -> None:
+    out = sarif_uri(INJECT_PATH)
+    assert out == "src/%3A%3Awarning%3A%3A%250A.py"
+    assert _URI_REFERENCE.fullmatch(sarif_uri(HOSTILE_PATH))
+
+
+@given(st.text(max_size=60))
+@settings(max_examples=300, deadline=None)
+@example(CS_LOW + "/" + CS_HIGH)
+@example("//" + CF_BIDI)
+def test_sarif_uri_property(text: str) -> None:
+    out = sarif_uri(text)
+    assert out.isascii() and _URI_REFERENCE.fullmatch(out)
+    assert not out.startswith("/")
+    assert out.count("/") == visible(text).count("/") - (len(text) - len(text.lstrip("/")))
+    assert out == pct(visible(text)) or out.startswith("%2F")
+
+
 # ---- md_codeblock() ------------------------------------------------------------------
 
 
@@ -1234,6 +1322,7 @@ def test_public_surface_is_exactly_one_function_per_sink() -> None:
         "md_codeblock",
         "output_heredoc",
         "sarif_text",
+        "sarif_uri",
         "text_field",
         "workflow_cmd",
         "workflow_prop",

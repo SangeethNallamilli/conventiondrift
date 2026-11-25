@@ -140,6 +140,23 @@ def test_text_field_is_defined_only_in_the_escape_module() -> None:
     assert elsewhere == []
 
 
+def test_sarif_uri_is_defined_only_in_the_escape_module() -> None:
+    """R3.2 / D-TL-97: the SARIF URI escaper lives with the other sink functions."""
+    tree = ast.parse(ESCAPE.read_text("utf-8"))
+    defined = {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    assert "sarif_uri" in defined
+    elsewhere = [
+        f"{p.relative_to(ROOT)}:{node.lineno}"
+        for p in _src_modules()
+        if p != ESCAPE
+        for node in ast.walk(ast.parse(p.read_text("utf-8")))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "sarif_uri"
+    ]
+    assert elsewhere == []
+
+
 def test_unicodedata_category_is_only_used_in_the_escape_module() -> None:
     """R3 character-class mapping must not be reimplemented outside escape.py."""
     hits: list[str] = []
