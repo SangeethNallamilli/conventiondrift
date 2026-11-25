@@ -19,6 +19,7 @@ __all__ = [
     "PRT_BODY",
     "PRT_HEADING",
     "RUN_LEVEL_TITLE",
+    "SARIF_RULES",
     "TEXT_HEADER",
     "analyzed_line",
     "analyzer_python_line",
@@ -56,6 +57,22 @@ FETCH_DEPTH: Final = "fetch-depth: 0"
 TEXT_HEADER: Final = "conventiondrift text 1"
 RUN_LEVEL_TITLE: Final = "conventiondrift"
 ANNOTATION_TITLE_PREFIX: Final = "conventiondrift: "
+SARIF_RULES: Final = (
+    (
+        "made-stale-by-code",
+        "MadeStaleByCode",
+        "Code changes in this pull request made an agent rule stale.",
+    ),
+    (
+        "stale-rule-added",
+        "StaleRuleAdded",
+        "This pull request adds an agent rule that is already stale.",
+    ),
+)
+"""SARIF reporting descriptors ``(id, name, shortDescription)``, one per finding case.
+
+The ids are the I-9 ``case`` values of the two finding cases (SPEC glossary "Warning").
+"""
 _NO_COMPARISON: Final = "No before/after comparison was made."
 _FETCH_HINT: Final = f"To compare against the pull request base, check out with {FETCH_DEPTH}."
 _GATING: Final = "Gating was not applied."
