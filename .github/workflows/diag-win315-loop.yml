@@ -51,6 +51,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: py
         with:
           python-version: "3.15"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -74,18 +75,26 @@ jobs:
       - name: Start CPU load (phase B only; one busy loop per logical CPU)
         if: matrix.load
         shell: pwsh
+        env:
+          # setup-python's real interpreter, not the .venv launcher stub (which
+          # re-spawns the interpreter as a child and shows 0 CPU itself).
+          BASE_PY: ${{ steps.py.outputs.python-path }}
         run: |
           $n = [Environment]::ProcessorCount
-          $py = (Get-Command python).Source
           $pids = @()
           for ($i = 0; $i -lt $n; $i++) {
-            $p = Start-Process -FilePath $py -ArgumentList '-c', '"while True: pass"' -WindowStyle Hidden -PassThru
+            $p = Start-Process -FilePath $env:BASE_PY -ArgumentList '-c', '"while True: pass"' -WindowStyle Hidden -PassThru
             $pids += $p.Id
           }
           $pids -join "`n" | Set-Content -Path "$env:RUNNER_TEMP\load-pids.txt"
-          Start-Sleep -Seconds 3
-          Write-Host "logical CPUs: $n; started busy loops: $($pids -join ', ')"
-          Get-Process -Id $pids | Format-Table Id, CPU, StartTime -AutoSize
+          Start-Sleep -Seconds 5
+          Write-Host "logical CPUs: $n; started busy loops: $($pids -join ', ') ($env:BASE_PY)"
+          $procs = Get-Process -Id $pids
+          $procs | Format-Table Id, CPU, StartTime -AutoSize
+          $idle = @($procs | Where-Object { $_.CPU -lt 2 })
+          if ($idle.Count -gt 0) { Write-Error "busy loops are not burning CPU: $($idle.Id -join ', ')"; exit 1 }
+          $load = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+          Write-Host "CPU load after start: $load %"
       - name: Loop the whole file under coverage (as the ci.yml coverage step)
         run: |
           set +e
@@ -105,6 +114,9 @@ jobs:
               -o junit_duration_report=call --junitxml="$out/junit-$n.xml" > "$out/pytest-$n.log" 2>&1
             rc=$?
             echo "iteration $n exit $rc" | tee -a "$out/exit-codes.txt"
+            if [ "${{ matrix.load }}" = "true" ]; then
+              echo "iteration $n cpu-load $(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average") %" | tee -a "$out/cpu-load.txt"
+            fi
             tail -n 25 "$out/pytest-$n.log"
             echo "::endgroup::"
             if [ "$rc" -ne 0 ]; then
@@ -121,6 +133,8 @@ jobs:
         run: |
           $pids = Get-Content "$env:RUNNER_TEMP\load-pids.txt"
           Get-Process -Id $pids -ErrorAction SilentlyContinue | Format-Table Id, CPU, StartTime -AutoSize
+          $load = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+          Write-Host "CPU load at end of phase B: $load %"
       - name: Stop CPU load (phase B only)
         if: always() && matrix.load
         shell: pwsh
