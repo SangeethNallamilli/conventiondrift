@@ -180,6 +180,17 @@ def test_same_input_gives_same_bytes_whatever_the_input_file_order() -> None:
     assert [s["path"] for s in report["skipped_files"]] == ["src/a.py", "src/b.py"]
 
 
+def test_rules_are_ordered_by_file_line_then_rule_id() -> None:
+    """CR1 S1 on #90: the report order is defined, not inherited from the model's tie-break."""
+    import dataclasses
+
+    first = dataclasses.replace(rule(), id="AGENTS.md:9:a")
+    second = dataclasses.replace(rule(), id="AGENTS.md:9:b")
+    out = json.loads(render_json(result([item(second), item(first)])))
+    assert [entry["id"] for entry in out["rules"]] == ["AGENTS.md:9:a", "AGENTS.md:9:b"]
+    assert [entry["file"] for entry in out["rules"]] == ["AGENTS.md", "AGENTS.md"]
+
+
 def test_skipped_files_with_the_same_path_sort_by_reason() -> None:
     reasons = sorted(get_args(SkipReason))
     skipped = [SkippedFile("x.py", r) for r in reversed(reasons)]

@@ -59,6 +59,7 @@ __all__ = [
     "_NOFOLLOW",
     "action_section",
     "cli_lines",
+    "safe_error",
     "write_internal_errors",
 ]
 
@@ -74,8 +75,15 @@ _GENERIC: Final = f"Exception: {WITHHELD}"
 _CORE: Final = "core"
 
 
-def _safe(error: InternalError) -> tuple[str, str]:
-    """The component and message to write: the I-14 forms, or the generic fixed ones."""
+def safe_error(error: InternalError) -> tuple[str, str]:
+    """The public form of one ``InternalError``: the I-14 component and message.
+
+    Returns ``(component, message)``, both validated: an unusable component becomes ``"core"``
+    and any message that is neither the fixed git-too-old text nor a ``Class: <withheld>``
+    line becomes the generic fixed line. Every writer (the summary section, the CLI lines,
+    the text format and the JSON report) uses this, so the rule lives in one place; the
+    function is public for exactly that reason (CR1 S2 on #90).
+    """
     component = error.component if _COMPONENT.fullmatch(error.component) else _CORE
     message = error.message
     if message != GIT_TOO_OLD_TEXT and not _MESSAGE.fullmatch(message):
@@ -87,7 +95,7 @@ def action_section(errors: Sequence[InternalError]) -> str:
     """The Markdown section for the job summary: a heading and one line per error."""
     lines = []
     for error in errors:
-        component, message = _safe(error)
+        component, message = safe_error(error)
         lines.append(f"Internal error in {md(component)}: {message}")
     return "\n" + SECTION_HEADING + "\n\n" + "\n\n".join(lines) + "\n"
 
@@ -96,7 +104,7 @@ def cli_lines(errors: Sequence[InternalError]) -> list[str]:
     """The stderr lines, one per error."""
     out = []
     for error in errors:
-        component, message = _safe(error)
+        component, message = safe_error(error)
         out.append(f"conventiondrift: internal error in {component}: {message}")
     return out
 

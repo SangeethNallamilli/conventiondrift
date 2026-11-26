@@ -21,6 +21,7 @@ from conventiondrift.render.comment import finding_lines, render_comment
 from conventiondrift.render.escape import sarif_text, sarif_uri
 from conventiondrift.render.findings import FINDING_CASES, MAX_FINDING_ANNOTATIONS, is_finding
 from conventiondrift.render.sarif import (
+    MAX_SARIF_RESULTS,
     SARIF_LEVEL,
     SARIF_SCHEMA,
     SARIF_VERSION,
@@ -144,6 +145,40 @@ def test_output_style_matches_the_json_report() -> None:
     assert text.endswith("}\n") and not text.endswith("\n\n")
     assert text == json.dumps(json.loads(text), sort_keys=True, indent=2) + "\n"
     assert render_sarif(result([item()])) == text
+
+
+def test_at_most_max_sarif_results_are_written() -> None:
+    """CR1 S3 on #90: a pathological repository cannot produce an enormous log."""
+    assert MAX_SARIF_RESULTS == 1000
+    assert len(_results(_findings(MAX_SARIF_RESULTS + 1))) == MAX_SARIF_RESULTS
+    assert len(_results(_findings(3))) == 3
+    assert _results(_findings(3)) != []
+
+
+def test_the_cap_is_a_documented_keyword_and_zero_is_allowed() -> None:
+    log = json.loads(render_sarif(result(_findings(3)), max_results=0))
+    assert log["runs"][0]["results"] == []
+    with pytest.raises(ValueError, match="max_results must not be negative"):
+        render_sarif(result(_findings(1)), max_results=-1)
+    with pytest.raises(ValueError, match="max_results must not be negative"):
+        sarif_object(result(_findings(1)), max_results=-1)
+
+
+def test_results_follow_the_json_report_order() -> None:
+    import dataclasses
+
+    first = dataclasses.replace(rule(), id="AGENTS.md:9:a")
+    second = dataclasses.replace(rule(), id="AGENTS.md:9:b")
+    log = json.loads(render_sarif(result([item(second), item(first)])))
+    (run,) = log["runs"]
+    ids = [run["tool"]["driver"]["rules"][res["ruleIndex"]]["id"] for res in run["results"]]
+    assert ids == [res["ruleId"] for res in run["results"]]
+    assert [res["ruleId"] for res in run["results"]] == ["made-stale-by-code"] * 2
+    # Both results point at the same line; their message text carries the rule ids in order.
+    lines = [
+        res["locations"][0]["physicalLocation"]["region"]["startLine"] for res in run["results"]
+    ]
+    assert lines == [9, 9]
 
 
 def test_empty_result_is_a_valid_log_with_no_results() -> None:

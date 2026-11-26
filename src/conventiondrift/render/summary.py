@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from conventiondrift.fallback import _safe
+from conventiondrift.fallback import safe_error
 from conventiondrift.model import Conflict, Result, Rule, RuleResult, SkippedFile
 from conventiondrift.render.context import RenderContext
 from conventiondrift.render.display import display_rule, summary_side, verdict_label
@@ -335,7 +335,7 @@ def _trailing_lines(result: Result, context: RenderContext) -> list[str]:
     if result.internal_errors:
         body = [INTERNAL_ERROR_HEADING, ""]
         for error in result.internal_errors:
-            component, message = _safe(error)
+            component, message = safe_error(error)
             body.append(internal_error_line(md(component), message))
         lines.append("\n".join(body))
     return lines
