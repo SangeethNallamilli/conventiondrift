@@ -10,6 +10,7 @@ import ast
 import importlib
 import io
 import os
+import re
 import stat
 import sys
 import threading
@@ -59,7 +60,7 @@ def test_the_constants_match_what_core_builds() -> None:
     assert internal_error(ValueError(PLANTED)) == _error("core", "ValueError")
     assert internal_error(GitTooOld()) == InternalError("gitread", GIT_TOO_OLD_TEXT)
     for error in (internal_error(ComponentError("render", PLANTED)), internal_error(GitTooOld())):
-        assert fallback._safe(error) == (error.component, error.message)
+        assert fallback.safe_error(error) == (error.component, error.message)
 
 
 def test_the_action_section_has_a_heading_and_one_line_per_error() -> None:
@@ -112,7 +113,7 @@ def _bad_components() -> list[str]:
 @pytest.mark.parametrize("component", _bad_components())
 def test_a_component_outside_the_i14_pattern_is_written_as_core(component: str) -> None:
     error = _error(component)
-    assert fallback._safe(error)[0] == "core"
+    assert fallback.safe_error(error)[0] == "core"
     assert "Internal error in `core`:" in action_section([error])
     assert cli_lines([error])[0].startswith("conventiondrift: internal error in core: ")
     for text in (action_section([error]), *cli_lines([error])):
@@ -141,7 +142,7 @@ def _bad_messages() -> list[str]:
 @pytest.mark.parametrize("message", _bad_messages())
 def test_a_message_that_is_not_one_of_the_fixed_forms_is_replaced(message: str) -> None:
     error = InternalError("render", message)
-    assert fallback._safe(error) == ("render", GENERIC)
+    assert fallback.safe_error(error) == ("render", GENERIC)
     for text in (action_section([error]), *cli_lines([error])):
         assert text.rstrip("\n").endswith(GENERIC)
         assert message in GENERIC or message not in text  # the bare text is part of GENERIC
@@ -844,6 +845,25 @@ def _fake_lstat(attributes: int) -> object:
         st_file_attributes = attributes
 
     return Result()
+
+
+def test_the_sanitiser_is_public_under_its_documented_name() -> None:
+    """CR1 S2 on #90: the shared I-14 sanitiser is public API, not a private import."""
+    assert "safe_error" in fallback.__all__
+    assert hasattr(fallback, "safe_error")
+    assert not hasattr(fallback, "_safe"), "the private name must not survive the rename"
+    root = Path(__file__).resolve().parents[2]
+    private = re.compile(r"\b_safe\(")
+    this_file = Path(__file__).resolve()
+    stragglers = [
+        str(path.relative_to(root))
+        for folder in ("src", "tests")
+        for path in (root / folder).rglob("*.py")
+        if path.resolve() != this_file and private.search(path.read_text(encoding="utf-8"))
+    ]
+    assert stragglers == [], f"the private _safe() is still used: {stragglers}"
+    error = InternalError("checker:logging", "x")
+    assert fallback.safe_error(error) == ("checker:logging", GENERIC)
 
 
 def test_the_reparse_point_bit_is_the_windows_one() -> None:

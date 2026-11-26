@@ -948,6 +948,23 @@ def test_sarif_uri_exact(path: str, expected: str) -> None:
     assert not out.startswith("/")
 
 
+@pytest.mark.parametrize("path", ["a/./b", "a/../b", "../x", "./x", ".", "..", "x/.."])
+def test_sarif_uri_refuses_a_dot_segment(path: str) -> None:
+    """SR L-90-1 on #90: refused, because RFC 3986 normalization would relocate the URI.
+
+    Percent-encoding the dots does not survive §6.2.2: it decodes ``%2E`` before it removes dot
+    segments, so the only fail-closed answer at this boundary is to refuse a segment discovery
+    can never produce.
+    """
+    with pytest.raises(ValueError, match="dot path segment"):
+        sarif_uri(path)
+
+
+@pytest.mark.parametrize("path", ["a.b/c.d", "a/..b/c", "a/b.c", "..a/b"])
+def test_sarif_uri_treats_a_dot_inside_a_name_as_ordinary(path: str) -> None:
+    assert sarif_uri(path) == pct(visible(path))
+
+
 def test_sarif_uri_maps_invisible_classes_before_encoding() -> None:
     sample = (
         f"d{C0_NUL}{C0_TAB}{C0_LF}{C0_CR}{DEL}{C1_NEL}{CF_BIDI}{CF_ZWSP}{CF_BOM}"
@@ -970,6 +987,11 @@ def test_sarif_uri_hostile_path_is_one_ascii_reference() -> None:
 @example(CS_LOW + "/" + CS_HIGH)
 @example("//" + CF_BIDI)
 def test_sarif_uri_property(text: str) -> None:
+    if any(segment in (".", "..") for segment in text.split("/")):
+        # The documented policy: a dot segment is refused, never encoded (SR L-90-1).
+        with pytest.raises(ValueError, match="dot path segment"):
+            sarif_uri(text)
+        return
     out = sarif_uri(text)
     assert out.isascii() and _URI_REFERENCE.fullmatch(out)
     assert not out.startswith("/")

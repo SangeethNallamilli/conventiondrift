@@ -21,7 +21,7 @@ from typing import Final, TypeAlias
 
 from conventiondrift import __version__
 from conventiondrift.checkers import REGISTRY
-from conventiondrift.fallback import _safe
+from conventiondrift.fallback import safe_error
 from conventiondrift.model import (
     Alternative,
     CausingFile,
@@ -42,6 +42,7 @@ __all__ = [
     "EXPERIMENTAL_CHECKERS",
     "REPORT_SCHEMA",
     "dump_json",
+    "ordered_rule_results",
     "percent",
     "render_json",
     "report_object",
@@ -64,6 +65,23 @@ def dump_json(obj: Mapping[str, JsonValue]) -> str:
     ``allow_nan=False`` keeps the output strict JSON; no value here can be NaN or infinite.
     """
     return json.dumps(obj, sort_keys=True, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
+
+
+def ordered_rule_results(result: Result) -> tuple[RuleResult, ...]:
+    """The results in the report's defined order: ``(file, line, rule_id)``, ascending.
+
+    The order is defined here, not inherited from ``Result``: the model guarantees only
+    ``(file, line)``, so two rules on one line would otherwise fall back to C10's internal
+    tie-break. ``rule_id`` is unique, so the key is total, and both the JSON report and the
+    SARIF log use it, so their rules and results always agree (CR1 S1 on #90). The file and
+    line are the head rule's, or the base rule's for a rule the PR removed.
+    """
+    return tuple(sorted(result.rule_results, key=_report_order_key))
+
+
+def _report_order_key(item: RuleResult) -> tuple[str, int, str]:
+    rule = display_rule(item)
+    return (rule.file, rule.line, item.rule_id)
 
 
 def percent(following: int, relevant: int) -> float | None:
@@ -178,17 +196,19 @@ def _conflict(item: Conflict) -> dict[str, JsonValue]:
 
 def _internal_error(error: InternalError) -> dict[str, JsonValue]:
     """Only the I-14 validated component and fixed message are written (CR1 S1 on #84)."""
-    component, message = _safe(error)
+    component, message = safe_error(error)
     return {"component": component, "message": message}
 
 
 def report_object(result: Result) -> dict[str, JsonValue]:
     """The I-9 object for ``result``, before serialization.
 
-    Sort orders (I-9): ``rules`` by (file, line), ``sites`` by (file, line, col, option) and
-    ``skipped_files`` by path. ``rules`` and ``sites`` arrive sorted (I-13 invariants);
-    instruction files and skipped files are sorted here so file-system order never leaks
-    into the bytes. ``analyzer_python`` is never written (DESIGN §10 B3).
+    Sort orders (I-9): ``rules`` by (file, line, rule_id) - the defined order, see
+    :func:`ordered_rule_results` - ``sites`` by (file, line, col, option) and
+    ``skipped_files`` by (path, reason). ``sites`` arrive sorted (I-13 invariants);
+    instruction files, rules and skipped files are sorted here so neither file-system order
+    nor C10's internal tie-break can leak into the bytes. ``analyzer_python`` is never
+    written (DESIGN §10 B3).
     """
     counts = result.counts
     return {
@@ -204,7 +224,7 @@ def report_object(result: Result) -> dict[str, JsonValue]:
             _skipped(item)
             for item in sorted(result.skipped_files, key=lambda s: (s.path, s.reason))
         ],
-        "rules": [_rule(item) for item in result.rule_results],
+        "rules": [_rule(item) for item in ordered_rule_results(result)],
         "conflicts": [_conflict(item) for item in result.conflicts],
         "internal_errors": [_internal_error(error) for error in result.internal_errors],
         "counts": {

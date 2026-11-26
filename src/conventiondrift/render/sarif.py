@@ -2,9 +2,15 @@
 
 One run, one tool (``conventiondrift``), and one result per PR-caused Stale finding, located
 at the instruction file and the rule's line (AC-F6.10). A finding is exactly what the comment
-shows (cases 1 and 2, not ignored, not disabled, not conflicting), in report order, with no
-cap: SARIF carries every finding (DECISIONS, annotation cap). Head-only and scan runs have no
-finding, so their log has an empty ``results`` list.
+shows (cases 1 and 2, not ignored, not disabled, not conflicting), in the report's defined
+order (``(file, line, rule_id)``, the same order as the JSON report's ``rules``). Head-only and
+scan runs have no finding, so their log has an empty ``results`` list.
+
+At most ``MAX_SARIF_RESULTS`` results are written (CR1 S3 on #90): a pathological repository
+cannot produce an enormous log, while the JSON report stays complete and the counts still carry
+the totals. SARIF 2.1.0 has no field for "truncated", so a capped log is silent by format; the
+cap is a keyword argument with a documented default, not a new I-6 config key (that would be a
+schema change beyond this follow-up).
 
 ``message.text`` is plain text, never Markdown (SECURITY-RULES R3.1). It reuses the comment's
 finding lines (approved wording, D-PM-40) and passes each whole line through
@@ -25,10 +31,11 @@ from conventiondrift.model import Result, Rule, RuleResult
 from conventiondrift.render.comment import finding_lines
 from conventiondrift.render.escape import sarif_text, sarif_uri
 from conventiondrift.render.findings import finding_rule
-from conventiondrift.render.jsonreport import JsonValue, dump_json
+from conventiondrift.render.jsonreport import JsonValue, dump_json, ordered_rule_results
 from conventiondrift.render.strings import SARIF_RULES
 
 __all__ = [
+    "MAX_SARIF_RESULTS",
     "SARIF_LEVEL",
     "SARIF_SCHEMA",
     "SARIF_VERSION",
@@ -46,6 +53,9 @@ SARIF_VERSION: Final = "2.1.0"
 TOOL_NAME: Final = "conventiondrift"
 SARIF_LEVEL: Final = "warning"
 """Same severity as the finding annotations."""
+MAX_SARIF_RESULTS: Final = 1000
+"""Most results in one log (CR1 S3 on #90). Far above a real PR, far below GitHub's upload
+limits (25,000 results / 10 MB), so a pathological repository cannot produce an enormous file."""
 
 _RULE_INDEX: Final = {rule_id: index for index, (rule_id, _, _) in enumerate(SARIF_RULES)}
 
@@ -92,12 +102,19 @@ def _result(rule_result: RuleResult, rule: Rule) -> dict[str, JsonValue]:
     }
 
 
-def sarif_object(result: Result) -> dict[str, JsonValue]:
-    """The SARIF 2.1.0 log for ``result``, before serialization."""
+def sarif_object(result: Result, *, max_results: int = MAX_SARIF_RESULTS) -> dict[str, JsonValue]:
+    """The SARIF 2.1.0 log for ``result``, before serialization.
+
+    At most ``max_results`` results are written, in the report's defined order. A negative
+    ``max_results`` is a caller bug and raises ``ValueError``; ``0`` is allowed and gives an
+    empty ``results`` list.
+    """
+    if max_results < 0:
+        raise ValueError("max_results must not be negative")
     results: list[JsonValue] = []
-    for item in result.rule_results:
+    for item in ordered_rule_results(result):
         rule = finding_rule(item)
-        if rule is not None:
+        if rule is not None and len(results) < max_results:
             results.append(_result(item, rule))
     return {
         "$schema": SARIF_SCHEMA,
@@ -117,6 +134,6 @@ def sarif_object(result: Result) -> dict[str, JsonValue]:
     }
 
 
-def render_sarif(result: Result) -> str:
-    """The SARIF text for ``--format sarif`` and ``results.sarif``."""
-    return dump_json(sarif_object(result))
+def render_sarif(result: Result, *, max_results: int = MAX_SARIF_RESULTS) -> str:
+    """The SARIF text for ``--format sarif`` and ``results.sarif``; see :func:`sarif_object`."""
+    return dump_json(sarif_object(result, max_results=max_results))

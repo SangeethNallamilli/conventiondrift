@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from conventiondrift.fallback import _safe
+from conventiondrift.fallback import safe_error
 from conventiondrift.model import Conflict, Result, Rule, RuleResult, SkippedFile
 from conventiondrift.render.context import RenderContext
 from conventiondrift.render.display import (
@@ -89,7 +89,7 @@ def render_text(result: Result, context: RenderContext) -> str:
         if omitted:
             lines.append(f"not-annotated {not_annotated_line(omitted)}")
     for error in result.internal_errors:
-        component, message = _safe(error)
+        component, message = safe_error(error)
         lines.append(f"internal-error {text_field(component)} {text_field(message)}")
     return "\n".join(lines) + "\n"
 

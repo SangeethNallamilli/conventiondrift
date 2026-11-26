@@ -228,7 +228,17 @@ def sarif_uri(path: str) -> str:
     character are encoded, so the output is pure ASCII, has no scheme, query or fragment,
     and is a valid relative URI reference. Leading ``/`` characters are encoded too so the
     value can never read as an absolute path or a ``//host`` network-path reference.
+
+    A ``.`` or ``..`` path segment is **refused** with ``ValueError`` (SR L-90-1 on #90). Such a
+    segment can never come from discovery - a tree path is a sequence of real file names - and a
+    consumer applying RFC 3986 §6.2.2 would relocate the artifact: ``a/../b`` becomes ``b`` and
+    ``../x`` escapes the repository. Percent-encoding the dots does not help, because §6.2.2
+    normalises ``%2E`` back to ``.`` *before* it removes dot segments, so the mitigation would be
+    ordering-dependent and defeated by a compliant consumer. Refusing is the only fail-closed
+    answer at this boundary; a dot inside a name (``a.b``) is still an ordinary character.
     """
+    if any(segment in (".", "..") for segment in path.split("/")):
+        raise ValueError("sarif_uri refuses a dot path segment")
     encoded = quote(_visible_text(path), safe=_URI_SAFE)
     lead = _LEADING_SLASHES.match(encoded)
     if lead is None:
