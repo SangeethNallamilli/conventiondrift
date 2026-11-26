@@ -637,3 +637,12 @@ class SummarySink(Protocol):
     """The one write the fallback writer needs (I-14, A-8), so it need not take all of ``Sinks``."""
 
     def summary_section(self, text: str) -> SinkStatus: ...
+
+
+# --- The sticky-comment marker (I-3) -------------------------------------------------------
+# One definition, imported by both sides: C11 writes it as line 1 of every comment body and C12
+# checks it to decide "is this our comment". A copy at either site drifting from the other would
+# silently break that check and produce duplicate sticky comments (dev review risk R5).
+
+STICKY_COMMENT_MARKER: Final = "<!-- conventiondrift:sticky v1 -->"
+"""I-3: line 1 of every conventiondrift PR comment body, written by C11 and checked by C12."""

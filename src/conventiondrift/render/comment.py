@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from typing import Final
 
 from conventiondrift.model import (
+    STICKY_COMMENT_MARKER,
     Alternative,
     CausingFile,
     Result,
@@ -32,8 +33,8 @@ from conventiondrift.render.escape import md_codeblock
 
 __all__ = ["MAX_COMMENT_CHARS", "STICKY_MARKER", "finding_lines", "render_comment"]
 
-STICKY_MARKER: Final = "<!-- conventiondrift:sticky v1 -->"
-"""I-3: line 1 of every comment body."""
+STICKY_MARKER: Final = STICKY_COMMENT_MARKER
+"""I-3: line 1 of every comment body; the single definition is in ``model``."""
 
 MAX_COMMENT_CHARS: Final = 65_536
 """AC-E.13: GitHub's limit on a comment body, counted in characters."""
