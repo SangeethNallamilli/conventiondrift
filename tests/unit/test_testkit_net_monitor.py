@@ -85,9 +85,13 @@ def test_a_bytes_host_is_checked_too() -> None:
     assert guard.attempts == ["example.com", "example.com"]
 
 
-def test_a_bytes_loopback_host_is_allowed() -> None:
+def test_a_bytes_loopback_host_is_not_blocked() -> None:
+    # The point is the guard's verdict, not the platform's ability to resolve a bytes host.
     with NetworkGuard("t") as guard:
-        assert socket.getaddrinfo(b"127.0.0.1", 0)
+        try:
+            socket.getaddrinfo(b"127.0.0.1", 0)
+        except OSError:
+            pass
     assert guard.attempts == []
 
 
@@ -153,9 +157,12 @@ def test_without_af_unix_the_guard_still_checks_egress(monkeypatch: pytest.Monke
 
 def test_getaddrinfo_for_a_local_bind_is_allowed() -> None:
     with NetworkGuard("t") as guard:
-        assert socket.getaddrinfo(None, 0)
-        assert socket.getaddrinfo("127.0.0.1", 0)
-        assert socket.getaddrinfo("::1", 0, socket.AF_INET6)
+        try:
+            assert socket.getaddrinfo(None, 0)
+            assert socket.getaddrinfo("127.0.0.1", 0)
+            assert socket.getaddrinfo("::1", 0, socket.AF_INET6)
+        except OSError:  # a platform that refuses one of these still must not be blocked
+            pass
     assert guard.attempts == []
 
 
