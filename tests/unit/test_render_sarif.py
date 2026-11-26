@@ -12,9 +12,17 @@ import unicodedata
 from typing import Any, get_args
 
 import pytest
-from render_support import item, policy, replace, result, rule, side
+from render_support import (
+    HOSTILE_CHARS,
+    installed_version,
+    item,
+    policy,
+    replace,
+    result,
+    rule,
+    side,
+)
 
-import conventiondrift
 from conventiondrift.model import Alternative, Case, Rule, RuleResult, Suggestion, Verdict
 from conventiondrift.render import escape
 from conventiondrift.render.comment import finding_lines, render_comment
@@ -32,21 +40,6 @@ from conventiondrift.render.sarif import (
 )
 from conventiondrift.render.strings import SARIF_RULES
 
-HOSTILE_CHARS = (
-    "\x00",
-    "\n",
-    "\r",
-    "\x1b",
-    "\x7f",
-    "\x85",
-    "\u202e",
-    "\u2066",
-    "\u200b",
-    "\ufeff",
-    "\u2028",
-    "\u2029",
-    "\ud800",
-)
 # AC-N3.10's rule string, plus every invisible class above.
 INJECTION = (
     "Use requests, ping @someone <img src=x onerror=alert(1)> "
@@ -121,15 +114,24 @@ def test_log_header_tool_and_descriptors() -> None:
     assert log["version"] == SARIF_VERSION == "2.1.0"
     driver = log["runs"][0]["tool"]["driver"]
     assert driver["name"] == TOOL_NAME
-    assert driver["version"] == conventiondrift.__version__
+    assert driver["version"] == installed_version()
     assert driver["rules"] == [
         {
-            "id": rule_id,
-            "name": name,
-            "shortDescription": {"text": short},
-            "defaultConfiguration": {"level": SARIF_LEVEL},
-        }
-        for rule_id, name, short in SARIF_RULES
+            "id": "made-stale-by-code",
+            "name": "MadeStaleByCode",
+            "shortDescription": {
+                "text": "Code changes in this pull request made an agent rule stale."
+            },
+            "defaultConfiguration": {"level": "warning"},
+        },
+        {
+            "id": "stale-rule-added",
+            "name": "StaleRuleAdded",
+            "shortDescription": {
+                "text": "This pull request adds an agent rule that is already stale."
+            },
+            "defaultConfiguration": {"level": "warning"},
+        },
     ]
 
 
@@ -378,8 +380,13 @@ def test_message_uses_http_client_noun_and_verdict_counts() -> None:
     assert "After this PR:  3 of 40" in text
 
 
-def test_policy_does_not_change_the_log() -> None:
-    one = render_sarif(result([item()], the_policy=policy(notes=("a",))))
+@pytest.mark.parametrize(
+    "other_policy",
+    [policy(notes=("a",)), policy(source="head")],
+    ids=["notes", "source"],
+)
+def test_policy_fields_do_not_change_the_log(other_policy: Any) -> None:
+    one = render_sarif(result([item()], the_policy=other_policy))
     two = render_sarif(result([item()], the_policy=policy()))
     assert one == two
 

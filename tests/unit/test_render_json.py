@@ -17,7 +17,10 @@ from typing import Any, get_args
 import pytest
 from render_support import (
     HEAD_SHA,
+    HOSTILE_CHARS,
+    HOSTILE_TEXT,
     SHA,
+    installed_version,
     item,
     policy,
     replace,
@@ -28,7 +31,6 @@ from render_support import (
     window_at,
 )
 
-import conventiondrift
 from conventiondrift.checkers import REGISTRY
 from conventiondrift.fallback import GIT_TOO_OLD_TEXT, WITHHELD
 from conventiondrift.model import (
@@ -99,28 +101,6 @@ REPORT_COUNT_KEYS = {
     "conflicts_incomplete",
 }
 
-# One or more stable samples per escaper category (Cc, Cf, Zl, Zp, Cs), incl. CR/LF, DEL, C1,
-# bidi, zero-width, BOM and a lone surrogate.
-HOSTILE_CHARS = (
-    "\x00",
-    "\n",
-    "\r",
-    "\x1b",
-    "\x7f",
-    "\x85",
-    "\u202e",
-    "\u2066",
-    "\u200b",
-    "\ufeff",
-    "\u2028",
-    "\u2029",
-    "\ud800",
-)
-HOSTILE_TEXT = (
-    "Use requests <img src=x onerror=alert(1)> [l](https://evil.example) @someone #123 "
-    "```\n::warning::x %0A \\ " + "".join(HOSTILE_CHARS)
-)
-
 
 def _loads(text: str) -> Any:
     return json.loads(text)
@@ -142,7 +122,7 @@ def test_top_level_keys_schema_version_and_shas() -> None:
     report = _report([item()])
     assert set(report) == TOP_KEYS
     assert report["schema"] == REPORT_SCHEMA
-    assert report["tool_version"] == conventiondrift.__version__
+    assert report["tool_version"] == installed_version()
     assert (report["mode"], report["base"], report["head"]) == ("compare", SHA, HEAD_SHA)
 
 
@@ -232,6 +212,13 @@ def test_window_end_is_iso_8601_with_offset(tz: timezone, suffix: str) -> None:
     assert report["window"]["end"] == f"2026-11-12T15:04:05{suffix}"
     assert report["window"]["available"] is True
     assert report["window"]["unavailable_reason"] is None
+
+
+def test_window_end_with_microseconds_is_pinned() -> None:
+    """N-71-4: `datetime.isoformat()` emits microseconds when present, so pin that form too."""
+    end = datetime(2026, 11, 12, 15, 4, 5, 123456, tzinfo=UTC)
+    report = _report(window=window_at(end))
+    assert report["window"]["end"] == "2026-11-12T15:04:05.123456+00:00"
 
 
 @pytest.mark.parametrize("source", ["base", "head"])
