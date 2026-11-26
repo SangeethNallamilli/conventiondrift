@@ -193,10 +193,10 @@ jobs:
         run: |
           python3 scripts/ci/install_pinned_pip.py
           python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/build.txt -r requirements/dev.txt
-      - name: mypy --strict src, tests/unit, and scripts/ci (D-TL-21, D-TL-94)
+      - name: mypy --strict src, tests/unit, tests/conventiondrift_testkit, and scripts/ci (D-TL-21, D-TL-94, CON-29)
         env:
           MYPYPATH: src
-        run: mypy --strict src tests/unit scripts/ci
+        run: mypy --strict src tests/unit tests/conventiondrift_testkit scripts/ci
 
 
   test:
