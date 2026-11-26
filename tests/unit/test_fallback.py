@@ -30,12 +30,12 @@ from conventiondrift.fallback import (
     SUMMARY_OPEN_FLAGS,
     SUMMARY_REFUSED,
     WITHHELD,
-    SummaryWriter,
     action_section,
     cli_lines,
     write_internal_errors,
 )
-from conventiondrift.model import CheckerId, InternalError
+from conventiondrift.model import CheckerId, InternalError, SinkStatus, SummarySink
+from conventiondrift.sinks import NOFOLLOW, REPARSE_POINT
 
 # The testkit is not on mypy's path (T-011 style: it is loaded by name, as in test_checkers_pool).
 MemorySinks = importlib.import_module("conventiondrift_testkit").MemorySinks
@@ -523,9 +523,9 @@ def test_without_a_summary_path_the_sink_is_not_called_at_all() -> None:
 
 
 def test_the_sink_parameter_is_pinned() -> None:
-    """CON-73: the fallback takes the one-method sink, so it need not import the seam (A-8)."""
-    assert get_type_hints(write_internal_errors)["summary_sink"] == SummaryWriter | None
-    assert get_type_hints(SummaryWriter.summary_section) == {"text": str, "return": str}
+    """CON-73: the fallback takes the seam's own one-method Protocol from ``model`` (A-8)."""
+    assert get_type_hints(write_internal_errors)["summary_sink"] == SummarySink | None
+    assert get_type_hints(SummarySink.summary_section) == {"text": str, "return": SinkStatus}
 
 
 # --- static checks (A-8, AC-N3.15) -----------------------------------------------------------
@@ -803,7 +803,7 @@ def test_a_created_summary_file_gets_the_same_mode_as_before(tmp_path: Path) -> 
 @pytest.fixture
 def no_nofollow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Take the platform's ``O_NOFOLLOW`` out of the open flags, as on Windows."""
-    monkeypatch.setattr(fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~fallback._NOFOLLOW)
+    monkeypatch.setattr(fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~NOFOLLOW)
     monkeypatch.setattr(fallback, "_NOFOLLOW", 0)
 
 
@@ -847,8 +847,8 @@ def _fake_lstat(attributes: int) -> object:
 
 
 def test_the_reparse_point_bit_is_the_windows_one() -> None:
-    assert fallback._REPARSE_POINT == stat.FILE_ATTRIBUTE_REPARSE_POINT == 0x400
-    assert fallback._NOFOLLOW == getattr(os, "O_NOFOLLOW", 0)
+    assert REPARSE_POINT == stat.FILE_ATTRIBUTE_REPARSE_POINT == 0x400
+    assert NOFOLLOW == getattr(os, "O_NOFOLLOW", 0) == fallback._NOFOLLOW
 
 
 @pytest.mark.skipif(not getattr(os, "O_NOFOLLOW", 0), reason="no O_NOFOLLOW on this platform")
@@ -891,7 +891,7 @@ def test_without_o_nofollow_a_reparse_point_is_refused_before_the_open(
 ) -> None:
     summary = tmp_path / "summary.md"
     summary.write_bytes(b"")
-    _LstatSpy(monkeypatch, summary, result=_fake_lstat(fallback._REPARSE_POINT))
+    _LstatSpy(monkeypatch, summary, result=_fake_lstat(REPARSE_POINT))
     spy = _Spy(monkeypatch)
     assert _refused(summary) == _fallback_output()
     assert spy.opened == []
@@ -904,7 +904,7 @@ def test_without_o_nofollow_other_file_attributes_still_append(
 ) -> None:
     summary = tmp_path / "summary.md"
     summary.write_text("before\n", encoding="utf-8")
-    others = ~fallback._REPARSE_POINT & 0xFFFF
+    others = ~REPARSE_POINT & 0xFFFF
     spy = _LstatSpy(monkeypatch, summary, result=_fake_lstat(others))
     assert _refused(summary) == ""
     assert spy.calls == [str(summary)]
@@ -1025,9 +1025,7 @@ def test_a_value_error_from_open_refuses_with_the_warning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, nofollow: bool
 ) -> None:
     if not nofollow:
-        monkeypatch.setattr(
-            fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~fallback._NOFOLLOW
-        )
+        monkeypatch.setattr(fallback, "SUMMARY_OPEN_FLAGS", SUMMARY_OPEN_FLAGS & ~NOFOLLOW)
         monkeypatch.setattr(fallback, "_NOFOLLOW", 0)
     summary = tmp_path / "summary.md"
     error = ValueError(f"bad path {summary}")

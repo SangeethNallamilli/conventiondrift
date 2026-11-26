@@ -27,7 +27,16 @@ from conventiondrift.model import (
     Window,
 )
 from conventiondrift.model import (
+    Outputs as Outputs,
+)
+from conventiondrift.model import (
     Side as Side,
+)
+from conventiondrift.model import (
+    SinkStatus as SinkStatus,
+)
+from conventiondrift.model import (
+    SummarySink as SummarySink,
 )
 
 TreeEntry = tuple[str, str, int | None, str]
@@ -35,14 +44,6 @@ TreeEntry = tuple[str, str, int | None, str]
 ChangedFile = tuple[str, str | None, str]
 """(status letter, old path or None, new path)."""
 PublishOutcome = Literal["posted", "updated", "skipped"]
-SinkStatus = Literal["written", "refused", "unavailable"]
-"""The outcome of one runner-side sink write (CON-73).
-
-``written``: the output was delivered. ``refused``: a destination was configured but the write
-was rejected (a symlink, a non-regular file, an unwritable path), so the caller may fall back.
-``unavailable``: nothing is configured for that sink (no ``GITHUB_OUTPUT``, no ``RUNNER_TEMP``).
-The tri-state is what preserves the fallback writer's "warn only when a path existed" behavior.
-"""
 
 
 class Checker(Protocol):
@@ -174,26 +175,6 @@ class GitHubClient(Protocol):
     ) -> tuple[PublishOutcome, str | None]: ...
 
     def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class Outputs:
-    """The four ``GITHUB_OUTPUT`` values of one run (CON-73).
-
-    ``report_path`` / ``sarif_path`` are the artifact paths, or "" when the run wrote no such
-    artifact. They are written even when empty, so a run always sets exactly four outputs.
-    """
-
-    stale_count: int
-    new_stale_count: int
-    report_path: str
-    sarif_path: str
-
-
-class SummarySink(Protocol):
-    """The one write the fallback writer needs (I-14, A-8), so it need not take all of ``Sinks``."""
-
-    def summary_section(self, text: str) -> SinkStatus: ...
 
 
 class Sinks(SummarySink, Protocol):

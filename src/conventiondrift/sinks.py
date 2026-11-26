@@ -25,7 +25,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, Final, cast
 
-from conventiondrift.components import Outputs, SinkStatus
+from conventiondrift.model import Outputs, SinkStatus
 from conventiondrift.render.escape import output_heredoc
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, keeps ``github`` out of this import path
@@ -78,19 +78,11 @@ inherited. ``O_NONBLOCK`` keeps a FIFO from blocking the open (it fails, or is r
 regular-file check); it changes nothing for a regular file. ``O_BINARY`` matters on Windows.
 """
 
-_OUTPUT_NAMES: Final = ("stale-count", "new-stale-count", "report-path", "sarif-path")
-OUTPUT_NAMES: Final = _OUTPUT_NAMES
+OUTPUT_NAMES: Final = ("stale-count", "new-stale-count", "report-path", "sarif-path")
 """The four ``GITHUB_OUTPUT`` names, in the order they are written."""
 
 _ARTIFACT_NAME: Final = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-_ARTIFACT_OPEN_FLAGS: Final = (
-    os.O_WRONLY
-    | os.O_CREAT
-    | os.O_TRUNC
-    | NOFOLLOW
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_BINARY", 0)
-)
+_NONBLOCK: Final = getattr(os, "O_NONBLOCK", 0)
 
 
 def _no_link_before_open(path: str, *, nofollow: int) -> bool:
@@ -112,17 +104,28 @@ def _no_link_before_open(path: str, *, nofollow: int) -> bool:
     return not getattr(st, "st_file_attributes", 0) & REPARSE_POINT
 
 
-def _append_bytes(path: str, data: bytes, *, flags: int, nofollow: int) -> bool:
-    """Append ``data`` to ``path`` as a regular file; False if it was refused.
+def _write_file(
+    path: str,
+    data: bytes,
+    *,
+    flags: int,
+    nofollow: int,
+    mode: str,
+    permission: int,
+) -> bool:
+    """Write ``data`` to ``path`` as a regular file; False if it was refused.
 
-    The file must open with ``flags`` and ``fstat`` as a regular file; the descriptor is always
-    closed. Without ``O_NOFOLLOW``, ``_no_link_before_open`` runs first. A write that fails
-    part-way can leave a truncated file; the caller still reports through another path.
+    The one hardened writer for every file sink (the summary, the outputs and the artifacts).
+    The file must open with ``flags`` and ``fstat`` as a regular file, so a FIFO is refused
+    instead of blocking the open (``O_NONBLOCK`` is in the flags). Without ``O_NOFOLLOW``,
+    ``_no_link_before_open`` runs first. The descriptor is closed on every path, including a
+    failed ``fdopen``; a write that fails part-way can leave a truncated file, and the caller
+    reports that through its return value.
     """
     if not _no_link_before_open(path, nofollow=nofollow):
         return False
     try:
-        fd = os.open(path, flags, 0o666)
+        fd = os.open(path, flags, permission)
     except (OSError, ValueError):  # ValueError: a NUL byte in the path
         return False
     try:
@@ -133,10 +136,14 @@ def _append_bytes(path: str, data: bytes, *, flags: int, nofollow: int) -> bool:
         os.close(fd)
         return False
     try:
-        # Bytes, so the encoding is UTF-8 whatever the locale. ``fdopen`` owns and closes ``fd``.
-        with os.fdopen(fd, "ab") as target:
+        target = os.fdopen(fd, mode)
+    except (OSError, ValueError):  # never leak the descriptor if the wrapper cannot be made
+        os.close(fd)
+        return False
+    try:
+        with target:
             target.write(data)
-    except (OSError, ValueError):  # ValueError too (e.g. a closed file): never raise, fall back
+    except (OSError, ValueError):  # the context manager has closed the descriptor
         return False
     return True
 
@@ -167,6 +174,11 @@ class EnvSinks:
         self._stdout = stdout
         self._open_flags = SUMMARY_OPEN_FLAGS if open_flags is None else open_flags
         self._nofollow = NOFOLLOW if nofollow is None else nofollow
+        # The artifact flags are the injected ones with the append semantics swapped for a
+        # truncating create, so a platform simulation reaches this path too (CON-73 review 1/5).
+        self._artifact_flags = (
+            (self._open_flags & ~os.O_APPEND) | os.O_CREAT | os.O_TRUNC | _NONBLOCK
+        )
 
     def outputs(self, outputs: Outputs) -> SinkStatus:
         """Append the four ``GITHUB_OUTPUT`` entries as one heredoc block each (AC-N3.13)."""
@@ -182,12 +194,17 @@ class EnvSinks:
         try:
             block = "".join(
                 output_heredoc(name, value)
-                for name, value in zip(_OUTPUT_NAMES, values, strict=True)
+                for name, value in zip(OUTPUT_NAMES, values, strict=True)
             )
         except ValueError:  # a value the delimiter search could not fit: report, never raise
             return "refused"
-        if _append_bytes(
-            path, block.encode("utf-8"), flags=self._open_flags, nofollow=self._nofollow
+        if _write_file(
+            path,
+            block.encode("utf-8"),
+            flags=self._open_flags,
+            nofollow=self._nofollow,
+            mode="ab",
+            permission=0o666,
         ):
             return "written"
         return "refused"
@@ -197,14 +214,25 @@ class EnvSinks:
         path = self._env.get(SUMMARY_ENV)
         if not path:
             return "unavailable"
-        if _append_bytes(
-            path, text.encode("utf-8"), flags=self._open_flags, nofollow=self._nofollow
+        if _write_file(
+            path,
+            text.encode("utf-8"),
+            flags=self._open_flags,
+            nofollow=self._nofollow,
+            mode="ab",
+            permission=0o666,
         ):
             return "written"
         return "refused"
 
     def annotations(self, lines: Sequence[str]) -> SinkStatus:
-        """Write the workflow commands, one per line, to the binary stdout (C11 already escaped)."""
+        """Write the workflow commands, one per line, to the binary stdout (C11 escaped them).
+
+        The stream is pinned to ``BinaryIO`` (``sys.stdout.buffer`` by default). A stream that
+        is not binary, or has no ``flush``, is a programming error: it raises ``TypeError`` or
+        ``AttributeError`` here rather than being turned into a status, so a wrong double fails
+        its test instead of silently dropping the annotations.
+        """
         if not lines:
             return "written"
         payload = "".join(line + "\n" for line in lines).encode("utf-8")
@@ -224,7 +252,10 @@ class EnvSinks:
         """Write ``data`` to ``$RUNNER_TEMP/conventiondrift/<name>``; None if it was not written.
 
         None means "no ``RUNNER_TEMP``" or "refused" (a bad name, a symlinked directory, an
-        unwritable path); the caller writes an empty path into ``Outputs`` either way.
+        unwritable path, a FIFO in place of the file); the caller writes an empty path into
+        ``Outputs`` either way. The write goes through the same hardened flags as the summary,
+        so a FIFO cannot block the run and a platform without ``O_NOFOLLOW`` cannot be
+        tricked into following a symlink over an existing file.
         """
         if not _ARTIFACT_NAME.fullmatch(name):
             return None
@@ -240,14 +271,14 @@ class EnvSinks:
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             return None
         path = root / name
-        try:
-            fd = os.open(path, _ARTIFACT_OPEN_FLAGS, 0o600)
-        except (OSError, ValueError):
-            return None
-        try:
-            with os.fdopen(fd, "wb") as target:
-                target.write(data)
-        except (OSError, ValueError):
+        if not _write_file(
+            str(path),
+            data,
+            flags=self._artifact_flags,
+            nofollow=self._nofollow,
+            mode="wb",
+            permission=0o600,
+        ):
             return None
         return path
 

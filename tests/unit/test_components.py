@@ -24,6 +24,7 @@ from conventiondrift.components import (
     Renderer,
     Side,
     Sinks,
+    SinkStatus,
     SummarySink,
     TreeEntry,
 )
@@ -316,6 +317,15 @@ def test_components_take_factories_and_stand_ins() -> None:
     variant = dataclasses.replace(components, github_base_url=None)
     assert variant.git_reader is git_factory
     assert variant.github_base_url is None
+
+
+def test_the_sink_types_are_defined_once_in_model() -> None:
+    """CON-73: ``model`` holds the shared sink types; ``components`` re-exports them for I-2."""
+    from conventiondrift import model
+
+    assert SummarySink is model.SummarySink
+    assert Outputs is model.Outputs
+    assert SinkStatus is model.SinkStatus
 
 
 def test_outputs_fields_are_pinned() -> None:

@@ -31,6 +31,7 @@ from conventiondrift.model import (
     InstructionFile,
     InternalError,
     ManifestFile,
+    Outputs,
     Policy,
     PyFile,
     ReportCounts,
@@ -171,6 +172,15 @@ RESULT = Result(
 
 # One sample per model type, with the field names I-13 gives it, in order.
 SAMPLES: dict[str, tuple[Any, tuple[str, ...]]] = {
+    "Outputs": (
+        Outputs(
+            stale_count=3,
+            new_stale_count=1,
+            report_path="/runner-temp/conventiondrift/report.json",
+            sarif_path="",
+        ),
+        ("stale_count", "new_stale_count", "report_path", "sarif_path"),
+    ),
     "RuleMatch": (MATCH, ("preferred", "prohibited", "specificity")),
     "Site": (SITE, ("file", "line", "col", "option")),
     "FileContext": (

@@ -33,15 +33,12 @@ status. Only ``KeyboardInterrupt`` propagates, as in ``run``.
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Final, Literal, Protocol, TextIO
+from typing import Final, Literal, TextIO
 
-from conventiondrift.model import InternalError
+from conventiondrift.model import InternalError, SummarySink
 from conventiondrift.render.escape import md
 from conventiondrift.sinks import (
     NOFOLLOW as _NOFOLLOW,
-)
-from conventiondrift.sinks import (
-    REPARSE_POINT as _REPARSE_POINT,
 )
 from conventiondrift.sinks import (
     SUMMARY_ENV,
@@ -57,10 +54,9 @@ __all__ = [
     "SUMMARY_OPEN_FLAGS",
     "SUMMARY_REFUSED",
     "WITHHELD",
-    # Re-exported from ``sinks``: the platform tests pin the fallback's own values, and the
-    # writer receives them at call time so those monkeypatches keep driving the real code.
+    # Re-exported from ``sinks``: the writer receives it at call time, so the platform tests
+    # that patch ``fallback._NOFOLLOW`` keep driving the real code.
     "_NOFOLLOW",
-    "_REPARSE_POINT",
     "action_section",
     "cli_lines",
     "write_internal_errors",
@@ -76,17 +72,6 @@ _COMPONENT: Final = re.compile(r"[a-z][a-z0-9_]*(:[a-z0-9_-]+)?")
 _MESSAGE: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*: " + re.escape(WITHHELD))
 _GENERIC: Final = f"Exception: {WITHHELD}"
 _CORE: Final = "core"
-
-
-class SummaryWriter(Protocol):
-    """The one sink the fallback needs (CON-73): a structural copy of ``components.SummarySink``.
-
-    A-8 keeps this module independent of the Components seam, so it cannot import that Protocol;
-    ``tests/unit/test_fallback.py`` enforces the import boundary. Any ``Sinks`` implementation
-    satisfies this by structure.
-    """
-
-    def summary_section(self, text: str) -> str: ...
 
 
 def _safe(error: InternalError) -> tuple[str, str]:
@@ -116,7 +101,7 @@ def cli_lines(errors: Sequence[InternalError]) -> list[str]:
     return out
 
 
-def _summary_sink(env: Mapping[str, str], summary_sink: SummaryWriter | None) -> SummaryWriter:
+def _summary_sink(env: Mapping[str, str], summary_sink: SummarySink | None) -> SummarySink:
     """The sink the fallback writes the section through (CON-73).
 
     The module-level flags are read here, at call time, so a test that simulates a platform
@@ -134,7 +119,7 @@ def write_internal_errors(
     entry: Literal["action", "cli"],
     env: Mapping[str, str],
     stderr: TextIO | None = None,
-    summary_sink: SummaryWriter | None = None,
+    summary_sink: SummarySink | None = None,
 ) -> None:
     """Report ``errors`` for ``entry``; see the module docstring. Writes nothing for no errors.
 

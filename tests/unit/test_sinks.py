@@ -247,7 +247,7 @@ def test_summary_refuses_when_the_write_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def failing_fdopen(fd: int, mode: str) -> object:
-        os.close(fd)
+        # Like the real ``os.fdopen``: a failure leaves the descriptor open (the sink closes it).
         raise OSError("disk full")
 
     monkeypatch.setattr(os, "fdopen", failing_fdopen)
@@ -456,6 +456,94 @@ def test_artifact_overwrites_an_existing_file(tmp_path: Path) -> None:
     assert path is not None and path.read_bytes() == b"two"
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX FIFOs")
+def test_artifact_refuses_a_fifo_without_blocking(tmp_path: Path) -> None:
+    """CON-73 review 1: a FIFO in place of the artifact must be refused, never block the open."""
+    root = _temp(tmp_path)
+    directory = root / ARTIFACT_DIR
+    directory.mkdir(mode=0o700)
+    os.mkfifo(directory / "report.json")
+    assert EnvSinks({TEMP_ENV: str(root)}).artifact(name="report.json", data=b"x") is None
+    assert stat.S_ISFIFO((directory / "report.json").lstat().st_mode)
+
+
+def test_artifact_flags_are_the_shared_hardened_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CON-73 review 5: the artifact uses the injected flags, minus append, plus create/trunc."""
+    root = _temp(tmp_path)
+    seen: list[int] = []
+    real_open = os.open
+
+    def opening(path: str, flags: int, mode: int = 0o777) -> int:
+        seen.append(flags)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", opening)
+    sink = EnvSinks(
+        {TEMP_ENV: str(root)},
+        open_flags=SUMMARY_OPEN_FLAGS & ~NOFOLLOW,
+        nofollow=0,
+    )
+    assert sink.artifact(name="report.json", data=b"x") is not None
+    assert seen, "the artifact never reached os.open"
+    flags = seen[-1]
+    assert flags & os.O_TRUNC and not flags & os.O_APPEND and flags & os.O_CREAT
+    if hasattr(os, "O_NONBLOCK"):
+        assert flags & os.O_NONBLOCK, "a FIFO must never block the artifact open"
+    assert not flags & NOFOLLOW, "the injected platform flags must reach this path"
+
+
+def test_without_o_nofollow_an_artifact_symlink_is_refused(tmp_path: Path) -> None:
+    """CON-73 review 2: on the Windows shape, a symlinked artifact must not be overwritten."""
+    root = _temp(tmp_path)
+    directory = root / ARTIFACT_DIR
+    directory.mkdir(mode=0o700)
+    target = tmp_path / "target.json"
+    target.write_bytes(b"kept")
+    try:
+        (directory / "report.json").symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    sink = EnvSinks(
+        {TEMP_ENV: str(root)},
+        open_flags=SUMMARY_OPEN_FLAGS & ~NOFOLLOW,
+        nofollow=0,
+    )
+    assert sink.artifact(name="report.json", data=b"OVERWRITTEN") is None
+    assert target.read_bytes() == b"kept"
+
+
+def test_artifact_closes_the_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _temp(tmp_path)
+    directory = root / ARTIFACT_DIR
+    directory.mkdir(mode=0o700)
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open = os.open
+    real_close = os.close
+
+    def opening(path: str, flags: int, mode: int = 0o777) -> int:
+        fd = real_open(path, flags, mode)
+        opened.append(fd)
+        return fd
+
+    def closing(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def failing_fdopen(fd: int, mode: str) -> object:
+        raise ValueError("bad handle")
+
+    monkeypatch.setattr(os, "open", opening)
+    monkeypatch.setattr(os, "close", closing)
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    assert EnvSinks({TEMP_ENV: str(root)}).artifact(name="report.json", data=b"x") is None
+    assert opened and opened[-1] in closed, "the descriptor must not leak when fdopen fails"
+
+
 @pytest.mark.parametrize("name", ["", ".", "..", "a/b", "a\\b", "/abs", "Upper", "-x", "a" * 65])
 def test_an_unsafe_artifact_name_is_refused(tmp_path: Path, name: str) -> None:
     root = _temp(tmp_path)
@@ -524,7 +612,7 @@ def test_artifact_refuses_when_the_open_or_write_fails(
     monkeypatch.undo()
 
     def failing_fdopen(fd: int, mode: str) -> object:
-        os.close(fd)
+        # Like the real ``os.fdopen``: a failure leaves the descriptor open (the sink closes it).
         raise ValueError("bad handle")
 
     monkeypatch.setattr(os, "fdopen", failing_fdopen)
