@@ -7,6 +7,7 @@ doesn't define.
 """
 
 import ast
+import importlib
 import io
 import os
 import stat
@@ -14,7 +15,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Literal, get_args, get_type_hints
 
 import pytest
 
@@ -29,11 +30,15 @@ from conventiondrift.fallback import (
     SUMMARY_OPEN_FLAGS,
     SUMMARY_REFUSED,
     WITHHELD,
+    SummaryWriter,
     action_section,
     cli_lines,
     write_internal_errors,
 )
 from conventiondrift.model import CheckerId, InternalError
+
+# The testkit is not on mypy's path (T-011 style: it is loaded by name, as in test_checkers_pool).
+MemorySinks = importlib.import_module("conventiondrift_testkit").MemorySinks
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "conventiondrift"
 CHECKER_IDS: tuple[CheckerId, ...] = get_args(CheckerId)
@@ -455,6 +460,72 @@ def test_a_run_without_an_error_writes_nothing(
     assert called == []
     assert not summary.exists()
     assert capsys.readouterr() == ("", "")
+
+
+# --- the sink seam (CON-73) ----------------------------------------------------------------
+
+
+def test_the_summary_section_is_byte_identical_through_the_sink(tmp_path: Path) -> None:
+    errors = [_error(), _error(f"checker:{CHECKER_IDS[0]}")]
+    path = tmp_path / "summary.md"
+    write_internal_errors(errors, entry="action", env={SUMMARY_ENV: str(path)})
+    on_disk = path.read_bytes()
+
+    sink = MemorySinks()
+    stream = io.StringIO()
+    write_internal_errors(
+        errors,
+        entry="action",
+        env={SUMMARY_ENV: str(path)},
+        stderr=stream,
+        summary_sink=sink,
+    )
+    assert [section.encode("utf-8") for section in sink.summaries] == [on_disk]
+    assert stream.getvalue() == ""
+
+
+def test_a_refusing_sink_keeps_the_warning_and_the_stderr_lines(tmp_path: Path) -> None:
+    errors = [_error()]
+    sink = MemorySinks(summary_status="refused")
+    stream = io.StringIO()
+    write_internal_errors(
+        errors,
+        entry="action",
+        env={SUMMARY_ENV: str(tmp_path / "summary.md")},
+        stderr=stream,
+        summary_sink=sink,
+    )
+    assert sink.summaries == [action_section(errors)]
+    assert stream.getvalue().splitlines() == [SUMMARY_REFUSED, *cli_lines(errors)]
+    assert not (tmp_path / "summary.md").exists()
+
+
+def test_an_unavailable_sink_keeps_the_warning_and_the_stderr_lines(tmp_path: Path) -> None:
+    sink = MemorySinks(summary_status="unavailable")
+    stream = io.StringIO()
+    write_internal_errors(
+        [_error()],
+        entry="action",
+        env={SUMMARY_ENV: str(tmp_path / "summary.md")},
+        stderr=stream,
+        summary_sink=sink,
+    )
+    assert sink.summaries == [action_section([_error()])]
+    assert stream.getvalue().splitlines()[0] == SUMMARY_REFUSED
+
+
+def test_without_a_summary_path_the_sink_is_not_called_at_all() -> None:
+    sink = MemorySinks()
+    stream = io.StringIO()
+    write_internal_errors([_error()], entry="action", env={}, stderr=stream, summary_sink=sink)
+    assert sink.summaries == [] and sink.calls == []
+    assert stream.getvalue().splitlines() == cli_lines([_error()])
+
+
+def test_the_sink_parameter_is_pinned() -> None:
+    """CON-73: the fallback takes the one-method sink, so it need not import the seam (A-8)."""
+    assert get_type_hints(write_internal_errors)["summary_sink"] == SummaryWriter | None
+    assert get_type_hints(SummaryWriter.summary_section) == {"text": str, "return": str}
 
 
 # --- static checks (A-8, AC-N3.15) -----------------------------------------------------------
