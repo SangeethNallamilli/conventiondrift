@@ -26,15 +26,45 @@ import importlib
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from conventiondrift_testkit.fake_gh import (
+    BASE_URL,
+    PR_NUMBER,
+    REPO,
+    FakeGitHub,
+    Req,
+    UnexpectedWrite,
+)
+from conventiondrift_testkit.github_env import (
+    ARTIFACT_DIR,
+    EnvironmentLeak,
+    GitHubEnv,
+    github_env,
+)
+from conventiondrift_testkit.net_monitor import NetworkEscape, NetworkGuard
 from conventiondrift_testkit.sinks import MemorySinks
+from conventiondrift_testkit.workflow_commands import Command, parse_commands
 
 __all__ = [
+    "ARTIFACT_DIR",
+    "BASE_URL",
+    "PR_NUMBER",
     "REPLACEABLE_PARTS",
+    "REPO",
+    "Command",
+    "EnvironmentLeak",
+    "FakeGitHub",
     "FaultyComponent",
+    "GitHubEnv",
     "InjectedFault",
     "MemorySinks",
+    "NetworkEscape",
+    "NetworkGuard",
+    "Req",
+    "UnexpectedWrite",
     "components_class",
+    "github_env",
     "make_components",
+    "parse_commands",
     "replace_checker",
 ]
 
