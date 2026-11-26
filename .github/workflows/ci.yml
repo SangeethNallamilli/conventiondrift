@@ -80,17 +80,42 @@ jobs:
         # are passed in as env; they are never interpolated into the
         # script body. persist-credentials stays false and this fetch is
         # unauthenticated, so no token is written to .git/config.
+        #
+        # DCO_EXCLUDE_REFS (2026-11-26): commits already on main or
+        # release/develop need no new trailer — only commits the PR
+        # introduces are checked. Both refs are fetched unauthenticated
+        # (the repo is public) so check_dco.py can resolve them.
+        #
+        # A push is checked against the branch's own previous tip
+        # (github.event.before) and excludes main only: release/develop
+        # IS the pushed head, so excluding it would leave nothing to
+        # check. A pull request is checked against the PR base and
+        # excludes both main and release/develop, since a PR into
+        # release/develop introduces the commits it adds on top of the
+        # base, and neither branch's older history needs a new trailer.
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main refs/heads/release/develop:refs/remotes/origin/release/develop
           if [ "$EVENT_NAME" = "pull_request" ]; then
             printf '%s\n' "DCO_BASE_SHA=${PR_BASE_SHA}" >> "$GITHUB_ENV"
             printf '%s\n' "DCO_HEAD_SHA=${PR_HEAD_SHA}" >> "$GITHUB_ENV"
+            printf '%s\n' "DCO_EXCLUDE_REFS=origin/main origin/release/develop" >> "$GITHUB_ENV"
           else
-            git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
-            base="$(git merge-base origin/main HEAD)"
+            base="${PUSH_BEFORE_SHA}"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              # Not a push (workflow_dispatch): fall back to the merge base and exclude
+              # release/develop too, so the branch's own older history needs no trailer.
+              base="$(git merge-base origin/main HEAD)"
+              printf '%s\n' "DCO_EXCLUDE_REFS=origin/main origin/release/develop" >> "$GITHUB_ENV"
+            else
+              # A push: release/develop is the pushed head, so excluding it would leave
+              # nothing to check. Only main is excluded; the range is this push's commits.
+              printf '%s\n' "DCO_EXCLUDE_REFS=origin/main" >> "$GITHUB_ENV"
+            fi
             head="$(git rev-parse HEAD)"
             printf '%s\n' "DCO_BASE_SHA=${base}" >> "$GITHUB_ENV"
             printf '%s\n' "DCO_HEAD_SHA=${head}" >> "$GITHUB_ENV"
@@ -99,6 +124,7 @@ jobs:
         env:
           DCO_BASE_SHA: ${{ env.DCO_BASE_SHA }}
           DCO_HEAD_SHA: ${{ env.DCO_HEAD_SHA }}
+          DCO_EXCLUDE_REFS: ${{ env.DCO_EXCLUDE_REFS }}
         run: python3 scripts/ci/check_dco.py
 
   lockfile:
