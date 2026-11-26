@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -123,10 +124,10 @@ def test_the_control_pictures_inverse_is_exact_and_leaves_labels_alone() -> None
 
 
 def test_a_custom_workspace_is_honoured(tmp_path: Any) -> None:
-    custom = str(tmp_path / "ws")
-    with github_env(workspace=custom) as gh:
-        assert gh.workspace.as_posix() == custom
-        assert gh.env["GITHUB_WORKSPACE"] == custom
+    custom = tmp_path / "ws"
+    with github_env(workspace=str(custom)) as gh:
+        assert gh.workspace == custom  # Path comparison, so Windows separators do not matter
+        assert Path(gh.env["GITHUB_WORKSPACE"]) == custom
 
 
 def test_the_default_workspace_is_inside_the_scope() -> None:
