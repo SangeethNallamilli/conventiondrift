@@ -15,7 +15,7 @@ from enum import StrEnum
 from heapq import merge
 from itertools import islice, pairwise
 from types import MappingProxyType
-from typing import Any, Final, Literal, cast, get_args
+from typing import Any, Final, Literal, Protocol, cast, get_args
 
 CheckerId = Literal[
     "logging",
@@ -602,3 +602,47 @@ def _rule_result_key(result: RuleResult) -> tuple[str, int]:
     # RuleResult.__post_init__ guarantees at least one of the two rules.
     rule = cast(Rule, result.head_rule or result.base_rule)
     return (rule.file, rule.line)
+
+
+# --- The output sink seam (CON-73) ---------------------------------------------------------
+# These live in ``model`` because both sides of the seam may import it: ``components`` for the
+# I-2 surface (where it re-exports them) and the fallback writer (A-8), which may not import the
+# Components seam. One definition, so the fallback's ``summary_sink`` is the same Protocol.
+
+SinkStatus = Literal["written", "refused", "unavailable"]
+"""The outcome of one runner-side sink write.
+
+``written``: the output was delivered. ``refused``: a destination was configured but the write
+was rejected (a symlink, a non-regular file, an unwritable path), so the caller may fall back.
+``unavailable``: nothing is configured for that sink (no ``GITHUB_OUTPUT``, no ``RUNNER_TEMP``).
+The tri-state is what preserves the fallback writer's "warn only when a path existed" behavior.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class Outputs:
+    """The four ``GITHUB_OUTPUT`` values of one run.
+
+    ``report_path`` / ``sarif_path`` are the artifact paths, or "" when the run wrote no such
+    artifact. They are written even when empty, so a run always sets exactly four outputs.
+    """
+
+    stale_count: int
+    new_stale_count: int
+    report_path: str
+    sarif_path: str
+
+
+class SummarySink(Protocol):
+    """The one write the fallback writer needs (I-14, A-8), so it need not take all of ``Sinks``."""
+
+    def summary_section(self, text: str) -> SinkStatus: ...
+
+
+# --- The sticky-comment marker (I-3) -------------------------------------------------------
+# One definition, imported by both sides: C11 writes it as line 1 of every comment body and C12
+# checks it to decide "is this our comment". A copy at either site drifting from the other would
+# silently break that check and produce duplicate sticky comments (dev review risk R5).
+
+STICKY_COMMENT_MARKER: Final = "<!-- conventiondrift:sticky v1 -->"
+"""I-3: line 1 of every conventiondrift PR comment body, written by C11 and checked by C12."""

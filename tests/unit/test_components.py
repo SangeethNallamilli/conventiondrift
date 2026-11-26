@@ -18,10 +18,14 @@ from conventiondrift.components import (
     GitHubClient,
     GitReaderProtocol,
     History,
+    Outputs,
     PublishOutcome,
     Rendered,
     Renderer,
     Side,
+    Sinks,
+    SinkStatus,
+    SummarySink,
     TreeEntry,
 )
 from conventiondrift.model import (
@@ -48,6 +52,7 @@ FIELDS = (
     "renderer",
     "github_client",
     "github_base_url",
+    "sinks",
 )
 
 
@@ -143,6 +148,7 @@ def test_components_field_types_are_pinned() -> None:
         "renderer": Renderer | None,
         "github_client": Callable[[str, str], GitHubClient] | None,
         "github_base_url": str | None,
+        "sinks": Sinks | None,
     }
 
 
@@ -224,6 +230,19 @@ I14_SIGNATURES: dict[tuple[type, str], tuple[tuple[str, Any, object], ...]] = {
         ("sarif_ref", KW, NO),
     ),
     (GitHubClient, "lookup"): (("repo", KW, NO), ("pr_number", KW, NO)),
+    (SummarySink, "summary_section"): (("text", POS, NO),),
+    (Sinks, "publish"): (
+        ("repo", KW, NO),
+        ("pr_number", KW, NO),
+        ("run_head_sha", KW, NO),
+        ("comment", KW, NO),
+        ("sarif", KW, NO),
+        ("sarif_commit_sha", KW, NO),
+        ("sarif_ref", KW, NO),
+    ),
+    (Sinks, "outputs"): (("outputs", POS, NO),),
+    (Sinks, "annotations"): (("lines", POS, NO),),
+    (Sinks, "artifact"): (("name", KW, NO), ("data", KW, NO)),
 }
 
 
@@ -241,7 +260,15 @@ def test_protocol_signatures_match_i14(
 
 
 def test_every_protocol_method_is_pinned() -> None:
-    protocols = (GitReaderProtocol, Extractor, History, Renderer, GitHubClient)
+    protocols = (
+        GitReaderProtocol,
+        Extractor,
+        History,
+        Renderer,
+        GitHubClient,
+        SummarySink,
+        Sinks,
+    )
     declared = {
         (proto, name)
         for proto in protocols
@@ -290,6 +317,36 @@ def test_components_take_factories_and_stand_ins() -> None:
     variant = dataclasses.replace(components, github_base_url=None)
     assert variant.git_reader is git_factory
     assert variant.github_base_url is None
+
+
+def test_the_sink_types_are_defined_once_in_model() -> None:
+    """CON-73: ``model`` holds the shared sink types; ``components`` re-exports them for I-2."""
+    from conventiondrift import model
+
+    assert SummarySink is model.SummarySink
+    assert Outputs is model.Outputs
+    assert SinkStatus is model.SinkStatus
+
+
+def test_outputs_fields_are_pinned() -> None:
+    """CON-73: the four GITHUB_OUTPUT values, in the order the sink writes them."""
+    outputs = Outputs(
+        stale_count=3, new_stale_count=1, report_path="/runner-temp/report.json", sarif_path=""
+    )
+    assert tuple(f.name for f in dataclasses.fields(outputs)) == (
+        "stale_count",
+        "new_stale_count",
+        "report_path",
+        "sarif_path",
+    )
+    assert get_type_hints(Outputs) == {
+        "stale_count": int,
+        "new_stale_count": int,
+        "report_path": str,
+        "sarif_path": str,
+    }
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        outputs.stale_count = 0  # type: ignore[misc]
 
 
 def test_rendered_fields_and_immutability() -> None:

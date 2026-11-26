@@ -50,8 +50,10 @@ from typing import Any, Final, Literal, Protocol
 from urllib.parse import urljoin, urlsplit
 
 from conventiondrift.components import GitHubClient, PublishOutcome
+from conventiondrift.model import STICKY_COMMENT_MARKER
 
-MARKER: Final = "<!-- conventiondrift:sticky v1 -->"
+MARKER: Final = STICKY_COMMENT_MARKER
+"""I-3: line 1 of our sticky comment body; the single definition is in ``model``."""
 """Line 1 of every sticky comment body (I-3)."""
 BOT_LOGIN: Final = "github-actions[bot]"
 BOT_TYPE: Final = "Bot"

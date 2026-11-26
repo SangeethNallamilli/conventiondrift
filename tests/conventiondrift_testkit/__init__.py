@@ -26,10 +26,13 @@ import importlib
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from conventiondrift_testkit.sinks import MemorySinks
+
 __all__ = [
     "REPLACEABLE_PARTS",
     "FaultyComponent",
     "InjectedFault",
+    "MemorySinks",
     "components_class",
     "make_components",
     "replace_checker",
@@ -140,6 +143,7 @@ REPLACEABLE_PARTS = frozenset(
         "renderer",
         "github_client",
         "github_base_url",
+        "sinks",
     }
 )  # I-11
 
