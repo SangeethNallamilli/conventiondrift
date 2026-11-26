@@ -38,6 +38,9 @@ import pytest
 
 __all__ = ["NetworkEscape", "NetworkGuard", "is_loopback", "network_guard"]
 
+_UNIX: Final = getattr(socket, "AF_UNIX", None)
+"""The Unix-domain family, or None on Windows, where ``socket.AF_UNIX`` does not exist."""
+
 _LOCAL_NAMES: Final = frozenset({"localhost", "localhost.localdomain"})
 
 
@@ -124,12 +127,12 @@ class NetworkGuard:
     # -- the wrappers ---------------------------------------------------------
 
     def _connect(self, sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
-        if getattr(sock, "family", None) != socket.AF_UNIX:
+        if getattr(sock, "family", None) != _UNIX:
             self.check(_host_of(address))
         return self._saved["connect"](sock, address, *args, **kwargs)
 
     def _connect_ex(self, sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
-        if getattr(sock, "family", None) != socket.AF_UNIX:
+        if getattr(sock, "family", None) != _UNIX:
             self.check(_host_of(address))
         return self._saved["connect_ex"](sock, address, *args, **kwargs)
 
@@ -139,7 +142,7 @@ class NetworkGuard:
 
     def _getaddrinfo(self, host: object, port: object, *args: Any, **kwargs: Any) -> Any:
         family = kwargs.get("family", args[0] if args else 0)
-        if family != socket.AF_UNIX:
+        if family != _UNIX:
             self.check(host if isinstance(host, str) else None)
         return self._saved["getaddrinfo"](host, port, *args, **kwargs)
 

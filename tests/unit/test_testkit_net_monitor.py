@@ -116,6 +116,7 @@ def test_a_loopback_connection_is_allowed_against_a_real_local_server() -> None:
     assert accepted == [True]
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX sockets")
 def test_an_af_unix_path_is_not_egress(tmp_path: Any) -> None:
     path = str(tmp_path / "s.sock")
     unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -165,6 +166,7 @@ def test_a_non_tuple_address_has_no_host_to_check() -> None:
     assert guard.attempts == []
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX sockets")
 def test_getaddrinfo_with_the_unix_family_skips_the_host_check() -> None:
     with NetworkGuard("t") as guard:
         try:
@@ -236,3 +238,14 @@ def test_thousands_of_guarded_no_ops_stay_cheap() -> None:
             socket.getaddrinfo("127.0.0.1", 0)
         elapsed = time.perf_counter() - start
     assert elapsed < 2.0, f"loopback getaddrinfo is too expensive under the guard: {elapsed:.3f}s"
+
+
+def test_without_af_unix_the_guard_still_checks_egress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Windows shape: no ``socket.AF_UNIX``, so the family check cannot compare to it."""
+    import conventiondrift_testkit.net_monitor as module
+
+    monkeypatch.setattr(module, "_UNIX", None)
+    with NetworkGuard("t") as guard:
+        with pytest.raises(NetworkEscape):
+            socket.getaddrinfo("10.9.9.9", 0)
+    assert guard.attempts == ["10.9.9.9"]
