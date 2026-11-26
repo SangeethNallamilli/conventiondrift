@@ -21,13 +21,23 @@ def main() -> int:
         print("DCO_BASE_SHA and DCO_HEAD_SHA must be set", file=sys.stderr)
         return 2
 
+    # Uniform exclusion rule (2026-11-26): a commit that already exists
+    # on an exclusion ref (e.g. main, release/develop) needs no new
+    # trailer — only commits the PR introduces (reachable from neither
+    # the base nor any exclusion ref) are checked. The caller passes
+    # space-separated refs via DCO_EXCLUDE_REFS; fail closed if any of
+    # them cannot be resolved.
+    exclude_refs = os.environ.get("DCO_EXCLUDE_REFS", "").split()
+    for ref in exclude_refs:
+        subprocess.run(["git", "rev-parse", "--verify", ref], check=True, capture_output=True)
+
     # Make sure both ends exist in the local clone.
     subprocess.run(["git", "rev-parse", "--verify", base], check=True, capture_output=True)
     subprocess.run(["git", "rev-parse", "--verify", head], check=True, capture_output=True)
 
-    shas = git("rev-list", "--reverse", f"{base}..{head}").splitlines()
+    shas = git("rev-list", "--reverse", head, "--not", base, *exclude_refs).splitlines()
     if not shas:
-        print(f"ok: no commits in {base[:12]}..{head[:12]}")
+        print(f"ok: no commits in {base[:12]}..{head[:12]} beyond the exclusion refs")
         return 0
 
     missing: list[str] = []
@@ -44,7 +54,7 @@ def main() -> int:
             print(line, file=sys.stderr)
         return 1
 
-    print(f"ok: {len(shas)} commit(s) in {base[:12]}..{head[:12]} have Signed-off-by")
+    print(f"ok: {len(shas)} checked commit(s) in {base[:12]}..{head[:12]} have Signed-off-by")
     return 0
 
 
