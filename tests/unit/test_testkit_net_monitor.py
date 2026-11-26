@@ -36,7 +36,7 @@ from conventiondrift_testkit.net_monitor import (
         ("8.8.8.8", False),
         ("2001:4860:4860::8888", False),
         ("example.com", False),
-        ("", False),
+        ("", True),  # no host at all: a bind, not egress
     ],
 )
 def test_loopback_classification(host: str, expected: bool) -> None:
@@ -70,6 +70,47 @@ def test_a_swallowed_escape_is_still_recorded() -> None:
     assert guard.attempts == ["example.com"]
 
 
+requires_af_unix = pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"), reason="this platform has no AF_UNIX sockets"
+)
+
+
+def test_a_bytes_host_is_checked_too() -> None:
+    # CR minor (a): a bytes host must not slip past the fail-closed check.
+    with NetworkGuard("t") as guard:
+        with pytest.raises(NetworkEscape):
+            socket.getaddrinfo(b"example.com", 80)
+        with pytest.raises(NetworkEscape):
+            socket.create_connection((b"example.com", 443), timeout=0.01)  # type: ignore[arg-type]
+    assert guard.attempts == ["example.com", "example.com"]
+
+
+def test_a_bytes_loopback_host_is_allowed() -> None:
+    with NetworkGuard("t") as guard:
+        assert socket.getaddrinfo(b"127.0.0.1", 0)
+    assert guard.attempts == []
+
+
+def test_a_non_ascii_bytes_host_is_blocked_without_raising() -> None:
+    with NetworkGuard("t") as guard:
+        with pytest.raises(NetworkEscape):
+            socket.getaddrinfo(b"\xff\xfe", 80)
+    assert guard.attempts and "\\xff" in guard.attempts[0]
+
+
+def test_datagram_egress_is_guarded() -> None:
+    # CR minor (b): sendto is intercepted, not merely documented.
+    with NetworkGuard("t") as guard:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            with pytest.raises(NetworkEscape):
+                sock.sendto(b"x", ("203.0.113.9", 53))
+            assert sock.sendto(b"x", ("127.0.0.1", 9)) == 1
+        finally:
+            sock.close()
+    assert guard.attempts == ["203.0.113.9"]
+
+
 def test_create_connection_and_getaddrinfo_are_guarded() -> None:
     with NetworkGuard("t") as guard:
         with pytest.raises(NetworkEscape):
@@ -77,6 +118,37 @@ def test_create_connection_and_getaddrinfo_are_guarded() -> None:
         with pytest.raises(NetworkEscape):
             socket.create_connection(("example.com", 443), timeout=0.01)
     assert sorted(guard.attempts) == ["example.com", "example.com"]
+
+
+def test_the_guard_works_on_a_platform_without_af_unix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the Windows CI crash: no wrapper may read ``socket.AF_UNIX`` at call time."""
+    monkeypatch.delattr(socket, "AF_UNIX", raising=False)
+    with NetworkGuard("t") as guard:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(NetworkEscape):  # not AttributeError
+                sock.connect(("example.com", 443))
+            with pytest.raises(NetworkEscape):
+                sock.connect_ex(("example.com", 443))
+        finally:
+            sock.close()
+        with pytest.raises(NetworkEscape):
+            socket.getaddrinfo("example.com", 80)
+        assert socket.getaddrinfo("127.0.0.1", 80)  # loopback still allowed
+    assert guard.attempts.count("example.com") == 3
+
+
+def test_without_af_unix_the_guard_still_checks_egress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Windows shape, from the narrow fix: a None family constant must still block egress."""
+    import conventiondrift_testkit.net_monitor as module
+
+    monkeypatch.setattr(module, "_UNIX", None)
+    with NetworkGuard("t") as guard:
+        with pytest.raises(NetworkEscape):
+            socket.getaddrinfo("10.9.9.9", 0)
+    assert guard.attempts == ["10.9.9.9"]
 
 
 def test_getaddrinfo_for_a_local_bind_is_allowed() -> None:
@@ -116,7 +188,7 @@ def test_a_loopback_connection_is_allowed_against_a_real_local_server() -> None:
     assert accepted == [True]
 
 
-@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX sockets")
+@requires_af_unix
 def test_an_af_unix_path_is_not_egress(tmp_path: Any) -> None:
     path = str(tmp_path / "s.sock")
     unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -166,7 +238,7 @@ def test_a_non_tuple_address_has_no_host_to_check() -> None:
     assert guard.attempts == []
 
 
-@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs AF_UNIX sockets")
+@requires_af_unix
 def test_getaddrinfo_with_the_unix_family_skips_the_host_check() -> None:
     with NetworkGuard("t") as guard:
         try:
@@ -238,14 +310,3 @@ def test_thousands_of_guarded_no_ops_stay_cheap() -> None:
             socket.getaddrinfo("127.0.0.1", 0)
         elapsed = time.perf_counter() - start
     assert elapsed < 2.0, f"loopback getaddrinfo is too expensive under the guard: {elapsed:.3f}s"
-
-
-def test_without_af_unix_the_guard_still_checks_egress(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The Windows shape: no ``socket.AF_UNIX``, so the family check cannot compare to it."""
-    import conventiondrift_testkit.net_monitor as module
-
-    monkeypatch.setattr(module, "_UNIX", None)
-    with NetworkGuard("t") as guard:
-        with pytest.raises(NetworkEscape):
-            socket.getaddrinfo("10.9.9.9", 0)
-    assert guard.attempts == ["10.9.9.9"]

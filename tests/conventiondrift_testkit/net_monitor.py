@@ -8,7 +8,8 @@ the error still fails at teardown: swallowing an escape is not a way to pass.
 
 Exempt, narrowly:
 
-* ``AF_UNIX`` sockets (path addresses) - a local socket, not egress;
+* ``AF_UNIX`` sockets (path addresses) - a local socket, not egress (skipped where the platform
+  has no ``AF_UNIX``, as on Windows);
 * loopback addresses - ``127.0.0.0/8``, ``::1`` and the names ``localhost``/
   ``localhost.localdomain`` - so a local test server (``tests/unit/test_github_transport.py``)
   and ``socketpair`` keep working;
@@ -18,8 +19,9 @@ Exempt, narrowly:
   download. ``--strict-markers`` is already on, so no unknown marker can open it.
 
 **Boundary.** This is a Python-level guard over socket entry points, not a sandbox. It does not
-see egress from a subprocess, from ``ctypes``, or through a connection that was already open when
-the test started, and it cannot police a library that talks to a socket obtained some other way.
+see egress from a subprocess, from ``ctypes``, through an already-open connection, or via
+``sendmmsg`` (which is not wrapped); it cannot police a library that talks to a socket obtained
+some other way. Datagrams *are* covered through ``sendto``.
 The reason the C12 path is safe is the transport seam, not this monitor: ``fake_gh`` is a
 ``github.Transport``, so ``GitHubApiClient`` runs with no socket at all. Do not treat the monitor
 as a guarantee about code it cannot intercept.
@@ -38,10 +40,9 @@ import pytest
 
 __all__ = ["NetworkEscape", "NetworkGuard", "is_loopback", "network_guard"]
 
-_UNIX: Final = getattr(socket, "AF_UNIX", None)
-"""The Unix-domain family, or None on Windows, where ``socket.AF_UNIX`` does not exist."""
-
 _LOCAL_NAMES: Final = frozenset({"localhost", "localhost.localdomain"})
+_UNIX: Final = getattr(socket, "AF_UNIX", None)
+"""Absent on Windows: resolved once, because comparing to ``socket.AF_UNIX`` raised there."""
 
 
 class NetworkEscape(RuntimeError):
@@ -53,9 +54,18 @@ class NetworkEscape(RuntimeError):
         self.node_id = node_id
 
 
+def _is_unix_family(family: object) -> bool:
+    return _UNIX is not None and family == _UNIX
+
+
+def _text(host: bytes) -> str:
+    """A bytes host, as text: ASCII when possible, a backslash-escaped label otherwise."""
+    return host.decode("ascii", "backslashreplace")
+
+
 def is_loopback(host: str) -> bool:
-    """True for a loopback address or a local name; ``False`` for anything unresolved."""
-    if host in _LOCAL_NAMES:
+    """True for a loopback address, an empty host, or a local name; else ``False``."""
+    if host == "" or host in _LOCAL_NAMES:
         return True
     try:
         address = ipaddress.ip_address(host)
@@ -68,7 +78,10 @@ def _host_of(address: object) -> str | None:
     """The host part of a connect/create_connection address, or ``None`` for a path address."""
     if isinstance(address, tuple) and address:
         first = address[0]
-        return first if isinstance(first, str) else None
+        if isinstance(first, str):
+            return first
+        if isinstance(first, bytes):
+            return _text(first)
     return None
 
 
@@ -86,6 +99,7 @@ class NetworkGuard:
             "connect_ex": socket.socket.connect_ex,
             "create_connection": socket.create_connection,
             "getaddrinfo": socket.getaddrinfo,
+            "sendto": socket.socket.sendto,
         }
         guard = self
 
@@ -95,12 +109,16 @@ class NetworkGuard:
         def connect_ex(sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
             return guard._connect_ex(sock, address, *args, **kwargs)
 
+        def sendto(sock: socket.socket, data: object, *args: Any, **kwargs: Any) -> Any:
+            return guard._sendto(sock, data, *args, **kwargs)
+
         # Plain functions, so the descriptor protocol still binds the socket instance; assigning
         # the guard's bound methods would make ``sock.connect(addr)`` pass only ``addr``.
         setattr(socket.socket, "connect", connect)  # noqa: B010 - a class patch
         setattr(socket.socket, "connect_ex", connect_ex)  # noqa: B010 - a class patch
         setattr(socket, "create_connection", self._create_connection)  # noqa: B010
         setattr(socket, "getaddrinfo", self._getaddrinfo)  # noqa: B010
+        setattr(socket.socket, "sendto", sendto)  # noqa: B010
         return self
 
     def __exit__(
@@ -113,6 +131,7 @@ class NetworkGuard:
         setattr(socket.socket, "connect_ex", self._saved["connect_ex"])  # noqa: B010
         setattr(socket, "create_connection", self._saved["create_connection"])  # noqa: B010
         setattr(socket, "getaddrinfo", self._saved["getaddrinfo"])  # noqa: B010
+        setattr(socket.socket, "sendto", self._saved["sendto"])  # noqa: B010
         self._saved.clear()
 
     # -- checks ---------------------------------------------------------------
@@ -127,12 +146,12 @@ class NetworkGuard:
     # -- the wrappers ---------------------------------------------------------
 
     def _connect(self, sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
-        if getattr(sock, "family", None) != _UNIX:
+        if not _is_unix_family(getattr(sock, "family", None)):
             self.check(_host_of(address))
         return self._saved["connect"](sock, address, *args, **kwargs)
 
     def _connect_ex(self, sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
-        if getattr(sock, "family", None) != _UNIX:
+        if not _is_unix_family(getattr(sock, "family", None)):
             self.check(_host_of(address))
         return self._saved["connect_ex"](sock, address, *args, **kwargs)
 
@@ -142,9 +161,19 @@ class NetworkGuard:
 
     def _getaddrinfo(self, host: object, port: object, *args: Any, **kwargs: Any) -> Any:
         family = kwargs.get("family", args[0] if args else 0)
-        if family != _UNIX:
-            self.check(host if isinstance(host, str) else None)
+        if not _is_unix_family(family):
+            if isinstance(host, bytes):
+                self.check(_text(host))
+            else:
+                self.check(host if isinstance(host, str) else None)
         return self._saved["getaddrinfo"](host, port, *args, **kwargs)
+
+    def _sendto(self, sock: socket.socket, data: object, *args: Any, **kwargs: Any) -> Any:
+        """Datagram egress: ``sendto(data, address)`` and ``sendto(data, flags, address)``."""
+        address = kwargs.get("address", args[-1] if args else None)
+        if not _is_unix_family(getattr(sock, "family", None)):
+            self.check(_host_of(address))
+        return self._saved["sendto"](sock, data, *args, **kwargs)
 
 
 @pytest.fixture(autouse=True)
