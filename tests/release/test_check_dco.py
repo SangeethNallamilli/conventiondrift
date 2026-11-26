@@ -7,6 +7,7 @@ DCO_HEAD_SHA / DCO_EXCLUDE_REFS). No network, no fixtures.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,16 @@ def _commit(repo: Path, message: str, *, signoff: bool) -> str:
     return _run_git(repo, "rev-parse", "HEAD")
 
 
+def _env(base: str, head: str, exclude: list[str]) -> dict[str, str]:
+    """Inherit the ambient environment (so `git` resolves on every OS,
+    Windows included) and layer the script's inputs on top."""
+    env = dict(os.environ)
+    env["DCO_BASE_SHA"] = base
+    env["DCO_HEAD_SHA"] = head
+    env["DCO_EXCLUDE_REFS"] = " ".join(exclude)
+    return env
+
+
 def _run_script(
     repo: Path, base: str, head: str, exclude: list[str]
 ) -> subprocess.CompletedProcess[str]:
@@ -47,12 +58,7 @@ def _run_script(
             sys.executable,
             str(SCRIPT),
         ],
-        env={
-            "DCO_BASE_SHA": base,
-            "DCO_HEAD_SHA": head,
-            "DCO_EXCLUDE_REFS": " ".join(exclude),
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-        },
+        env=_env(base, head, exclude),
         cwd=str(repo),
         text=True,
         capture_output=True,
@@ -145,11 +151,7 @@ def test_empty_range_passes(tmp_path: Path) -> None:
 def test_missing_env_fails(tmp_path: Path, missing_env: str) -> None:
     repo = _init_repo(tmp_path)
     head = _commit(repo, "head", signoff=True)
-    env = {
-        "DCO_BASE_SHA": head,
-        "DCO_HEAD_SHA": head,
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
-    }
+    env = _env(head, head, [])
     env.pop(missing_env)
     done = subprocess.run(
         [sys.executable, str(SCRIPT)],
