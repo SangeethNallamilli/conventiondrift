@@ -30,15 +30,22 @@ The writer catches its own exceptions and writes nothing more (I-14); it never c
 status. Only ``KeyboardInterrupt`` propagates, as in ``run``.
 """
 
-import os
 import re
-import stat
 import sys
 from collections.abc import Mapping, Sequence
 from typing import Final, Literal, TextIO
 
-from conventiondrift.model import InternalError
+from conventiondrift.model import InternalError, SummarySink
 from conventiondrift.render.escape import md
+from conventiondrift.sinks import (
+    NOFOLLOW as _NOFOLLOW,
+)
+from conventiondrift.sinks import (
+    SUMMARY_ENV,
+    SUMMARY_OPEN_FLAGS,
+    SUMMARY_REFUSED,
+    EnvSinks,
+)
 
 __all__ = [
     "GIT_TOO_OLD_TEXT",
@@ -47,12 +54,14 @@ __all__ = [
     "SUMMARY_OPEN_FLAGS",
     "SUMMARY_REFUSED",
     "WITHHELD",
+    # Re-exported from ``sinks``: the writer receives it at call time, so the platform tests
+    # that patch ``fallback._NOFOLLOW`` keep driving the real code.
+    "_NOFOLLOW",
     "action_section",
     "cli_lines",
     "write_internal_errors",
 ]
 
-SUMMARY_ENV: Final = "GITHUB_STEP_SUMMARY"
 SECTION_HEADING: Final = "## Internal error"
 WITHHELD: Final = "this part of the analysis could not finish; details are withheld"
 """The fixed part of every ``InternalError`` message (I-14 Q6)."""
@@ -92,78 +101,16 @@ def cli_lines(errors: Sequence[InternalError]) -> list[str]:
     return out
 
 
-_NOFOLLOW: Final[int] = getattr(os, "O_NOFOLLOW", 0)
-_REPARSE_POINT: Final[int] = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+def _summary_sink(env: Mapping[str, str], summary_sink: SummarySink | None) -> SummarySink:
+    """The sink the fallback writes the section through (CON-73).
 
-SUMMARY_OPEN_FLAGS: Final = (
-    os.O_WRONLY
-    | os.O_APPEND
-    | os.O_CREAT
-    | _NOFOLLOW
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_NONBLOCK", 0)
-    | getattr(os, "O_BINARY", 0)
-)
-"""How the summary file is opened (SR ruling on T-006b).
-
-Append, created if missing as before; a symlink is refused where ``O_NOFOLLOW`` exists; the fd
-is not inherited. ``O_NONBLOCK`` keeps a FIFO from blocking the open (it fails, or is refused by
-the regular-file check); it changes nothing for a regular file. ``O_BINARY`` matters on Windows.
-"""
-
-SUMMARY_REFUSED: Final = (
-    "conventiondrift: the job summary file could not be used; writing to stderr instead"
-)
-"""The warning when the summary file is refused or can't be written; never the path or OS text."""
-
-
-def _no_link_before_open(path: str) -> bool:
-    """False if ``path`` must be refused before the open (SR ruling for Windows).
-
-    Only where ``SUMMARY_OPEN_FLAGS`` has no ``O_NOFOLLOW``: ``lstat`` the path; a missing file is
-    created as before, any other error refuses, and so does a symlink or a reparse point.
+    The module-level flags are read here, at call time, so a test that simulates a platform
+    without ``O_NOFOLLOW`` by patching ``fallback.SUMMARY_OPEN_FLAGS`` / ``fallback._NOFOLLOW``
+    keeps driving the real writer, including the ``lstat`` branch Windows takes.
     """
-    if SUMMARY_OPEN_FLAGS & _NOFOLLOW:
-        return True
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return True
-    except (OSError, ValueError):  # ValueError: a NUL byte in the path
-        return False
-    if stat.S_ISLNK(st.st_mode):
-        return False
-    return not getattr(st, "st_file_attributes", 0) & _REPARSE_POINT
-
-
-def _append_to_summary(path: str, errors: Sequence[InternalError]) -> bool:
-    """Append the section to ``path``; False if it was refused (the caller then uses stderr).
-
-    The file must open with ``SUMMARY_OPEN_FLAGS`` and ``fstat`` as a regular file (SR ruling);
-    the descriptor is always closed. Without ``O_NOFOLLOW``, ``_no_link_before_open`` runs first.
-    A write that fails part-way can leave a truncated section in the file; the caller still
-    writes the stderr lines, so the report is never lost.
-    """
-    if not _no_link_before_open(path):
-        return False
-    try:
-        fd = os.open(path, SUMMARY_OPEN_FLAGS, 0o666)
-    except (OSError, ValueError):  # ValueError: a NUL byte in the path
-        return False
-    try:
-        regular = stat.S_ISREG(os.fstat(fd).st_mode)
-    except OSError:
-        regular = False
-    if not regular:
-        os.close(fd)
-        return False
-    try:
-        # Bytes, so the encoding is UTF-8 whatever the locale. ``fdopen`` owns and closes ``fd``.
-        with os.fdopen(fd, "ab") as summary:
-            summary.write(action_section(errors).encode("utf-8"))
-    except (OSError, ValueError):  # ValueError too (e.g. a closed file): never raise, fall back
-        return False
-    return True
+    if summary_sink is not None:
+        return summary_sink
+    return EnvSinks(env, open_flags=SUMMARY_OPEN_FLAGS, nofollow=_NOFOLLOW)
 
 
 def write_internal_errors(
@@ -172,8 +119,14 @@ def write_internal_errors(
     entry: Literal["action", "cli"],
     env: Mapping[str, str],
     stderr: TextIO | None = None,
+    summary_sink: SummarySink | None = None,
 ) -> None:
-    """Report ``errors`` for ``entry``; see the module docstring. Writes nothing for no errors."""
+    """Report ``errors`` for ``entry``; see the module docstring. Writes nothing for no errors.
+
+    The Action's summary section goes through the ``Sinks`` seam (CON-73): ``summary_sink``
+    defaults to ``sinks.EnvSinks`` over ``env``, so a test can inject a recording sink and the
+    last writer still owns the refusal warning and the stderr fallback.
+    """
     if not errors:
         return
     try:
@@ -181,7 +134,9 @@ def write_internal_errors(
         if entry == "action":
             path = env.get(SUMMARY_ENV)
             if path:
-                if _append_to_summary(path, errors):
+                if _summary_sink(env, summary_sink).summary_section(action_section(errors)) == (
+                    "written"
+                ):
                     return
                 stream.write(SUMMARY_REFUSED + "\n")
         # The CLI, or an Action run with no usable summary file: never silent (I-14).

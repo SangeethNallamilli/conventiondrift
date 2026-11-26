@@ -12,6 +12,7 @@ from conventiondrift_testkit import (
     REPLACEABLE_PARTS,
     FaultyComponent,
     InjectedFault,
+    MemorySinks,
     make_components,
     replace_checker,
 )
@@ -113,6 +114,18 @@ def test_make_components_uses_dataclasses_replace() -> None:
     assert base.renderer is None
     with pytest.raises(TypeError):
         make_components(base, fault_hook=True)
+
+
+def test_the_sinks_seam_is_replaceable_and_recorded() -> None:
+    """CON-73: ``sinks`` is an I-11 replaceable part, and ``MemorySinks`` keeps every write."""
+    assert "sinks" in REPLACEABLE_PARTS
+    sinks = MemorySinks()
+    out = make_components(sinks=sinks)
+    assert out.sinks is sinks
+    out.sinks.summary_section("## x\n")
+    assert sinks.calls == ["summary_section"] and sinks.summaries == ["## x\n"]
+    component = dataclasses.replace(make_components(), sinks=sinks)
+    assert component.sinks is sinks
 
 
 def test_production_components_documented_shape() -> None:

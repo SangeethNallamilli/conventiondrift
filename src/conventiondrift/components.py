@@ -27,7 +27,16 @@ from conventiondrift.model import (
     Window,
 )
 from conventiondrift.model import (
+    Outputs as Outputs,
+)
+from conventiondrift.model import (
     Side as Side,
+)
+from conventiondrift.model import (
+    SinkStatus as SinkStatus,
+)
+from conventiondrift.model import (
+    SummarySink as SummarySink,
 )
 
 TreeEntry = tuple[str, str, int | None, str]
@@ -168,6 +177,43 @@ class GitHubClient(Protocol):
     def lookup(self, *, repo: str, pr_number: int) -> tuple[bool, str | None]: ...
 
 
+class Sinks(SummarySink, Protocol):
+    """Where a run's outputs go (I-2, CON-73). Production writes the real runner paths.
+
+    One method per output venue: ``publish`` for the PR comment and the SARIF upload (it
+    mirrors C12's atomic ``publish`` and delegates to it), ``outputs`` for the four
+    ``GITHUB_OUTPUT`` values, ``summary_section`` for ``GITHUB_STEP_SUMMARY``, ``annotations``
+    for the workflow commands on stdout, and ``artifact`` for ``$RUNNER_TEMP`` files.
+
+    Publishing goes only through ``sinks.publish``: ``Components.github_client`` stays the C12
+    seam that ``publish`` delegates to, and the only place a reader calls for ``lookup``, so a
+    run never posts the same comment twice. ``annotations`` writes to a binary stream, so a
+    non-UTF-8 console encoding can never raise mid-write.
+
+    No method raises for a refused or unavailable destination: they report it through
+    ``SinkStatus`` (or ``None`` from ``artifact``), so the fallback writer can call them last.
+    ``publish`` keeps C12's contract: HTTP errors are returned, never raised.
+    """
+
+    def publish(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        run_head_sha: str,
+        comment: str | None,
+        sarif: str | None,
+        sarif_commit_sha: str,
+        sarif_ref: str,
+    ) -> tuple[PublishOutcome, str | None]: ...
+
+    def outputs(self, outputs: Outputs) -> SinkStatus: ...
+
+    def annotations(self, lines: Sequence[str]) -> SinkStatus: ...
+
+    def artifact(self, *, name: str, data: bytes) -> Path | None: ...
+
+
 @dataclass(frozen=True, kw_only=True)
 class Components:
     """Replaceable parts for tests (I-2). ``None`` means the production default."""
@@ -179,3 +225,4 @@ class Components:
     renderer: Renderer | None = None
     github_client: Callable[[str, str], GitHubClient] | None = None
     github_base_url: str | None = None
+    sinks: Sinks | None = None
