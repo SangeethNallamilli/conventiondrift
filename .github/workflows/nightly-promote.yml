@@ -1,12 +1,11 @@
 # Nightly promotion of release/develop into main (owner decision
-# 2026-11-19, amended 2026-11-26). PRs land in release/develop (squash
-# only, 3.11 CI). Each night this job first syncs main into
-# release/develop when release/develop is strictly behind main and
-# their trees differ, through a squash PR — the only way main's content
-# can land on a linear-history branch (a squash imports content, not
-# history). Then it opens or reuses a PR from nightly/promote into main
-# and dispatches the full 3.11-3.15 CI on it. GitHub auto-merges it
-# with a regular merge commit only once the required `ci` check is
+# 2026-11-19, amended 2026-11-26; merge policy reversed 2026-11-26).
+# PRs land in release/develop as MERGE COMMITS (3.11 CI). Each night
+# this job first syncs main into release/develop through a merge-commit
+# PR (only when release/develop is strictly behind main), then opens or
+# reuses a PR from nightly/promote into main and dispatches the full
+# 3.11-3.15 CI on it. GitHub auto-merges it as a SQUASH — one squash
+# commit per nightly promotion — only once the required `ci` check is
 # green.
 #
 # Schedule: 09:00 UTC = 04:00 Eastern Standard Time (owner request
@@ -15,24 +14,23 @@
 # under load.
 #
 # Why nightly/promote and not release/develop as the PR head: main
-# requires branches to be up to date (strict `ci`). Each promotion adds a
-# merge commit to main. release/develop takes only squash PR merges
-# (classic protection with linear history + ruleset 27675422, no bypass
-# actors), so the nightly sync below contributes a squash commit via a
-# PR — the only way main's content can land there (owner request
-# 2026-11-26). So the job builds the head branch as main plus a merge of
-# release/develop. Its merge commit carries a Signed-off-by line and is
-# checked by the dco job like any other commit.
+# requires branches to be up to date (strict `ci`), and the nightly sync
+# merge into release/develop lands asynchronously (its own auto-merge
+# waits for CI), so a same-night PR from release/develop could lack
+# main's tip. The job builds the head branch as main plus a merge of
+# release/develop via the merges API. Its merge commit carries a
+# Signed-off-by line and is checked by the dco job like any other
+# commit.
 #
 # Security: no checkout and no repository code runs here. It only makes
 # GitHub API calls with the short-lived GITHUB_TOKEN, scoped to this job.
 # No secrets, no PAT, no App, no branch-protection bypass. For the
 # promotion, the merge goes through main's normal protection (required
-# `ci`, up to date, conversation resolution). The sync opens a PR of
-# main into release/develop and enables squash auto-merge, so the
-# branch's own gates (required `ci`, squash-only) still apply; it
-# introduces no authored content beyond main's commits. Schedule and
-# manual runs on main only.
+# `ci`, up to date, conversation resolution) and lands as a squash. The
+# sync opens a PR of main into release/develop and enables merge-commit
+# auto-merge, so the branch's own gates (required `ci`, merge-commit
+# ruleset) still apply; it introduces no authored content beyond main's
+# commits. Schedule and manual runs on main only.
 # nightly/promote is guarded by a ruleset (only the GitHub Actions app may
 # create, update or delete it), and this job also re-checks its contents
 # and pins auto-merge to the exact SHA it built (H-52-1).
@@ -67,73 +65,74 @@ jobs:
       SOB: "Signed-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
     steps:
       - name: Sync release/develop with main (owner request 2026-11-26)
-        # release/develop enforces linear history and squash-only PR
-        # merges (classic protection + ruleset 27675422, no bypass
-        # actors), so the merges API cannot add a merge commit to it.
-        # Sync through the one merge method the branch allows: a squash
-        # PR of main into release/develop. The sync branch sits at
-        # main's tip; the PR's own pull_request CI (3.11) is the branch's
-        # required `ci` check. The squash commit message carries the
-        # sync prefix and a Signed-off-by line, so the promotion's dco
-        # job (range merge-base(main)..HEAD on push to release/develop)
-        # passes and the promotion gate below excludes it from the real
+        # Merge policy 2026-11-26: release/develop takes merge commits
+        # (linear history relaxed, ruleset 27675422 allows "merge"), so
+        # the sync is a plain merge-commit PR of main into
+        # release/develop. A merge keeps release/develop's newer
+        # content, so the sync can never roll anything back — the guard
+        # below only decides whether a sync is needed.
+        #
+        # The sync branch must contain release/develop's tip: rd's
+        # classic protection has strict `ci` ("branches must be up to
+        # date"), and a head branch at main's tip alone would not, so
+        # the PR would block forever. Build the sync branch as rd's tip
+        # plus a merges-API merge of main (bot merge commit with the
+        # Signed-off-by line), so the head contains the base tip and the
+        # PR's own pull_request CI (3.11) is the required `ci` check.
+        # The bot merge carries the SOB, and the eventual PR merge
+        # commit carries one too (auto-merge commit_message), so rd's
+        # push-time dco range stays clean. A merge imports history:
+        # behind_by reaches 0 for real once synced.
         run: |
           set -euo pipefail
-          # Direction guard first: sync only when release/develop is
-          # strictly behind main (compare status "behind" = an ancestor
-          # of main, i.e. main is content-ahead and this is a genuine
-          # forward sync). "ahead" or "diverged" means release/develop
-          # has newer content the promotion will carry to main — a sync
-          # PR main->release/develop in that state would DELETE that
-          # newer content (a rollback), so it must never open.
-          status="$(gh api "repos/$REPO/compare/main...release/develop" --jq .status)"
-          if [ "$status" != "behind" ]; then
-            echo "release/develop is not behind main (compare status: $status); skipping the sync so it cannot roll back release/develop's newer content"
+          # Sync when main has commits that release/develop lacks.
+          # behind_by > 0 while a merge is safe (merges never delete
+          # rd's own newer content); "ahead" means nothing to sync, and
+          # "diverged" means main has newer work — still a safe merge.
+          behind="$(gh api "repos/$REPO/compare/main...release/develop" --jq .behind_by)"
+          if [ "$behind" = "0" ]; then
+            echo "release/develop has everything main has (compare behind_by: 0); nothing to sync"
             exit 0
           fi
-          # Trigger on content, not on commit history: a squash sync
-          # imports main's content but not its history, so behind_by
-          # never reaches 0 — comparing the two tip trees is what
-          # actually says "current".
-          main_sha="$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)"
-          rd_sha="$(gh api "repos/$REPO/git/ref/heads/release/develop" --jq .object.sha)"
-          main_tree="$(gh api "repos/$REPO/commits/$main_sha" --jq .commit.tree.sha)"
-          rd_tree="$(gh api "repos/$REPO/commits/$rd_sha" --jq .commit.tree.sha)"
-          if [ "$main_tree" = "$rd_tree" ]; then
-            echo "release/develop is content-current with main"
-            exit 0
-          fi
-          echo "release/develop content differs from main; opening or refreshing the sync PR"
+          echo "main is $behind commits ahead of the merge base; building the sync branch"
           SB="sync/main-into-release-develop"
+          rd_sha="$(gh api "repos/$REPO/git/ref/heads/release/develop" --jq .object.sha)"
           if gh api "repos/$REPO/git/ref/heads/$SB" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$SB" -f sha="$main_sha" -F force=true >/dev/null
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$SB" -f sha="$rd_sha" -F force=true >/dev/null
           else
-            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$SB" -f sha="$main_sha" >/dev/null
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$SB" -f sha="$rd_sha" >/dev/null
           fi
+          # Bot merge of main into the sync branch (contains rd's tip by
+          # construction). Refuses conflicts (409) — fail closed; rd's
+          # squashes and main's promoted content are the same changes, so
+          # none is expected.
+          gh api -X POST "repos/$REPO/merges" -f base="$SB" -f head=main \
+            -f commit_message="$(printf 'Merge main into %s for the nightly sync\n\n%s' "$SB" "$SOB")" >/dev/null
           pr="$(gh pr list --repo "$REPO" --head "$SB" --base release/develop --state open --json number --jq '.[0].number // empty')"
           if [ -z "$pr" ]; then
             url="$(gh pr create --repo "$REPO" --base release/develop --head "$SB" \
               --title "Sync main into release/develop (nightly)" \
-              --body "Automated nightly sync (owner request 2026-11-26): a squash of main into release/develop, so release/develop is content-current with main. Auto-merges once release/develop's own gates are met — the required ci check and any review the branch's ruleset asks for.")"
+              --body "Automated nightly sync (owner request 2026-11-26): a merge of main into release/develop, so release/develop is current with main — history included. Auto-merges once release/develop's own gates are met — the required ci check and any review the branch's ruleset asks for.")"
             pr="${url##*/}"
           fi
           if gh api -X PUT "repos/$REPO/pulls/$pr/auto-merge" \
-            -f merge_method=squash \
-            -f commit_title="Sync main into release/develop (nightly) (#$pr)" \
-            -f commit_message="$(printf 'Automated nightly sync of main into release/develop (owner request 2026-11-26).\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>')" \
+            -f merge_method=merge \
+            -f commit_title="Merge main into release/develop (nightly sync) (#$pr)" \
+            -f commit_message="$(printf 'Merge main into release/develop to keep it current (nightly sync)\n\nSigned-off-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>')" \
             > /dev/null; then
-            echo "sync PR #$pr: squash auto-merge enabled"
+            echo "sync PR #$pr: merge-commit auto-merge enabled"
           else
-            echo "::warning::sync PR #$pr could not enable squash auto-merge; leaving it open for the next nightly run"
+            echo "::warning::sync PR #$pr could not enable merge auto-merge; leaving it open for the next nightly run"
           fi
 
       - name: Open or reuse the promotion PR and start full CI
         run: |
           set -euo pipefail
           # Count only real (single-parent) commits that are not nightly
-          # sync squashes: a sync squash is content-identical to main and
-          # must not trigger a promotion of its own, so a sync-only night
-          # opens no PR. (Root commits have 0 parents and are likewise
+          # sync squashes. Sync MERGE commits (two parents) are excluded
+          # by the parent-count filter itself; the prefix filter only
+          # guards against sync squashes left over from the pre-reversal
+          # flow. (Root commits have 0 parents and are likewise
           # excluded; release/develop will never see one.)
           n="$(gh api "repos/$REPO/compare/main...release/develop" --jq .ahead_by)"
           len="$(gh api "repos/$REPO/compare/main...release/develop" --jq '.commits | length')"
@@ -201,11 +200,16 @@ jobs:
           if [ -z "$pr" ]; then
             url="$(gh pr create --repo "$REPO" --base main --head "$BR" \
               --title "Nightly: promote release/develop to main" \
-              --body "Automated nightly promotion (owner decision 2026-11-19). Full 3.11-3.15 CI on ubuntu, windows and macOS. Auto-merges with a merge commit once the required ci check is green.")"
+              --body "Automated nightly promotion (owner decision 2026-11-19, merge policy 2026-11-26: one squash commit per promotion). Full 3.11-3.15 CI on ubuntu, windows and macOS. Auto-merges as a squash once the required ci check is green.")"
             pr="${url##*/}"
           fi
+          # The promotion lands as a SQUASH (policy 2026-11-26: one
+          # squash commit per nightly promotion; main-squash-only ruleset
+          # 28142725 requires it). The squash commit message carries the
+          # bot Signed-off-by, which is the only commit in main's
+          # push-time dco range.
           gh workflow run ci.yml --repo "$REPO" --ref "$BR"
-          gh pr merge "$pr" --repo "$REPO" --merge --auto --match-head-commit "$built" \
+          gh pr merge "$pr" --repo "$REPO" --squash --auto --match-head-commit "$built" \
             --subject "Nightly promotion of release/develop to main ($day) (#$pr)" \
             --body "$SOB"
-          echo "promotion PR #$pr: full CI dispatched on $BR at $built, auto-merge pinned to $built"
+          echo "promotion PR #$pr: full CI dispatched on $BR at $built, squash auto-merge pinned to $built"
