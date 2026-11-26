@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from types import TracebackType
+from types import FrameType, TracebackType
 from typing import Any, Final
 
 import pytest
@@ -45,11 +46,69 @@ _UNIX: Final = getattr(socket, "AF_UNIX", None)
 """Absent on Windows: resolved once, because comparing to ``socket.AF_UNIX`` raised there."""
 
 
-class NetworkEscape(RuntimeError):
-    """An outbound connection attempt to a non-local destination was blocked."""
+_LAYER_SKIP: Final = ("conventiondrift_testkit.net_monitor", "_pytest.", "pluggy.", "pytest.")
+"""Frames that are the guard itself or the runner, never the layer worth naming."""
 
-    def __init__(self, target: str, node_id: str) -> None:
-        super().__init__(f"blocked outbound network access to {target!r} in {node_id}")
+CLIENT_LIBRARIES: Final = (
+    "urllib.request",
+    "http.client",
+    "socket",
+    "requests",
+    "urllib3",
+    "conventiondrift.github",
+)
+"""The explicit, small set of client libraries whose frame names the layer (outermost wins)."""
+
+
+def _library_layer() -> str | None:
+    """The **outermost known client-library frame** that led to the blocked call (TE finding 2).
+
+    Walked only on the failure path, from the raise site outwards. Only the explicit small
+    ``CLIENT_LIBRARIES`` set counts: ``urllib.request.urlopen``, ``http.client``'s own call,
+    ``requests``/``urllib3`` and our C12 client are all named by the library, and the outermost
+    such frame wins. A raw call that never enters a library frame (a patched
+    ``socket.create_connection`` or a bare ``sock.connect``) has no frame to name here; the
+    wrapper then uses its own ``socket.*`` entry-point name.
+    """
+    frame: FrameType | None = sys._getframe(1)
+    outer: str | None = None
+    while frame is not None:
+        module = str(frame.f_globals.get("__name__", ""))
+        if any(module == lib or module.startswith(f"{lib}.") for lib in CLIENT_LIBRARIES):
+            outer = f"{module}.{frame.f_code.co_name}"
+        frame = frame.f_back
+    return outer
+
+
+def _calling_layer() -> str:
+    """The innermost test frame, else the outermost non-runner frame, else ``"unknown"``."""
+    frame: FrameType | None = sys._getframe(1)
+    test_fallback: str | None = None
+    outermost: str | None = None
+    while frame is not None:
+        module = str(frame.f_globals.get("__name__", ""))
+        if not any(module == skip or module.startswith(skip) for skip in _LAYER_SKIP):
+            name = f"{module}.{frame.f_code.co_name}"
+            if module == "__main__" or module.startswith("tests.") or module.startswith("unit."):
+                test_fallback = test_fallback or name
+            else:
+                outermost = name
+        frame = frame.f_back
+    return test_fallback or outermost or "unknown"
+
+
+class NetworkEscape(RuntimeError):
+    """An outbound connection attempt to a non-local destination was blocked.
+
+    ``layer`` names the outermost client-library frame that attempted it, so the same failure
+    from ``socket``, ``http.client`` and ``urllib.request`` is distinguishable in one message.
+    """
+
+    def __init__(self, target: str, node_id: str, layer: str | None = None) -> None:
+        self.layer = (_library_layer() or _calling_layer()) if layer is None else layer
+        super().__init__(
+            f"blocked outbound network access to {target!r} in {node_id} (layer: {self.layer})"
+        )
         self.target = target
         self.node_id = node_id
 
@@ -136,43 +195,49 @@ class NetworkGuard:
 
     # -- checks ---------------------------------------------------------------
 
-    def check(self, host: str | None) -> None:
-        """Record and raise for a non-local host; ``None`` means "no host to check"."""
+    def check(self, host: str | None, *, via: str | None = None) -> None:
+        """Record and raise for a non-local host; ``None`` means "no host to check".
+
+        ``via`` is the socket entry point the call came through. It is used only when the stack
+        walk finds no known client-library frame (a raw ``socket.*`` call from test code), so the
+        three planted escapes stay distinguishable either way.
+        """
         if host is None or is_loopback(host):
             return
         self.attempts.append(host)
-        raise NetworkEscape(host, self.node_id)
+        layer = _library_layer() or via or _calling_layer()
+        raise NetworkEscape(host, self.node_id, layer)
 
     # -- the wrappers ---------------------------------------------------------
 
     def _connect(self, sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
         if not _is_unix_family(getattr(sock, "family", None)):
-            self.check(_host_of(address))
+            self.check(_host_of(address), via="socket.connect")
         return self._saved["connect"](sock, address, *args, **kwargs)
 
     def _connect_ex(self, sock: socket.socket, address: object, *args: Any, **kwargs: Any) -> Any:
         if not _is_unix_family(getattr(sock, "family", None)):
-            self.check(_host_of(address))
+            self.check(_host_of(address), via="socket.connect_ex")
         return self._saved["connect_ex"](sock, address, *args, **kwargs)
 
     def _create_connection(self, address: object, *args: Any, **kwargs: Any) -> Any:
-        self.check(_host_of(address))
+        self.check(_host_of(address), via="socket.create_connection")
         return self._saved["create_connection"](address, *args, **kwargs)
 
     def _getaddrinfo(self, host: object, port: object, *args: Any, **kwargs: Any) -> Any:
         family = kwargs.get("family", args[0] if args else 0)
         if not _is_unix_family(family):
             if isinstance(host, bytes):
-                self.check(_text(host))
+                self.check(_text(host), via="socket.getaddrinfo")
             else:
-                self.check(host if isinstance(host, str) else None)
+                self.check(host if isinstance(host, str) else None, via="socket.getaddrinfo")
         return self._saved["getaddrinfo"](host, port, *args, **kwargs)
 
     def _sendto(self, sock: socket.socket, data: object, *args: Any, **kwargs: Any) -> Any:
         """Datagram egress: ``sendto(data, address)`` and ``sendto(data, flags, address)``."""
         address = kwargs.get("address", args[-1] if args else None)
         if not _is_unix_family(getattr(sock, "family", None)):
-            self.check(_host_of(address))
+            self.check(_host_of(address), via="socket.sendto")
         return self._saved["sendto"](sock, data, *args, **kwargs)
 
 

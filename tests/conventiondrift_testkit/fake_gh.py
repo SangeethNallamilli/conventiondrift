@@ -14,6 +14,9 @@ reason to exist) or opted out for the whole fake with :meth:`FakeGitHub.allow_al
 Read-only paths - ``lookup``, a head-only run, a skipped comment - need no declaration and get
 the zero-write assertion for free.
 
+A ``hook`` reply is served before the default-deny check, so a hook is the explicit escape
+hatch: a test that answers a write itself has taken responsibility for that write.
+
 Failure injection is one-shot and applies to the next request, before routing:
 :meth:`FakeGitHub.fail_next` (401/403/404/429/5xx), :meth:`FakeGitHub.timeout_next` (raises
 ``github.DeadlineExceeded``), :meth:`FakeGitHub.malformed_next` (200 with a body that is not
@@ -51,7 +54,6 @@ TOKEN: Final = "fake-token-for-tests-0000"  # noqa: S105 -- an obvious fake, nev
 _HEAD: Final = "a" * 40
 
 _ROUTE: Final = re.compile(r"^/repos/([^/]+/[^/]+)/(pulls|issues|code-scanning)/(.+)$")
-_OURS_CONDITIONS: Final = 4  # id, bot identity, marker, issue_url - see github.failed_conditions
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +204,8 @@ class FakeGitHub:
         return [r for r in self.requests if r.method == "DELETE"]
 
     def comment_requests(self) -> list[Req]:
-        return [r for r in self.requests if "/comments" in r.path or "/pulls/" in r.path]
+        """Only the comment endpoints; the pull-request head read is not a comment request."""
+        return [r for r in self.requests if "/comments" in r.path]
 
     def requests_to(self, suffix: str) -> list[Req]:
         return [r for r in self.requests if r.path.endswith(suffix)]

@@ -58,6 +58,26 @@ def test_the_environment_is_restored_exactly_and_new_keys_are_removed() -> None:
     assert os.environ.get("GITHUB_OUTPUT") == before.get("GITHUB_OUTPUT")
 
 
+def test_the_restore_never_clears_the_environment() -> None:
+    """TE finding 1: a clear() would empty the environment for one call (Windows DLL lookups)."""
+    import inspect
+
+    from conventiondrift_testkit.github_env import GitHubEnv as Env
+
+    source = inspect.getsource(Env.__exit__)
+    assert "environ.clear(" not in source
+    assert "del os.environ[key]" in source
+
+
+def test_the_restore_reverts_a_changed_and_a_deleted_key() -> None:
+    before = dict(os.environ)
+    with github_env():
+        os.environ["PATH"] = "/changed/inside/the/scope"
+        os.environ.pop("HOME", None)
+    assert os.environ.get("PATH") == before.get("PATH")
+    assert os.environ.get("HOME") == before.get("HOME")
+
+
 def test_the_scope_is_not_re_entrant() -> None:
     with github_env(), pytest.raises(RuntimeError, match="not re-entrant"):
         with github_env():

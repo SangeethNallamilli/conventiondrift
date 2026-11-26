@@ -123,11 +123,21 @@ class GitHubEnv:
         tb: TracebackType | None,
     ) -> None:
         try:
-            os.environ.clear()
-            os.environ.update(self._snapshot)
-            if dict(os.environ) != self._snapshot:  # pragma: no cover - the comparison above
-                changed = sorted(set(os.environ) ^ set(self._snapshot))
-                raise EnvironmentLeak(f"environment not restored; keys differ: {changed}")
+            # Diff-based restore (TE finding 1): no ``clear()``, so ``PATH`` and every other
+            # key stay present for the whole restore - on Windows an empty environment for even
+            # one call can break a child process or a DLL lookup. Only the keys this scope
+            # touched are reverted, and the leak is computed from the pre-restore state.
+            current = dict(os.environ)
+            added = [key for key in current if key not in self._snapshot]
+            changed = [key for key, value in self._snapshot.items() if current.get(key) != value]
+            for key in added:
+                del os.environ[key]
+            for key in changed:
+                os.environ[key] = self._snapshot[key]
+            if exc_type is None and dict(os.environ) != self._snapshot:
+                raise EnvironmentLeak(
+                    f"environment not restored; keys differ: {sorted(added + changed)}"
+                )
         finally:
             GitHubEnv._active -= 1
             self._entered = False

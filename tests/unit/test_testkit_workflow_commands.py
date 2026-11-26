@@ -55,6 +55,8 @@ def test_data_unescapes_percent_once_and_leaves_the_rest_literal() -> None:
     # One left-to-right pass: "%250A" is the literal text "%0A", not a newline.
     assert unescape("%250A") == "%0A"
     assert unescape("%2C and %3A are not data escapes") == "%2C and %3A are not data escapes"
+    # The single-pass pin for the data path too: sequential replacement would give "," here.
+    assert unescape("%252C") == "%2C"
     assert unescape("a\u240ab") == "a\nb"
 
 

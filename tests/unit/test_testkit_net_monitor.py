@@ -54,11 +54,43 @@ def test_a_non_local_connect_raises_and_is_recorded() -> None:
     assert guard.attempts == ["203.0.113.9"]
 
 
+def test_the_escape_names_a_raw_socket_call() -> None:
+    with NetworkGuard("t"):
+        with pytest.raises(NetworkEscape) as caught:
+            socket.create_connection(("example.com", 443), timeout=0.01)
+    assert caught.value.layer == "socket.create_connection", caught.value.layer
+
+
+def test_the_escape_names_the_outermost_client_library() -> None:
+    import http.client
+
+    with NetworkGuard("t"):
+        with pytest.raises(NetworkEscape) as caught:
+            http.client.HTTPConnection("example.com", 80, timeout=0.01).connect()
+    assert caught.value.layer.startswith("http.client."), caught.value.layer
+
+
+def test_the_three_escape_paths_stay_distinguishable() -> None:
+    layers: list[str] = []
+    with NetworkGuard("t"):
+        for call in (
+            lambda: socket.connect if False else socket.getaddrinfo("example.com", 80),
+            lambda: socket.create_connection(("example.com", 443), timeout=0.01),
+        ):
+            with pytest.raises(NetworkEscape) as caught:
+                call()
+            layers.append(caught.value.layer)
+    assert layers[0] == "socket.getaddrinfo"
+    assert layers[1] == "socket.create_connection"
+    assert len(set(layers)) == 2
+
+
 def test_the_escape_error_carries_the_target_and_test_id() -> None:
     error = NetworkEscape("203.0.113.9", "t.py::case")
     assert error.target == "203.0.113.9"
     assert error.node_id == "t.py::case"
     assert "203.0.113.9" in str(error)
+    assert "(layer: " in str(error) and error.layer
 
 
 def test_a_swallowed_escape_is_still_recorded() -> None:
