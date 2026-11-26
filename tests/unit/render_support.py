@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 from collections.abc import Sequence
 from datetime import datetime
 from types import MappingProxyType
 from typing import get_args
+
+import pytest
 
 from conventiondrift.model import (
     Alternative,
@@ -32,6 +35,43 @@ from conventiondrift.model import (
     Verdict,
     Window,
 )
+
+# One hostile corpus for both renderers (TE N-71-3): a stable sample per escaper category
+# (Cc, Cf, Zl, Zp, Cs), incl. CR/LF, DEL, C1, bidi, zero-width, BOM and a lone surrogate.
+HOSTILE_CHARS = (
+    "\x00",
+    "\n",
+    "\r",
+    "\x1b",
+    "\x7f",
+    "\x85",
+    "\u202e",
+    "\u2066",
+    "\u200b",
+    "\ufeff",
+    "\u2028",
+    "\u2029",
+    "\ud800",
+)
+HOSTILE_TEXT = (
+    "Use requests <img src=x onerror=alert(1)> [l](https://evil.example) @someone #123 "
+    "```\n::warning::x %0A \\ " + "".join(HOSTILE_CHARS)
+)
+
+
+def installed_version() -> str:
+    """The installed distribution's version, or a loud skip when metadata is unavailable.
+
+    TE N-71-1: ``conventiondrift.__version__`` is the same binding the renderers read, so a stale
+    binding would satisfy both sides of the assertion. Reading the installed metadata is an
+    independent oracle; where the package is not installed, skipping loudly is honest, silently
+    passing is not.
+    """
+    try:
+        return importlib.metadata.version("conventiondrift")
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover - env without an install
+        pytest.skip("conventiondrift distribution metadata is unavailable (not installed)")
+
 
 SHA = "a" * 40
 HEAD_SHA = "b" * 40

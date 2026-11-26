@@ -11,6 +11,10 @@ including bidi, zero-width, separator and lone-surrogate code points, is written
 ``\\uXXXX`` escape and the output is pure ASCII (valid UTF-8). Nothing in this module
 escapes text itself (SECURITY-RULES R3.2). Internal errors pass the same I-14 validation as
 every other sink, so only fixed messages are written.
+
+The report's contract - including that its strings are raw data a consumer must escape for its own
+sink, and that a lone surrogate makes the document valid JSON but not strict I-JSON - is
+``INTERFACES.md`` I-9.
 """
 
 from __future__ import annotations
